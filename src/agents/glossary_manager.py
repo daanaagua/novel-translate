@@ -157,16 +157,6 @@ class GlossaryManager:
     ) -> GlossaryItem:
         """
         添加新术语
-        
-        Args:
-            src: 英文原词
-            default_target: 默认译法
-            category: 分类
-            description: 说明
-            rules: 语境规则列表
-        
-        Returns:
-            创建的 GlossaryItem
         """
         parsed_rules = []
         if rules:
@@ -177,6 +167,11 @@ class GlossaryManager:
                     example=r.get("example")
                 ))
         
+        # 简单去重：如果已存在同名术语，不添加
+        # 注意：这里我们做一个不区分大小写的检查
+        if self.find_by_src(src):
+            return self.find_by_src(src)
+
         item = GlossaryItem(
             id=f"term_{src.lower().replace(' ', '_')}",
             src=src,
@@ -192,7 +187,39 @@ class GlossaryManager:
         pattern = re.compile(rf'\b{re.escape(src)}\b', re.IGNORECASE)
         self._term_patterns[src] = pattern
         
+        # 自动保存到 auto_generated.json
+        self._save_auto_term(item)
+        
         return item
+
+    def _save_auto_term(self, item: GlossaryItem):
+        """将新术语追加到 auto_generated.json"""
+        if not self.glossary_dir.exists():
+            return
+            
+        auto_file = self.glossary_dir / "auto_generated.json"
+        
+        data = []
+        if auto_file.exists():
+            try:
+                with open(auto_file, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+            except Exception:
+                data = [] # 文件损坏或为空，重新开始
+        
+        # 构造字典
+        item_data = {
+            "id": item.id,
+            "src": item.src,
+            "default_target": item.default_target,
+            "category": item.category.value if item.category else None,
+            "description": item.description
+        }
+        
+        data.append(item_data)
+        
+        with open(auto_file, 'w', encoding='utf-8') as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
     
     def save(self, file_path: str) -> None:
         """

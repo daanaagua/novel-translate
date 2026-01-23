@@ -40,11 +40,13 @@ class TermExtractor:
                 temperature=0.1
             )
             
-            # 兼容可能的 key 差异
-            items = result.get("terms", result.get("items", []))
+            # 兼容各种 JSON 结构
+            items = []
             if isinstance(result, list):
                 items = result
-                
+            elif isinstance(result, dict):
+                items = result.get("terms", result.get("items", []))
+            
             return items
             
         except Exception as e:
