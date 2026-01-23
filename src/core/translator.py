@@ -9,35 +9,26 @@ from .schemas import TextChunk, ChunkStatus, LogicAnalysisResult
 from .llm_client import LLMManager
 from ..agents.logic_analyzer import LogicAnalyzer
 from ..agents.glossary_manager import GlossaryManager
-
+from ..agents.term_extractor import TermExtractor
 
 @dataclass
 class TranslationConfig:
     """翻译配置"""
-    # 直译参数
+    # ... 原有字段 ...
     draft_temperature: float = 0.1
     draft_max_tokens: int = 4096
-    
-    # 润色参数
     polish_temperature: float = 0.7
     polish_max_tokens: int = 4096
-    
-    # 是否启用逻辑分析
     enable_logic_analysis: bool = True
-    
-    # 是否启用润色
     enable_polish: bool = True
-    
-    # 风格参考文本
     style_reference: Optional[str] = None
+    
+    # 新增：自动术语提取
+    enable_auto_glossary: bool = False
 
 
 class TranslationEngine:
-    """
-    翻译引擎
-    实现 PRD 中的 "直译 -> 润色" 双流架构
-    """
-    
+    # ...
     def __init__(
         self,
         llm_manager: LLMManager,
@@ -45,25 +36,16 @@ class TranslationEngine:
         prompts: Dict[str, Any],
         config: Optional[TranslationConfig] = None
     ):
-        """
-        初始化翻译引擎
-        
-        Args:
-            llm_manager: LLM 管理器
-            glossary_manager: 术语表管理器
-            prompts: Prompt 配置（从 prompts.yaml 加载）
-            config: 翻译配置
-        """
         self.llm = llm_manager
         self.glossary = glossary_manager
         self.prompts = prompts
         self.config = config or TranslationConfig()
         
-        # 初始化逻辑分析器
         self.logic_analyzer = LogicAnalyzer(
             llm_manager=llm_manager,
             prompts=prompts.get("logic_analysis", {})
         )
+        self.term_extractor = TermExtractor(llm_manager)
         
         # 上下文缓存（用于滑动窗口）
         self._context_buffer: List[str] = []
@@ -72,47 +54,104 @@ class TranslationEngine:
     def translate_chunk(
         self,
         chunk: TextChunk,
-        previous_summary: Optional[str] = None
+        previous_summary: Optional[str] = None,
+        previous_chunk_text: Optional[str] = None,
+        stream_callback: Optional[callable] = None
     ) -> TextChunk:
         """
         翻译单个文本块
         
-        完整流程：
-        1. 逻辑分析（如需要）
-        2. 直译
-        3. 润色
-        
         Args:
-            chunk: 待翻译的 TextChunk
-            previous_summary: 前文摘要（上下文）
-        
-        Returns:
-            翻译完成的 TextChunk
+            stream_callback: (phase, content) -> None, 用于实时回显流式内容
         """
         try:
+            # 步骤 0: 自动术语提取 (Pre-flight)
+            if self.config.enable_auto_glossary:
+                if stream_callback: stream_callback("logic", "正在扫描新术语...")
+                new_terms = self.term_extractor.extract(chunk.source_text)
+                for term in new_terms:
+                    # 只有当术语不在库中时才添加
+                    if not self.glossary.find_by_src(term["src"]):
+                        self.glossary.add_term(
+                            src=term["src"],
+                            default_target=term["src"], # 默认译名暂为原文，待人工确认
+                            category=term.get("category"),
+                            description=f"Auto-extracted from context: {term.get('context')}"
+                        )
+                        if stream_callback: stream_callback("logic", f"发现新术语: {term['src']}")
+
             # 步骤 1: 逻辑分析
             if self.config.enable_logic_analysis:
                 chunk.status = ChunkStatus.ANALYZING
+                if stream_callback: stream_callback("logic", "正在进行逻辑分析...")
                 chunk = self.logic_analyzer.analyze_chunk(chunk)
             
             # 步骤 2: 直译
             chunk.status = ChunkStatus.DRAFTING
-            chunk.draft_translation = self._draft_translate(
+            if stream_callback: stream_callback("draft_start", "")
+            
+            draft_gen = self._draft_translate(
                 source_text=chunk.source_text,
                 logic_analysis=chunk.logic_analysis,
-                previous_summary=previous_summary
+                previous_summary=previous_summary,
+                previous_chunk_text=previous_chunk_text
             )
+            
+            # 消费直译流
+            full_draft = ""
+            for item in draft_gen:
+                if isinstance(item, tuple):
+                    msg_type, content = item
+                else:
+                    msg_type, content = "content", item # 兼容旧格式
+                
+                if msg_type == "content":
+                    full_draft += content
+                
+                if stream_callback: stream_callback(f"draft_{msg_type}", content)
+            
+            chunk.draft_translation = full_draft
             
             # 步骤 3: 润色
             if self.config.enable_polish:
                 chunk.status = ChunkStatus.POLISHING
-                chunk.polished_translation = self._polish_translate(
+                if stream_callback: stream_callback("polish_start", "")
+                
+                polish_gen = self._polish_translate(
                     source_text=chunk.source_text,
                     draft_translation=chunk.draft_translation
                 )
+                
+                # 消费润色流
+                full_polish = ""
+                for item in polish_gen:
+                    if isinstance(item, tuple):
+                        msg_type, content = item
+                    else:
+                        msg_type, content = "content", item
+                    
+                    if msg_type == "content":
+                        full_polish += content
+                        
+                    if stream_callback: stream_callback(f"polish_{msg_type}", content)
+                
+                chunk.polished_translation = full_polish
                 chunk.final_translation = chunk.polished_translation
             else:
                 chunk.final_translation = chunk.draft_translation
+            
+            # 去重处理：如果译文开头包含了上一段译文的末尾，则切除
+            if self._last_chunk_translation:
+                # 取上一段译文的最后 20 个字符
+                suffix = self._last_chunk_translation[-20:].strip()
+                if suffix and suffix in chunk.final_translation[:100]:
+                    # 如果在当前译文前 100 字内发现了上一段的结尾，说明有重复
+                    idx = chunk.final_translation.find(suffix)
+                    if idx != -1:
+                        # 切除重复部分
+                        clean_translation = chunk.final_translation[idx + len(suffix):].strip()
+                        if clean_translation: # 确保没切空
+                            chunk.final_translation = clean_translation
             
             chunk.status = ChunkStatus.COMPLETED
             
@@ -122,6 +161,9 @@ class TranslationEngine:
         except Exception as e:
             chunk.status = ChunkStatus.FAILED
             chunk.error_message = str(e)
+            # 重新抛出以便上层知晓
+            # raise e 
+            # 暂时不抛出，让流程继续
         
         return chunk
     
@@ -129,18 +171,20 @@ class TranslationEngine:
         self,
         source_text: str,
         logic_analysis: Optional[LogicAnalysisResult] = None,
-        previous_summary: Optional[str] = None
-    ) -> str:
+        previous_summary: Optional[str] = None,
+        previous_chunk_text: Optional[str] = None
+    ) -> Any: # Return type changed to Any to support stream generator or str
         """
         直译阶段
         
         Args:
             source_text: 原文
             logic_analysis: 逻辑分析结果
-            previous_summary: 前文摘要
+            previous_summary: 前文摘要 (Story Context)
+            previous_chunk_text: 上一个 Chunk 的原文末尾 (Text Context)
         
         Returns:
-            直译文本
+            直译文本 (str) 或 生成器 (stream)
         """
         # 获取术语规则
         glossary_rules = self.glossary.get_prompt_text(source_text)
@@ -157,40 +201,44 @@ class TranslationEngine:
             logic_analysis=logic_text
         )
         
-        # 构建 User Prompt
-        user_template = self.prompts.get("draft", {}).get("user", "请翻译以下文本：\n\n{source_text}")
-        user_prompt = user_template.format(source_text=source_text)
+        # 构建 User Prompt (采用结构化 Context 注入)
+        user_content = ""
         
-        # 如果有前文摘要，添加上下文
+        # 1. 注入 Story Context (摘要)
         if previous_summary:
-            user_prompt = f"【前文摘要】\n{previous_summary}\n\n" + user_prompt
+            user_content += f"<story_context>\n{previous_summary}\n</story_context>\n\n"
+            
+        # 2. 注入 Text Context (上一段原文，防止割裂)
+        if previous_chunk_text:
+            # 取最后 200 字符作为衔接参考
+            context_snippet = previous_chunk_text[-200:] if len(previous_chunk_text) > 200 else previous_chunk_text
+            user_content += f"<immediate_context>\n...{context_snippet}\n</immediate_context>\n\n"
+        
+        # 3. 注入当前文本
+        user_content += f"<text_to_translate>\n{source_text}\n</text_to_translate>"
         
         messages = [
             {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_prompt}
+            {"role": "user", "content": user_content}
         ]
         
+        # 强制流式输出
         return self.llm.chat(
             messages=messages,
             purpose="draft",
             temperature=self.config.draft_temperature,
-            max_tokens=self.config.draft_max_tokens
+            max_tokens=self.config.draft_max_tokens,
+            stream=True # Enable streaming
         )
     
     def _polish_translate(
         self,
         source_text: str,
         draft_translation: str
-    ) -> str:
+    ) -> Any:
         """
         润色阶段
-        
-        Args:
-            source_text: 原文
-            draft_translation: 直译文本
-        
-        Returns:
-            润色后的文本
+        Returns: 文本 (str) 或 生成器
         """
         # 构建 System Prompt
         system_template = self.prompts.get("polish", {}).get("system", self._default_polish_system())
@@ -215,7 +263,8 @@ class TranslationEngine:
             messages=messages,
             purpose="polish",
             temperature=self.config.polish_temperature,
-            max_tokens=self.config.polish_max_tokens
+            max_tokens=self.config.polish_max_tokens,
+            stream=True # Force streaming
         )
     
     def translate_text(
@@ -267,10 +316,12 @@ class TranslationEngine:
         """默认直译 System Prompt"""
         return """你是一位严谨的文学翻译家。你的任务是将英文小说翻译成中文。
 
-## 核心原则
-1. **准确第一**：绝对忠于原文的事实和逻辑，不添加不删减。
-2. **术语一致**：严格遵守提供的术语表规则。
-3. **逻辑遵从**：如果提供了逻辑分析，必须按照分析结果处理指代关系。
+## 核心指令
+1. **只翻译 <text_to_translate> 标签内的内容**。
+2. `<story_context>` 和 `<immediate_context>` 仅作为理解参考，**绝对不要翻译它们**。
+3. **准确第一**：绝对忠于原文的事实和逻辑，不添加不删减。
+4. **术语一致**：严格遵守提供的术语表规则。
+5. **逻辑遵从**：如果提供了逻辑分析，必须按照分析结果处理指代关系。
 
 ## 术语表
 {glossary_rules}
@@ -280,7 +331,7 @@ class TranslationEngine:
 
 ## 输出要求
 - 直接输出中文译文，保持原文的分段格式。
-- 不要添加任何解释或注释。"""
+- 不要输出标签，也不要添加任何解释。"""
     
     def _default_polish_system(self) -> str:
         """默认润色 System Prompt"""

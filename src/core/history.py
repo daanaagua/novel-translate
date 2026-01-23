@@ -108,6 +108,12 @@ class TranslationMemory:
                 encoding='utf-8'
             )
 
+    def get_previous_chunk(self, current_chunk: TextChunk) -> Optional[TextChunk]:
+        """获取前一个 Chunk"""
+        if current_chunk.index == 0:
+            return None
+        return self.get_chunk(current_chunk.chapter_id, current_chunk.index - 1)
+
     def get_context_for_chunk(self, chunk: TextChunk, window_size: int = 2000) -> str:
         """
         获取用于翻译的上下文

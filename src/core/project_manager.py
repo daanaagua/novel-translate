@@ -79,13 +79,25 @@ class ProjectManager:
         (project_dir / "glossary").mkdir()
         (project_dir / "artifacts").mkdir()
         
-        # 2. 复制原文
+        # 2. 处理原文 (格式转换)
         src_file = Path(source_path)
         if not src_file.exists():
             raise FileNotFoundError(f"源文件不存在: {source_path}")
         
         dest_source = project_dir / "source.txt"
-        shutil.copy2(src_file, dest_source)
+        
+        # 使用 Preprocessor 加载（支持 docx 自动转换）
+        # 注意：这里我们临时实例化一个 Preprocessor 仅用于转换
+        temp_prep = TextPreprocessor()
+        try:
+            # 加载并清洗文本
+            clean_text = temp_prep.load_text(str(src_file))
+            # 写入项目目录为纯文本
+            dest_source.write_text(clean_text, encoding='utf-8')
+        except Exception as e:
+            # 如果转换失败，回滚清理目录
+            shutil.rmtree(project_dir)
+            raise RuntimeError(f"原文处理失败: {e}")
         
         # 3. 初始化项目对象
         project = Project(book_id, self.projects_root)

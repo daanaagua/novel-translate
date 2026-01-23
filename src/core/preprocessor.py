@@ -20,6 +20,17 @@ class TextPreprocessor:
         r'^CHAPTER\s+([IVXLC]+)',               # CHAPTER IV
         r'^\d+\.',                              # 1.
         r'^第.+章',                              # 中文章节
+        r'^([IVXLC]+)\s*$',                     # 纯罗马数字 (如 II, III) - 独占一行
+    ]
+    
+    # 卷/书标题模式 (针对多卷本合集)
+    VOLUME_PATTERNS = [
+        r'^BOOK\s+[IVXLC]+',                    # BOOK I
+        r'^THE\s+SHADOW\s+OF\s+THE\s+TORTURER', # 第一卷
+        r'^THE\s+CLAW\s+OF\s+THE\s+CONCILIATOR', # 第二卷
+        r'^THE\s+SWORD\s+OF\s+THE\s+LICTOR',     # 第三卷
+        r'^THE\s+CITADEL\s+OF\s+THE\s+AUTARCH',  # 第四卷
+        r'^THE\s+URTH\s+OF\s+THE\s+NEW\s+SUN',   # 续集
     ]
     
     # 场景分隔符
@@ -43,10 +54,10 @@ class TextPreprocessor:
     
     def load_text(self, file_path: str) -> str:
         """
-        加载文本文件
+        加载文本文件 (支持 .txt, .md, .docx)
         
         Args:
-            file_path: 文件路径 (支持 .txt, .md)
+            file_path: 文件路径
         
         Returns:
             清洗后的文本
@@ -55,7 +66,36 @@ class TextPreprocessor:
         
         if not path.exists():
             raise FileNotFoundError(f"文件不存在: {file_path}")
+            
+        suffix = path.suffix.lower()
         
+        if suffix == '.docx':
+            return self._load_docx(path)
+        else:
+            return self._load_plain_text(path)
+
+    def _load_docx(self, path: Path) -> str:
+        """加载 docx 文件"""
+        try:
+            import docx
+            doc = docx.Document(path)
+            # 提取所有段落文本
+            # 改进：直接过滤掉空段落，避免 excessive newlines 干扰正则
+            full_text = []
+            for para in doc.paragraphs:
+                text = para.text.strip()
+                if text:
+                    full_text.append(text)
+            
+            # 用双换行连接，保持段落感
+            return '\n\n'.join(full_text)
+        except ImportError:
+            raise ImportError("请安装 python-docx 以支持 .docx 文件: pip install python-docx")
+        except Exception as e:
+            raise ValueError(f"读取 docx 失败: {e}")
+
+    def _load_plain_text(self, path: Path) -> str:
+        """加载纯文本文件"""
         # 读取文件，尝试多种编码
         content = None
         for encoding in ['utf-8', 'utf-8-sig', 'gbk', 'latin-1']:
@@ -83,43 +123,110 @@ class TextPreprocessor:
         text = '\n'.join(lines)
         return text
     
-    def split_chapters(self, text: str) -> List[Tuple[str, str]]:
+    def split_chapters(self, text: str) -> List[Tuple[str, str, str]]:
         """
-        将文本分割为章节
-        
-        Args:
-            text: 完整文本
+        将文本分割为章节 (支持多卷结构 + 智能兜底)
         
         Returns:
-            [(chapter_title, chapter_content), ...]
+            [(chapter_id, chapter_title, chapter_content), ...]
         """
-        # 合并所有章节模式
-        combined_pattern = '|'.join(f'({p})' for p in self.CHAPTER_PATTERNS)
+        # 1. 尝试正则切分 Volume
+        volume_pattern = '|'.join(f'({p})' for p in self.VOLUME_PATTERNS)
+        volume_matches = list(re.finditer(volume_pattern, text, re.MULTILINE | re.IGNORECASE))
         
-        # 查找所有章节标题位置
-        matches = list(re.finditer(combined_pattern, text, re.MULTILINE))
-        
-        if not matches:
-            # 没有找到章节标题，整个文本作为一个章节
-            return [("Chapter 1", text)]
-        
+        volumes = []
+        if not volume_matches:
+            volumes.append(("v01", text))
+        else:
+            if volume_matches[0].start() > 0:
+                volumes.append(("v00", text[:volume_matches[0].start()]))
+            
+            for i, match in enumerate(volume_matches):
+                vol_id = f"v{i+1:02d}"
+                start = match.end()
+                end = volume_matches[i+1].start() if i + 1 < len(volume_matches) else len(text)
+                volumes.append((vol_id, text[start:end]))
+
+        # 2. 在每个 Volume 内切分 Chapter
         chapters = []
+        combined_chapter_pattern = '|'.join(f'({p})' for p in self.CHAPTER_PATTERNS)
+        
+        for vol_id, vol_content in volumes:
+            # 尝试正则切分
+            vol_chapters = self._regex_split_chapters(vol_content, combined_chapter_pattern, vol_id)
+            
+            # 检查切分结果是否合理
+            # 如果内容很长（>1万字）但只切出不到 2 章，说明正则可能失效
+            if len(vol_content) > 10000 and len(vol_chapters) < 2:
+                print(f"[Preprocessor] 卷 {vol_id} 正则切分效果不佳 (仅 {len(vol_chapters)} 章)，启用物理兜底分章...")
+                vol_chapters = self._fallback_split_chapters(vol_content, vol_id)
+            
+            chapters.extend(vol_chapters)
+            
+        return chapters
+
+    def _regex_split_chapters(self, text: str, pattern: str, vol_id: str) -> List[Tuple[str, str, str]]:
+        """正则切分逻辑"""
+        matches = list(re.finditer(pattern, text, re.MULTILINE))
+        if not matches:
+            return [(f"{vol_id}_ch00", f"Volume {vol_id}", text)]
+            
+        chapters = []
+        if matches[0].start() > 0:
+            pre_content = text[:matches[0].start()].strip()
+            if pre_content:
+                chapters.append((f"{vol_id}_pre", "Preamble", pre_content))
+                
         for i, match in enumerate(matches):
             title = match.group().strip()
             start = match.end()
-            
-            # 确定章节结束位置
-            if i + 1 < len(matches):
-                end = matches[i + 1].start()
-            else:
-                end = len(text)
-            
+            end = matches[i+1].start() if i + 1 < len(matches) else len(text)
             content = text[start:end].strip()
-            if content:  # 忽略空章节
-                chapters.append((title, content))
-        
+            
+            if content:
+                # 尝试提取数字 ID
+                nums = re.findall(r'\d+', title)
+                if nums:
+                    idx = int(nums[0])
+                else:
+                    # 罗马数字转阿拉伯数字 (简化版，仅处理 I-X)
+                    roman_map = {'I':1, 'II':2, 'III':3, 'IV':4, 'V':5, 'VI':6, 'VII':7, 'VIII':8, 'IX':9, 'X':10}
+                    clean_title = title.replace('CHAPTER','').replace('Chapter','').strip().upper()
+                    idx = roman_map.get(clean_title, i + 1)
+                
+                ch_id = f"{vol_id}_ch{idx:02d}"
+                chapters.append((ch_id, title, content))
         return chapters
-    
+
+    def _fallback_split_chapters(self, text: str, vol_id: str, chunk_size: int = 5000) -> List[Tuple[str, str, str]]:
+        """
+        兜底分章逻辑：按字数强制切分
+        适用于无任何章节标题的文本
+        """
+        # 简单按双换行符分割段落
+        paragraphs = text.split('\n\n')
+        current_chunk = []
+        current_len = 0
+        chapters = []
+        idx = 1
+        
+        for para in paragraphs:
+            current_chunk.append(para)
+            current_len += len(para)
+            
+            if current_len >= chunk_size:
+                content = '\n\n'.join(current_chunk)
+                chapters.append((f"{vol_id}_auto_{idx:03d}", f"Part {idx}", content))
+                current_chunk = []
+                current_len = 0
+                idx += 1
+        
+        if current_chunk:
+            content = '\n\n'.join(current_chunk)
+            chapters.append((f"{vol_id}_auto_{idx:03d}", f"Part {idx}", content))
+            
+        return chapters
+
     def split_into_chunks(
         self,
         text: str,
@@ -207,11 +314,40 @@ class TextPreprocessor:
         return chunks
     
     def _split_paragraphs(self, text: str) -> List[str]:
-        """按段落分割文本"""
+        """按段落分割文本，对超长段落进行硬切分"""
         # 双换行分割段落
-        paragraphs = re.split(r'\n\s*\n', text)
-        # 过滤空段落
-        return [p.strip() for p in paragraphs if p.strip()]
+        raw_paragraphs = re.split(r'\n\s*\n', text)
+        final_paragraphs = []
+        
+        # 设定硬切分阈值 (字符数)
+        # 英文平均单词长度5，1500 tokens 约等于 6000-8000 字符
+        MAX_CHAR_PER_PARA = 3000 
+        
+        for p in raw_paragraphs:
+            p = p.strip()
+            if not p:
+                continue
+                
+            if len(p) <= MAX_CHAR_PER_PARA:
+                final_paragraphs.append(p)
+            else:
+                # 暴力按句号切分长段落
+                sentences = re.split(r'(?<=[.!?。！？])\s+', p)
+                current_chunk = []
+                current_len = 0
+                
+                for sent in sentences:
+                    current_chunk.append(sent)
+                    current_len += len(sent)
+                    if current_len >= MAX_CHAR_PER_PARA:
+                        final_paragraphs.append(' '.join(current_chunk))
+                        current_chunk = []
+                        current_len = 0
+                
+                if current_chunk:
+                    final_paragraphs.append(' '.join(current_chunk))
+                    
+        return final_paragraphs
     
     def _is_scene_break(self, text: str) -> bool:
         """判断是否是场景分隔符"""
@@ -263,14 +399,13 @@ class TextPreprocessor:
         
         # 构建 Book
         chapters = []
-        for i, (chapter_title, chapter_content) in enumerate(raw_chapters):
-            chapter_id = f"ch{i+1:02d}"
-            
+        # 注意：raw_chapters 现在是 (id, title, content)
+        for i, (ch_id, chapter_title, chapter_content) in enumerate(raw_chapters):
             # 分块
-            chunks = self.split_into_chunks(chapter_content, chapter_id)
+            chunks = self.split_into_chunks(chapter_content, ch_id)
             
             chapter = Chapter(
-                id=chapter_id,
+                id=ch_id,
                 title=chapter_title,
                 index=i,
                 source_text=chapter_content,

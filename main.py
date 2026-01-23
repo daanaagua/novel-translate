@@ -32,10 +32,10 @@ def cmd_init(args):
             source_path=args.file,
             force=args.force
         )
-        print(f"✅ 项目创建成功！位置: {project.root_dir}")
+        print(f"[OK] 项目创建成功！位置: {project.root_dir}")
         print(f"下一步: 请运行 'python main.py translate {args.book_id}' 开始翻译")
     except Exception as e:
-        print(f"❌ 创建失败: {e}")
+        print(f"[ERROR] 创建失败: {e}")
 
 def cmd_list(args):
     """列出所有项目"""
@@ -48,6 +48,27 @@ def cmd_list(args):
     for p in projects:
         print(f"  - {p}")
 
+# 定义流式打印回调
+def stream_printer(phase, content):
+    # 处理不同阶段的输出
+    if phase == "logic":
+        print(f"\r[Logic] {content}", end="", flush=True)
+    
+    elif phase == "draft_start":
+        print("\n\n[Draft] ", end="", flush=True)
+    elif phase == "draft_think":
+        # 思考过程用灰色或斜体显示 (ANSI code)
+        print(f"\033[90m{content}\033[0m", end="", flush=True)
+    elif phase == "draft_content":
+        print(content, end="", flush=True)
+        
+    elif phase == "polish_start":
+        print("\n\n[Polish] ", end="", flush=True)
+    elif phase == "polish_think":
+        print(f"\033[90m{content}\033[0m", end="", flush=True)
+    elif phase == "polish_content":
+        print(content, end="", flush=True)
+
 def cmd_translate(args):
     """项目翻译命令"""
     book_id = args.book_id
@@ -59,7 +80,6 @@ def cmd_translate(args):
         return
 
     # 1. 加载配置
-    # TODO: 优先加载项目级配置 project.config_file
     global_config = config_loader.load_config()
     prompts = config_loader.load_prompts()
     
@@ -84,11 +104,10 @@ def cmd_translate(args):
         config=trans_config
     )
     
-    print(f"🚀 开始翻译项目: {book_id}")
+    print(f"[START] 开始翻译项目: {book_id}")
     print(f"配置: 逻辑分析={'OFF' if args.no_logic else 'ON'}, 润色={'OFF' if args.no_polish else 'ON'}")
     
     # 3. 遍历章节和 Chunk
-    # 从文件系统加载章节列表
     chapter_files = sorted(project.memory.chapters_dir.glob("*.json"))
     
     total_processed = 0
@@ -101,44 +120,53 @@ def cmd_translate(args):
         if args.chapters and chapter_id not in args.chapters.split(','):
             continue
             
-        print(f"\n📖 处理章节: {chapter_id}")
+        print(f"\n[Chapter] 处理章节: {chapter_id}")
         
         # 加载章节数据
         chapter = project.memory.load_chapter(chapter_id)
         if not chapter:
-            print(f"  ⚠️ 无法加载章节 {chapter_id}")
+            print(f"  [WARN] 无法加载章节 {chapter_id}")
             continue
             
         for chunk in chapter.chunks:
             # 检查是否需要跳过
             if project.memory.should_skip(chunk, force=args.force):
-                print(f"  ⏭️ Chunk {chunk.id}: 已完成，跳过")
+                print(f"  [SKIP] Chunk {chunk.id}: 已完成，跳过")
                 total_skipped += 1
                 continue
             
-            print(f"  ⚡ 翻译 Chunk {chunk.id} (Tokens: {chunk.token_count})...")
+            print(f"  [TRANS] 翻译 Chunk {chunk.id} (Tokens: {chunk.token_count})...")
             
-            # 获取上下文
+            # 获取上下文 (Story Summary)
             context = project.memory.get_context_for_chunk(chunk)
             
-            # 执行翻译
-            result_chunk = engine.translate_chunk(chunk, previous_summary=context)
+            # 获取上一段原文 (Text Context) 用于避免重复翻译
+            prev_chunk_obj = project.memory.get_previous_chunk(chunk)
+            prev_source = prev_chunk_obj.source_text if prev_chunk_obj else None
+            
+            # 执行翻译 (带流式回调)
+            result_chunk = engine.translate_chunk(
+                chunk, 
+                previous_summary=context,
+                previous_chunk_text=prev_source,
+                stream_callback=stream_printer
+            )
+            
+            # 换行，结束当前 Chunk 的打印
+            print("") 
             
             # 保存结果 (实时持久化)
             project.memory.save_chunk(result_chunk)
             
             if result_chunk.status == ChunkStatus.COMPLETED:
-                print(f"     ✅ 完成")
+                print(f"     [OK] 完成")
             else:
-                print(f"     ❌ 失败: {result_chunk.error_message}")
+                print(f"     [ERR] 失败: {result_chunk.error_message}")
             
             total_processed += 1
             
-            # 简单的限流/中断检查点
-            # time.sleep(0.5) 
-            
     print("\n" + "="*40)
-    print(f"🎉 任务结束")
+    print(f"[DONE] 任务结束")
     print(f"处理: {total_processed}")
     print(f"跳过: {total_skipped}")
 
@@ -180,4 +208,8 @@ def main():
     args.func(args)
 
 if __name__ == "__main__":
+    # 强制 stdout 使用 utf-8，解决 Windows 下 emoji 和特殊字符乱码
+    if sys.platform.startswith('win'):
+        import io
+        sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
     main()

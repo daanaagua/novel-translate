@@ -3,27 +3,62 @@ LLM 客户端工厂模块
 支持多渠道模型切换：豆包、OpenAI、Anthropic、DeepSeek 等
 """
 import os
+import time
 import json
+import logging
 from abc import ABC, abstractmethod
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, Any, List, Callable
+from functools import wraps
+
 from openai import OpenAI
 
+# 配置日志
+logger = logging.getLogger(__name__)
+
+def retry_with_backoff(retries: int = 3, backoff_in_seconds: int = 1):
+    """
+    重试装饰器：指数退避策略
+    """
+    def decorator(func):
+        @wraps(func)
+        def wrapper(*args, **kwargs):
+            x = 0
+            while True:
+                try:
+                    return func(*args, **kwargs)
+                except Exception as e:
+                    if x == retries:
+                        logger.error(f"LLM调用失败，已重试 {retries} 次: {e}")
+                        raise e
+                    sleep = (backoff_in_seconds * 2 ** x)
+                    logger.warning(f"LLM调用出错: {e}. {sleep}秒后重试 ({x+1}/{retries})...")
+                    time.sleep(sleep)
+                    x += 1
+        return wrapper
+    return decorator
 
 class BaseLLMClient(ABC):
-    """LLM 客户端基类"""
+    """
+    LLM 客户端抽象基类
+    定义统一的接口规范
+    """
     
-    def __init__(self, base_url: str, api_key: str, default_model: str):
+    def __init__(self, base_url: str, api_key: str, default_model: str, timeout: int = 600):
         self.base_url = base_url
         self.api_key = self._resolve_api_key(api_key)
         self.default_model = default_model
+        self.timeout = timeout
     
     def _resolve_api_key(self, api_key: str) -> str:
-        """解析 API Key，支持从环境变量读取"""
+        """解析 API Key，支持环境变量 ${VAR} 格式"""
         if api_key.startswith("${") and api_key.endswith("}"):
             env_var = api_key[2:-1]
             resolved = os.getenv(env_var)
             if not resolved:
-                raise ValueError(f"环境变量 {env_var} 未设置")
+                # 尝试从 ConfigLoader 已解析的配置中获取，或者直接报错
+                # 在这里我们假设 ConfigLoader 已经处理过了，如果还是 ${} 说明环境变量缺失
+                logger.warning(f"环境变量 {env_var} 未设置，使用原始字符串")
+                return api_key 
             return resolved
         return api_key
     
@@ -34,58 +69,79 @@ class BaseLLMClient(ABC):
         model: Optional[str] = None,
         temperature: float = 0.7,
         max_tokens: int = 4096,
-        json_mode: bool = False
-    ) -> str:
-        """发送聊天请求"""
+        json_mode: bool = False,
+        stream: bool = False
+    ) -> Any:
+        """
+        发送聊天请求
+        :param stream: 是否流式返回
+        :return: 文本 (str) 或 生成器 (Iterator[str])
+        """
         pass
-    
-    @abstractmethod
-    def chat_json(
-        self,
-        messages: List[Dict[str, str]],
-        model: Optional[str] = None,
-        temperature: float = 0.1,
-        max_tokens: int = 4096
-    ) -> Dict[str, Any]:
-        """发送聊天请求并返回 JSON"""
-        pass
-
 
 class OpenAICompatibleClient(BaseLLMClient):
     """
-    兼容 OpenAI API 格式的客户端
-    适用于：OpenAI、豆包、DeepSeek、Ollama、vLLM 等
+    OpenAI 兼容客户端 (支持 OpenAI, Doubao, DeepSeek 等)
     """
     
-    def __init__(self, base_url: str, api_key: str, default_model: str):
-        super().__init__(base_url, api_key, default_model)
+    def __init__(self, base_url: str, api_key: str, default_model: str, timeout: int = 600):
+        super().__init__(base_url, api_key, default_model, timeout)
         self.client = OpenAI(
             base_url=self.base_url,
-            api_key=self.api_key
+            api_key=self.api_key,
+            timeout=self.timeout
         )
     
+    @retry_with_backoff(retries=3, backoff_in_seconds=2)
     def chat(
         self,
         messages: List[Dict[str, str]],
         model: Optional[str] = None,
         temperature: float = 0.7,
         max_tokens: int = 4096,
-        json_mode: bool = False
-    ) -> str:
-        """发送聊天请求，返回文本"""
+        json_mode: bool = False,
+        stream: bool = False
+    ) -> Any:
         kwargs = {
             "model": model or self.default_model,
             "messages": messages,
             "temperature": temperature,
             "max_tokens": max_tokens,
+            "stream": stream
         }
         
         if json_mode:
             kwargs["response_format"] = {"type": "json_object"}
         
         response = self.client.chat.completions.create(**kwargs)
-        return response.choices[0].message.content
-    
+        
+        if stream:
+            return self._stream_response(response)
+        else:
+            return response.choices[0].message.content
+
+    def _stream_response(self, response):
+        """
+        处理流式响应生成器
+        Yields:
+            tuple: (type, content)
+            type: "think" | "content"
+        """
+        for chunk in response:
+            if not chunk.choices:
+                continue
+                
+            delta = chunk.choices[0].delta
+            
+            # 支持 DeepSeek/Doubao 等模型的思维链字段
+            if hasattr(delta, 'reasoning_content') and delta.reasoning_content:
+                yield ("think", delta.reasoning_content)
+            
+            # 标准内容字段
+            if delta.content:
+                yield ("content", delta.content)
+
+    @retry_with_backoff(retries=3, backoff_in_seconds=2)
     def chat_json(
         self,
         messages: List[Dict[str, str]],
@@ -93,15 +149,29 @@ class OpenAICompatibleClient(BaseLLMClient):
         temperature: float = 0.1,
         max_tokens: int = 4096
     ) -> Dict[str, Any]:
-        """发送聊天请求，返回解析后的 JSON"""
-        result = self.chat(
+        """
+        专门处理 JSON 返回的请求
+        会自动尝试解析 JSON，如果解析失败会抛出异常触发重试
+        """
+        content = self.chat(
             messages=messages,
             model=model,
             temperature=temperature,
             max_tokens=max_tokens,
             json_mode=True
         )
-        return json.loads(result)
+        try:
+            # 清理可能的 markdown 代码块标记
+            content = content.strip()
+            if content.startswith("```json"):
+                content = content[7:]
+            if content.endswith("```"):
+                content = content[:-3]
+            return json.loads(content)
+        except json.JSONDecodeError as e:
+            logger.error(f"JSON解析失败: {content[:100]}...")
+            raise e
+
 
 
 class AnthropicClient(BaseLLMClient):
@@ -240,17 +310,14 @@ class LLMManager:
         purpose: str = "draft",
         temperature: Optional[float] = None,
         max_tokens: int = 4096,
-        json_mode: bool = False
-    ) -> str:
+        json_mode: bool = False,
+        stream: bool = False
+    ) -> Any:
         """
         发送聊天请求
         
         Args:
-            messages: 消息列表
-            purpose: 用途 (logic, draft, polish)
-            temperature: 温度，None 则使用默认值
-            max_tokens: 最大 Token 数
-            json_mode: 是否强制 JSON 输出
+            stream: 是否流式返回
         """
         model = self.get_model(purpose)
         temp = temperature if temperature is not None else (0.1 if purpose == "logic" else 0.7)
@@ -260,7 +327,8 @@ class LLMManager:
             model=model,
             temperature=temp,
             max_tokens=max_tokens,
-            json_mode=json_mode
+            json_mode=json_mode,
+            stream=stream
         )
     
     def chat_json(

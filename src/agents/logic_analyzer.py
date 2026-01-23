@@ -5,8 +5,8 @@
 import re
 from typing import List, Optional, Dict, Any
 
-from .schemas import LogicAnalysisResult, AmbiguityAnalysis, TextChunk
-from .llm_client import LLMManager
+from ..core.schemas import LogicAnalysisResult, AmbiguityAnalysis, TextChunk
+from ..core.llm_client import LLMManager
 
 
 class LogicAnalyzer:
