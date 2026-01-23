@@ -1,0 +1,102 @@
+# DeepNovel-Translator 配置文件
+# 复制此文件为 config.yaml 并填入你的 API Key
+
+# ============================================================
+# LLM 模型配置 (支持多渠道切换)
+# ============================================================
+llm:
+  # 当前激活的模型配置名称
+  active_provider: "doubao"
+  
+  providers:
+    # 字节跳动 - 豆包/火山引擎
+    doubao:
+      base_url: "https://ark.cn-beijing.volces.com/api/v3"
+      api_key: "${ARK_API_KEY}"  # 从环境变量读取，或直接填写
+      models:
+        logic: "ep-20260110004038-6h49x"   # 用于逻辑分析
+        draft: "ep-20260110004038-6h49x"   # 用于直译
+        polish: "ep-20260110004038-6h49x"  # 用于润色
+    
+    # OpenAI
+    openai:
+      base_url: "https://api.openai.com/v1"
+      api_key: "${OPENAI_API_KEY}"
+      models:
+        logic: "gpt-4o"
+        draft: "gpt-4o"
+        polish: "gpt-4o"
+    
+    # Anthropic Claude
+    anthropic:
+      base_url: "https://api.anthropic.com/v1"
+      api_key: "${ANTHROPIC_API_KEY}"
+      models:
+        logic: "claude-3-5-sonnet-20241022"
+        draft: "claude-3-5-sonnet-20241022"
+        polish: "claude-3-5-sonnet-20241022"
+    
+    # DeepSeek
+    deepseek:
+      base_url: "https://api.deepseek.com/v1"
+      api_key: "${DEEPSEEK_API_KEY}"
+      models:
+        logic: "deepseek-chat"
+        draft: "deepseek-chat"
+        polish: "deepseek-chat"
+
+    # 兼容 OpenAI 格式的其他服务 (如本地 Ollama, vLLM 等)
+    custom:
+      base_url: "http://localhost:11434/v1"
+      api_key: "ollama"
+      models:
+        logic: "qwen2.5:72b"
+        draft: "qwen2.5:72b"
+        polish: "qwen2.5:72b"
+
+# ============================================================
+# 翻译引擎参数
+# ============================================================
+translation:
+  # 分块参数
+  chunking:
+    max_tokens: 1500          # 每个 Chunk 的最大 Token 数
+    overlap_sentences: 2      # 相邻 Chunk 重叠的句子数 (保持连贯)
+  
+  # 直译阶段参数
+  draft:
+    temperature: 0.1
+    max_tokens: 4096
+  
+  # 润色阶段参数
+  polish:
+    temperature: 0.7
+    max_tokens: 4096
+  
+  # 逻辑分析阶段参数
+  logic_analysis:
+    temperature: 0.1
+    max_tokens: 2048
+    # 触发逻辑分析的关键词
+    trigger_patterns:
+      - "I mean"
+      - "Which is"
+      - "That is"
+      - "In other words"
+      - "Not that"
+
+# ============================================================
+# 文件路径配置
+# ============================================================
+paths:
+  input_dir: "data/input"
+  output_dir: "data/output"
+  glossary_dir: "data/glossary"
+  cache_dir: "data/cache"
+
+# ============================================================
+# 日志与调试
+# ============================================================
+logging:
+  level: "INFO"  # DEBUG, INFO, WARNING, ERROR
+  save_intermediate: true  # 是否保存中间结果 (直译稿、逻辑分析)
