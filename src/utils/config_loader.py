@@ -69,6 +69,9 @@ class ConfigLoader:
     def _resolve_env_vars(self, obj: Any) -> Any:
         """递归解析配置中的环境变量"""
         if isinstance(obj, str):
+            if obj.startswith("opencode://"):
+                provider = obj.removeprefix("opencode://").strip()
+                return self._load_opencode_api_key(provider)
             # 匹配 ${VAR_NAME} 格式
             pattern = r'\$\{([^}]+)\}'
             matches = re.findall(pattern, obj)
@@ -81,6 +84,23 @@ class ConfigLoader:
         elif isinstance(obj, list):
             return [self._resolve_env_vars(item) for item in obj]
         return obj
+
+    @staticmethod
+    def _load_opencode_api_key(provider: str) -> str:
+        """Read a provider key from the local OpenCode config without copying it."""
+        opencode_path = Path.home() / ".config" / "opencode" / "opencode.json"
+        if not opencode_path.exists():
+            raise FileNotFoundError(f"OpenCode 配置不存在: {opencode_path}")
+        import json
+
+        data = json.loads(opencode_path.read_text(encoding="utf-8"))
+        try:
+            key = data["provider"][provider]["options"]["apiKey"]
+        except (KeyError, TypeError) as exc:
+            raise KeyError(f"OpenCode 中没有 provider={provider} 的 apiKey") from exc
+        if not key:
+            raise ValueError(f"OpenCode 中 provider={provider} 的 apiKey 为空")
+        return str(key)
     
     @property
     def config(self) -> Dict[str, Any]:

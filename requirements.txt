@@ -4,6 +4,7 @@
 openai>=1.0.0
 pydantic>=2.0.0
 pyyaml>=6.0
+python-docx>=1.1.0
 
 # CLI 美化
 rich>=13.0.0

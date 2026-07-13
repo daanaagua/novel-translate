@@ -174,6 +174,10 @@ class TextChunk(BaseModel):
     draft_translation: Optional[str] = None
     polished_translation: Optional[str] = None
     final_translation: Optional[str] = None
+    memory_summary: Optional[str] = Field(
+        None,
+        description="翻译本块后更新的自包含全书滚动摘要",
+    )
     
     # 元数据
     token_count: Optional[int] = None

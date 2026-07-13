@@ -7,6 +7,7 @@ from typing import List, Optional, Tuple
 from pathlib import Path
 
 from ..core.schemas import Book, Chapter, TextChunk
+from ..core.epub_reader import EpubReader
 
 
 class TextPreprocessor:
@@ -54,7 +55,7 @@ class TextPreprocessor:
     
     def load_text(self, file_path: str) -> str:
         """
-        加载文本文件 (支持 .txt, .md, .docx)
+        加载文本文件 (支持 .txt, .md, .docx, .epub)
         
         Args:
             file_path: 文件路径
@@ -71,6 +72,11 @@ class TextPreprocessor:
         
         if suffix == '.docx':
             return self._load_docx(path)
+        elif suffix == '.epub':
+            document = EpubReader.read(path)
+            return self._clean_text(EpubReader.to_chapter_marked_text(document))
+        elif suffix not in {'.txt', '.md'}:
+            raise ValueError(f"不支持的文件格式: {suffix}；支持 .txt、.md、.docx、.epub")
         else:
             return self._load_plain_text(path)
 

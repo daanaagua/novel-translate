@@ -70,7 +70,8 @@ class BaseLLMClient(ABC):
         temperature: float = 0.7,
         max_tokens: int = 4096,
         json_mode: bool = False,
-        stream: bool = False
+        stream: bool = False,
+        extra_body: Optional[Dict[str, Any]] = None,
     ) -> Any:
         """
         发送聊天请求
@@ -100,7 +101,8 @@ class OpenAICompatibleClient(BaseLLMClient):
         temperature: float = 0.7,
         max_tokens: int = 4096,
         json_mode: bool = False,
-        stream: bool = False
+        stream: bool = False,
+        extra_body: Optional[Dict[str, Any]] = None,
     ) -> Any:
         kwargs = {
             "model": model or self.default_model,
@@ -112,6 +114,8 @@ class OpenAICompatibleClient(BaseLLMClient):
         
         if json_mode:
             kwargs["response_format"] = {"type": "json_object"}
+        if extra_body:
+            kwargs["extra_body"] = extra_body
         
         response = self.client.chat.completions.create(**kwargs)
         
@@ -195,7 +199,9 @@ class AnthropicClient(BaseLLMClient):
         model: Optional[str] = None,
         temperature: float = 0.7,
         max_tokens: int = 4096,
-        json_mode: bool = False
+        json_mode: bool = False,
+        stream: bool = False,
+        extra_body: Optional[Dict[str, Any]] = None,
     ) -> str:
         """发送聊天请求"""
         # 分离 system 消息
@@ -249,7 +255,8 @@ class LLMClientFactory:
         provider: str,
         base_url: str,
         api_key: str,
-        default_model: str
+        default_model: str,
+        timeout: int = 600,
     ) -> BaseLLMClient:
         """
         创建 LLM 客户端
@@ -264,12 +271,12 @@ class LLMClientFactory:
             对应的 LLM 客户端实例
         """
         if provider in cls.OPENAI_COMPATIBLE:
-            return OpenAICompatibleClient(base_url, api_key, default_model)
+            return OpenAICompatibleClient(base_url, api_key, default_model, timeout=timeout)
         elif provider == "anthropic":
             return AnthropicClient(base_url, api_key, default_model)
         else:
             # 未知 provider，尝试用 OpenAI 兼容格式
-            return OpenAICompatibleClient(base_url, api_key, default_model)
+            return OpenAICompatibleClient(base_url, api_key, default_model, timeout=timeout)
 
 
 class LLMManager:
@@ -294,11 +301,13 @@ class LLMManager:
             provider=self.active_provider,
             base_url=self.provider_config["base_url"],
             api_key=self.provider_config["api_key"],
-            default_model=self.provider_config["models"]["draft"]
+            default_model=self.provider_config["models"]["draft"],
+            timeout=int(self.provider_config.get("timeout", 600)),
         )
         
         # 模型映射
         self.models = self.provider_config["models"]
+        self.request_options = self.provider_config.get("request_options", {})
     
     def get_model(self, purpose: str) -> str:
         """获取指定用途的模型 ID"""
@@ -321,6 +330,7 @@ class LLMManager:
         """
         model = self.get_model(purpose)
         temp = temperature if temperature is not None else (0.1 if purpose == "logic" else 0.7)
+        extra_body = self.request_options.get(purpose) or self.request_options.get("default")
         
         return self.client.chat(
             messages=messages,
@@ -328,7 +338,8 @@ class LLMManager:
             temperature=temp,
             max_tokens=max_tokens,
             json_mode=json_mode,
-            stream=stream
+            stream=stream,
+            extra_body=extra_body,
         )
     
     def chat_json(

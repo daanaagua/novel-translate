@@ -3,10 +3,8 @@
 负责管理翻译结果的持久化、检索和增量更新检查
 """
 import json
-import shutil
 from pathlib import Path
-from typing import Optional, List, Dict, Any
-from datetime import datetime
+from typing import Optional
 
 from .schemas import TextChunk, ChunkStatus, Chapter
 
@@ -21,6 +19,7 @@ class TranslationMemory:
         self.project_dir = project_dir
         self.artifacts_dir = project_dir / "artifacts"
         self.chapters_dir = self.artifacts_dir / "chapters"
+        self.long_term_memory_file = self.artifacts_dir / "long_term_memory.json"
         
         # 确保目录存在
         self.chapters_dir.mkdir(parents=True, exist_ok=True)
@@ -51,12 +50,36 @@ class TranslationMemory:
         if not found:
             raise ValueError(f"Chunk {chunk.id} 不在章节文件中")
         
-        # 写入文件
-        # TODO: 生产环境应使用原子写入 (temp file -> rename)
-        chapter_file.write_text(
-            json.dumps(chapter_data, ensure_ascii=False, indent=2),
-            encoding='utf-8'
+        self._atomic_write_json(chapter_file, chapter_data)
+
+    @staticmethod
+    def _atomic_write_json(path: Path, data: dict) -> None:
+        temp_path = path.with_suffix(path.suffix + ".tmp")
+        temp_path.write_text(
+            json.dumps(data, ensure_ascii=False, indent=2),
+            encoding="utf-8",
         )
+        temp_path.replace(path)
+
+    def _load_long_term_memory(self) -> dict:
+        if not self.long_term_memory_file.exists():
+            return {
+                "rolling_summary": "",
+                "recent_chunks": [],
+                "last_updated_chunk": None,
+            }
+        try:
+            data = json.loads(self.long_term_memory_file.read_text(encoding="utf-8"))
+            data.setdefault("rolling_summary", "")
+            data.setdefault("recent_chunks", [])
+            data.setdefault("last_updated_chunk", None)
+            return data
+        except (json.JSONDecodeError, OSError):
+            return {
+                "rolling_summary": "",
+                "recent_chunks": [],
+                "last_updated_chunk": None,
+            }
     
     def get_chunk(self, chapter_id: str, chunk_index: int) -> Optional[TextChunk]:
         """获取指定 Chunk"""
@@ -103,10 +126,7 @@ class TranslationMemory:
         """初始化章节存储（如果不存在）"""
         chapter_file = self.chapters_dir / f"{chapter.id}.json"
         if not chapter_file.exists():
-            chapter_file.write_text(
-                chapter.model_dump_json(indent=2),
-                encoding='utf-8'
-            )
+            self._atomic_write_json(chapter_file, chapter.model_dump(mode="json"))
 
     def get_previous_chunk(self, current_chunk: TextChunk) -> Optional[TextChunk]:
         """获取前一个 Chunk"""
@@ -114,23 +134,80 @@ class TranslationMemory:
             return None
         return self.get_chunk(current_chunk.chapter_id, current_chunk.index - 1)
 
-    def get_context_for_chunk(self, chunk: TextChunk, window_size: int = 2000) -> str:
+    def get_context_for_chunk(
+        self,
+        chunk: TextChunk,
+        summary_max_chars: int = 1200,
+        recent_chunks: int = 2,
+        recent_source_chars: int = 600,
+        recent_translation_chars: int = 1000,
+    ) -> str:
         """
         获取用于翻译的上下文
         
-        策略：
-        1. 优先获取该 Chunk 所在章节的前文剧情摘要 (Chapter Summary)
-        2. 如果没有摘要，尝试获取前几个 Chunk 的【已确认】译文作为参考
+        同时注入固定长度的全书滚动摘要，以及最近若干块的原文和译文。
+        最近块存放在独立状态文件中，因此能跨章节衔接并支持断点续译。
         """
-        # TODO: 实现更高级的上下文检索逻辑
-        # 目前简单返回上一段的译文（如果在同一章）
-        
-        if chunk.index == 0:
-            return ""
-            
-        # 尝试获取上一个 chunk
-        prev_chunk = self.get_chunk(chunk.chapter_id, chunk.index - 1)
-        if prev_chunk and prev_chunk.final_translation:
-            return f"【上文衔接】\n{prev_chunk.final_translation[-500:]}"
-            
-        return ""
+        state = self._load_long_term_memory()
+        parts = []
+        summary = str(state.get("rolling_summary") or "").strip()
+        if summary:
+            parts.append(
+                "<long_term_summary>\n"
+                + summary[-summary_max_chars:]
+                + "\n</long_term_summary>"
+            )
+
+        recent = list(state.get("recent_chunks") or [])[-recent_chunks:]
+        if recent:
+            rendered = []
+            for item in recent:
+                source = str(item.get("source") or "")[-recent_source_chars:]
+                translation = str(item.get("translation") or "")[-recent_translation_chars:]
+                rendered.append(
+                    f"<chunk id=\"{item.get('chunk_id', '')}\">\n"
+                    f"<source_tail>{source}</source_tail>\n"
+                    f"<translation_tail>{translation}</translation_tail>\n"
+                    "</chunk>"
+                )
+            parts.append("<recent_context>\n" + "\n".join(rendered) + "\n</recent_context>")
+        return "\n\n".join(parts)
+
+    def update_long_term_memory(
+        self,
+        chunk: TextChunk,
+        recent_chunks: int = 2,
+        summary_max_chars: int = 1200,
+        recent_source_chars: int = 600,
+        recent_translation_chars: int = 1000,
+    ) -> None:
+        """Persist the memory snapshot emitted by layer one after a completed chunk."""
+        if chunk.status not in {ChunkStatus.COMPLETED, ChunkStatus.HUMAN_REVIEW}:
+            return
+        if not chunk.final_translation:
+            return
+
+        state = self._load_long_term_memory()
+        if chunk.memory_summary:
+            state["rolling_summary"] = chunk.memory_summary.strip()[-summary_max_chars:]
+
+        recent = [
+            item for item in state.get("recent_chunks", [])
+            if item.get("chunk_id") != chunk.id
+        ]
+        recent.append({
+            "chunk_id": chunk.id,
+            "chapter_id": chunk.chapter_id,
+            "source": chunk.source_text[-recent_source_chars:],
+            "translation": chunk.final_translation[-recent_translation_chars:],
+        })
+        state["recent_chunks"] = recent[-recent_chunks:]
+        state["last_updated_chunk"] = chunk.id
+        self._atomic_write_json(self.long_term_memory_file, state)
+
+    def reset_long_term_memory(self) -> None:
+        """Reset derived context without deleting any translations."""
+        self._atomic_write_json(
+            self.long_term_memory_file,
+            {"rolling_summary": "", "recent_chunks": [], "last_updated_chunk": None},
+        )

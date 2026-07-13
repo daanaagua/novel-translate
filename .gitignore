@@ -5,6 +5,7 @@ __pycache__/
 *.so
 .Python
 env/
+.venv/
 build/
 develop-eggs/
 dist/
@@ -32,5 +33,15 @@ config/config.yaml
 
 # Logs
 *.log
+logs/
 data/cache/
 data/output/
+
+# 本地调试遗留物
+debug_*.py
+deep_test_xml.py
+session-*.md
+streamlit
+test.txt
+log.txt
+用于测试的模型.txt

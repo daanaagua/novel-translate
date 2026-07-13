@@ -51,6 +51,7 @@ class TranslationEngine:
         result = {
             "analysis": "",
             "translation": "",
+            "memory_summary": "",
             "new_terms": [],
             "relations": []
         }
@@ -62,6 +63,7 @@ class TranslationEngine:
 
         result["analysis"] = get_tag_content("analysis", text)
         result["translation"] = get_tag_content("translation", text)
+        result["memory_summary"] = get_tag_content("memory_summary", text)
         
         # Helper to extract attributes order-independently
         def extract_attributes(tag_string):
@@ -138,6 +140,7 @@ class TranslationEngine:
     def translate_chunk(
         self,
         chunk: TextChunk,
+        memory_context: Optional[str] = None,
         previous_summary: Optional[str] = None,
         previous_chunk_text: Optional[str] = None,
         stream_callback: Optional[callable] = None
@@ -156,7 +159,7 @@ class TranslationEngine:
             # 准备 Prompt 上下文
             draft_response_generator = self._draft_translate(
                 source_text=chunk.source_text,
-                previous_summary=previous_summary,
+                memory_context=memory_context or previous_summary,
                 previous_chunk_text=previous_chunk_text
             )
             
@@ -200,6 +203,7 @@ class TranslationEngine:
                 
                 chunk.analysis = response_data.get("analysis", "")
                 chunk.draft_translation = response_data.get("translation", "")
+                chunk.memory_summary = response_data.get("memory_summary", "")
                 
                 # 处理新术语
                 new_terms = response_data.get("new_terms", [])
@@ -223,7 +227,9 @@ class TranslationEngine:
                 
                 polish_gen = self._polish_translate(
                     source_text=chunk.source_text,
-                    draft_translation=chunk.draft_translation
+                    draft_translation=chunk.draft_translation,
+                    analysis=chunk.analysis or "",
+                    memory_context=memory_context or previous_summary or "",
                 )
                 
                 # 消费润色流
@@ -239,7 +245,7 @@ class TranslationEngine:
                         
                     if stream_callback: stream_callback(f"polish_{msg_type}", content)
                 
-                chunk.polished_translation = full_polish
+                chunk.polished_translation = self._clean_final_translation(full_polish)
                 chunk.final_translation = chunk.polished_translation
             else:
                 chunk.final_translation = chunk.draft_translation
@@ -270,6 +276,22 @@ class TranslationEngine:
             # 暂时不抛出，让流程继续
         
         return chunk
+
+    @staticmethod
+    def _clean_final_translation(text: str) -> str:
+        """Remove harmless wrappers while preserving the translated paragraphs."""
+        import re
+
+        cleaned = text.strip()
+        if cleaned.startswith("```"):
+            cleaned = re.sub(r"^```(?:text|markdown)?\s*", "", cleaned, flags=re.IGNORECASE)
+            cleaned = re.sub(r"\s*```$", "", cleaned)
+        match = re.search(
+            r"<final_translation>(.*?)</final_translation>",
+            cleaned,
+            re.DOTALL | re.IGNORECASE,
+        )
+        return (match.group(1) if match else cleaned).strip()
     
     def _process_relations(self, relations: List[dict], callback: Optional[callable]):
         """处理新发现的实体关系"""
@@ -394,16 +416,34 @@ class TranslationEngine:
     def _draft_translate(
         self,
         source_text: str,
-        previous_summary: Optional[str] = None,
+        memory_context: Optional[str] = None,
         previous_chunk_text: Optional[str] = None,
         logic_analysis: Any = None # Keep for compatibility signature, unused
     ) -> Any:
         """
         直译阶段 (Logic-Aware + Memory-Augmented)
         """
-        # 1. 获取术语 (只获取 VERIFIED)
-        glossary_terms = self.glossary.find_terms_in_text(source_text, status_filter=[TermStatus.VERIFIED])
-        glossary_rules = "\n".join(term.to_prompt_text() for term in glossary_terms) if glossary_terms else "（无特殊术语）"
+        # 1. 获取术语。已确认术语是硬约束；待审核术语只作为一致性建议。
+        verified_terms = self.glossary.find_terms_in_text(
+            source_text,
+            status_filter=[TermStatus.VERIFIED],
+        )
+        pending_terms = self.glossary.find_terms_in_text(
+            source_text,
+            status_filter=[TermStatus.PENDING],
+        )
+        glossary_terms = verified_terms + pending_terms
+        glossary_parts = []
+        if verified_terms:
+            glossary_parts.append(
+                "【硬性术语】\n" + "\n".join(term.to_prompt_text() for term in verified_terms)
+            )
+        if pending_terms:
+            glossary_parts.append(
+                "【待审核建议：仅用于保持暂时一致，不得压过本段语境】\n"
+                + "\n".join(term.to_prompt_text() for term in pending_terms)
+            )
+        glossary_rules = "\n\n".join(glossary_parts) or "（无特殊术语）"
         
         # 2. 获取实体档案 (Memory Injection)
         entity_context = ""
@@ -422,9 +462,9 @@ class TranslationEngine:
         # 构建 User Prompt (采用结构化 Context 注入)
         user_content = ""
         
-        # 1. 注入 Story Context (摘要)
-        if previous_summary:
-            user_content += f"<story_context>\n{previous_summary}\n</story_context>\n\n"
+        # 1. 注入全书滚动摘要和最近块衔接
+        if memory_context:
+            user_content += f"<memory_context>\n{memory_context}\n</memory_context>\n\n"
             
         # 2. 注入 Text Context (上一段原文，防止割裂)
         if previous_chunk_text:
@@ -452,7 +492,9 @@ class TranslationEngine:
     def _polish_translate(
         self,
         source_text: str,
-        draft_translation: str
+        draft_translation: str,
+        analysis: str = "",
+        memory_context: str = "",
     ) -> Any:
         """
         润色阶段
@@ -460,8 +502,27 @@ class TranslationEngine:
         """
         # 构建 System Prompt
         system_template = self.prompts.get("polish", {}).get("system", self._default_polish_system())
+        verified_terms = self.glossary.find_terms_in_text(
+            source_text,
+            status_filter=[TermStatus.VERIFIED],
+        )
+        pending_terms = self.glossary.find_terms_in_text(
+            source_text,
+            status_filter=[TermStatus.PENDING],
+        )
+        glossary_parts = []
+        if verified_terms:
+            glossary_parts.append(
+                "【硬性术语】\n" + "\n".join(term.to_prompt_text() for term in verified_terms)
+            )
+        if pending_terms:
+            glossary_parts.append(
+                "【待审核建议】\n" + "\n".join(term.to_prompt_text() for term in pending_terms)
+            )
+        glossary_rules = "\n\n".join(glossary_parts) or "（无特殊术语）"
         system_prompt = system_template.format(
-            style_reference=self.config.style_reference or "(无特定风格参考)"
+            style_reference=self.config.style_reference or "(无特定风格参考)",
+            glossary_rules=glossary_rules,
         )
         
         # 构建 User Prompt
@@ -469,7 +530,9 @@ class TranslationEngine:
             "## 原文\n{source_text}\n\n## 初译稿\n{draft_translation}\n\n请润色上述初译稿，输出最终译文。")
         user_prompt = user_template.format(
             source_text=source_text,
-            draft_translation=draft_translation
+            draft_translation=draft_translation,
+            analysis=analysis,
+            memory_context=memory_context,
         )
         
         messages = [
@@ -513,12 +576,14 @@ class TranslationEngine:
     
     def _default_draft_system(self) -> str:
         """默认直译 System Prompt (XML Mode)"""
-        return """你是一位精通逻辑分析的文学翻译家。你的任务是将英文小说翻译成中文。
+        return """你是一位擅长高难度科幻文学的中文译者。你的任务是完成忠实、可校订的第一层译稿。
 
 ## 核心指令
 1. **术语一致**：严格遵守提供的术语表规则。
-2. **逻辑推演**：在翻译前，必须先进行逻辑推演 (Analysis)，补全省略的从句，解析 "I mean" 等指代关系。
-3. **格式严格**：必须输出合法的 XML 格式。
+2. **逻辑准确**：识别从句依附、指代、比较对象、观察者视角和因果关系，不得把尚未揭示的信息擅自讲明。
+3. **科学准确**：物理概念、计量单位、空间关系和人造术语优先于辞藻；不确定处在 analysis 中简短注明。
+4. **记忆更新**：根据旧摘要和本段，输出一份不超过1200个汉字、可以独立替代旧摘要的全书滚动摘要。只记录已经明示的事实、人物状态、概念定义和未解决问题。
+5. **格式严格**：必须输出合法的 XML 格式。
 
 ## 术语表 (仅参考)
 {glossary_rules}
@@ -534,8 +599,12 @@ class TranslationEngine:
     </analysis>
     
     <translation>
-    最终的中文译文（保持原文分段）
+    忠实、通顺的第一层中文译文（保持原文分段）
     </translation>
+
+    <memory_summary>
+    翻译本段之后更新的自包含全书摘要，不超过1200个汉字
+    </memory_summary>
     
     <new_terms>
         <term src="新术语原文" tgt="建议译名" type="person/place/item/organization" />
@@ -548,20 +617,23 @@ class TranslationEngine:
     
     def _default_polish_system(self) -> str:
         """默认润色 System Prompt"""
-        return """你是我的首席文学翻译家，负责将初译稿润色为具有卓越文学品质的中文。
+        return """你是第二层中文定稿译者。请逐句对照英文原文、第一层译稿和分析提示，输出准确而自然的最终译文。
 
 ## 核心优化原则
 
-### 语境智能净化原则
-当原文中的指代、重复或衔接成分在中文语境下显得冗余或不自然时，应基于对前后文的深刻理解，进行符合中文表达习惯的简化或重组，使译文行文干净、气韵流畅。
-
-### 诗意结构重生原则
-当原文包含比喻、象征、排比等富有诗意的表达时，应深入捕捉其核心意象与情感张力，运用中文特有的凝练对仗、意象排比或古典韵律进行重构。
+1. 先纠正漏译、误译、指代错误、逻辑关系错误和物理概念错误，再改善中文节奏。
+2. 保留原文的信息释放顺序、段落、叙事距离与不确定性；不得替作者解释谜底。
+3. 科学术语和人造概念保持精确、一致；不能为了顺口改写成含义更宽泛的词。
+4. 中文应清楚、克制、有文学节奏，避免无依据的古雅化、诗化和增添形容词。
 
 ## 铁律（不可违反）
 1. **禁止修改人名、地名、专有名词**：它们已在直译阶段被锁定。
 2. **禁止改变原文的叙事视角和时态**。
 3. **禁止添加原文不存在的情节或形容**。
+4. **只输出最终中文译文**，不得附带说明、标题、XML标签或Markdown代码块。
+
+## 已确认术语
+{glossary_rules}
 
 ## 风格参考
 {style_reference}"""

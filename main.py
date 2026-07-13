@@ -48,10 +48,14 @@ def cmd_init(args):
     """初始化新项目"""
     print(f"正在创建项目: {args.book_id} ...")
     try:
+        global_config = config_loader.load_config()
+        chunking = global_config.get("translation", {}).get("chunking", {})
         project = project_manager.create_project(
             book_id=args.book_id,
             source_path=args.file,
-            force=args.force
+            force=args.force,
+            max_chunk_tokens=int(chunking.get("max_tokens", 1100)),
+            overlap_sentences=int(chunking.get("overlap_sentences", 0)),
         )
         print(f"[OK] 项目创建成功！位置: {project.root_dir}")
         print(f"下一步: 请运行 'python main.py translate {args.book_id}' 开始翻译")
@@ -91,11 +95,17 @@ def cmd_translate(args):
     glossary_manager.load()
     
     # 初始化翻译引擎
+    translation_settings = global_config.get("translation", {})
+    draft_settings = translation_settings.get("draft", {})
+    polish_settings = translation_settings.get("polish", {})
+    memory_settings = translation_settings.get("memory", {})
     trans_config = TranslationConfig(
         enable_polish=not args.no_polish,
-        draft_temperature=args.temp_draft,
-        polish_temperature=args.temp_polish,
-        glossary_mode=args.glossary_mode
+        draft_temperature=(args.temp_draft if args.temp_draft is not None else float(draft_settings.get("temperature", 0.1))),
+        draft_max_tokens=int(draft_settings.get("max_tokens", 6144)),
+        polish_temperature=(args.temp_polish if args.temp_polish is not None else float(polish_settings.get("temperature", 0.2))),
+        polish_max_tokens=int(polish_settings.get("max_tokens", 6144)),
+        glossary_mode=args.glossary_mode,
     )
     engine = TranslationEngine(
         llm_manager=llm_manager,
@@ -113,6 +123,7 @@ def cmd_translate(args):
     
     total_processed = 0
     total_skipped = 0
+    stop_requested = False
     
     for ch_file in chapter_files:
         chapter_id = ch_file.stem
@@ -130,6 +141,9 @@ def cmd_translate(args):
             continue
             
         for chunk in chapter.chunks:
+            if args.max_chunks is not None and total_processed >= args.max_chunks:
+                stop_requested = True
+                break
             # 检查是否需要跳过
             if project.memory.should_skip(chunk, force=args.force):
                 print(f"  [SKIP] Chunk {chunk.id}: 已完成，跳过")
@@ -139,24 +153,32 @@ def cmd_translate(args):
             print(f"  [TRANS] 翻译 Chunk {chunk.id} (Tokens: {chunk.token_count})...")
             
             # 获取上下文
-            context = project.memory.get_context_for_chunk(chunk)
-            
-            # 获取上一段原文 (Text Context)
-            prev_chunk_obj = project.memory.get_previous_chunk(chunk)
-            prev_source = prev_chunk_obj.source_text if prev_chunk_obj else None
+            context = project.memory.get_context_for_chunk(
+                chunk,
+                summary_max_chars=int(memory_settings.get("rolling_summary_max_chars", 1200)),
+                recent_chunks=int(memory_settings.get("recent_chunks", 2)),
+                recent_source_chars=int(memory_settings.get("recent_source_chars", 600)),
+                recent_translation_chars=int(memory_settings.get("recent_translation_chars", 1000)),
+            )
             
             # 执行翻译 (带流式回调)
             result_chunk = engine.translate_chunk(
                 chunk, 
-                previous_summary=context,
-                previous_chunk_text=prev_source,
-                stream_callback=stream_printer
+                memory_context=context,
+                stream_callback=None if args.quiet else stream_printer,
             )
             
             print("") # 换行
             
             # 保存结果
             project.memory.save_chunk(result_chunk)
+            project.memory.update_long_term_memory(
+                result_chunk,
+                recent_chunks=int(memory_settings.get("recent_chunks", 2)),
+                summary_max_chars=int(memory_settings.get("rolling_summary_max_chars", 1200)),
+                recent_source_chars=int(memory_settings.get("recent_source_chars", 600)),
+                recent_translation_chars=int(memory_settings.get("recent_translation_chars", 1000)),
+            )
             
             if result_chunk.status == ChunkStatus.COMPLETED:
                 print(f"     [OK] 完成")
@@ -164,6 +186,9 @@ def cmd_translate(args):
                 print(f"     [ERR] 失败: {result_chunk.error_message}")
             
             total_processed += 1
+
+        if stop_requested:
+            break
             
     print("\n" + "="*40)
     print(f"[DONE] 任务结束")
@@ -180,7 +205,7 @@ def main():
     # init
     p_init = subparsers.add_parser("init", help="初始化新项目")
     p_init.add_argument("book_id", help="项目ID (英文，无空格)")
-    p_init.add_argument("file", help="小说原文路径 (.txt)")
+    p_init.add_argument("file", help="小说原文路径 (.txt/.md/.docx/.epub)")
     p_init.add_argument("--force", "-f", action="store_true", help="强制覆盖已存在项目")
     p_init.set_defaults(func=cmd_init)
     
@@ -193,10 +218,12 @@ def main():
     p_trans.add_argument("book_id", help="项目ID")
     p_trans.add_argument("--chapters", "-c", help="指定章节ID，逗号分隔 (如 ch01,ch02)")
     p_trans.add_argument("--force", "-f", action="store_true", help="强制重翻已完成的块")
-    p_trans.add_argument("--glossary-mode", choices=["auto", "manual"], default="auto", help="术语库模式 (auto: 自动采纳, manual: 需人工审核)")
+    p_trans.add_argument("--glossary-mode", choices=["auto", "manual"], default="manual", help="术语库模式 (auto: 自动采纳, manual: 需人工审核)")
     p_trans.add_argument("--no-polish", action="store_true", help="禁用润色")
-    p_trans.add_argument("--temp-draft", type=float, default=0.1, help="直译温度")
-    p_trans.add_argument("--temp-polish", type=float, default=0.7, help="润色温度")
+    p_trans.add_argument("--temp-draft", type=float, default=None, help="覆盖配置中的第一层温度")
+    p_trans.add_argument("--temp-polish", type=float, default=None, help="覆盖配置中的第二层温度")
+    p_trans.add_argument("--max-chunks", type=int, default=None, help="本次最多翻译多少个新文本块，适合试跑")
+    p_trans.add_argument("--quiet", action="store_true", help="不实时打印模型思考和译文，只显示进度与结果")
     p_trans.set_defaults(func=cmd_translate)
     
     args = parser.parse_args()

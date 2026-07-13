@@ -1,126 +1,89 @@
-# DeepNovel-Translator (DNT) 产品需求文档 (PRD)
-**版本：** v2.1 (Confidence Mode)
-**日期：** 2026-01-26
-**状态：** In Progress
+# DeepNovel-Translator v3.0 规格说明
 
-## 1. 项目概述
-构建一个专用于超长篇、高难度文学小说（如 Gene Wolfe 的《新日之书》）的 AI 翻译系统。
-核心理念从“预处理分析”转向**“在线流式处理 (On-the-fly Processing)”**、**“深度记忆增强 (Memory Augmented)”**与**“双模信度管理 (Confidence Modes)”**。
+## 1. 目标
 
-### 核心痛点解决方案
-1.  **术语动态化**：放弃静态表，在阅读中动态提取、动态更新、多义词上下文匹配。
-2.  **逻辑内化**：利用大模型自身的推理能力，通过 CoT (思维链) 和从句补全技术解决指代歧义。
-3.  **长程记忆**：构建“实体档案”与“关系网”，解决跨章节伏笔与人物关系变迁问题。
-4.  **信度分级**：引入 AI/人工双模式，平衡效率与准确性。
+系统用于翻译长篇、高概念、术语密集的文学小说。准确性优先级依次为：事实和逻辑、科学概念、术语一致、叙事信息释放顺序、中文文体。
 
-## 2. 技术栈
-*   **语言：** Python 3.10+
-*   **交互形式：** 
-    *   **CLI:** 核心跑批工具 (Runner)，负责批量翻译、状态监控。
-    *   **Streamlit WebUI:** 核心审阅与交互工具，负责术语校对、翻译修正、记忆库可视化。
-*   **核心库：** `pydantic` (数据校验), `rich` (CLI 输出), `networkx` (可选，用于关系网构建)。
-*   **LLM 支持：** 
-    *   **Logic/Translation:** DeepSeek-V3 / GPT-4o / Claude 3.5 Sonnet (需支持长 Context 和 JSON Mode)。
-    *   **Test Model:** ep-20260110004038-6h49x (Volcengine).
+本版本固定采用两层流程。不得在批量任务中暗中增加第三次摘要调用或独立逻辑调用。
 
-## 3. 系统架构流水线
+## 2. 输入与项目初始化
 
-### 3.1 翻译主循环 (Translation Loop)
-不再分阶段预处理，而是以 **Chunk (文本块)** 为单位进行流式迭代：
+支持以下输入：
 
-1.  **Context Retrieval (上下文检索):**
-    *   **Glossary Match:** 检索当前 Chunk 出现的术语（模糊匹配/忽略大小写），注入 Prompt。
-    *   **Memory Injection:** 识别文中实体（人/物），检索其“实体档案”与“当前关系状态”，注入 Prompt。
-    *   **Recent History:** 注入前文摘要 (Summary) 和上一段原文 (Last Sentence)。
+- `.txt`、`.md`：按文本编码读取。
+- `.docx`：按段落提取。
+- `.epub`：解析 `container.xml`、OPF Manifest和Spine，按书脊顺序提取XHTML正文。
 
-2.  **LLM Inference (推理翻译):**
-    *   **Input:** 原文 + 术语表 + 实体记忆 + 逻辑引导 Prompt。
-    *   **Logic Enhancement:** 要求模型先补全省略的从句，或输出 `<analysis>` 步骤解析歧义。
-    *   **Translation:** 输出最终译文。
-    *   **Extraction:** 同时输出本段发现的新术语、更新的实体关系（JSON 格式）。
+EPUB不得作为普通二进制文本读取。初始化时先生成统一的 `source.txt`，再按章节标题切章并按段落分块。
 
-3.  **System Update (系统状态更新):**
-    *   **Glossary Update:** 根据 **Confidence Mode** 决定新术语的状态 (`verified`/`pending`)。
-    *   **Memory Update:** 解析实体关系变化，追加到本地知识库/关系网。
+分块参数必须从 `config.yaml` 读取并传给实际预处理器。默认上限为1100个英文词量级，物理重叠为0句。不得出现“配置写1000、实际仍用类默认值1500”的情况。
 
-### 3.2 翻译模式
-*   **直译 (Drafting):** 侧重逻辑准确性，包含从句补全和显式逻辑分析。
-*   **润色 (Polishing):** (可选) 基于直译结果进行文学性重写，严禁修改术语和逻辑。
+## 3. 两层翻译流程
 
-## 4. 核心功能模块详细设计
+### 3.1 第一层：忠实初译与状态提取
 
-### 4.1 动态术语管理器 (Dynamic Glossary Manager)
-*   **数据结构升级：** 新增 `status` 字段 (`verified`, `pending`, `rejected`)。
-*   **置信度模式 (Confidence Modes):**
-    1.  **Auto-Trust (AI High Confidence):**
-        *   适用：初次批量翻译。
-        *   行为：模型返回的新术语直接标记为 `verified`，立即生效。
-        *   逻辑：信任模型对语境的判断，优先保证术语库的覆盖率。
-    2.  **Human-Review (Manual):**
-        *   适用：精细化校对。
-        *   行为：模型返回的新术语标记为 `pending`。
-        *   逻辑：`pending` 术语在后续翻译中仅作为“低权重建议”或不生效，直到人工在 WebUI 确认。
+输入必须包括：
 
-### 4.2 记忆与关系网 (Memory & Relation Network)
-*   **目标：** 解决伏笔与上下文暗示。
-*   **实现方案：**
-    *   **Entity Dossier (实体档案):** 为每个主要角色/物品维护一个 Markdown/JSON 文件。
-    *   **Relation Graph (关系网):** 记录 `(Entity A) --[relation, timestamp]--> (Entity B)`。
-    *   **Temporal Awareness:** 处理插叙/倒叙，标注关系的“历史变迁”（如：Enemy -> Ally）。
-*   **流程：**
-    *   Prompt 中要求模型输出：`{"relations": [{"subject": "Severian", "object": "Foila", "relation": "recognized", "context": "..."}]}`
-    *   系统解析并更新本地 Graph。
+- 当前块完整原文；
+- 全书滚动摘要；
+- 最近两个块的原文尾部和最终译文尾部；
+- 当前块命中的已确认术语和待审核术语；
+- 与命中术语有关的实体档案。
 
-### 4.3 逻辑增强 (Logic Boosting)
-*   **策略:** 不依赖外部正则。
-*   **Prompt Engineering:**
-    *   **Thinking Stream:** 强制模型输出 `<analysis>...</analysis>`，展示指代消歧过程。
-    *   **Clause Completion:** 显式补全省略成分。
+输出必须包括：
 
-## 5. 交互流程
+- `analysis`：只记录会影响译法的句法、指代、科学概念和歧义；
+- `translation`：保持段落的忠实初译；
+- `memory_summary`：结合旧摘要和当前块生成、可完全替代旧摘要的自包含摘要；
+- `new_terms`：新专名和新概念；
+- `relations`：新出现的实体关系或状态。
 
-### 5.1 CLI (Runner)
-*   `python main.py init <book_id> <file_path>`: 初始化。
-*   `python main.py translate <book_id> --glossary-mode [auto|manual]`
-    *   `--glossary-mode auto`: 新词自动通过。
-    *   `--glossary-mode manual`: 新词需人工审核。
-    *   显示：进度条、当前处理的术语、Token 消耗。
-    *   **不暂停**，错误记录到日志。
+第一层输出采用XML。术语的 `src` 及关系的 `sub`、`obj` 必须使用原文拼写，防止知识库同时出现互不关联的中英文实体。
 
-### 5.2 Streamlit WebUI (Reviewer)
-*   **Dashboard:** 项目列表、总体进度。
-*   **Editor:** 
-    *   左侧：原文。
-    *   中间：译文（可编辑）。
-    *   右侧：
-        *   **Glossary Panel:** 显示本段命中的术语，支持新增/修改术语。支持 **Review Mode** 筛选 `pending` 术语。
-        *   **Memory Panel:** 显示相关实体档案。
-        *   **Logic View:** 显示模型的思维链/补全过程。
-*   **Actions:** "Re-translate chunk" (修改术语后重翻), "Approve" (确认并保存)。
+### 3.2 第二层：对照原文定稿
 
-## 6. 里程碑 (Roadmap)
-*   **Phase 1 (Core Loop):** 
-    *   [DATA] 更新 Schema 支持 `status` 和 `thinking`。
-    *   [CORE] 重构 TranslationEngine，移除 LogicAnalyzer，接入 Context -> Inference -> Update 闭环。
-    *   [CORE] 实现 Glossary Manager 的置信度逻辑。
-*   **Phase 2 (Memory System):** 
-    *   [FEAT] 实现实体档案 (Entity Dossier) 的读写与注入。
-    *   [CORE] 实现关系网更新逻辑。
-*   **Phase 3 (Review System):** 
-    *   [UI] 完善 Streamlit WebUI，支持人工介入修正术语和记忆。
+输入必须包括当前原文、第一层译文、第一层难点说明、上下文和术语。第二层先修正漏译、误译、指代和科学概念，再改善中文节奏。
 
-## 7. 数据结构示例
+第二层只能输出最终中文译文。不得输出分析、Markdown代码块或解释性前后缀。
 
-### 7.1 LLM 响应结构
-```json
-{
-  "analysis": "Here implies the lazaret...",
-  "translation": "中文译文...",
-  "new_terms": [
-    {"src": "lazaret", "tgt": "野战医院", "type": "place"}
-  ],
-  "relations": [
-    {"sub": "Severian", "obj": "Foila", "rel": "acquaintance"}
-  ]
-}
-```
+## 4. 长程记忆
+
+长程记忆保存在 `artifacts/long_term_memory.json`，包括：
+
+- `rolling_summary`：不超过1200个汉字的全书状态摘要；
+- `recent_chunks`：最近两个已完成块的原文和译文尾部；
+- `last_updated_chunk`：最后推进记忆的块ID。
+
+第一层必须利用旧摘要生成更新后的完整摘要；程序随后用新摘要替换旧摘要。不得无限追加摘要文本。
+
+每块翻译结果和记忆文件都必须立即落盘。章节JSON和记忆JSON使用临时文件替换方式写入，降低中断导致文件损坏的风险。
+
+## 5. 术语规则
+
+- `verified`：硬约束。
+- `pending`：低权重一致性建议，不得覆盖当前语境。
+- `rejected`：不注入Prompt。
+
+默认使用 `manual` 模式，避免第一处误译永久污染全书。人工确认稳定译名后再改为 `verified`。
+
+## 6. 模型配置
+
+当前两层均使用 `deepseek-v4-flash`：
+
+- Thinking：开启；
+- `reasoning_effort`：`high`；
+- 第一层温度：0.1；
+- 第二层温度：0.2；
+- API超时：1800秒。
+
+本机密钥通过 `opencode://deepseek`在运行时读取OpenCode配置。示例配置使用 `${DEEPSEEK_API_KEY}`，版本库中不得保存真实密钥。
+
+## 7. 验收条件
+
+1. EPUB章节顺序与Spine一致，正文不含HTML标签、目录页和封面页。
+2. 配置的分块上限实际生效，关闭重叠后句段不重复。
+3. 每个块恰好调用模型两次。
+4. 原文与最终译文段落数量在正常情况下保持一致。
+5. 第二块能够读取第一块生成的滚动摘要和衔接文本。
+6. 中断后重跑能够跳过已完成块，并继续更新记忆。
+7. 日志、项目文件和Git历史中不出现API密钥。
