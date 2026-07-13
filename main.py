@@ -16,12 +16,33 @@ from src.core.llm_client import LLMManager
 from src.core.translator import TranslationEngine, TranslationConfig
 from src.core.project_manager import ProjectManager
 from src.agents.glossary_manager import GlossaryManager
-from src.agents.logic_analyzer import LogicAnalyzer
 from src.core.schemas import ChunkStatus
+from rich.console import Console
+from rich.theme import Theme
+
+# 初始化 Rich Console
+console = Console(theme=Theme({"think": "dim white", "info": "cyan"}))
 
 # 初始化核心组件
 config_loader = ConfigLoader(config_dir=str(project_root / "config"))
 project_manager = ProjectManager(projects_root=str(project_root / "projects"))
+
+def stream_printer(phase, content):
+    """流式打印回调"""
+    if phase == "logic":
+        console.print(f"\r[info][Logic][/info] {content}", end="")
+    elif phase == "draft_start":
+        console.print("\n\n[bold green][Draft][/bold green] ", end="")
+    elif phase == "draft_think":
+        console.print(content, style="think", end="")
+    elif phase == "draft_content":
+        console.print(content, end="")
+    elif phase == "polish_start":
+        console.print("\n\n[bold yellow][Polish][/bold yellow] ", end="")
+    elif phase == "polish_think":
+        console.print(content, style="think", end="")
+    elif phase == "polish_content":
+        console.print(content, end="")
 
 def cmd_init(args):
     """初始化新项目"""
@@ -48,27 +69,6 @@ def cmd_list(args):
     for p in projects:
         print(f"  - {p}")
 
-# 定义流式打印回调
-def stream_printer(phase, content):
-    # 处理不同阶段的输出
-    if phase == "logic":
-        print(f"\r[Logic] {content}", end="", flush=True)
-    
-    elif phase == "draft_start":
-        print("\n\n[Draft] ", end="", flush=True)
-    elif phase == "draft_think":
-        # 思考过程用灰色或斜体显示 (ANSI code)
-        print(f"\033[90m{content}\033[0m", end="", flush=True)
-    elif phase == "draft_content":
-        print(content, end="", flush=True)
-        
-    elif phase == "polish_start":
-        print("\n\n[Polish] ", end="", flush=True)
-    elif phase == "polish_think":
-        print(f"\033[90m{content}\033[0m", end="", flush=True)
-    elif phase == "polish_content":
-        print(content, end="", flush=True)
-
 def cmd_translate(args):
     """项目翻译命令"""
     book_id = args.book_id
@@ -92,20 +92,21 @@ def cmd_translate(args):
     
     # 初始化翻译引擎
     trans_config = TranslationConfig(
-        enable_logic_analysis=not args.no_logic,
         enable_polish=not args.no_polish,
         draft_temperature=args.temp_draft,
-        polish_temperature=args.temp_polish
+        polish_temperature=args.temp_polish,
+        glossary_mode=args.glossary_mode
     )
     engine = TranslationEngine(
         llm_manager=llm_manager,
         glossary_manager=glossary_manager,
+        knowledge_base=project.knowledge_base,
         prompts=prompts,
         config=trans_config
     )
     
     print(f"[START] 开始翻译项目: {book_id}")
-    print(f"配置: 逻辑分析={'OFF' if args.no_logic else 'ON'}, 润色={'OFF' if args.no_polish else 'ON'}")
+    print(f"配置: 术语模式={args.glossary_mode}, 润色={'OFF' if args.no_polish else 'ON'}")
     
     # 3. 遍历章节和 Chunk
     chapter_files = sorted(project.memory.chapters_dir.glob("*.json"))
@@ -137,10 +138,10 @@ def cmd_translate(args):
             
             print(f"  [TRANS] 翻译 Chunk {chunk.id} (Tokens: {chunk.token_count})...")
             
-            # 获取上下文 (Story Summary)
+            # 获取上下文
             context = project.memory.get_context_for_chunk(chunk)
             
-            # 获取上一段原文 (Text Context) 用于避免重复翻译
+            # 获取上一段原文 (Text Context)
             prev_chunk_obj = project.memory.get_previous_chunk(chunk)
             prev_source = prev_chunk_obj.source_text if prev_chunk_obj else None
             
@@ -152,10 +153,9 @@ def cmd_translate(args):
                 stream_callback=stream_printer
             )
             
-            # 换行，结束当前 Chunk 的打印
-            print("") 
+            print("") # 换行
             
-            # 保存结果 (实时持久化)
+            # 保存结果
             project.memory.save_chunk(result_chunk)
             
             if result_chunk.status == ChunkStatus.COMPLETED:
@@ -193,7 +193,7 @@ def main():
     p_trans.add_argument("book_id", help="项目ID")
     p_trans.add_argument("--chapters", "-c", help="指定章节ID，逗号分隔 (如 ch01,ch02)")
     p_trans.add_argument("--force", "-f", action="store_true", help="强制重翻已完成的块")
-    p_trans.add_argument("--no-logic", action="store_true", help="禁用逻辑分析")
+    p_trans.add_argument("--glossary-mode", choices=["auto", "manual"], default="auto", help="术语库模式 (auto: 自动采纳, manual: 需人工审核)")
     p_trans.add_argument("--no-polish", action="store_true", help="禁用润色")
     p_trans.add_argument("--temp-draft", type=float, default=0.1, help="直译温度")
     p_trans.add_argument("--temp-polish", type=float, default=0.7, help="润色温度")
@@ -208,7 +208,6 @@ def main():
     args.func(args)
 
 if __name__ == "__main__":
-    # 强制 stdout 使用 utf-8，解决 Windows 下 emoji 和特殊字符乱码
     if sys.platform.startswith('win'):
         import io
         sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')

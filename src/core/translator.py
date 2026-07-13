@@ -5,26 +5,24 @@
 from typing import Optional, Dict, Any, List
 from dataclasses import dataclass
 
-from .schemas import TextChunk, ChunkStatus, LogicAnalysisResult
+from .schemas import TextChunk, ChunkStatus, TermStatus
 from .llm_client import LLMManager
-from ..agents.logic_analyzer import LogicAnalyzer
 from ..agents.glossary_manager import GlossaryManager
-from ..agents.term_extractor import TermExtractor
+from .knowledge_base import KnowledgeBase
 
 @dataclass
 class TranslationConfig:
     """翻译配置"""
-    # ... 原有字段 ...
     draft_temperature: float = 0.1
     draft_max_tokens: int = 4096
     polish_temperature: float = 0.7
     polish_max_tokens: int = 4096
-    enable_logic_analysis: bool = True
     enable_polish: bool = True
     style_reference: Optional[str] = None
     
-    # 新增：自动术语提取
-    enable_auto_glossary: bool = False
+    # 术语表模式: "auto" (AI可信) 或 "manual" (人工审核)
+    glossary_mode: str = "auto" 
+
 
 
 class TranslationEngine:
@@ -33,24 +31,110 @@ class TranslationEngine:
         self,
         llm_manager: LLMManager,
         glossary_manager: GlossaryManager,
-        prompts: Dict[str, Any],
+        knowledge_base: Optional[KnowledgeBase] = None,
+        prompts: Dict[str, Any] = None,
         config: Optional[TranslationConfig] = None
     ):
         self.llm = llm_manager
         self.glossary = glossary_manager
-        self.prompts = prompts
+        self.knowledge_base = knowledge_base
+        self.prompts = prompts or {}
         self.config = config or TranslationConfig()
-        
-        self.logic_analyzer = LogicAnalyzer(
-            llm_manager=llm_manager,
-            prompts=prompts.get("logic_analysis", {})
-        )
-        self.term_extractor = TermExtractor(llm_manager)
         
         # 上下文缓存（用于滑动窗口）
         self._context_buffer: List[str] = []
         self._last_chunk_translation: Optional[str] = None
     
+    def _parse_xml_response(self, text: str) -> Dict[str, Any]:
+        """Parse XML-like response from LLM using regex (Robust)"""
+        import re
+        result = {
+            "analysis": "",
+            "translation": "",
+            "new_terms": [],
+            "relations": []
+        }
+        
+        # Helper to extract tag content
+        def get_tag_content(tag, source):
+            match = re.search(f"<{tag}>(.*?)</{tag}>", source, re.DOTALL | re.IGNORECASE)
+            return match.group(1).strip() if match else ""
+
+        result["analysis"] = get_tag_content("analysis", text)
+        result["translation"] = get_tag_content("translation", text)
+        
+        # Helper to extract attributes order-independently
+        def extract_attributes(tag_string):
+            attrs = {}
+            for match in re.finditer(r'(\w+)=["\'](.*?)["\']', tag_string):
+                attrs[match.group(1).lower()] = match.group(2)
+            return attrs
+
+        # Extract terms
+        # Find all <term ... /> or <term ...>
+        for match in re.finditer(r'<term\s+(.*?)/>', text, re.DOTALL | re.IGNORECASE):
+            attrs = extract_attributes(match.group(1))
+            if "src" in attrs:
+                result["new_terms"].append({
+                    "src": attrs.get("src"),
+                    "tgt": attrs.get("tgt"),
+                    "type": attrs.get("type"),
+                    "context": attrs.get("context")
+                })
+            
+        # Extract relations
+        for match in re.finditer(r'<relation\s+(.*?)/>', text, re.DOTALL | re.IGNORECASE):
+            attrs = extract_attributes(match.group(1))
+            if "sub" in attrs:
+                result["relations"].append({
+                    "sub": attrs.get("sub"),
+                    "rel": attrs.get("rel"),
+                    "obj": attrs.get("obj"),
+                    "context": attrs.get("context")
+                })
+            
+        return result
+
+    def _sanitize_json(self, raw_json: str) -> str:
+        """
+        修复 LLM 输出的破损 JSON
+        """
+        text = raw_json.strip()
+        
+        # 1. 去除 markdown 代码块
+        if text.startswith("```json"):
+            text = text[7:]
+        elif text.startswith("```"):
+            text = text[3:]
+        if text.endswith("```"):
+            text = text[:-3]
+        
+        text = text.strip()
+        
+        # 2. 修复字符串内的物理换行
+        # 遍历字符串，维护 in_string 状态
+        result = []
+        in_string = False
+        escape = False
+        
+        for char in text:
+            if char == '"' and not escape:
+                in_string = not in_string
+            
+            if char == '\\':
+                escape = not escape
+            else:
+                escape = False
+                
+            if char == '\n' and in_string:
+                result.append('\\n')
+            elif char == '\t' and in_string:
+                result.append('\\t')
+            else:
+                result.append(char)
+        
+        return "".join(result)
+
     def translate_chunk(
         self,
         chunk: TextChunk,
@@ -59,60 +143,80 @@ class TranslationEngine:
         stream_callback: Optional[callable] = None
     ) -> TextChunk:
         """
-        翻译单个文本块
+        翻译单个文本块 (新版流式逻辑)
         
         Args:
-            stream_callback: (phase, content) -> None, 用于实时回显流式内容
+            stream_callback: (phase, content) -> None
         """
         try:
-            # 步骤 0: 自动术语提取 (Pre-flight)
-            if self.config.enable_auto_glossary:
-                if stream_callback: stream_callback("logic", "正在扫描新术语...")
-                new_terms = self.term_extractor.extract(chunk.source_text)
-                for term in new_terms:
-                    # 只有当术语不在库中时才添加
-                    if not self.glossary.find_by_src(term["src"]):
-                        self.glossary.add_term(
-                            src=term["src"],
-                            default_target=term["src"], # 默认译名暂为原文，待人工确认
-                            category=term.get("category"),
-                            description=f"Auto-extracted from context: {term.get('context')}"
-                        )
-                        if stream_callback: stream_callback("logic", f"发现新术语: {term['src']}")
-
-            # 步骤 1: 逻辑分析
-            if self.config.enable_logic_analysis:
-                chunk.status = ChunkStatus.ANALYZING
-                if stream_callback: stream_callback("logic", "正在进行逻辑分析...")
-                chunk = self.logic_analyzer.analyze_chunk(chunk)
-            
-            # 步骤 2: 直译
+            # 步骤 1: 直译 (含 Thinking & Term Extraction)
             chunk.status = ChunkStatus.DRAFTING
             if stream_callback: stream_callback("draft_start", "")
             
-            draft_gen = self._draft_translate(
+            # 准备 Prompt 上下文
+            draft_response_generator = self._draft_translate(
                 source_text=chunk.source_text,
-                logic_analysis=chunk.logic_analysis,
                 previous_summary=previous_summary,
                 previous_chunk_text=previous_chunk_text
             )
             
-            # 消费直译流
-            full_draft = ""
-            for item in draft_gen:
+            # 流式解析 Accumulator
+            full_response_text = ""
+            current_analysis = ""
+            current_translation = ""
+            
+            # 简单的流式解析状态机
+            # 注意：DeepSeek 等模型输出 JSON 时，可能无法完美流式解析结构，
+            # 这里我们先累积全文，同时尝试提取 content 打印给用户
+            
+            for item in draft_response_generator:
                 if isinstance(item, tuple):
                     msg_type, content = item
                 else:
-                    msg_type, content = "content", item # 兼容旧格式
+                    msg_type, content = "content", item
                 
                 if msg_type == "content":
-                    full_draft += content
+                    full_response_text += content
+                    
+                    # 尝试实时回显（这是一个简化的 hack，假设模型按顺序输出 keys）
+                    # 实际生产中建议使用专门的 JSON stream parser
+                    if stream_callback: 
+                        stream_callback("draft_content", content)
+
+            # 解析最终响应 (优先 XML, 失败尝试 JSON)
+            try:
+                # 尝试 XML 解析
+                if "<response>" in full_response_text:
+                    response_data = self._parse_xml_response(full_response_text)
+                else:
+                    # 尝试修复 JSON
+                    json_str = self._sanitize_json(full_response_text)
+                    import json
+                    response_data = json.loads(json_str)
+                    
+                    # Normalize keys for JSON
+                    if "thinking" in response_data and "analysis" not in response_data:
+                        response_data["analysis"] = response_data["thinking"]
                 
-                if stream_callback: stream_callback(f"draft_{msg_type}", content)
-            
-            chunk.draft_translation = full_draft
-            
-            # 步骤 3: 润色
+                chunk.analysis = response_data.get("analysis", "")
+                chunk.draft_translation = response_data.get("translation", "")
+                
+                # 处理新术语
+                new_terms = response_data.get("new_terms", [])
+                self._process_new_terms(new_terms, stream_callback)
+                
+                # 处理实体关系 (Phase 2)
+                if self.knowledge_base:
+                    relations = response_data.get("relations", [])
+                    self._process_relations(relations, stream_callback)
+                
+            except Exception as e:
+                # Fallback: 如果解析失败，假设全文都是译文
+                print(f"[Warn] Parse failed: {e}")
+                chunk.draft_translation = full_response_text
+                chunk.analysis = "Parse Failed"
+
+            # 步骤 2: 润色 (可选)
             if self.config.enable_polish:
                 chunk.status = ChunkStatus.POLISHING
                 if stream_callback: stream_callback("polish_start", "")
@@ -167,38 +271,152 @@ class TranslationEngine:
         
         return chunk
     
+    def _process_relations(self, relations: List[dict], callback: Optional[callable]):
+        """处理新发现的实体关系"""
+        if not self.knowledge_base:
+            return
+
+        for rel in relations:
+            try:
+                sub = rel.get("sub") or rel.get("subject")
+                obj = rel.get("obj") or rel.get("object")
+                relation = rel.get("rel") or rel.get("relation")
+                context = rel.get("context")
+                
+                if sub and obj and relation:
+                    self.knowledge_base.update_entity_relation(sub, obj, relation, context)
+                    if callback:
+                        callback("logic", f"[Relation] {sub} --{relation}--> {obj}")
+            except Exception as e:
+                print(f"[Warn] Relation update failed: {e}")
+
+    def _process_new_terms(self, new_terms: List[dict], callback: Optional[callable]):
+        """处理新发现的术语"""
+        for term in new_terms:
+            try:
+                src = term.get("src")
+                tgt = term.get("tgt", src) # 默认译名
+                raw_type = term.get("type", "concept")
+                context = term.get("context")
+                
+                if not src: continue
+                
+                # Normalize category (handle 'person/group', 'mythical figure' etc)
+                raw_type_lower = raw_type.lower()
+                # Remove brackets and split by slash
+                cat_str = raw_type_lower.split("(")[0].strip().split("/")[0].strip()
+                
+                # Category Mapping
+                type_mapping = {
+                    "mythical figure": "person",
+                    "mythical creature": "concept", 
+                    "animal": "concept",
+                    "weapon": "item",
+                    "vehicle": "item",
+                    "unit": "unit",
+                    "description": "concept",
+                    "identity": "concept",
+                    "group": "organization"
+                }
+                
+                if raw_type_lower in type_mapping:
+                    cat_str = type_mapping[raw_type_lower]
+                elif cat_str in type_mapping:
+                    cat_str = type_mapping[cat_str]
+                
+                # Try to validate/convert to Enum, fallback to concept
+                try:
+                    # Check if valid enum value
+                    from .schemas import TermCategory
+                    TermCategory(cat_str)
+                except ValueError:
+                    cat_str = "concept"
+                
+                # 检查是否存在
+                existing_item = self.glossary.find_by_src(src)
+                if existing_item:
+                    # 如果译名不同，处理更新逻辑
+                    if existing_item.default_target != tgt:
+                        is_auto = self.config.glossary_mode == "auto"
+                        note_prefix = "[Auto-Update]" if is_auto else "[Pending Suggestion]"
+                        note = f"\n{note_prefix} Alt: {tgt} (Ctx: {context or 'None'})"
+                        
+                        # 避免重复
+                        if existing_item.description and note.strip() in existing_item.description:
+                            pass
+                        else:
+                            existing_item.description = (existing_item.description or "") + note
+                            
+                            # Auto模式下更新默认译名
+                            if is_auto:
+                                existing_item.default_target = tgt
+                                existing_item.status = TermStatus.VERIFIED
+                                if callback: callback("logic", f"[Update] {src}: {existing_item.default_target} -> {tgt}")
+                            else:
+                                if callback: callback("logic", f"[Suggest] {src}: {tgt} (Pending)")
+                                
+                    continue
+                    
+                # 根据模式决定状态
+                status = TermStatus.VERIFIED if self.config.glossary_mode == "auto" else TermStatus.PENDING
+                
+                description = context or "Auto-extracted"
+                
+                self.glossary.add_term(
+                    src=src,
+                    default_target=tgt,
+                    category=cat_str,
+                    description=description,
+                    status=status
+                )
+                
+                # Sync with KnowledgeBase
+                if self.knowledge_base:
+                    try:
+                        entity = self.knowledge_base.add_entity(
+                            name=src,
+                            category=cat_str,
+                            description=description
+                        )
+                        # Add translation as alias
+                        if tgt and tgt != src:
+                            self.knowledge_base.add_alias(entity.id, tgt)
+                    except Exception as e:
+                        print(f"[Warn] KB sync failed for {src}: {e}")
+                
+                if callback:
+                    tag = "[New Term]" if status == TermStatus.VERIFIED else "[Pending Term]"
+                    callback("logic", f"{tag} {src} -> {tgt}")
+                    
+            except Exception as e:
+                print(f"[Warn] Term processing failed for {term}: {e}")
+
     def _draft_translate(
         self,
         source_text: str,
-        logic_analysis: Optional[LogicAnalysisResult] = None,
         previous_summary: Optional[str] = None,
-        previous_chunk_text: Optional[str] = None
-    ) -> Any: # Return type changed to Any to support stream generator or str
+        previous_chunk_text: Optional[str] = None,
+        logic_analysis: Any = None # Keep for compatibility signature, unused
+    ) -> Any:
         """
-        直译阶段
-        
-        Args:
-            source_text: 原文
-            logic_analysis: 逻辑分析结果
-            previous_summary: 前文摘要 (Story Context)
-            previous_chunk_text: 上一个 Chunk 的原文末尾 (Text Context)
-        
-        Returns:
-            直译文本 (str) 或 生成器 (stream)
+        直译阶段 (Logic-Aware + Memory-Augmented)
         """
-        # 获取术语规则
-        glossary_rules = self.glossary.get_prompt_text(source_text)
+        # 1. 获取术语 (只获取 VERIFIED)
+        glossary_terms = self.glossary.find_terms_in_text(source_text, status_filter=[TermStatus.VERIFIED])
+        glossary_rules = "\n".join(term.to_prompt_text() for term in glossary_terms) if glossary_terms else "（无特殊术语）"
         
-        # 获取逻辑分析提示
-        logic_text = "(无特殊逻辑注意事项)"
-        if logic_analysis and logic_analysis.has_ambiguity:
-            logic_text = logic_analysis.to_prompt_text()
+        # 2. 获取实体档案 (Memory Injection)
+        entity_context = ""
+        if self.knowledge_base and glossary_terms:
+            # 提取名字
+            names = [term.src for term in glossary_terms]
+            entity_context = self.knowledge_base.get_prompt_text(names)
         
         # 构建 System Prompt
         system_template = self.prompts.get("draft", {}).get("system", self._default_draft_system())
         system_prompt = system_template.format(
             glossary_rules=glossary_rules,
-            logic_analysis=logic_text
+            entity_context=entity_context
         )
         
         # 构建 User Prompt (采用结构化 Context 注入)
@@ -270,68 +488,63 @@ class TranslationEngine:
     def translate_text(
         self,
         source_text: str,
-        enable_logic_analysis: bool = True,
         enable_polish: bool = True
     ) -> Dict[str, Any]:
         """
         翻译单段文本（便捷方法）
-        
-        Args:
-            source_text: 原文
-            enable_logic_analysis: 是否启用逻辑分析
-            enable_polish: 是否启用润色
-        
-        Returns:
-            包含各阶段结果的字典
         """
-        result = {
+        # 为了兼容便捷调用，我们需要构造一个 Fake Chunk
+        chunk = TextChunk(
+            id="temp", 
+            chapter_id="temp", 
+            index=0, 
+            source_text=source_text
+        )
+        
+        # 复用核心逻辑
+        result_chunk = self.translate_chunk(chunk)
+        
+        return {
             "source": source_text,
-            "logic_analysis": None,
-            "draft": None,
-            "polished": None,
-            "final": None
+            "analysis": result_chunk.analysis,
+            "draft": result_chunk.draft_translation,
+            "final": result_chunk.final_translation
         }
-        
-        # 逻辑分析
-        logic_result = None
-        if enable_logic_analysis:
-            logic_result = self.logic_analyzer.analyze(source_text)
-            result["logic_analysis"] = logic_result.model_dump() if logic_result.has_ambiguity else None
-        
-        # 直译
-        draft = self._draft_translate(source_text, logic_result)
-        result["draft"] = draft
-        
-        # 润色
-        if enable_polish:
-            polished = self._polish_translate(source_text, draft)
-            result["polished"] = polished
-            result["final"] = polished
-        else:
-            result["final"] = draft
-        
-        return result
     
     def _default_draft_system(self) -> str:
-        """默认直译 System Prompt"""
-        return """你是一位严谨的文学翻译家。你的任务是将英文小说翻译成中文。
+        """默认直译 System Prompt (XML Mode)"""
+        return """你是一位精通逻辑分析的文学翻译家。你的任务是将英文小说翻译成中文。
 
 ## 核心指令
-1. **只翻译 <text_to_translate> 标签内的内容**。
-2. `<story_context>` 和 `<immediate_context>` 仅作为理解参考，**绝对不要翻译它们**。
-3. **准确第一**：绝对忠于原文的事实和逻辑，不添加不删减。
-4. **术语一致**：严格遵守提供的术语表规则。
-5. **逻辑遵从**：如果提供了逻辑分析，必须按照分析结果处理指代关系。
+1. **术语一致**：严格遵守提供的术语表规则。
+2. **逻辑推演**：在翻译前，必须先进行逻辑推演 (Analysis)，补全省略的从句，解析 "I mean" 等指代关系。
+3. **格式严格**：必须输出合法的 XML 格式。
 
-## 术语表
+## 术语表 (仅参考)
 {glossary_rules}
 
-## 逻辑分析
-{logic_analysis}
+{entity_context}
 
-## 输出要求
-- 直接输出中文译文，保持原文的分段格式。
-- 不要输出标签，也不要添加任何解释。"""
+## 输出格式
+请严格按照以下 XML 格式输出：
+
+<response>
+    <analysis>
+    这里写下你的思考过程。1. 分析难句结构... 2. 确认代词指代... 3. 决定意译策略...
+    </analysis>
+    
+    <translation>
+    最终的中文译文（保持原文分段）
+    </translation>
+    
+    <new_terms>
+        <term src="新术语原文" tgt="建议译名" type="person/place/item/organization" />
+    </new_terms>
+    
+    <relations>
+        <relation sub="主体名" rel="关系描述" obj="客体名" context="简短证据" />
+    </relations>
+</response>"""
     
     def _default_polish_system(self) -> str:
         """默认润色 System Prompt"""

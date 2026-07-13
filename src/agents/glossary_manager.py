@@ -7,7 +7,7 @@ import re
 from pathlib import Path
 from typing import List, Optional, Set
 
-from ..core.schemas import Glossary, GlossaryItem, GlossaryRule, TermCategory
+from ..core.schemas import Glossary, GlossaryItem, GlossaryRule, TermCategory, TermStatus
 
 
 class GlossaryManager:
@@ -89,11 +89,19 @@ class GlossaryManager:
                 except ValueError:
                     pass
             
+            status = TermStatus.VERIFIED
+            if "status" in data:
+                try:
+                    status = TermStatus(data["status"])
+                except ValueError:
+                    pass
+
             return GlossaryItem(
                 id=data.get("id"),
                 src=data["src"],
                 default_target=data.get("default_target") or data.get("default_tgt", ""),
                 category=category,
+                status=status,
                 description=data.get("description"),
                 rules=rules
             )
@@ -108,20 +116,28 @@ class GlossaryManager:
             pattern = re.compile(rf'\b{re.escape(item.src)}\b', re.IGNORECASE)
             self._term_patterns[item.src] = pattern
     
-    def find_terms_in_text(self, text: str) -> List[GlossaryItem]:
+    def find_terms_in_text(self, text: str, status_filter: Optional[List[TermStatus]] = None) -> List[GlossaryItem]:
         """
         在文本中查找所有出现的术语
         
         Args:
             text: 待检索文本
+            status_filter: 状态过滤列表，默认为 [TermStatus.VERIFIED]
         
         Returns:
             命中的术语列表
         """
+        if status_filter is None:
+            status_filter = [TermStatus.VERIFIED]
+            
         found_terms = []
         found_srcs: Set[str] = set()
         
         for item in self.glossary.items:
+            # 状态过滤
+            if item.status not in status_filter:
+                continue
+                
             pattern = self._term_patterns.get(item.src)
             if pattern and pattern.search(text):
                 if item.src.lower() not in found_srcs:
@@ -133,27 +149,27 @@ class GlossaryManager:
     def get_prompt_text(self, text: str) -> str:
         """
         根据文本内容生成术语提示文本
-        
-        Args:
-            text: 待翻译文本
-        
-        Returns:
-            可嵌入 Prompt 的术语规则文本
+        (仅返回已确认的术语)
         """
-        terms = self.find_terms_in_text(text)
+        terms = self.find_terms_in_text(text, status_filter=[TermStatus.VERIFIED])
         
         if not terms:
             return "（无特殊术语）"
         
         return "\n".join(term.to_prompt_text() for term in terms)
     
+    def find_by_src(self, src: str) -> Optional[GlossaryItem]:
+        """根据原词查找术语 (代理方法)"""
+        return self.glossary.find_by_src(src)
+
     def add_term(
         self,
         src: str,
         default_target: str,
         category: Optional[str] = None,
         description: Optional[str] = None,
-        rules: Optional[List[dict]] = None
+        rules: Optional[List[dict]] = None,
+        status: TermStatus = TermStatus.PENDING
     ) -> GlossaryItem:
         """
         添加新术语
@@ -177,6 +193,7 @@ class GlossaryManager:
             src=src,
             default_target=default_target,
             category=TermCategory(category) if category else None,
+            status=status,
             description=description,
             rules=parsed_rules
         )
@@ -213,6 +230,7 @@ class GlossaryManager:
             "src": item.src,
             "default_target": item.default_target,
             "category": item.category.value if item.category else None,
+            "status": item.status.value,
             "description": item.description
         }
         
@@ -234,6 +252,7 @@ class GlossaryManager:
                 "id": item.id,
                 "src": item.src,
                 "default_target": item.default_target,
+                "status": item.status.value
             }
             if item.category:
                 item_data["category"] = item.category.value

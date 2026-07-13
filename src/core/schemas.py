@@ -29,11 +29,19 @@ class TermCategory(str, Enum):
     ORGANIZATION = "organization" # 组织
     ITEM = "item"                 # 物品
     CONCEPT = "concept"           # 概念/术语
+    UNIT = "unit"                 # 计量单位
 
 
 # ============================================================
 # 术语表相关
 # ============================================================
+
+class TermStatus(str, Enum):
+    """术语状态"""
+    VERIFIED = "verified"   # 已确认
+    PENDING = "pending"     # 待审核 (AI 生成)
+    REJECTED = "rejected"   # 已驳回
+
 
 class GlossaryRule(BaseModel):
     """术语的语境规则"""
@@ -48,6 +56,7 @@ class GlossaryItem(BaseModel):
     src: str = Field(..., description="英文原词")
     default_target: str = Field(..., description="默认译法")
     category: Optional[TermCategory] = Field(None, description="分类")
+    status: TermStatus = Field(TermStatus.VERIFIED, description="状态")
     description: Optional[str] = Field(None, description="说明")
     rules: List[GlossaryRule] = Field(default_factory=list, description="语境规则")
     
@@ -79,6 +88,41 @@ class Glossary(BaseModel):
         if not self.items:
             return "（无特殊术语）"
         return "\n".join(item.to_prompt_text() for item in self.items)
+
+
+# ============================================================
+# 记忆/知识库相关
+# ============================================================
+
+class EntityRelation(BaseModel):
+    """实体关系"""
+    source: str = Field(..., description="主体 (Subject)")
+    target: str = Field(..., description="客体 (Object)")
+    relation: str = Field(..., description="关系描述 (e.g. 'friend of', 'located in')")
+    context: Optional[str] = Field(None, description="上下文/证据")
+    chapter_id: Optional[str] = None
+
+class Entity(BaseModel):
+    """实体档案"""
+    id: str = Field(..., description="唯一ID (normalized name)")
+    name: str = Field(..., description="标准名称")
+    type: TermCategory = Field(TermCategory.PERSON, description="实体类型")
+    description: str = Field("", description="人物/物品简介")
+    aliases: List[str] = Field(default_factory=list, description="别名")
+    relations: List[EntityRelation] = Field(default_factory=list, description="相关关系")
+    
+    def to_markdown(self) -> str:
+        """转换为 Markdown 格式"""
+        lines = [f"# {self.name} ({self.type.value})", ""]
+        if self.description:
+            lines.append(f"**简介**: {self.description}")
+            lines.append("")
+        
+        if self.relations:
+            lines.append("## 关系")
+            for rel in self.relations:
+                lines.append(f"- **{rel.relation}** {rel.target} ({rel.context or ''})")
+        return "\n".join(lines)
 
 
 # ============================================================
@@ -125,7 +169,8 @@ class TextChunk(BaseModel):
     
     # 处理结果
     status: ChunkStatus = Field(ChunkStatus.PENDING)
-    logic_analysis: Optional[LogicAnalysisResult] = None
+    logic_analysis: Optional[LogicAnalysisResult] = None # Deprecated
+    analysis: Optional[str] = Field(None, description="思维链/逻辑推演过程")
     draft_translation: Optional[str] = None
     polished_translation: Optional[str] = None
     final_translation: Optional[str] = None

@@ -10,6 +10,7 @@ import yaml
 from .schemas import Book
 from .preprocessor import TextPreprocessor
 from .history import TranslationMemory
+from .knowledge_base import KnowledgeBase
 
 
 class Project:
@@ -23,6 +24,9 @@ class Project:
         
         # 翻译记忆
         self.memory = TranslationMemory(self.root_dir)
+        
+        # 知识库
+        self.knowledge_base = KnowledgeBase(str(self.root_dir))
         
         # 状态
         self._book_metadata: Optional[Book] = None

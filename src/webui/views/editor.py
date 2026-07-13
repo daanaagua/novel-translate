@@ -57,8 +57,12 @@ def show_editor(project):
         st.info(chunk.source_text)
         
         # 显示逻辑分析
-        if chunk.logic_analysis and chunk.logic_analysis.has_ambiguity:
-            with st.expander("🧠 逻辑分析 (AI)", expanded=True):
+        if chunk.analysis:
+            with st.expander("🧠 逻辑分析 (AI Analysis)", expanded=True):
+                st.markdown(chunk.analysis)
+        # 兼容旧版本数据
+        elif chunk.logic_analysis and chunk.logic_analysis.has_ambiguity:
+            with st.expander("🧠 逻辑分析 (Legacy)", expanded=True):
                 for item in chunk.logic_analysis.analysis:
                     st.markdown(f"**引用**: `{item.quote}`")
                     st.markdown(f"**含义**: {item.interpretation}")
@@ -72,11 +76,17 @@ def show_editor(project):
         # 初始值
         initial_value = chunk.final_translation or chunk.draft_translation or ""
         
+        # 动态计算高度
+        # 假设每行约 40-50 字符，行高 25px，基础高度 200px
+        # 这是一个粗略估计，为了更好的阅读体验
+        line_count = initial_value.count('\n') + (len(initial_value) / 40)
+        dynamic_height = max(400, int(line_count * 25))
+        
         # 编辑框
         new_translation = st.text_area(
             "编辑译文",
             value=initial_value,
-            height=400,
+            height=dynamic_height,
             key=f"edit_{chunk.id}"
         )
         

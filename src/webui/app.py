@@ -44,7 +44,7 @@ with st.sidebar:
 
     st.divider()
     st.markdown("### 导航")
-    page = st.radio("Go to", ["仪表盘", "翻译审阅", "术语库", "导出"])
+    page = st.radio("Go to", ["仪表盘", "翻译审阅", "术语库", "知识库", "导出"])
 
 # 路由分发
 if not st.session_state.current_project:
@@ -61,8 +61,12 @@ else:
         show_editor(project)
         
     elif page == "术语库":
-        st.title("术语库管理")
-        st.write("🚧 开发中...")
+        from src.webui.views.glossary_view import show_glossary
+        show_glossary(project)
+        
+    elif page == "知识库":
+        from src.webui.views.knowledge_base_view import show_knowledge_base
+        show_knowledge_base(project)
         
     elif page == "导出":
         from src.webui.views.export import show_export
