@@ -322,9 +322,12 @@ class V4TranslationPipeline:
                     "memory_summary": result.memory_summary or "",
                 }
             if polish_audits:
+                normalized_polish = engine._normalize_chinese_punctuation(
+                    result.polished_translation or ""
+                )
                 polish_audits[-1]["accepted"] = bool(
                     result.polished_translation
-                    and result.final_translation == result.polished_translation
+                    and result.final_translation == normalized_polish
                 )
                 polish_audits[-1]["parsed"] = {
                     "final_translation": result.final_translation or "",

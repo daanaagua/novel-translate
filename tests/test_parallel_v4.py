@@ -355,6 +355,14 @@ class ParallelV4Tests(unittest.TestCase):
         self.assertIn("逐句查漏和比较措辞", polish["messages"][-1]["content"])
         final = self.database.active_translations()[block.id]["final_translation"]
         self.assertEqual(final, "“这是综合两稿后的完整译文。”")
+        with closing(self.database.connect()) as connection:
+            accepted = connection.execute(
+                """SELECT accepted FROM audit_calls
+                   WHERE run_id=? AND purpose='polish'
+                   ORDER BY id DESC LIMIT 1""",
+                (result["run_id"],),
+            ).fetchone()["accepted"]
+        self.assertEqual(accepted, 1)
 
     def test_polish_falls_back_to_aligned_serial_translation(self):
         block = self.add_blocks(["Alpha begins."], status="ready")[0]
