@@ -83,10 +83,10 @@ class RetryingPolishLLM:
 
 class PipelineTests(unittest.TestCase):
     def test_chinese_quote_normalization_preserves_word_apostrophes(self):
-        text = "「'Everything is done.'」don't \"again\""
+        text = "「'Everything is done.'」don't \"again\" «Never.»"
         self.assertEqual(
             normalize_chinese_quote_style(text),
-            "“‘Everything is done.’”don't “again”",
+            "“‘Everything is done.’”don't “again” “Never.”",
         )
 
     def test_epub_spine_and_chapter_markers(self):
