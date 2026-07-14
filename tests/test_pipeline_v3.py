@@ -161,6 +161,32 @@ class PipelineTests(unittest.TestCase):
             self.assertEqual(result.memory_summary, "人物抵达观测站，尚不知道信号来源。")
             self.assertEqual(result.status, ChunkStatus.COMPLETED)
 
+    def test_independent_semantic_hint_reaches_both_translation_layers(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            fake_llm = FakeLLM()
+            engine = TranslationEngine(
+                llm_manager=fake_llm,
+                glossary_manager=GlossaryManager(str(Path(temp_dir) / "glossary")),
+                prompts={},
+                config=TranslationConfig(enable_polish=True),
+            )
+            hint = "同一离去动作在普通视角和拟景视角中连续呈现；只作强暗示。"
+            result = engine.translate_chunk(
+                TextChunk(
+                    id="ch01_000",
+                    chapter_id="ch01",
+                    index=0,
+                    source_text="Source.",
+                ),
+                semantic_obligations_hint=hint,
+            )
+            draft_prompt = fake_llm.calls[0][1][-1]["content"]
+            polish_prompt = fake_llm.calls[1][1][-1]["content"]
+            self.assertIn("<semantic_obligations_hint>", draft_prompt)
+            self.assertIn(hint, draft_prompt)
+            self.assertIn(hint, polish_prompt)
+            self.assertEqual(result.semantic_obligations, hint)
+
     def test_truncated_polish_is_retried_and_complete_retry_is_used(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             fake_llm = RetryingPolishLLM(retry_succeeds=True)

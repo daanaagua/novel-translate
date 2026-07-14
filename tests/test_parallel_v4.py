@@ -14,6 +14,7 @@ from src.core.v4.migration import V4Migrator
 from src.core.v4.models import ScanOutcome, ScanResponse
 from src.core.v4.pipeline import V4PipelineConfig, V4TranslationPipeline
 from src.core.v4.scanner import ScanProtocolError, V4Scanner
+from src.core.v4.semantic_mapper import SemanticMapper
 from src.core.v4.validation import V4Validator
 
 
@@ -95,6 +96,16 @@ class FakeReferencePolishLLM:
             yield ("content", payload)
 
         return generator() if stream else payload
+
+
+class FakeSemanticLLM:
+    def __init__(self, response):
+        self.response = response
+        self.calls = []
+
+    def chat(self, **kwargs):
+        self.calls.append(kwargs)
+        return self.response
 
 
 class ParallelV4Tests(unittest.TestCase):
@@ -283,6 +294,52 @@ class ParallelV4Tests(unittest.TestCase):
             packet.rendered,
         )
         self.assertNotIn("They waited without speaking.", packet.rendered)
+
+    def test_semantic_mapper_extracts_grounded_cross_layer_relation(self):
+        source = (
+            "As Lahl walked away across the mesa, Rakesh peeked at her version of the scape. "
+            "A long, translucent, segmented creature pushed its way briskly through a dense carpet."
+        )
+        response = json.dumps(
+            {
+                "relations": [
+                    {
+                        "relation_type": "same_event_different_rendering",
+                        "inference_strength": "strongly_implied",
+                        "source_spans": [
+                            "Lahl walked away across the mesa",
+                            "A long, translucent, segmented creature pushed its way briskly",
+                        ],
+                        "translation_constraint": (
+                            "后句是在拉凯什所见的拟景版本中延续前句的离去动作；"
+                            "中文必须让对应关系可推知，但不得直接宣布两者等同。"
+                        ),
+                    }
+                ]
+            },
+            ensure_ascii=False,
+        )
+        fake = FakeSemanticLLM(response)
+        rendered = SemanticMapper(fake).map(source, "The scape differs by observer.")
+        self.assertIn("same_event_different_rendering", rendered)
+        self.assertIn("后句是在拉凯什所见的拟景版本中延续前句的离去动作", rendered)
+        self.assertEqual(fake.calls[0]["purpose"], "semantic")
+        self.assertTrue(fake.calls[0]["json_mode"])
+
+    def test_semantic_mapper_rejects_ungrounded_source_spans(self):
+        response = json.dumps(
+            {
+                "relations": [
+                    {
+                        "relation_type": "referential_link",
+                        "inference_strength": "explicit",
+                        "source_spans": ["Missing quote", "Another missing quote"],
+                        "translation_constraint": "保留指代。",
+                    }
+                ]
+            }
+        )
+        self.assertEqual(SemanticMapper(FakeSemanticLLM(response)).map("Actual source."), "")
 
     def test_human_can_merge_inflected_concept_forms(self):
         self.database.import_legacy_concept(

@@ -23,6 +23,7 @@ from ..translator import TranslationConfig, TranslationEngine
 from .context import ContextBuilder, ContextOverflow
 from .database import V4Database
 from .models import Island, TranslationOutcome, V4Block, V4BlockStatus
+from .semantic_mapper import SemanticMapper, SemanticMapperConfig
 
 
 @dataclass
@@ -36,6 +37,10 @@ class V4PipelineConfig:
     include_block_ids: tuple[str, ...] = ()
     decision_mode: str = "unattended"
     enable_polish: bool = True
+    enable_semantic_mapper: bool = False
+    semantic_temperature: float = 0.0
+    semantic_max_tokens: int = 4096
+    semantic_max_attempts: int = 2
     draft_temperature: float = 0.1
     draft_max_tokens: int = 6144
     polish_temperature: float = 0.2
@@ -54,6 +59,7 @@ class V4PipelineConfig:
         self.initial_workers = max(1, self.initial_workers)
         self.max_workers = max(self.initial_workers, self.max_workers)
         self.max_attempts = max(1, self.max_attempts)
+        self.semantic_max_attempts = max(1, self.semantic_max_attempts)
         self.include_block_ids = tuple(dict.fromkeys(self.include_block_ids))
 
 
@@ -219,6 +225,14 @@ class V4TranslationPipeline:
 
     def _translate_island(self, island: Island, knowledge_version: int) -> List[TranslationOutcome]:
         audited_llm = AuditedLLM(self.llm_factory())
+        semantic_mapper = SemanticMapper(
+            audited_llm,
+            SemanticMapperConfig(
+                temperature=self.config.semantic_temperature,
+                max_tokens=self.config.semantic_max_tokens,
+                max_attempts=self.config.semantic_max_attempts,
+            ),
+        )
         proposals: List[tuple[str, Dict[str, Any]]] = []
         engine = TranslationEngine(
             llm_manager=audited_llm,
@@ -280,6 +294,40 @@ class V4TranslationPipeline:
                     break
             result: Optional[TextChunk] = None
             attempts = 0
+            semantic_obligations_hint = ""
+            if self.config.enable_semantic_mapper:
+                semantic_obligations_hint = semantic_mapper.map(
+                    block.source_text,
+                    packet.rendered,
+                )
+                required_with_hint = packet.required_chars + len(semantic_obligations_hint)
+                if required_with_hint > self.config.max_context_chars:
+                    block_audits = [dict(call) for call in audited_llm.calls[call_start:]]
+                    for call in block_audits:
+                        call["accepted"] = False
+                    semantic_audits = [
+                        call for call in block_audits if call.get("purpose") == "semantic"
+                    ]
+                    if semantic_audits:
+                        semantic_audits[-1]["accepted"] = semantic_mapper.last_succeeded
+                        semantic_audits[-1]["parsed"] = {
+                            "semantic_obligations_hint": semantic_obligations_hint
+                        }
+                    outcomes.append(
+                        TranslationOutcome(
+                            block=block,
+                            knowledge_version=knowledge_version,
+                            status=V4BlockStatus.INCOMPLETE_REQUIRES_HUMAN.value,
+                            audit_calls=block_audits,
+                            elapsed_ms=int((time.perf_counter() - started) * 1000),
+                            error=(
+                                f"{block.id} 加入独立语义映射后必需上下文为 "
+                                f"{required_with_hint} 字符，超过预算 "
+                                f"{self.config.max_context_chars}；需要人工处理"
+                            ),
+                        )
+                    )
+                    break
             for attempts in range(1, self.config.max_attempts + 1):
                 result = engine.translate_chunk(
                     TextChunk(
@@ -293,6 +341,7 @@ class V4TranslationPipeline:
                     previous_summary=local_summary,
                     previous_chunk_text=previous_source,
                     comparison_reference=comparison_reference,
+                    semantic_obligations_hint=semantic_obligations_hint,
                 )
                 if result.status in {ChunkStatus.COMPLETED, ChunkStatus.HUMAN_REVIEW}:
                     break
@@ -311,6 +360,14 @@ class V4TranslationPipeline:
                 call["accepted"] = False
             draft_audits = [call for call in block_audits if call.get("purpose") == "draft"]
             polish_audits = [call for call in block_audits if call.get("purpose") == "polish"]
+            semantic_audits = [
+                call for call in block_audits if call.get("purpose") == "semantic"
+            ]
+            if semantic_audits:
+                semantic_audits[-1]["accepted"] = semantic_mapper.last_succeeded
+                semantic_audits[-1]["parsed"] = {
+                    "semantic_obligations_hint": semantic_obligations_hint
+                }
             if draft_audits:
                 draft_audits[-1]["accepted"] = result.status in {
                     ChunkStatus.COMPLETED,

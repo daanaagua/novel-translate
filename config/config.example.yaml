@@ -8,6 +8,7 @@ llm:
       timeout: 1800
       models:
         scan: "deepseek-v4-flash"
+        semantic: "deepseek-v4-flash"
         reconcile: "deepseek-v4-flash"
         verify: "deepseek-v4-flash"
         repair: "deepseek-v4-flash"
@@ -23,6 +24,10 @@ llm:
           thinking:
             type: "enabled"
         scan:
+          reasoning_effort: "high"
+          thinking:
+            type: "enabled"
+        semantic:
           reasoning_effort: "high"
           thinking:
             type: "enabled"
@@ -57,6 +62,10 @@ parallel_v4:
   initial_workers: 2
   max_workers: 4
   max_context_chars: 24000
+  enable_semantic_mapper: true
+  semantic_temperature: 0.0
+  semantic_max_tokens: 4096
+  semantic_max_attempts: 2
   use_baseline_reference: false
   audit_mode: "full"
 

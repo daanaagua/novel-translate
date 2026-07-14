@@ -154,6 +154,7 @@ class TranslationEngine:
         previous_chunk_text: Optional[str] = None,
         stream_callback: Optional[callable] = None,
         comparison_reference: Optional[str] = None,
+        semantic_obligations_hint: Optional[str] = None,
     ) -> TextChunk:
         """
         翻译单个文本块 (新版流式逻辑)
@@ -174,7 +175,8 @@ class TranslationEngine:
             draft_response_generator = self._draft_translate(
                 source_text=chunk.source_text,
                 memory_context=memory_context or previous_summary,
-                previous_chunk_text=previous_chunk_text
+                previous_chunk_text=previous_chunk_text,
+                semantic_obligations_hint=semantic_obligations_hint,
             )
             
             # 流式解析 Accumulator
@@ -216,9 +218,13 @@ class TranslationEngine:
                         response_data["analysis"] = response_data["thinking"]
                 
                 chunk.analysis = response_data.get("analysis", "")
-                chunk.semantic_obligations = response_data.get(
-                    "semantic_obligations", ""
-                )
+                generated_obligations = response_data.get("semantic_obligations", "")
+                obligations = []
+                if semantic_obligations_hint:
+                    obligations.append(semantic_obligations_hint.strip())
+                if generated_obligations and generated_obligations.strip() not in {"无", "None"}:
+                    obligations.append(generated_obligations.strip())
+                chunk.semantic_obligations = "\n".join(dict.fromkeys(obligations))
                 chunk.draft_translation = response_data.get("translation", "")
                 chunk.memory_summary = response_data.get("memory_summary", "")
                 
@@ -577,7 +583,8 @@ class TranslationEngine:
         source_text: str,
         memory_context: Optional[str] = None,
         previous_chunk_text: Optional[str] = None,
-        logic_analysis: Any = None # Keep for compatibility signature, unused
+        logic_analysis: Any = None, # Keep for compatibility signature, unused
+        semantic_obligations_hint: Optional[str] = None,
     ) -> Any:
         """
         直译阶段 (Logic-Aware + Memory-Augmented)
@@ -630,6 +637,15 @@ class TranslationEngine:
             # 取最后 200 字符作为衔接参考
             context_snippet = previous_chunk_text[-200:] if len(previous_chunk_text) > 200 else previous_chunk_text
             user_content += f"<immediate_context>\n...{context_snippet}\n</immediate_context>\n\n"
+
+        if semantic_obligations_hint:
+            user_content += (
+                "<semantic_obligations_hint>\n"
+                f"{semantic_obligations_hint}\n"
+                "</semantic_obligations_hint>\n"
+                "该提示来自独立的原文关系检查。译文必须让读者能够恢复其中的关系，"
+                "但不得把强暗示或歧义改写成明说。\n\n"
+            )
         
         # 3. 注入当前文本
         user_content += f"<text_to_translate>\n{source_text}\n</text_to_translate>"
