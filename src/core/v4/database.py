@@ -13,7 +13,7 @@ from typing import Any, Dict, Iterable, Iterator, List, Optional, Sequence
 from .models import ScanOutcome, TranslationOutcome, V4Block, V4BlockStatus
 
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 
 def utc_now() -> str:
@@ -381,6 +381,21 @@ class V4Database:
                     resolved_at TEXT,
                     translation_id INTEGER REFERENCES translation_versions(id)
                 );
+
+                CREATE TABLE IF NOT EXISTS comparison_votes (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    block_id TEXT NOT NULL UNIQUE REFERENCES blocks(id),
+                    candidate_a_origin TEXT NOT NULL,
+                    candidate_b_origin TEXT NOT NULL,
+                    choice TEXT NOT NULL,
+                    selected_origin TEXT,
+                    blinded INTEGER NOT NULL DEFAULT 1,
+                    note TEXT NOT NULL DEFAULT '',
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_comparison_votes_choice
+                    ON comparison_votes(choice, updated_at);
                 """
             )
             connection.execute(
@@ -1552,10 +1567,12 @@ class V4Database:
         with closing(self.connect()) as connection:
             rows = connection.execute(
                 """SELECT b.id, b.legacy_id, b.chapter_title, b.global_index,
-                          b.status, tv.status translation_status, tv.warnings_json
+                          b.status, tv.status translation_status, tv.warnings_json,
+                          cv.choice comparison_choice
                    FROM blocks b
                    LEFT JOIN translation_versions tv
                      ON tv.block_id=b.id AND tv.pipeline='parallel_v4' AND tv.active=1
+                   LEFT JOIN comparison_votes cv ON cv.block_id=b.id
                    WHERE b.source_edition_id=(SELECT id FROM source_editions WHERE active=1)
                    ORDER BY CASE
                        WHEN tv.status='completed_with_warnings' THEN 0
@@ -1656,6 +1673,70 @@ class V4Database:
         query += " ORDER BY b.global_index, a.paragraph_index, a.created_at"
         with closing(self.connect()) as connection:
             return [dict(row) for row in connection.execute(query, params)]
+
+    def record_comparison_vote(
+        self,
+        block_identifier: str,
+        choice: str,
+        candidate_a_origin: str,
+        candidate_b_origin: str,
+        blinded: bool = True,
+        note: str = "",
+    ) -> Dict[str, Any]:
+        if choice not in {"A", "B", "tie", "neither"}:
+            raise ValueError("盲评选择必须是A、B、tie或neither")
+        block = self.get_block_by_identifier(block_identifier)
+        selected_origin = {
+            "A": candidate_a_origin,
+            "B": candidate_b_origin,
+        }.get(choice)
+        now = utc_now()
+        with self.transaction() as connection:
+            connection.execute(
+                """INSERT INTO comparison_votes(
+                       block_id, candidate_a_origin, candidate_b_origin, choice,
+                       selected_origin, blinded, note, created_at, updated_at
+                   ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)
+                   ON CONFLICT(block_id) DO UPDATE SET
+                       candidate_a_origin=excluded.candidate_a_origin,
+                       candidate_b_origin=excluded.candidate_b_origin,
+                       choice=excluded.choice,
+                       selected_origin=excluded.selected_origin,
+                       blinded=excluded.blinded,
+                       note=excluded.note,
+                       updated_at=excluded.updated_at""",
+                (
+                    block.id,
+                    candidate_a_origin,
+                    candidate_b_origin,
+                    choice,
+                    selected_origin,
+                    int(blinded),
+                    note.strip(),
+                    now,
+                    now,
+                ),
+            )
+        return self.comparison_vote_for_block(block.id) or {}
+
+    def comparison_vote_for_block(
+        self, block_identifier: str
+    ) -> Optional[Dict[str, Any]]:
+        block = self.get_block_by_identifier(block_identifier)
+        with closing(self.connect()) as connection:
+            row = connection.execute(
+                "SELECT * FROM comparison_votes WHERE block_id=?", (block.id,)
+            ).fetchone()
+            return dict(row) if row else None
+
+    def list_comparison_votes(self) -> List[Dict[str, Any]]:
+        with closing(self.connect()) as connection:
+            rows = connection.execute(
+                """SELECT v.*, b.legacy_id, b.global_index
+                   FROM comparison_votes v JOIN blocks b ON b.id=v.block_id
+                   ORDER BY b.global_index"""
+            ).fetchall()
+            return [dict(row) for row in rows]
 
     def resolve_annotation(self, annotation_id: str, action: str) -> Dict[str, Any]:
         if action not in {"approve", "reject"}:

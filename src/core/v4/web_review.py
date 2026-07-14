@@ -24,6 +24,7 @@ header{position:sticky;top:0;z-index:3;padding:14px 20px;background:#111318ee;bo
 header h1{font-size:17px;margin:0}.muted{color:var(--muted)}button,input,textarea,select{font:inherit;color:var(--text);background:#11151c;border:1px solid var(--line);border-radius:6px;padding:7px 9px}button{cursor:pointer}button:hover{border-color:var(--accent)}
 main{display:grid;grid-template-columns:minmax(280px,360px) 1fr;min-height:calc(100vh - 58px)}aside{padding:16px;border-right:1px solid var(--line);overflow:auto}.content{padding:20px;overflow:auto}.card{background:var(--panel);border:1px solid var(--line);border-radius:9px;padding:12px;margin-bottom:12px}.card h3{margin:0 0 8px;font-size:15px}.pill{display:inline-block;padding:2px 7px;border-radius:99px;background:#2a3340;color:var(--muted);font-size:12px}.queue-actions{display:flex;gap:6px;flex-wrap:wrap;margin-top:8px}.block{cursor:pointer}.block:hover{border-color:var(--accent)}
 .queue-payload{max-height:120px;overflow:auto;word-break:break-all;font-size:12px}details{margin-top:18px;border-top:1px solid var(--line);padding-top:12px}summary{cursor:pointer;font-size:16px;font-weight:700;margin-bottom:12px}details[open]>summary{color:var(--accent)}
+.vote-actions{display:flex;gap:8px;flex-wrap:wrap;margin:10px 0}.vote-actions button{min-width:92px}.vote-status{color:var(--ok);margin-top:8px}
 .columns{display:grid;grid-template-columns:1fr 1fr;gap:14px}.prose{white-space:pre-wrap;background:#12161d;border:1px solid var(--line);padding:14px;border-radius:8px;max-height:58vh;overflow:auto}.source{max-height:35vh}.section-title{display:flex;justify-content:space-between;align-items:center;margin:24px 0 9px}h2{font-size:18px;margin:0}.ok{color:var(--ok)}.warn{color:var(--warn)}.bad{color:var(--bad)}
 @media(max-width:900px){main{grid-template-columns:1fr}aside{border-right:0;border-bottom:1px solid var(--line)}.columns{grid-template-columns:1fr}}
 </style></head><body>
@@ -33,6 +34,7 @@ main{display:grid;grid-template-columns:minmax(280px,360px) 1fr;min-height:calc(
 <div class="section-title"><h2 id="blockTitle"></h2><button id="revealBtn">揭示来源</button></div><div id="blockMeta" class="muted"></div>
 <div class="section-title"><h2>原文</h2></div><div id="source" class="prose source"></div>
 <div class="section-title"><h2>译文对照</h2></div><div id="candidates" class="columns"></div>
+<div id="votePanel" class="card" hidden><h3>盲评选择</h3><div class="muted">选择你认为更好的译文；也可以选择相当或都不合格。</div><div class="vote-actions"><button onclick="submitVote('A')">A更好</button><button onclick="submitVote('B')">B更好</button><button onclick="submitVote('tie')">两者相当</button><button onclick="submitVote('neither')">都不合格</button></div><input id="voteNote" placeholder="可选：简短说明理由" style="width:100%"><div id="voteStatus" class="vote-status"></div></div>
 <div class="section-title"><h2>证据</h2></div><div id="evidence"></div>
 <div class="section-title"><h2>注释</h2></div><div id="annotations"></div><div class="card"><input id="annIndex" type="number" min="0" value="0" style="width:90px"><input id="annBody" placeholder="注释正文" style="width:min(560px,70%)"><button onclick="addAnnotation()">添加待审注释</button></div>
 <div class="section-title"><h2>局部修复</h2></div><div class="card"><textarea id="repairIssues" rows="3" style="width:100%" placeholder="每行一个需要修复的问题"></textarea><button onclick="requestRepair()">加入局部修复队列</button></div>
@@ -45,10 +47,12 @@ async function loadState(){const s=await api('/api/state');escText(document.quer
 function renderQueue(rows){const root=document.querySelector('#queue');root.innerHTML='';if(!rows.length){root.innerHTML='<div class="muted">暂无待裁决项目</div>';return}for(const q of rows){const c=document.createElement('div');c.className='card';const h=document.createElement('h3');h.textContent=`#${q.id} ${q.kind}`;c.append(h);const p=document.createElement('div');p.className='muted queue-payload';p.textContent=JSON.stringify(q.payload);c.append(p);const a=document.createElement('div');a.className='queue-actions';const actions=(q.kind==='context_overflow'||q.kind==='repair_failed')?['retry']:['accept','reject'];for(const action of actions){const b=document.createElement('button');b.textContent={accept:'接受并锁定',reject:'拒绝',retry:'重试'}[action];b.onclick=()=>queueAction(q.id,action);a.append(b)}if(q.kind==='translation_proposal'||q.kind==='high_impact_verification'){const e=document.createElement('button');e.textContent='编辑后接受';e.onclick=()=>editAccept(q.id);a.append(e)}c.append(a);root.append(c)}}
 function renderClaims(rows){const root=document.querySelector('#claims');root.innerHTML='';if(!rows.length){root.innerHTML='<div class="muted">暂无声明</div>';return}for(const x of rows.slice(0,50)){const c=document.createElement('div');c.className='card';const h=document.createElement('h3');h.textContent=`${x.kind} · ${x.status}`;c.append(h);const p=document.createElement('div');p.textContent=x.statement;c.append(p);const m=document.createElement('div');m.className='muted';m.textContent=`揭示位置 ${x.reveal_global_index} · ${x.scope}${x.locked?' · 已锁定':''}`;c.append(m);root.append(c)}}
 function renderTasks(verify,repair){const root=document.querySelector('#tasks');root.innerHTML='';for(const x of verify){const c=document.createElement('div');c.className='card';c.textContent=`核验 ${x.subject_type}:${x.subject_id} · ${x.status}`;root.append(c)}for(const x of repair){const c=document.createElement('div');c.className='card';c.textContent=`修复 ${x.legacy_id} · ${x.status}`;root.append(c)}if(!root.children.length)root.innerHTML='<div class="muted">暂无开放任务</div>'}
-function renderBlocks(rows){const root=document.querySelector('#blocks');root.innerHTML='';for(const b of rows){const c=document.createElement('div');c.className='card block';c.onclick=()=>loadBlock(b.legacy_id,true);c.innerHTML=`<h3></h3><span class="pill"></span>`;c.querySelector('h3').textContent=`${b.legacy_id} · ${b.chapter_title}`;c.querySelector('.pill').textContent=b.translation_status||b.status;root.append(c)}}
+function renderBlocks(rows){const root=document.querySelector('#blocks');root.innerHTML='';for(const b of rows){const c=document.createElement('div');c.className='card block';c.onclick=()=>loadBlock(b.legacy_id,true);c.innerHTML=`<h3></h3><span class="pill"></span>`;c.querySelector('h3').textContent=`${b.legacy_id} · ${b.chapter_title}`;c.querySelector('.pill').textContent=(b.translation_status||b.status)+(b.comparison_choice?` · 已选${{A:'A',B:'B',tie:'相当',neither:'均不合格'}[b.comparison_choice]}`:'');root.append(c)}}
 async function queueAction(id,action){try{await api(`/api/queue/${id}`,{method:'POST',body:JSON.stringify({action})});await loadState()}catch(e){alert(e.message)}}
 async function editAccept(id){const replacement=prompt('输入替换后的译法或声明：');if(!replacement)return;try{await api(`/api/queue/${id}`,{method:'POST',body:JSON.stringify({action:'accept',replacement})});await loadState()}catch(e){alert(e.message)}}
-async function loadBlock(id,blind=true){currentBlock=id;const d=await api(`/api/block?id=${encodeURIComponent(id)}&blind=${blind?'1':'0'}`);revealed=d.blind_available?!blind:true;document.querySelector('#empty').hidden=true;document.querySelector('#detail').hidden=false;escText(document.querySelector('#blockTitle'),`${d.legacy_id} · ${d.chapter_title}`);const warnings=JSON.parse(d.warnings_json||'[]');escText(document.querySelector('#blockMeta'),`${d.v4_status||d.status} · global_index=${d.global_index}${warnings.length?' · 警告：'+warnings.join('；'):''}`);escText(document.querySelector('#source'),d.source_text);const cr=document.querySelector('#candidates');cr.innerHTML='';for(const x of d.candidates){const box=document.createElement('div');box.innerHTML='<h3></h3><div class="prose"></div>';box.querySelector('h3').textContent=x.label+(x.origin?` · ${x.origin}`:'');box.querySelector('.prose').textContent=x.text||'（无译文）';cr.append(box)}const er=document.querySelector('#evidence');er.innerHTML='';for(const e of d.evidence){const c=document.createElement('div');c.className='card';c.textContent=`[${e.kind}] ${e.paragraph_id}: ${e.evidence_quote}`;er.append(c)}renderAnnotations(d.annotations);const reveal=document.querySelector('#revealBtn');reveal.hidden=!d.blind_available;reveal.onclick=()=>loadBlock(id,revealed);reveal.textContent=revealed?'恢复盲评':'揭示来源'}
+async function loadBlock(id,blind=true){currentBlock=id;const d=await api(`/api/block?id=${encodeURIComponent(id)}&blind=${blind?'1':'0'}`);revealed=d.blind_available?!blind:true;document.querySelector('#empty').hidden=true;document.querySelector('#detail').hidden=false;escText(document.querySelector('#blockTitle'),`${d.legacy_id} · ${d.chapter_title}`);const warnings=JSON.parse(d.warnings_json||'[]');escText(document.querySelector('#blockMeta'),`${d.v4_status||d.status} · global_index=${d.global_index}${warnings.length?' · 警告：'+warnings.join('；'):''}`);escText(document.querySelector('#source'),d.source_text);const cr=document.querySelector('#candidates');cr.innerHTML='';for(const x of d.candidates){const box=document.createElement('div');box.innerHTML='<h3></h3><div class="prose"></div>';box.querySelector('h3').textContent=x.label+(x.origin?` · ${x.origin}`:'');box.querySelector('.prose').textContent=x.text||'（无译文）';cr.append(box)}renderVote(d);const er=document.querySelector('#evidence');er.innerHTML='';for(const e of d.evidence){const c=document.createElement('div');c.className='card';c.textContent=`[${e.kind}] ${e.paragraph_id}: ${e.evidence_quote}`;er.append(c)}renderAnnotations(d.annotations);const reveal=document.querySelector('#revealBtn');reveal.hidden=!d.blind_available;reveal.onclick=()=>loadBlock(id,revealed);reveal.textContent=revealed?'恢复盲评':'揭示来源'}
+function renderVote(d){const panel=document.querySelector('#votePanel');panel.hidden=!d.blind_available;if(panel.hidden)return;const labels={A:'A更好',B:'B更好',tie:'两者相当',neither:'都不合格'};document.querySelector('#voteNote').value=d.comparison_vote?.note||'';document.querySelector('#voteStatus').textContent=d.comparison_vote?`已记录：${labels[d.comparison_vote.choice]}${d.comparison_vote.blinded?'（盲评）':'（揭示后选择）'}`:''}
+async function submitVote(choice){const note=document.querySelector('#voteNote').value;await api('/api/comparison-votes',{method:'POST',body:JSON.stringify({block:currentBlock,choice,blinded:!revealed,note})});await loadBlock(currentBlock,!revealed);const s=await api('/api/state');renderBlocks(s.blocks)}
 function renderAnnotations(rows){const root=document.querySelector('#annotations');root.innerHTML='';for(const a of rows){const c=document.createElement('div');c.className='card';c.textContent=`P${a.paragraph_index} [${a.status}] ${a.body}`;if(a.status==='proposed'){for(const action of ['approve','reject']){const b=document.createElement('button');b.textContent=action==='approve'?'批准':'拒绝';b.onclick=()=>resolveAnnotation(a.id,action);c.append(b)}}root.append(c)}}
 async function resolveAnnotation(id,action){await api(`/api/annotations/${id}`,{method:'POST',body:JSON.stringify({action})});await loadBlock(currentBlock,!revealed)}
 async function addAnnotation(){const paragraph_index=Number(document.querySelector('#annIndex').value);const body=document.querySelector('#annBody').value;await api('/api/annotations',{method:'POST',body:JSON.stringify({block:currentBlock,paragraph_index,body})});document.querySelector('#annBody').value='';await loadBlock(currentBlock,!revealed)}
@@ -133,6 +137,7 @@ def create_review_server(database: V4Database, port: int = 8765):
                             "verification_tasks": _json_safe_tasks(database.list_verification_tasks()),
                             "annotations": database.list_annotations("proposed"),
                             "repair_tasks": _json_safe_tasks(database.list_repair_tasks()),
+                            "comparison_vote_count": len(database.list_comparison_votes()),
                         }
                     )
                     return
@@ -178,6 +183,15 @@ def create_review_server(database: V4Database, port: int = 8765):
                         candidates = [baseline_candidate, v4_candidate]
                     data["blind_available"] = blind_available
                     data["candidates"] = candidates
+                    vote = database.comparison_vote_for_block(identifier)
+                    if vote and blind:
+                        for key in (
+                            "candidate_a_origin",
+                            "candidate_b_origin",
+                            "selected_origin",
+                        ):
+                            vote.pop(key, None)
+                    data["comparison_vote"] = vote
                     data.pop("v4_translation", None)
                     data.pop("serial_translation", None)
                     self._send_json(data)
@@ -213,6 +227,43 @@ def create_review_server(database: V4Database, port: int = 8765):
                 if parsed.path == "/api/repair":
                     task_id = database.request_repair(body["block"], body.get("issues") or [])
                     self._send_json({"id": task_id}, 201)
+                    return
+                if parsed.path == "/api/comparison-votes":
+                    identifier = str(body["block"])
+                    detail = database.get_review_block(identifier)
+                    baseline = detail.get("baseline") or {}
+                    baseline_origin = baseline.get("document", {}).get(
+                        "name", "serial_v3"
+                    )
+                    baseline_text = (
+                        baseline.get("text")
+                        or detail.get("serial_translation")
+                        or ""
+                    )
+                    v4_text = detail.get("v4_translation") or ""
+                    if not baseline_text.strip() or not v4_text.strip():
+                        raise ValueError("只有两份候选译文都存在时才能提交盲评")
+                    origins = ["parallel_v4", baseline_origin]
+                    if int(
+                        hashlib.sha256(detail["id"].encode()).hexdigest(), 16
+                    ) % 2:
+                        origins.reverse()
+                    vote = database.record_comparison_vote(
+                        identifier,
+                        str(body["choice"]),
+                        origins[0],
+                        origins[1],
+                        blinded=bool(body.get("blinded", True)),
+                        note=str(body.get("note") or ""),
+                    )
+                    if vote.get("blinded"):
+                        for key in (
+                            "candidate_a_origin",
+                            "candidate_b_origin",
+                            "selected_origin",
+                        ):
+                            vote.pop(key, None)
+                    self._send_json(vote, 201)
                     return
                 if parsed.path == "/api/claims":
                     claim_id = database.create_claim(**body)

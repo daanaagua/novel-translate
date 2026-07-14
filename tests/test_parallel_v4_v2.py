@@ -368,6 +368,69 @@ class ParallelV4V2Tests(unittest.TestCase):
             server.server_close()
             thread.join(timeout=2)
 
+    def test_blind_comparison_vote_records_hidden_candidate_origin(self):
+        docx = self.root / "vote-baseline.docx"
+        self.write_docx(docx, ["阿尔法开始。", "贝塔继续。", "伽马结束。"])
+        DocxBaselineImporter(self.database, self.project).import_docx(
+            docx, name="vote_baseline"
+        )
+        self.insert_translations()
+        server = create_review_server(self.database, port=0)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            host, port = server.server_address
+            block = self.database.list_blocks()[0]
+            blind = json.loads(
+                urlopen(
+                    f"http://{host}:{port}/api/block?id={block.id}&blind=1"
+                ).read()
+            )
+            revealed = json.loads(
+                urlopen(
+                    f"http://{host}:{port}/api/block?id={block.id}&blind=0"
+                ).read()
+            )
+            self.assertTrue(blind["blind_available"])
+            self.assertTrue(all("origin" not in item for item in blind["candidates"]))
+            payload = json.dumps(
+                {
+                    "block": block.id,
+                    "choice": "A",
+                    "blinded": True,
+                    "note": "A更流畅",
+                }
+            ).encode()
+            response = urlopen(
+                Request(
+                    f"http://{host}:{port}/api/comparison-votes",
+                    data=payload,
+                    headers={
+                        "Content-Type": "application/json",
+                        "X-Review-Token": server.review_token,
+                    },
+                    method="POST",
+                )
+            )
+            submitted = json.loads(response.read())
+            self.assertEqual(submitted["choice"], "A")
+            self.assertNotIn("selected_origin", submitted)
+            stored = self.database.comparison_vote_for_block(block.id)
+            self.assertEqual(stored["choice"], "A")
+            self.assertEqual(stored["candidate_a_origin"], revealed["candidates"][0]["origin"])
+            self.assertEqual(stored["selected_origin"], revealed["candidates"][0]["origin"])
+            after = json.loads(
+                urlopen(
+                    f"http://{host}:{port}/api/block?id={block.id}&blind=1"
+                ).read()
+            )
+            self.assertEqual(after["comparison_vote"]["choice"], "A")
+            self.assertNotIn("selected_origin", after["comparison_vote"])
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=2)
+
 
 if __name__ == "__main__":
     unittest.main()
