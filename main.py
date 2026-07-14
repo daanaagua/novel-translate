@@ -191,6 +191,8 @@ def cmd_translate(args):
             else:
                 print(f"     [ERR] 失败: {result_chunk.error_message}")
                 total_failed += 1
+                print("[STOP] 为保持长程记忆连续，当前块必须先重试成功。")
+                return 1
             
             total_processed += 1
 
