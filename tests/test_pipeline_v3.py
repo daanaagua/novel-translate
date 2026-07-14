@@ -2,10 +2,12 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from zipfile import ZIP_DEFLATED, ZipFile
 
 from src.agents.glossary_manager import GlossaryManager
 from src.core.epub_reader import EpubReader
+from src.core.exporter import BookExporter
 from src.core.history import TranslationMemory
 from src.core.preprocessor import TextPreprocessor
 from src.core.schemas import Chapter, ChunkStatus, TextChunk
@@ -129,6 +131,47 @@ class PipelineTests(unittest.TestCase):
             self.assertEqual(result.final_translation, "最终译文。")
             self.assertEqual(result.memory_summary, "人物抵达观测站，尚不知道信号来源。")
             self.assertEqual(result.status, ChunkStatus.COMPLETED)
+
+    def test_exporter_writes_txt_and_valid_epub_and_rejects_incomplete(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            memory = TranslationMemory(root)
+            config_file = root / "config.yaml"
+            config_file.write_text(
+                "title: Incandescence\nauthor: Greg Egan\nlanguage: zh-CN\n",
+                encoding="utf-8",
+            )
+            pending = TextChunk(
+                id="ch01_000", chapter_id="ch01", index=0, source_text="Source."
+            )
+            chapter = Chapter(
+                id="ch01", title="Chapter 1", index=0, source_text="Source.", chunks=[pending]
+            )
+            memory.initialize_chapter(chapter)
+            project = SimpleNamespace(
+                book_id="incandescence",
+                root_dir=root,
+                config_file=config_file,
+                memory=memory,
+            )
+            exporter = BookExporter(project)
+            with self.assertRaisesRegex(ValueError, "1 个文本块未完成"):
+                exporter.export()
+
+            pending.status = ChunkStatus.COMPLETED
+            pending.final_translation = "第一段。\n\n第二段。"
+            memory.save_chunk(pending)
+            result = exporter.export()
+            self.assertTrue(result.txt_path.exists())
+            self.assertTrue(result.epub_path.exists())
+            txt = result.txt_path.read_text(encoding="utf-8-sig")
+            self.assertIn("作者：Greg Egan", txt)
+            self.assertIn("第一段。", txt)
+            with ZipFile(result.epub_path) as archive:
+                self.assertEqual(archive.namelist()[0], "mimetype")
+                self.assertEqual(archive.read("mimetype"), b"application/epub+zip")
+                self.assertIn("OEBPS/chapter-001.xhtml", archive.namelist())
+                self.assertIn("第一段".encode("utf-8"), archive.read("OEBPS/chapter-001.xhtml"))
 
 
 if __name__ == "__main__":

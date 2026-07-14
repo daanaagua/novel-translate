@@ -41,6 +41,14 @@ Copy-Item config\config.example.yaml config\config.yaml
 
 继续翻译时直接重复命令；已经完成的块会自动跳过。去掉 `--max-chunks` 即处理所选章节的全部剩余块，去掉 `--chapters` 即处理全书。
 
+全书完成后导出TXT和EPUB：
+
+```powershell
+.\.venv\Scripts\python.exe main.py export incandescence
+```
+
+默认会拦截不完整项目；只有显式添加 `--allow-incomplete` 才会生成试读版。
+
 ## 项目数据
 
 每本书位于 `projects/<book_id>/`：

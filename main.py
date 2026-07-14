@@ -15,6 +15,7 @@ from src.utils.config_loader import ConfigLoader
 from src.core.llm_client import LLMManager
 from src.core.translator import TranslationEngine, TranslationConfig
 from src.core.project_manager import ProjectManager
+from src.core.exporter import BookExporter
 from src.agents.glossary_manager import GlossaryManager
 from src.core.schemas import ChunkStatus
 from rich.console import Console
@@ -123,6 +124,7 @@ def cmd_translate(args):
     
     total_processed = 0
     total_skipped = 0
+    total_failed = 0
     stop_requested = False
     
     for ch_file in chapter_files:
@@ -184,6 +186,7 @@ def cmd_translate(args):
                 print(f"     [OK] 完成")
             else:
                 print(f"     [ERR] 失败: {result_chunk.error_message}")
+                total_failed += 1
             
             total_processed += 1
 
@@ -194,10 +197,28 @@ def cmd_translate(args):
     print(f"[DONE] 任务结束")
     print(f"处理: {total_processed}")
     print(f"跳过: {total_skipped}")
+    print(f"失败: {total_failed}")
+    return 1 if total_failed else 0
+
+def cmd_export(args):
+    """导出完整译文为TXT和EPUB。"""
+    try:
+        project = project_manager.load_project(args.book_id)
+        result = BookExporter(project).export(
+            output_dir=args.output_dir,
+            require_complete=not args.allow_incomplete,
+        )
+    except Exception as exc:
+        print(f"[ERROR] 导出失败: {exc}")
+        return 1
+    print(f"[OK] TXT: {result.txt_path}")
+    print(f"[OK] EPUB: {result.epub_path}")
+    print(f"章节: {result.chapter_count}，文本块: {result.chunk_count}")
+    return 0
 
 def main():
     parser = argparse.ArgumentParser(
-        description="DeepNovel-Translator CLI (v2.0)",
+        description="DeepNovel-Translator CLI (v3.0)",
         formatter_class=argparse.RawDescriptionHelpFormatter
     )
     subparsers = parser.add_subparsers(dest="command", help="可用命令")
@@ -225,6 +246,13 @@ def main():
     p_trans.add_argument("--max-chunks", type=int, default=None, help="本次最多翻译多少个新文本块，适合试跑")
     p_trans.add_argument("--quiet", action="store_true", help="不实时打印模型思考和译文，只显示进度与结果")
     p_trans.set_defaults(func=cmd_translate)
+
+    # export
+    p_export = subparsers.add_parser("export", help="导出TXT和EPUB阅读版")
+    p_export.add_argument("book_id", help="项目ID")
+    p_export.add_argument("--output-dir", help="导出目录，默认 projects/<book_id>/exports")
+    p_export.add_argument("--allow-incomplete", action="store_true", help="允许导出尚未翻译完整的项目")
+    p_export.set_defaults(func=cmd_export)
     
     args = parser.parse_args()
     
@@ -232,10 +260,11 @@ def main():
         parser.print_help()
         return
     
-    args.func(args)
+    result = args.func(args)
+    return result if isinstance(result, int) else 0
 
 if __name__ == "__main__":
     if sys.platform.startswith('win'):
         import io
         sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
-    main()
+    raise SystemExit(main())
