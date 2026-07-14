@@ -329,6 +329,11 @@ def cmd_translate_v4(args):
     translation = global_config.get("translation", {})
     draft = translation.get("draft", {})
     polish = translation.get("polish", {})
+    database = V4Database(project.root_dir)
+    include_block_ids = tuple(
+        database.get_block_by_identifier(identifier).id
+        for identifier in (args.block or [])
+    )
     pipeline_config = V4PipelineConfig(
         island_size=args.island_size or int(settings.get("island_size", 3)),
         initial_workers=args.initial_workers or int(settings.get("initial_workers", 2)),
@@ -336,6 +341,7 @@ def cmd_translate_v4(args):
         max_context_chars=int(settings.get("max_context_chars", 24000)),
         max_attempts=args.max_attempts,
         max_blocks=args.max_blocks,
+        include_block_ids=include_block_ids,
         decision_mode=args.decision_mode,
         enable_polish=not args.no_polish,
         draft_temperature=float(draft.get("temperature", 0.1)),
@@ -346,7 +352,6 @@ def cmd_translate_v4(args):
         audit_mode=args.audit_mode or settings.get("audit_mode", "full"),
         force=args.force,
     )
-    database = V4Database(project.root_dir)
     result = V4TranslationPipeline(
         database=database,
         llm_factory=lambda: LLMManager(global_config["llm"]),
@@ -633,6 +638,11 @@ def main():
     p_translate_v4.add_argument("--max-workers", type=int)
     p_translate_v4.add_argument("--max-attempts", type=int, default=2)
     p_translate_v4.add_argument("--max-blocks", type=int)
+    p_translate_v4.add_argument(
+        "--block",
+        action="append",
+        help="只翻译指定块；可重复使用，支持块ID或legacy_id",
+    )
     p_translate_v4.add_argument(
         "--audit-mode", choices=["full", "response", "minimal"]
     )

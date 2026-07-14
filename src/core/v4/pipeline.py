@@ -33,6 +33,7 @@ class V4PipelineConfig:
     max_context_chars: int = 24000
     max_attempts: int = 2
     max_blocks: Optional[int] = None
+    include_block_ids: tuple[str, ...] = ()
     decision_mode: str = "unattended"
     enable_polish: bool = True
     draft_temperature: float = 0.1
@@ -53,6 +54,7 @@ class V4PipelineConfig:
         self.initial_workers = max(1, self.initial_workers)
         self.max_workers = max(self.initial_workers, self.max_workers)
         self.max_attempts = max(1, self.max_attempts)
+        self.include_block_ids = tuple(dict.fromkeys(self.include_block_ids))
 
 
 class AuditedLLM:
@@ -384,6 +386,9 @@ class V4TranslationPipeline:
                 }
             )
         ]
+        if self.config.include_block_ids:
+            included = set(self.config.include_block_ids)
+            candidates = [block for block in candidates if block.id in included]
         if self.config.max_blocks is not None:
             candidates = candidates[: self.config.max_blocks]
         islands = self._make_islands(candidates, self.config.island_size)

@@ -316,8 +316,39 @@ class ParallelV4Tests(unittest.TestCase):
         self.assertEqual(result["completed"], 1)
         polish = next(call for call in fake.calls if call["purpose"] == "polish")
         self.assertIn("旧译文供逐句查漏。", polish["messages"][-1]["content"])
+        self.assertIn("原样保留", polish["messages"][0]["content"])
+        self.assertIn("不得为了替换同义词", polish["messages"][-1]["content"])
         final = self.database.active_translations()[block.id]["final_translation"]
         self.assertEqual(final, "“这是综合两稿后的完整译文。”")
+
+    def test_force_run_can_target_specific_block_ids(self):
+        blocks = self.add_blocks(["First block.", "Second block."], status="ready")
+        initial = V4TranslationPipeline(
+            self.database,
+            llm_factory=FakeTranslationLLM,
+            config=V4PipelineConfig(enable_polish=False),
+        ).run()
+        self.assertEqual(initial["completed"], 2)
+        targeted = V4TranslationPipeline(
+            self.database,
+            llm_factory=FakeTranslationLLM,
+            config=V4PipelineConfig(
+                enable_polish=False,
+                force=True,
+                include_block_ids=(blocks[1].id,),
+            ),
+        ).run()
+        self.assertEqual(targeted["completed"], 1)
+        with closing(self.database.connect()) as connection:
+            counts = {
+                row["block_id"]: row["version_count"]
+                for row in connection.execute(
+                    """SELECT block_id, COUNT(*) version_count
+                       FROM translation_versions GROUP BY block_id"""
+                )
+            }
+        self.assertEqual(counts[blocks[0].id], 1)
+        self.assertEqual(counts[blocks[1].id], 2)
 
     def test_interactive_mode_pauses_only_for_a_new_decision(self):
         self.add_blocks(["The Archon spoke.", "The Archon waited."], status="ready")
