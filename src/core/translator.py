@@ -22,6 +22,8 @@ class TranslationConfig:
     
     # 术语表模式: "auto" (AI可信) 或 "manual" (人工审核)
     glossary_mode: str = "auto" 
+    strict_response_parsing: bool = False
+    persist_discoveries: bool = True
 
 
 
@@ -33,13 +35,15 @@ class TranslationEngine:
         glossary_manager: GlossaryManager,
         knowledge_base: Optional[KnowledgeBase] = None,
         prompts: Dict[str, Any] = None,
-        config: Optional[TranslationConfig] = None
+        config: Optional[TranslationConfig] = None,
+        proposal_sink: Optional[callable] = None,
     ):
         self.llm = llm_manager
         self.glossary = glossary_manager
         self.knowledge_base = knowledge_base
         self.prompts = prompts or {}
         self.config = config or TranslationConfig()
+        self.proposal_sink = proposal_sink
         
         # 上下文缓存（用于滑动窗口）
         self._context_buffer: List[str] = []
@@ -214,11 +218,13 @@ class TranslationEngine:
                 self._process_new_terms(new_terms, stream_callback)
                 
                 # 处理实体关系 (Phase 2)
-                if self.knowledge_base:
-                    relations = response_data.get("relations", [])
+                relations = response_data.get("relations", [])
+                if relations:
                     self._process_relations(relations, stream_callback)
                 
             except Exception as e:
+                if self.config.strict_response_parsing:
+                    raise ValueError(f"第一层结构化响应解析失败: {e}") from e
                 # Fallback: 如果解析失败，假设全文都是译文
                 print(f"[Warn] Parse failed: {e}")
                 chunk.draft_translation = full_response_text
@@ -419,6 +425,11 @@ class TranslationEngine:
     
     def _process_relations(self, relations: List[dict], callback: Optional[callable]):
         """处理新发现的实体关系"""
+        if self.proposal_sink:
+            for relation in relations:
+                self.proposal_sink("relation", dict(relation))
+        if not self.config.persist_discoveries:
+            return
         if not self.knowledge_base:
             return
 
@@ -440,6 +451,10 @@ class TranslationEngine:
         """处理新发现的术语"""
         for term in new_terms:
             try:
+                if self.proposal_sink:
+                    self.proposal_sink("term", dict(term))
+                if not self.config.persist_discoveries:
+                    continue
                 src = term.get("src")
                 tgt = term.get("tgt", src) # 默认译名
                 raw_type = term.get("type", "concept")

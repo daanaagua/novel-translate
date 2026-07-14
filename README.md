@@ -49,6 +49,33 @@ Copy-Item config\config.example.yaml config\config.yaml
 
 默认会拦截不完整项目；只有显式添加 `--allow-incomplete` 才会生成试读版。
 
+## parallel_v4 影子流程
+
+第一版并行架构不会修改原有章节JSON、串行译文或串行导出。它把扫描证据、知识版本、并行译文和审计记录写入独立的 `artifacts/parallel_v4/book.db`。
+
+```powershell
+.\.venv\Scripts\python.exe main.py migrate-v4 incandescence
+.\.venv\Scripts\python.exe main.py scan-v4 incandescence
+.\.venv\Scripts\python.exe main.py reconcile-v4 incandescence
+.\.venv\Scripts\python.exe main.py translate-v4 incandescence --decision-mode unattended
+.\.venv\Scripts\python.exe main.py compare-v4 incandescence --max-blocks 10
+.\.venv\Scripts\python.exe main.py validate-v4 incandescence
+.\.venv\Scripts\python.exe main.py export-v4 incandescence
+```
+
+`--decision-mode interactive` 会在一个批次产生新的知识建议后暂停，并把建议写入人工队列；`unattended` 会继续处理全书。上下文超过硬预算时，两种模式都会把该块标记为 `incomplete_requires_human`，不会压缩规则或伪装完成。
+
+```powershell
+.\.venv\Scripts\python.exe main.py review-v4 incandescence
+.\.venv\Scripts\python.exe main.py review-v4 incandescence --accept 12
+.\.venv\Scripts\python.exe main.py review-v4 incandescence --reject 13
+.\.venv\Scripts\python.exe main.py review-v4 incandescence --retry 14
+```
+
+人工接受的术语会锁定为书内规则；受影响译文先标记为 `needs_revalidate`，再次运行 `translate-v4` 后才会生成新版本。模型不能覆盖人工锁定项。
+
+严格导出会拒绝未完成块和任何警告。人工确认警告可接受后，使用 `export-v4 --allow-warnings`。输出位于 `exports/parallel_v4/`，包含TXT、EPUB和质量报告。
+
 ## 项目数据
 
 每本书位于 `projects/<book_id>/`：

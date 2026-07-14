@@ -7,6 +7,9 @@ llm:
       api_key: "${DEEPSEEK_API_KEY}"
       timeout: 1800
       models:
+        scan: "deepseek-v4-flash"
+        reconcile: "deepseek-v4-flash"
+        verify: "deepseek-v4-flash"
         draft: "deepseek-v4-flash"
         polish: "deepseek-v4-flash"
       request_options:
@@ -15,6 +18,10 @@ llm:
           thinking:
             type: "enabled"
         polish:
+          reasoning_effort: "high"
+          thinking:
+            type: "enabled"
+        scan:
           reasoning_effort: "high"
           thinking:
             type: "enabled"
@@ -35,6 +42,13 @@ translation:
     recent_source_chars: 600
     recent_translation_chars: 1000
   enable_auto_glossary: true
+
+parallel_v4:
+  island_size: 3
+  initial_workers: 2
+  max_workers: 4
+  max_context_chars: 24000
+  audit_mode: "full"
 
 paths:
   input_dir: "data/input"

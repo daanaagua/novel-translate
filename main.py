@@ -18,6 +18,16 @@ from src.core.project_manager import ProjectManager
 from src.core.exporter import BookExporter
 from src.agents.glossary_manager import GlossaryManager
 from src.core.schemas import ChunkStatus
+from src.core.v4 import (
+    ParallelV4BookExporter,
+    V4Database,
+    V4Migrator,
+    V4PipelineConfig,
+    V4Scanner,
+    V4TranslationPipeline,
+    V4Validator,
+    write_shadow_comparison,
+)
 from rich.console import Console
 from rich.theme import Theme
 
@@ -223,6 +233,190 @@ def cmd_export(args):
     print(f"章节: {result.chapter_count}，文本块: {result.chunk_count}")
     return 0
 
+
+def _load_project_or_error(book_id):
+    try:
+        return project_manager.load_project(book_id)
+    except FileNotFoundError as exc:
+        print(f"[ERROR] {exc}")
+        return None
+
+
+def cmd_migrate_v4(args):
+    project = _load_project_or_error(args.book_id)
+    if not project:
+        return 1
+    result = V4Migrator(project).migrate()
+    print(json.dumps(result, ensure_ascii=False, indent=2))
+    return 0
+
+
+def cmd_scan_v4(args):
+    project = _load_project_or_error(args.book_id)
+    if not project:
+        return 1
+    V4Migrator(project).migrate()
+    config = config_loader.load_config()
+    scanner = V4Scanner(
+        V4Database(project.root_dir),
+        LLMManager(config["llm"]),
+        max_attempts=args.max_attempts,
+        audit_mode=args.audit_mode or config.get("parallel_v4", {}).get("audit_mode", "full"),
+    )
+    result = scanner.scan_project(
+        initial_workers=args.initial_workers,
+        max_workers=args.max_workers,
+        max_blocks=args.max_blocks,
+    )
+    print(json.dumps(result, ensure_ascii=False, indent=2))
+    return 1 if result["failed"] else 0
+
+
+def cmd_reconcile_v4(args):
+    project = _load_project_or_error(args.book_id)
+    if not project:
+        return 1
+    database = V4Database(project.root_dir)
+    version = database.reconcile_exact_forms()
+    print(f"[OK] knowledge_version={version}")
+    print(json.dumps(database.status_summary(), ensure_ascii=False, indent=2))
+    return 0
+
+
+def cmd_translate_v4(args):
+    project = _load_project_or_error(args.book_id)
+    if not project:
+        return 1
+    V4Migrator(project).migrate()
+    global_config = config_loader.load_config()
+    settings = global_config.get("parallel_v4", {})
+    translation = global_config.get("translation", {})
+    draft = translation.get("draft", {})
+    polish = translation.get("polish", {})
+    pipeline_config = V4PipelineConfig(
+        island_size=args.island_size or int(settings.get("island_size", 3)),
+        initial_workers=args.initial_workers or int(settings.get("initial_workers", 2)),
+        max_workers=args.max_workers or int(settings.get("max_workers", 4)),
+        max_context_chars=int(settings.get("max_context_chars", 24000)),
+        max_attempts=args.max_attempts,
+        max_blocks=args.max_blocks,
+        decision_mode=args.decision_mode,
+        enable_polish=not args.no_polish,
+        draft_temperature=float(draft.get("temperature", 0.1)),
+        draft_max_tokens=int(draft.get("max_tokens", 6144)),
+        polish_temperature=float(polish.get("temperature", 0.2)),
+        polish_max_tokens=int(polish.get("max_tokens", 6144)),
+        audit_mode=args.audit_mode or settings.get("audit_mode", "full"),
+    )
+    database = V4Database(project.root_dir)
+    result = V4TranslationPipeline(
+        database=database,
+        llm_factory=lambda: LLMManager(global_config["llm"]),
+        prompts=config_loader.load_prompts(),
+        config=pipeline_config,
+    ).run()
+    print(json.dumps(result, ensure_ascii=False, indent=2))
+    return 1 if result["failed_retryable"] or result["incomplete_requires_human"] else 0
+
+
+def cmd_status_v4(args):
+    project = _load_project_or_error(args.book_id)
+    if not project:
+        return 1
+    database = V4Database(project.root_dir)
+    print(json.dumps(database.status_summary(), ensure_ascii=False, indent=2))
+    print(f"knowledge_version={database.current_knowledge_version()}")
+    print(f"open_human_queue={len(database.list_human_queue())}")
+    return 0
+
+
+def cmd_review_v4(args):
+    project = _load_project_or_error(args.book_id)
+    if not project:
+        return 1
+    database = V4Database(project.root_dir)
+    if args.accept is not None or args.reject is not None or args.retry is not None:
+        if args.accept is not None:
+            item_id, action = args.accept, "accept"
+        elif args.reject is not None:
+            item_id, action = args.reject, "reject"
+        else:
+            item_id, action = args.retry, "retry"
+        try:
+            result = database.resolve_human_item(item_id, action)
+        except Exception as exc:
+            print(f"[ERROR] 裁决失败: {exc}")
+            return 1
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+        return 0
+    rows = database.list_human_queue()
+    if not rows:
+        print("当前没有待处理的人工队列项。")
+        return 0
+    for row in rows:
+        print(
+            json.dumps(
+                {
+                    "id": row["id"],
+                    "block": row.get("legacy_id") or row.get("block_id"),
+                    "kind": row["kind"],
+                    "severity": row["severity"],
+                    "payload": json.loads(row["payload_json"]),
+                },
+                ensure_ascii=False,
+            )
+        )
+    return 0
+
+
+def cmd_validate_v4(args):
+    project = _load_project_or_error(args.book_id)
+    if not project:
+        return 1
+    report = V4Validator(V4Database(project.root_dir)).validate()
+    print(report.to_markdown())
+    return 1 if report.high_count else 0
+
+
+def cmd_export_v4(args):
+    project = _load_project_or_error(args.book_id)
+    if not project:
+        return 1
+    try:
+        result = ParallelV4BookExporter(project).export_v4(
+            output_dir=args.output_dir,
+            allow_warnings=args.allow_warnings,
+        )
+    except Exception as exc:
+        print(f"[ERROR] 导出失败: {exc}")
+        return 1
+    print(f"[OK] TXT: {result.txt_path}")
+    print(f"[OK] EPUB: {result.epub_path}")
+    print(f"[OK] 质量报告: {result.quality_report_path}")
+    return 0
+
+
+def cmd_compare_v4(args):
+    project = _load_project_or_error(args.book_id)
+    if not project:
+        return 1
+    output = (
+        Path(args.output)
+        if args.output
+        else project.root_dir / "exports" / "parallel_v4" / "shadow_comparison.md"
+    )
+    try:
+        path = write_shadow_comparison(
+            V4Database(project.root_dir),
+            output,
+            max_blocks=args.max_blocks,
+        )
+    except Exception as exc:
+        print(f"[ERROR] 生成对照失败: {exc}")
+        return 1
+    print(f"[OK] 影子对照: {path}")
+    return 0
+
 def main():
     parser = argparse.ArgumentParser(
         description="DeepNovel-Translator CLI (v3.0)",
@@ -260,6 +454,72 @@ def main():
     p_export.add_argument("--output-dir", help="导出目录，默认 projects/<book_id>/exports")
     p_export.add_argument("--allow-incomplete", action="store_true", help="允许导出尚未翻译完整的项目")
     p_export.set_defaults(func=cmd_export)
+
+    p_migrate_v4 = subparsers.add_parser("migrate-v4", help="非破坏性导入串行项目到parallel_v4")
+    p_migrate_v4.add_argument("book_id", help="项目ID")
+    p_migrate_v4.set_defaults(func=cmd_migrate_v4)
+
+    p_scan_v4 = subparsers.add_parser("scan-v4", help="执行证据式并行预扫描")
+    p_scan_v4.add_argument("book_id", help="项目ID")
+    p_scan_v4.add_argument("--initial-workers", type=int, default=2)
+    p_scan_v4.add_argument("--max-workers", type=int, default=4)
+    p_scan_v4.add_argument("--max-attempts", type=int, default=3)
+    p_scan_v4.add_argument("--max-blocks", type=int)
+    p_scan_v4.add_argument(
+        "--audit-mode", choices=["full", "response", "minimal"]
+    )
+    p_scan_v4.set_defaults(func=cmd_scan_v4)
+
+    p_reconcile_v4 = subparsers.add_parser("reconcile-v4", help="保守归并完全相同的英文词形")
+    p_reconcile_v4.add_argument("book_id", help="项目ID")
+    p_reconcile_v4.set_defaults(func=cmd_reconcile_v4)
+
+    p_translate_v4 = subparsers.add_parser("translate-v4", help="执行带屏障的并行两层翻译")
+    p_translate_v4.add_argument("book_id", help="项目ID")
+    p_translate_v4.add_argument("--island-size", type=int)
+    p_translate_v4.add_argument("--initial-workers", type=int)
+    p_translate_v4.add_argument("--max-workers", type=int)
+    p_translate_v4.add_argument("--max-attempts", type=int, default=2)
+    p_translate_v4.add_argument("--max-blocks", type=int)
+    p_translate_v4.add_argument(
+        "--audit-mode", choices=["full", "response", "minimal"]
+    )
+    p_translate_v4.add_argument(
+        "--decision-mode",
+        choices=["interactive", "unattended"],
+        default="unattended",
+        help="interactive在出现新知识建议的批次后暂停；unattended自动继续",
+    )
+    p_translate_v4.add_argument("--no-polish", action="store_true")
+    p_translate_v4.set_defaults(func=cmd_translate_v4)
+
+    p_status_v4 = subparsers.add_parser("status-v4", help="查看parallel_v4状态")
+    p_status_v4.add_argument("book_id", help="项目ID")
+    p_status_v4.set_defaults(func=cmd_status_v4)
+
+    p_review_v4 = subparsers.add_parser("review-v4", help="查看或裁决parallel_v4人工队列")
+    p_review_v4.add_argument("book_id", help="项目ID")
+    review_action = p_review_v4.add_mutually_exclusive_group()
+    review_action.add_argument("--accept", type=int, metavar="ID")
+    review_action.add_argument("--reject", type=int, metavar="ID")
+    review_action.add_argument("--retry", type=int, metavar="ID")
+    p_review_v4.set_defaults(func=cmd_review_v4)
+
+    p_validate_v4 = subparsers.add_parser("validate-v4", help="执行确定性完整性校验")
+    p_validate_v4.add_argument("book_id", help="项目ID")
+    p_validate_v4.set_defaults(func=cmd_validate_v4)
+
+    p_export_v4 = subparsers.add_parser("export-v4", help="严格导出parallel_v4的TXT和EPUB")
+    p_export_v4.add_argument("book_id", help="项目ID")
+    p_export_v4.add_argument("--output-dir")
+    p_export_v4.add_argument("--allow-warnings", action="store_true")
+    p_export_v4.set_defaults(func=cmd_export_v4)
+
+    p_compare_v4 = subparsers.add_parser("compare-v4", help="生成串行基线与parallel_v4人工对照")
+    p_compare_v4.add_argument("book_id", help="项目ID")
+    p_compare_v4.add_argument("--output")
+    p_compare_v4.add_argument("--max-blocks", type=int)
+    p_compare_v4.set_defaults(func=cmd_compare_v4)
     
     args = parser.parse_args()
     
