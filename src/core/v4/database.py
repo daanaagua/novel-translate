@@ -1020,6 +1020,13 @@ class V4Database:
                        scope='book', locked=1, retired_version=NULL""",
                 (rule_id, concept_id, target, version, utc_now()),
             )
+            connection.execute(
+                """UPDATE verification_tasks
+                   SET status='resolved', resolved_at=?
+                   WHERE subject_type='concept' AND subject_id=?
+                     AND status IN ('open','needs_human')""",
+                (utc_now(), concept_id),
+            )
             affected_rows = connection.execute(
                 """SELECT DISTINCT tv.id translation_id, tv.block_id
                    FROM dependencies d
