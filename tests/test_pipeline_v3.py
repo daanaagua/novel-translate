@@ -59,6 +59,27 @@ class FakeLLM:
         return iter([("content", response)])
 
 
+class RetryingPolishLLM:
+    def __init__(self, retry_succeeds=True):
+        self.calls = []
+        self.retry_succeeds = retry_succeeds
+
+    def chat(self, messages, purpose, **kwargs):
+        self.calls.append((purpose, messages, kwargs))
+        if purpose == "draft":
+            response = """<response><analysis>无。</analysis>
+            <translation>第一段完整初稿。\n\n第二段完整初稿。</translation>
+            <memory_summary>摘要。</memory_summary>
+            <new_terms></new_terms><relations></relations></response>"""
+        elif len([call for call in self.calls if call[0] == "polish"]) == 1:
+            response = "<final_translation>只有第一段。</final_translation>"
+        elif self.retry_succeeds:
+            response = "<final_translation>第一段完整定稿。\n\n第二段完整定稿。</final_translation>"
+        else:
+            response = "<final_translation>仍然只有一段。</final_translation>"
+        return iter([("content", response)])
+
+
 class PipelineTests(unittest.TestCase):
     def test_epub_spine_and_chapter_markers(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -131,6 +152,45 @@ class PipelineTests(unittest.TestCase):
             self.assertEqual(result.final_translation, "最终译文。")
             self.assertEqual(result.memory_summary, "人物抵达观测站，尚不知道信号来源。")
             self.assertEqual(result.status, ChunkStatus.COMPLETED)
+
+    def test_truncated_polish_is_retried_and_complete_retry_is_used(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            fake_llm = RetryingPolishLLM(retry_succeeds=True)
+            engine = TranslationEngine(
+                llm_manager=fake_llm,
+                glossary_manager=GlossaryManager(str(Path(temp_dir) / "glossary")),
+                config=TranslationConfig(enable_polish=True),
+            )
+            chunk = TextChunk(
+                id="ch01_000",
+                chapter_id="ch01",
+                index=0,
+                source_text="First paragraph.\n\nSecond paragraph.",
+            )
+            result = engine.translate_chunk(chunk)
+            self.assertEqual([call[0] for call in fake_llm.calls], ["draft", "polish", "polish"])
+            self.assertEqual(result.final_translation, "第一段完整定稿。\n\n第二段完整定稿。")
+            self.assertEqual(result.polish_retry_count, 1)
+            self.assertEqual(result.status, ChunkStatus.COMPLETED)
+
+    def test_twice_truncated_polish_falls_back_to_complete_draft(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            fake_llm = RetryingPolishLLM(retry_succeeds=False)
+            engine = TranslationEngine(
+                llm_manager=fake_llm,
+                glossary_manager=GlossaryManager(str(Path(temp_dir) / "glossary")),
+                config=TranslationConfig(enable_polish=True),
+            )
+            chunk = TextChunk(
+                id="ch01_000",
+                chapter_id="ch01",
+                index=0,
+                source_text="First paragraph.\n\nSecond paragraph.",
+            )
+            result = engine.translate_chunk(chunk)
+            self.assertEqual(result.final_translation, "第一段完整初稿。\n\n第二段完整初稿。")
+            self.assertEqual(result.status, ChunkStatus.HUMAN_REVIEW)
+            self.assertIn("已回退到完整初稿", result.quality_warnings[-1])
 
     def test_exporter_writes_txt_and_valid_epub_and_rejects_incomplete(self):
         with tempfile.TemporaryDirectory() as temp_dir:

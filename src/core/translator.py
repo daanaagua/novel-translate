@@ -152,6 +152,10 @@ class TranslationEngine:
             stream_callback: (phase, content) -> None
         """
         try:
+            chunk.error_message = None
+            chunk.quality_warnings = []
+            chunk.polish_retry_count = 0
+
             # 步骤 1: 直译 (含 Thinking & Term Extraction)
             chunk.status = ChunkStatus.DRAFTING
             if stream_callback: stream_callback("draft_start", "")
@@ -220,7 +224,17 @@ class TranslationEngine:
                 chunk.draft_translation = full_response_text
                 chunk.analysis = "Parse Failed"
 
+            draft_problems = self._translation_shape_problems(
+                chunk.source_text,
+                chunk.draft_translation or "",
+                stage="第一层译稿",
+                min_length_ratio=0.15,
+            )
+            if draft_problems:
+                raise ValueError("；".join(draft_problems))
+
             # 步骤 2: 润色 (可选)
+            needs_human_review = False
             if self.config.enable_polish:
                 chunk.status = ChunkStatus.POLISHING
                 if stream_callback: stream_callback("polish_start", "")
@@ -246,7 +260,58 @@ class TranslationEngine:
                     if stream_callback: stream_callback(f"polish_{msg_type}", content)
                 
                 chunk.polished_translation = self._clean_final_translation(full_polish)
-                chunk.final_translation = chunk.polished_translation
+                polish_problems = self._translation_shape_problems(
+                    chunk.draft_translation or "",
+                    chunk.polished_translation or "",
+                    stage="第二层定稿",
+                    min_length_ratio=0.75,
+                )
+
+                if polish_problems:
+                    chunk.quality_warnings.append(
+                        "第一次润色未通过完整性校验：" + "；".join(polish_problems)
+                    )
+                    chunk.polish_retry_count = 1
+                    if stream_callback:
+                        stream_callback("polish_retry", "")
+
+                    retry_gen = self._polish_translate(
+                        source_text=chunk.source_text,
+                        draft_translation=chunk.draft_translation or "",
+                        analysis=chunk.analysis or "",
+                        memory_context=memory_context or previous_summary or "",
+                        retry_reason="；".join(polish_problems),
+                    )
+                    retry_text = ""
+                    for item in retry_gen:
+                        if isinstance(item, tuple):
+                            msg_type, content = item
+                        else:
+                            msg_type, content = "content", item
+                        if msg_type == "content":
+                            retry_text += content
+                        if stream_callback:
+                            stream_callback(f"polish_retry_{msg_type}", content)
+
+                    retry_polish = self._clean_final_translation(retry_text)
+                    retry_problems = self._translation_shape_problems(
+                        chunk.draft_translation or "",
+                        retry_polish,
+                        stage="第二层重试定稿",
+                        min_length_ratio=0.75,
+                    )
+                    chunk.polished_translation = retry_polish
+                    if retry_problems:
+                        chunk.quality_warnings.append(
+                            "润色重试仍未通过，最终译文已回退到完整初稿："
+                            + "；".join(retry_problems)
+                        )
+                        chunk.final_translation = chunk.draft_translation
+                        needs_human_review = True
+                    else:
+                        chunk.final_translation = retry_polish
+                else:
+                    chunk.final_translation = chunk.polished_translation
             else:
                 chunk.final_translation = chunk.draft_translation
             
@@ -263,7 +328,18 @@ class TranslationEngine:
                         if clean_translation: # 确保没切空
                             chunk.final_translation = clean_translation
             
-            chunk.status = ChunkStatus.COMPLETED
+            final_problems = self._translation_shape_problems(
+                chunk.draft_translation or "",
+                chunk.final_translation or "",
+                stage="最终译文",
+                min_length_ratio=0.75,
+            )
+            if final_problems:
+                raise ValueError("；".join(final_problems))
+
+            chunk.status = (
+                ChunkStatus.HUMAN_REVIEW if needs_human_review else ChunkStatus.COMPLETED
+            )
             
             # 更新上下文缓存
             self._last_chunk_translation = chunk.final_translation
@@ -276,6 +352,44 @@ class TranslationEngine:
             # 暂时不抛出，让流程继续
         
         return chunk
+
+    @staticmethod
+    def _translation_shape_problems(
+        reference: str,
+        candidate: str,
+        stage: str,
+        min_length_ratio: float,
+    ) -> List[str]:
+        """检查模型是否漏掉整段或在输出中途截断。"""
+        import re
+
+        def paragraphs(text: str) -> List[str]:
+            return [
+                part.strip()
+                for part in re.split(r"\n\s*\n", (text or "").strip())
+                if part.strip()
+            ]
+
+        def compact_length(text: str) -> int:
+            return len(re.sub(r"\s+", "", text or ""))
+
+        problems = []
+        reference_paragraphs = paragraphs(reference)
+        candidate_paragraphs = paragraphs(candidate)
+        reference_length = compact_length(reference)
+        candidate_length = compact_length(candidate)
+
+        if not candidate_length:
+            return [f"{stage}为空"]
+        if len(candidate_paragraphs) != len(reference_paragraphs):
+            problems.append(
+                f"{stage}段落数为{len(candidate_paragraphs)}，应为{len(reference_paragraphs)}"
+            )
+        if reference_length and candidate_length / reference_length < min_length_ratio:
+            problems.append(
+                f"{stage}长度仅为参照文本的{candidate_length / reference_length:.1%}"
+            )
+        return problems
 
     @staticmethod
     def _clean_final_translation(text: str) -> str:
@@ -495,6 +609,7 @@ class TranslationEngine:
         draft_translation: str,
         analysis: str = "",
         memory_context: str = "",
+        retry_reason: str = "",
     ) -> Any:
         """
         润色阶段
@@ -534,6 +649,18 @@ class TranslationEngine:
             analysis=analysis,
             memory_context=memory_context,
         )
+        if retry_reason:
+            paragraph_count = len([
+                part for part in __import__("re").split(
+                    r"\n\s*\n", draft_translation.strip()
+                ) if part.strip()
+            ])
+            user_prompt += (
+                "\n\n## 完整性修复指令\n"
+                f"上一次输出未通过完整性校验：{retry_reason}。"
+                f"本次必须完整覆盖初译稿的全部{paragraph_count}个段落，段落数必须一致；"
+                "不得摘要、跳段、合并段落或在中途停止。请从第一段重新输出到最后一段。"
+            )
         
         messages = [
             {"role": "system", "content": system_prompt},

@@ -125,6 +125,7 @@ def cmd_translate(args):
     total_processed = 0
     total_skipped = 0
     total_failed = 0
+    total_review = 0
     stop_requested = False
     
     for ch_file in chapter_files:
@@ -184,6 +185,9 @@ def cmd_translate(args):
             
             if result_chunk.status == ChunkStatus.COMPLETED:
                 print(f"     [OK] 完成")
+            elif result_chunk.status == ChunkStatus.HUMAN_REVIEW:
+                total_review += 1
+                print(f"     [WARN] 润色不完整，已用完整初稿兜底并标记复核")
             else:
                 print(f"     [ERR] 失败: {result_chunk.error_message}")
                 total_failed += 1
@@ -198,6 +202,7 @@ def cmd_translate(args):
     print(f"处理: {total_processed}")
     print(f"跳过: {total_skipped}")
     print(f"失败: {total_failed}")
+    print(f"待复核: {total_review}")
     return 1 if total_failed else 0
 
 def cmd_export(args):

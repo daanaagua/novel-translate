@@ -182,6 +182,11 @@ class TextChunk(BaseModel):
     # 元数据
     token_count: Optional[int] = None
     error_message: Optional[str] = None
+    quality_warnings: List[str] = Field(
+        default_factory=list,
+        description="自动完整性校验产生的警告",
+    )
+    polish_retry_count: int = Field(0, description="润色层因完整性问题而重试的次数")
 
 
 class Chapter(BaseModel):
