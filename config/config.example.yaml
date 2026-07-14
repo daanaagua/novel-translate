@@ -57,6 +57,7 @@ parallel_v4:
   initial_workers: 2
   max_workers: 4
   max_context_chars: 24000
+  use_baseline_reference: false
   audit_mode: "full"
 
 paths:

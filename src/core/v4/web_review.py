@@ -186,7 +186,13 @@ def create_review_server(database: V4Database, port: int = 8765):
                         candidates = [baseline_candidate, v4_candidate]
                     data["blind_available"] = blind_available
                     data["candidates"] = candidates
-                    vote = database.comparison_vote_for_block(identifier)
+                    candidate_hashes = [
+                        hashlib.sha256(candidate["text"].encode("utf-8")).hexdigest()
+                        for candidate in candidates
+                    ]
+                    vote = database.comparison_vote_for_block(
+                        identifier, candidate_hashes[0], candidate_hashes[1]
+                    )
                     if vote and blind:
                         for key in (
                             "candidate_a_origin",
@@ -194,6 +200,9 @@ def create_review_server(database: V4Database, port: int = 8765):
                             "selected_origin",
                         ):
                             vote.pop(key, None)
+                    if vote:
+                        vote.pop("candidate_a_hash", None)
+                        vote.pop("candidate_b_hash", None)
                     data["comparison_vote"] = vote
                     data.pop("v4_translation", None)
                     data.pop("serial_translation", None)
@@ -246,16 +255,25 @@ def create_review_server(database: V4Database, port: int = 8765):
                     v4_text = detail.get("v4_translation") or ""
                     if not baseline_text.strip() or not v4_text.strip():
                         raise ValueError("只有两份候选译文都存在时才能提交盲评")
-                    origins = ["parallel_v4", baseline_origin]
+                    candidate_pairs = [
+                        ("parallel_v4", v4_text),
+                        (baseline_origin, baseline_text),
+                    ]
                     if int(
                         hashlib.sha256(detail["id"].encode()).hexdigest(), 16
                     ) % 2:
-                        origins.reverse()
+                        candidate_pairs.reverse()
                     vote = database.record_comparison_vote(
                         identifier,
                         str(body["choice"]),
-                        origins[0],
-                        origins[1],
+                        candidate_pairs[0][0],
+                        candidate_pairs[1][0],
+                        hashlib.sha256(
+                            candidate_pairs[0][1].encode("utf-8")
+                        ).hexdigest(),
+                        hashlib.sha256(
+                            candidate_pairs[1][1].encode("utf-8")
+                        ).hexdigest(),
                         blinded=bool(body.get("blinded", True)),
                         note=str(body.get("note") or ""),
                     )
@@ -266,6 +284,8 @@ def create_review_server(database: V4Database, port: int = 8765):
                             "selected_origin",
                         ):
                             vote.pop(key, None)
+                    vote.pop("candidate_a_hash", None)
+                    vote.pop("candidate_b_hash", None)
                     self._send_json(vote, 201)
                     return
                 if parsed.path == "/api/claims":

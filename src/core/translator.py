@@ -147,7 +147,8 @@ class TranslationEngine:
         memory_context: Optional[str] = None,
         previous_summary: Optional[str] = None,
         previous_chunk_text: Optional[str] = None,
-        stream_callback: Optional[callable] = None
+        stream_callback: Optional[callable] = None,
+        comparison_reference: Optional[str] = None,
     ) -> TextChunk:
         """
         翻译单个文本块 (新版流式逻辑)
@@ -250,6 +251,7 @@ class TranslationEngine:
                     draft_translation=chunk.draft_translation,
                     analysis=chunk.analysis or "",
                     memory_context=memory_context or previous_summary or "",
+                    comparison_reference=comparison_reference or "",
                 )
                 
                 # 消费润色流
@@ -286,6 +288,7 @@ class TranslationEngine:
                         draft_translation=chunk.draft_translation or "",
                         analysis=chunk.analysis or "",
                         memory_context=memory_context or previous_summary or "",
+                        comparison_reference=comparison_reference or "",
                         retry_reason="；".join(polish_problems),
                     )
                     retry_text = ""
@@ -320,6 +323,10 @@ class TranslationEngine:
                     chunk.final_translation = chunk.polished_translation
             else:
                 chunk.final_translation = chunk.draft_translation
+
+            chunk.final_translation = self._normalize_chinese_punctuation(
+                chunk.final_translation or ""
+            )
             
             # 去重处理：如果译文开头包含了上一段译文的末尾，则切除
             if self._last_chunk_translation:
@@ -422,6 +429,13 @@ class TranslationEngine:
             re.DOTALL | re.IGNORECASE,
         )
         return (match.group(1) if match else cleaned).strip()
+
+    @staticmethod
+    def _normalize_chinese_punctuation(text: str) -> str:
+        """统一项目要求的中文引号，不改动普通ASCII字符。"""
+        return (text or "").translate(
+            str.maketrans({"「": "“", "」": "”", "『": "‘", "』": "’"})
+        )
     
     def _process_relations(self, relations: List[dict], callback: Optional[callable]):
         """处理新发现的实体关系"""
@@ -634,6 +648,7 @@ class TranslationEngine:
         draft_translation: str,
         analysis: str = "",
         memory_context: str = "",
+        comparison_reference: str = "",
         retry_reason: str = "",
     ) -> Any:
         """
@@ -667,12 +682,16 @@ class TranslationEngine:
         
         # 构建 User Prompt
         user_template = self.prompts.get("polish", {}).get("user", 
-            "## 原文\n{source_text}\n\n## 初译稿\n{draft_translation}\n\n请润色上述初译稿，输出最终译文。")
+            "## 原文\n{source_text}\n\n## 初译稿\n{draft_translation}"
+            "\n\n## 旧译文对照\n{comparison_reference}"
+            "\n\n旧译文只用于逐句查漏和比较措辞，英文原文是唯一事实依据。"
+            "请综合两稿各自较好的部分，输出最终译文。")
         user_prompt = user_template.format(
             source_text=source_text,
             draft_translation=draft_translation,
             analysis=analysis,
             memory_context=memory_context,
+            comparison_reference=comparison_reference or "（无旧译文对照）",
         )
         if retry_reason:
             paragraph_count = len([
@@ -777,6 +796,8 @@ class TranslationEngine:
 2. 保留原文的信息释放顺序、段落、叙事距离与不确定性；不得替作者解释谜底。
 3. 科学术语和人造概念保持精确、一致；不能为了顺口改写成含义更宽泛的词。
 4. 中文应清楚、克制、有文学节奏，避免无依据的古雅化、诗化和增添形容词。
+5. 外层引语统一使用“……”，嵌套引语使用‘……’，不得使用「……」或『……』。
+6. 若提供旧译文对照，只能用于逐句查漏和比较措辞；英文原文是唯一事实依据，不得整段照抄或机械二选一。
 
 ## 铁律（不可违反）
 1. **禁止修改人名、地名、专有名词**：它们已在直译阶段被锁定。

@@ -237,6 +237,42 @@ class ParallelV4V2Tests(unittest.TestCase):
         self.assertFalse(verified["verification_pending"])
         self.assertEqual(verified["default_target"], "执政官")
 
+    def test_human_term_lock_invalidates_dependent_parallel_translation(self):
+        block = self.database.list_blocks()[0]
+        concept_id = self.database.import_legacy_concept(
+            "Archon", "执政官", "title", "政治职衔"
+        )
+        with self.database.transaction() as connection:
+            cursor = connection.execute(
+                """INSERT INTO translation_versions(
+                       block_id, pipeline, knowledge_version, status,
+                       draft_translation, final_translation, active, created_at
+                   ) VALUES(?, 'parallel_v4', 1, 'completed', '旧稿', '旧稿', 1, 'now')""",
+                (block.id,),
+            )
+            connection.execute(
+                """INSERT INTO dependencies(
+                       translation_id, dependency_type, dependency_id, knowledge_version
+                   ) VALUES(?, 'concept', ?, 1)""",
+                (cursor.lastrowid, concept_id),
+            )
+            connection.execute(
+                "UPDATE blocks SET status='completed' WHERE id=?", (block.id,)
+            )
+        result = self.database.lock_concept_translation(
+            "Archon", "阁下", kind="title"
+        )
+        self.assertEqual(result["affected_translations"], 1)
+        concept = self.database.concepts_for_text("Archon")[0]
+        self.assertEqual(concept["default_target"], "阁下")
+        self.assertTrue(concept["locked"])
+        active = self.database.active_translations()[block.id]
+        self.assertEqual(active["status"], "needs_revalidate")
+        self.assertEqual(
+            self.database.get_block_by_identifier(block.id).status,
+            "needs_revalidate",
+        )
+
     def insert_translations(self):
         with self.database.transaction() as connection:
             for block in self.database.list_blocks():
@@ -431,6 +467,43 @@ class ParallelV4V2Tests(unittest.TestCase):
             )
             self.assertEqual(after["comparison_vote"]["choice"], "A")
             self.assertNotIn("selected_origin", after["comparison_vote"])
+            with self.database.transaction() as connection:
+                connection.execute(
+                    """UPDATE translation_versions
+                       SET final_translation=final_translation || ' 修订。'
+                       WHERE block_id=? AND pipeline='parallel_v4' AND active=1""",
+                    (block.id,),
+                )
+            stale = json.loads(
+                urlopen(
+                    f"http://{host}:{port}/api/block?id={block.id}&blind=1"
+                ).read()
+            )
+            self.assertIsNone(stale["comparison_vote"])
+            revised_payload = json.dumps(
+                {
+                    "block": block.id,
+                    "choice": "B",
+                    "blinded": True,
+                    "note": "修订后重新评价",
+                }
+            ).encode()
+            urlopen(
+                Request(
+                    f"http://{host}:{port}/api/comparison-votes",
+                    data=revised_payload,
+                    headers={
+                        "Content-Type": "application/json",
+                        "X-Review-Token": server.review_token,
+                    },
+                    method="POST",
+                )
+            ).read()
+            self.assertEqual(len(self.database.list_comparison_vote_history()), 1)
+            revised_vote = self.database.comparison_vote_for_block(block.id)
+            self.assertEqual(revised_vote["choice"], "B")
+            self.assertTrue(revised_vote["candidate_a_hash"])
+            self.assertTrue(revised_vote["candidate_b_hash"])
         finally:
             server.shutdown()
             server.server_close()

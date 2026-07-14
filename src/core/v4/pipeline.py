@@ -40,6 +40,7 @@ class V4PipelineConfig:
     polish_temperature: float = 0.2
     polish_max_tokens: int = 6144
     style_reference: Optional[str] = None
+    use_baseline_reference: bool = False
     audit_mode: str = "full"
     force: bool = False
 
@@ -252,6 +253,33 @@ class V4TranslationPipeline:
             started = time.perf_counter()
             call_start = len(audited_llm.calls)
             proposal_start = len(proposals)
+            comparison_reference = ""
+            if self.config.use_baseline_reference:
+                baseline = self.database.baseline_for_block(block.id)
+                if (
+                    baseline
+                    and not baseline.get("has_partial_boundary")
+                    and not baseline.get("has_ambiguous_alignment")
+                ):
+                    comparison_reference = str(baseline.get("text") or "").strip()
+                if (
+                    comparison_reference
+                    and packet.required_chars + len(comparison_reference)
+                    > self.config.max_context_chars
+                ):
+                    outcomes.append(
+                        TranslationOutcome(
+                            block=block,
+                            knowledge_version=knowledge_version,
+                            status=V4BlockStatus.INCOMPLETE_REQUIRES_HUMAN.value,
+                            error=(
+                                f"{block.id} 加入旧译文对照后必需上下文 "
+                                f"{packet.required_chars + len(comparison_reference)} 字符超过预算 "
+                                f"{self.config.max_context_chars}；需要人工处理"
+                            ),
+                        )
+                    )
+                    break
             result: Optional[TextChunk] = None
             attempts = 0
             for attempts in range(1, self.config.max_attempts + 1):
@@ -266,6 +294,7 @@ class V4TranslationPipeline:
                     memory_context=packet.rendered,
                     previous_summary=local_summary,
                     previous_chunk_text=previous_source,
+                    comparison_reference=comparison_reference,
                 )
                 if result.status in {ChunkStatus.COMPLETED, ChunkStatus.HUMAN_REVIEW}:
                     break

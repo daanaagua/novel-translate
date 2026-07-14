@@ -13,7 +13,7 @@ from typing import Any, Dict, Iterable, Iterator, List, Optional, Sequence
 from .models import ScanOutcome, TranslationOutcome, V4Block, V4BlockStatus
 
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 
 def utc_now() -> str:
@@ -387,6 +387,8 @@ class V4Database:
                     block_id TEXT NOT NULL UNIQUE REFERENCES blocks(id),
                     candidate_a_origin TEXT NOT NULL,
                     candidate_b_origin TEXT NOT NULL,
+                    candidate_a_hash TEXT NOT NULL DEFAULT '',
+                    candidate_b_hash TEXT NOT NULL DEFAULT '',
                     choice TEXT NOT NULL,
                     selected_origin TEXT,
                     blinded INTEGER NOT NULL DEFAULT 1,
@@ -396,6 +398,25 @@ class V4Database:
                 );
                 CREATE INDEX IF NOT EXISTS idx_comparison_votes_choice
                     ON comparison_votes(choice, updated_at);
+
+                CREATE TABLE IF NOT EXISTS comparison_vote_history (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    original_vote_id INTEGER NOT NULL,
+                    block_id TEXT NOT NULL REFERENCES blocks(id),
+                    candidate_a_origin TEXT NOT NULL,
+                    candidate_b_origin TEXT NOT NULL,
+                    candidate_a_hash TEXT NOT NULL DEFAULT '',
+                    candidate_b_hash TEXT NOT NULL DEFAULT '',
+                    choice TEXT NOT NULL,
+                    selected_origin TEXT,
+                    blinded INTEGER NOT NULL DEFAULT 1,
+                    note TEXT NOT NULL DEFAULT '',
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    archived_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_comparison_vote_history_block
+                    ON comparison_vote_history(block_id, archived_at);
                 """
             )
             connection.execute(
@@ -419,6 +440,28 @@ class V4Database:
             if "subject_form" not in claim_columns:
                 connection.execute(
                     "ALTER TABLE claims ADD COLUMN subject_form TEXT NOT NULL DEFAULT ''"
+                )
+            vote_columns = {
+                row[1]
+                for row in connection.execute(
+                    "PRAGMA table_info(comparison_votes)"
+                ).fetchall()
+            }
+            if "candidate_a_hash" not in vote_columns:
+                connection.execute(
+                    "ALTER TABLE comparison_votes ADD COLUMN candidate_a_hash TEXT NOT NULL DEFAULT ''"
+                )
+            if "candidate_b_hash" not in vote_columns:
+                connection.execute(
+                    "ALTER TABLE comparison_votes ADD COLUMN candidate_b_hash TEXT NOT NULL DEFAULT ''"
+                )
+            legacy_votes = connection.execute(
+                """SELECT * FROM comparison_votes
+                   WHERE candidate_a_hash='' OR candidate_b_hash=''"""
+            ).fetchall()
+            for legacy_vote in legacy_votes:
+                self._archive_comparison_vote(
+                    connection, legacy_vote, utc_now()
                 )
             connection.commit()
 
@@ -897,6 +940,99 @@ class V4Database:
                 )
         return concept_id
 
+    def lock_concept_translation(
+        self,
+        source: str,
+        target: str,
+        kind: str = "concept",
+        description: str = "",
+    ) -> Dict[str, Any]:
+        """人工确认一个全书级译名，并使依赖旧译名的V4译文失效。"""
+        source = source.strip()
+        target = target.strip()
+        if not source or not target:
+            raise ValueError("人工锁定术语时source和target均不能为空")
+        normalized = normalize_english_form(source)
+        concept_id = stable_id("concept", normalized)
+        with self.transaction() as connection:
+            version = self.create_knowledge_version(
+                f"human lock concept translation: {source}", connection
+            )
+            existing = connection.execute(
+                "SELECT id FROM concepts WHERE id=? AND retired_version IS NULL",
+                (concept_id,),
+            ).fetchone()
+            if existing is None:
+                connection.execute(
+                    """INSERT INTO concepts(
+                           id, kind, canonical_source, default_target, description,
+                           status, scope, locked, created_version, created_at
+                       ) VALUES(?, ?, ?, ?, ?, 'verified', 'book', 1, ?, ?)""",
+                    (
+                        concept_id,
+                        kind,
+                        source,
+                        target,
+                        description,
+                        version,
+                        utc_now(),
+                    ),
+                )
+            else:
+                connection.execute(
+                    """UPDATE concepts SET default_target=?,
+                           description=CASE WHEN ?!='' THEN ? ELSE description END,
+                           status='verified', locked=1
+                       WHERE id=?""",
+                    (target, description, description, concept_id),
+                )
+            connection.execute(
+                """INSERT OR IGNORE INTO source_forms(
+                       concept_id, form, normalized_form, grammar_json
+                   ) VALUES(?, ?, ?, '{}')""",
+                (concept_id, source, normalized),
+            )
+            connection.execute(
+                """UPDATE rendering_rules SET retired_version=?
+                   WHERE concept_id=? AND retired_version IS NULL AND target!=?""",
+                (version, concept_id, target),
+            )
+            rule_id = stable_id("rule", f"{concept_id}:human-default:{target}")
+            connection.execute(
+                """INSERT INTO rendering_rules(
+                       id, concept_id, condition_json, target, priority, status,
+                       scope, locked, created_version, retired_version, created_at
+                   ) VALUES(?, ?, '{}', ?, 100, 'verified', 'book', 1, ?, NULL, ?)
+                   ON CONFLICT(id) DO UPDATE SET
+                       target=excluded.target, priority=100, status='verified',
+                       scope='book', locked=1, retired_version=NULL""",
+                (rule_id, concept_id, target, version, utc_now()),
+            )
+            affected_rows = connection.execute(
+                """SELECT DISTINCT tv.id translation_id, tv.block_id
+                   FROM dependencies d
+                   JOIN translation_versions tv ON tv.id=d.translation_id
+                   WHERE d.dependency_type='concept' AND d.dependency_id=?
+                     AND tv.active=1 AND tv.pipeline='parallel_v4'""",
+                (concept_id,),
+            ).fetchall()
+            for row in affected_rows:
+                connection.execute(
+                    "UPDATE translation_versions SET status=? WHERE id=?",
+                    (V4BlockStatus.NEEDS_REVALIDATE.value, row["translation_id"]),
+                )
+                connection.execute(
+                    "UPDATE blocks SET status=?, updated_at=? WHERE id=?",
+                    (V4BlockStatus.NEEDS_REVALIDATE.value, utc_now(), row["block_id"]),
+                )
+        return {
+            "concept_id": concept_id,
+            "source": source,
+            "target": target,
+            "knowledge_version": version,
+            "affected_translations": len(affected_rows),
+        }
+
     def import_legacy_translation(
         self,
         block_id: str,
@@ -997,6 +1133,15 @@ class V4Database:
         ordered = sorted(outcomes, key=lambda item: item.block.global_index)
         with self.transaction() as connection:
             for outcome in ordered:
+                if pipeline == "parallel_v4":
+                    previous_vote = connection.execute(
+                        "SELECT * FROM comparison_votes WHERE block_id=?",
+                        (outcome.block.id,),
+                    ).fetchone()
+                    if previous_vote is not None:
+                        self._archive_comparison_vote(
+                            connection, previous_vote, utc_now()
+                        )
                 connection.execute(
                     "UPDATE translation_versions SET active=0 WHERE block_id=? AND pipeline=? AND active=1",
                     (outcome.block.id, pipeline),
@@ -1674,12 +1819,47 @@ class V4Database:
         with closing(self.connect()) as connection:
             return [dict(row) for row in connection.execute(query, params)]
 
+    @staticmethod
+    def _archive_comparison_vote(
+        connection: sqlite3.Connection,
+        vote: sqlite3.Row,
+        archived_at: str,
+    ) -> None:
+        connection.execute(
+            """INSERT INTO comparison_vote_history(
+                   original_vote_id, block_id, candidate_a_origin,
+                   candidate_b_origin, candidate_a_hash, candidate_b_hash,
+                   choice, selected_origin, blinded, note, created_at,
+                   updated_at, archived_at
+               ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                vote["id"],
+                vote["block_id"],
+                vote["candidate_a_origin"],
+                vote["candidate_b_origin"],
+                vote["candidate_a_hash"],
+                vote["candidate_b_hash"],
+                vote["choice"],
+                vote["selected_origin"],
+                vote["blinded"],
+                vote["note"],
+                vote["created_at"],
+                vote["updated_at"],
+                archived_at,
+            ),
+        )
+        connection.execute(
+            "DELETE FROM comparison_votes WHERE id=?", (vote["id"],)
+        )
+
     def record_comparison_vote(
         self,
         block_identifier: str,
         choice: str,
         candidate_a_origin: str,
         candidate_b_origin: str,
+        candidate_a_hash: str = "",
+        candidate_b_hash: str = "",
         blinded: bool = True,
         note: str = "",
     ) -> Dict[str, Any]:
@@ -1692,14 +1872,27 @@ class V4Database:
         }.get(choice)
         now = utc_now()
         with self.transaction() as connection:
+            existing = connection.execute(
+                "SELECT * FROM comparison_votes WHERE block_id=?", (block.id,)
+            ).fetchone()
+            if existing is not None and (
+                existing["candidate_a_hash"] != candidate_a_hash
+                or existing["candidate_b_hash"] != candidate_b_hash
+            ):
+                self._archive_comparison_vote(
+                    connection, existing, now
+                )
             connection.execute(
                 """INSERT INTO comparison_votes(
-                       block_id, candidate_a_origin, candidate_b_origin, choice,
-                       selected_origin, blinded, note, created_at, updated_at
-                   ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)
+                       block_id, candidate_a_origin, candidate_b_origin,
+                       candidate_a_hash, candidate_b_hash, choice, selected_origin,
+                       blinded, note, created_at, updated_at
+                   ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                    ON CONFLICT(block_id) DO UPDATE SET
                        candidate_a_origin=excluded.candidate_a_origin,
                        candidate_b_origin=excluded.candidate_b_origin,
+                       candidate_a_hash=excluded.candidate_a_hash,
+                       candidate_b_hash=excluded.candidate_b_hash,
                        choice=excluded.choice,
                        selected_origin=excluded.selected_origin,
                        blinded=excluded.blinded,
@@ -1709,6 +1902,8 @@ class V4Database:
                     block.id,
                     candidate_a_origin,
                     candidate_b_origin,
+                    candidate_a_hash,
+                    candidate_b_hash,
                     choice,
                     selected_origin,
                     int(blinded),
@@ -1717,16 +1912,28 @@ class V4Database:
                     now,
                 ),
             )
-        return self.comparison_vote_for_block(block.id) or {}
+        return self.comparison_vote_for_block(
+            block.id, candidate_a_hash, candidate_b_hash
+        ) or {}
 
     def comparison_vote_for_block(
-        self, block_identifier: str
+        self,
+        block_identifier: str,
+        candidate_a_hash: Optional[str] = None,
+        candidate_b_hash: Optional[str] = None,
     ) -> Optional[Dict[str, Any]]:
         block = self.get_block_by_identifier(block_identifier)
         with closing(self.connect()) as connection:
-            row = connection.execute(
-                "SELECT * FROM comparison_votes WHERE block_id=?", (block.id,)
-            ).fetchone()
+            if candidate_a_hash is None or candidate_b_hash is None:
+                row = connection.execute(
+                    "SELECT * FROM comparison_votes WHERE block_id=?", (block.id,)
+                ).fetchone()
+            else:
+                row = connection.execute(
+                    """SELECT * FROM comparison_votes
+                       WHERE block_id=? AND candidate_a_hash=? AND candidate_b_hash=?""",
+                    (block.id, candidate_a_hash, candidate_b_hash),
+                ).fetchone()
             return dict(row) if row else None
 
     def list_comparison_votes(self) -> List[Dict[str, Any]]:
@@ -1735,6 +1942,15 @@ class V4Database:
                 """SELECT v.*, b.legacy_id, b.global_index
                    FROM comparison_votes v JOIN blocks b ON b.id=v.block_id
                    ORDER BY b.global_index"""
+            ).fetchall()
+            return [dict(row) for row in rows]
+
+    def list_comparison_vote_history(self) -> List[Dict[str, Any]]:
+        with closing(self.connect()) as connection:
+            rows = connection.execute(
+                """SELECT v.*, b.legacy_id, b.global_index
+                   FROM comparison_vote_history v JOIN blocks b ON b.id=v.block_id
+                   ORDER BY v.archived_at, b.global_index"""
             ).fetchall()
             return [dict(row) for row in rows]
 

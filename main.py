@@ -342,6 +342,7 @@ def cmd_translate_v4(args):
         draft_max_tokens=int(draft.get("max_tokens", 6144)),
         polish_temperature=float(polish.get("temperature", 0.2)),
         polish_max_tokens=int(polish.get("max_tokens", 6144)),
+        use_baseline_reference=bool(settings.get("use_baseline_reference", False)),
         audit_mode=args.audit_mode or settings.get("audit_mode", "full"),
         force=args.force,
     )

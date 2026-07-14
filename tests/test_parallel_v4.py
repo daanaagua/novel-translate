@@ -65,6 +65,35 @@ class FakeTranslationLLM:
         return generator() if stream else payload
 
 
+class FakeReferencePolishLLM:
+    def __init__(self):
+        self.calls = []
+
+    def get_model(self, purpose):
+        return f"fake-{purpose}"
+
+    def chat(self, messages, purpose="draft", stream=False, **kwargs):
+        self.calls.append({"purpose": purpose, "messages": messages})
+        if purpose == "draft":
+            payload = json.dumps(
+                {
+                    "analysis": "逐句核对",
+                    "translation": "这是完整的第一层译文。",
+                    "memory_summary": "阿尔法开始。",
+                    "new_terms": [],
+                    "relations": [],
+                },
+                ensure_ascii=False,
+            )
+        else:
+            payload = "「这是综合两稿后的完整译文。」"
+
+        def generator():
+            yield ("content", payload)
+
+        return generator() if stream else payload
+
+
 class ParallelV4Tests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
@@ -231,12 +260,64 @@ class ParallelV4Tests(unittest.TestCase):
             config=V4PipelineConfig(enable_polish=False),
         ).run()
         self.assertEqual(second["completed"], 0)
+        first_block = self.database.list_blocks()[0]
+        self.database.record_comparison_vote(
+            first_block.id,
+            "A",
+            "parallel_v4",
+            "serial_v3",
+            "old-v4-hash",
+            "old-baseline-hash",
+        )
         forced = V4TranslationPipeline(
             self.database,
             llm_factory=FakeTranslationLLM,
             config=V4PipelineConfig(enable_polish=False, force=True, max_blocks=1),
         ).run()
         self.assertEqual(forced["completed"], 1)
+        self.assertIsNone(self.database.comparison_vote_for_block(first_block.id))
+        self.assertEqual(len(self.database.list_comparison_vote_history()), 1)
+
+    def test_polish_can_compare_exact_baseline_and_normalizes_quote_style(self):
+        block = self.add_blocks(["Alpha begins."], status="ready")[0]
+        with self.database.transaction() as connection:
+            connection.execute(
+                """INSERT INTO baseline_documents(
+                       id, source_edition_id, name, kind, file_path, file_sha256,
+                       paragraph_count, metadata_json, active, created_at
+                   ) VALUES('baseline_test', ?, 'serial_v3', 'docx', 'baseline.docx',
+                            'hash', 1, '{}', 1, 'now')""",
+                (self.edition,),
+            )
+            connection.execute(
+                """INSERT INTO baseline_paragraphs(
+                       baseline_document_id, paragraph_index, target_text, target_hash
+                   ) VALUES('baseline_test', 0, '旧译文供逐句查漏。', 'target-hash')"""
+            )
+            connection.execute(
+                """INSERT INTO block_baseline_links(
+                       block_id, baseline_document_id, paragraph_index, ordinal,
+                       overlap_start, overlap_end, partial_start, partial_end,
+                       alignment_status
+                   ) VALUES(?, 'baseline_test', 0, 0, 0, 13, 0, 0, 'exact')""",
+                (block.id,),
+            )
+        fake = FakeReferencePolishLLM()
+        result = V4TranslationPipeline(
+            self.database,
+            llm_factory=lambda: fake,
+            config=V4PipelineConfig(
+                island_size=1,
+                initial_workers=1,
+                max_workers=1,
+                use_baseline_reference=True,
+            ),
+        ).run()
+        self.assertEqual(result["completed"], 1)
+        polish = next(call for call in fake.calls if call["purpose"] == "polish")
+        self.assertIn("旧译文供逐句查漏。", polish["messages"][-1]["content"])
+        final = self.database.active_translations()[block.id]["final_translation"]
+        self.assertEqual(final, "“这是综合两稿后的完整译文。”")
 
     def test_interactive_mode_pauses_only_for_a_new_decision(self):
         self.add_blocks(["The Archon spoke.", "The Archon waited."], status="ready")
