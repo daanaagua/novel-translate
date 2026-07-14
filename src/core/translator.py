@@ -378,10 +378,20 @@ class TranslationEngine:
         candidate_paragraphs = paragraphs(candidate)
         reference_length = compact_length(reference)
         candidate_length = compact_length(candidate)
+        normalized_reference = (reference or "").strip().lower()
+        # EPUB 后记中的书目信息常把同一条引文拆成多行；中文合并这些短行
+        # 是正常排版，不应被当作漏段。
+        allows_bibliography_merges = (
+            normalized_reference.startswith("afterword")
+            and normalized_reference.endswith("the end")
+        )
 
         if not candidate_length:
             return [f"{stage}为空"]
-        if len(candidate_paragraphs) != len(reference_paragraphs):
+        if (
+            len(candidate_paragraphs) != len(reference_paragraphs)
+            and not allows_bibliography_merges
+        ):
             problems.append(
                 f"{stage}段落数为{len(candidate_paragraphs)}，应为{len(reference_paragraphs)}"
             )

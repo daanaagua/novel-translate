@@ -192,6 +192,23 @@ class PipelineTests(unittest.TestCase):
             self.assertEqual(result.status, ChunkStatus.HUMAN_REVIEW)
             self.assertIn("已回退到完整初稿", result.quality_warnings[-1])
 
+    def test_afterword_bibliography_may_merge_wrapped_reference_lines(self):
+        reference = (
+            "Afterword\n\nIntroductory note about the references.\n\n"
+            "A Book by A. Author,\n\nPublisher, 2000.\n\nTHE END"
+        )
+        candidate = (
+            "Afterword\n\nIntroductory note about the references.\n\n"
+            "A Book by A. Author, Publisher, 2000.\n\nTHE END"
+        )
+        problems = TranslationEngine._translation_shape_problems(
+            reference,
+            candidate,
+            stage="第一层译稿",
+            min_length_ratio=0.15,
+        )
+        self.assertEqual(problems, [])
+
     def test_exporter_writes_txt_and_valid_epub_and_rejects_incomplete(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
