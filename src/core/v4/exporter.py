@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
+import re
 from typing import Dict, List
 
 from ..exporter import BookExporter, ExportResult
@@ -26,8 +27,13 @@ class ParallelV4BookExporter(BookExporter):
     def __init__(self, project, database: V4Database | None = None):
         super().__init__(project)
         self.database = database or V4Database(project.root_dir)
+        self._include_annotations = False
 
     def _chapters(self) -> List[Chapter]:
+        annotations_by_block: Dict[str, List[dict]] = {}
+        if self._include_annotations:
+            for annotation in self.database.list_annotations("approved"):
+                annotations_by_block.setdefault(annotation["block_id"], []).append(annotation)
         grouped: Dict[str, List[dict]] = {}
         for row in self.database.export_rows("parallel_v4"):
             grouped.setdefault(row["chapter_id"], []).append(row)
@@ -35,6 +41,7 @@ class ParallelV4BookExporter(BookExporter):
         for rows in grouped.values():
             first = rows[0]
             chunks = []
+            chapter_notes: List[str] = []
             for row in rows:
                 status = row.get("translation_status")
                 if status == V4BlockStatus.COMPLETED.value:
@@ -43,6 +50,22 @@ class ParallelV4BookExporter(BookExporter):
                     chunk_status = ChunkStatus.HUMAN_REVIEW
                 else:
                     chunk_status = ChunkStatus.PENDING
+                final_translation = row.get("final_translation") or ""
+                for annotation in annotations_by_block.get(row["id"], []):
+                    paragraphs = [
+                        part.strip()
+                        for part in re.split(r"\n\s*\n", final_translation.strip())
+                        if part.strip()
+                    ]
+                    paragraph_index = int(annotation["paragraph_index"])
+                    if paragraph_index >= len(paragraphs):
+                        raise ValueError(
+                            f"注释 {annotation['id']} 的段落序号超出译文范围"
+                        )
+                    note_number = len(chapter_notes) + 1
+                    paragraphs[paragraph_index] += f"〔注{note_number}〕"
+                    chapter_notes.append(f"〔注{note_number}〕{annotation['body']}")
+                    final_translation = "\n\n".join(paragraphs)
                 chunks.append(
                     TextChunk(
                         id=row["id"],
@@ -51,8 +74,14 @@ class ParallelV4BookExporter(BookExporter):
                         source_text=row["source_text"],
                         status=chunk_status,
                         draft_translation=row.get("draft_translation") or "",
-                        final_translation=row.get("final_translation") or "",
+                        final_translation=final_translation,
                     )
+                )
+            if chapter_notes and chunks:
+                chunks[-1].final_translation = (
+                    chunks[-1].final_translation.rstrip()
+                    + "\n\n注释\n\n"
+                    + "\n\n".join(chapter_notes)
                 )
             chapters.append(
                 Chapter(
@@ -69,6 +98,7 @@ class ParallelV4BookExporter(BookExporter):
         self,
         output_dir: str | Path | None = None,
         allow_warnings: bool = False,
+        include_annotations: bool = False,
     ) -> V4ExportResult:
         report = V4Validator(self.database).validate()
         if report.high_count:
@@ -83,7 +113,11 @@ class ParallelV4BookExporter(BookExporter):
             if output_dir
             else self.project.root_dir / "exports" / "parallel_v4"
         )
-        result: ExportResult = super().export(output_dir=target_dir, require_complete=True)
+        self._include_annotations = include_annotations
+        try:
+            result: ExportResult = super().export(output_dir=target_dir, require_complete=True)
+        finally:
+            self._include_annotations = False
         report_path = target_dir / "quality_report.md"
         report_path.write_text(report.to_markdown(), encoding="utf-8")
         return V4ExportResult(

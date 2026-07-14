@@ -31,7 +31,12 @@ class ContextBuilder:
         rendered = []
         for concept in concepts:
             lines = [
-                f"- {concept['source']} → {concept['default_target'] or '（未定）'}",
+                f"- {concept['source']} → "
+                + (
+                    "（高影响项待核验，不提供候选译法）"
+                    if concept.get("verification_pending")
+                    else concept["default_target"] or "（未定）"
+                ),
                 f"  concept_id: {concept['id']}",
             ]
             if concept.get("description"):
@@ -54,10 +59,13 @@ class ContextBuilder:
     ) -> ContextPacket:
         version = knowledge_version or self.database.current_knowledge_version()
         concepts = self.database.concepts_for_text(block.source_text)
+        claims = self.database.claims_for_block(block)
         parts = [
             "<translation_constraints>",
             "只使用当前位置可知的信息；不得根据后文推断身份、性别或谜底。",
             self._render_concepts(concepts),
+            "可用的保守翻译约束：",
+            *(f"- {claim['statement']}" for claim in claims),
             "</translation_constraints>",
         ]
         if local_summary:
@@ -81,4 +89,5 @@ class ContextBuilder:
             rendered=rendered,
             required_chars=required_chars,
             matched_concept_ids=[concept["id"] for concept in concepts],
+            matched_claim_ids=[claim["id"] for claim in claims],
         )

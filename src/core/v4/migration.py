@@ -43,11 +43,13 @@ class V4Migrator:
         block_rows: List[dict] = []
         legacy_chunks = []
         global_index = 0
+        chapters = []
         for chapter_file in sorted(self.project.memory.chapters_dir.glob("*.json")):
             chapter = self.project.memory.load_chapter(chapter_file.stem)
-            if not chapter:
-                continue
-            for chunk in chapter.chunks:
+            if chapter:
+                chapters.append(chapter)
+        for chapter in sorted(chapters, key=lambda item: (item.index, item.id)):
+            for chunk in sorted(chapter.chunks, key=lambda item: (item.index, item.id)):
                 internal_id = stable_id("block", f"{edition_id}:{chunk.id}")
                 block_rows.append(
                     {

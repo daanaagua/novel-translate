@@ -76,6 +76,44 @@ Copy-Item config\config.example.yaml config\config.yaml
 
 严格导出会拒绝未完成块和任何警告。人工确认警告可接受后，使用 `export-v4 --allow-warnings`。输出位于 `exports/parallel_v4/`，包含TXT、EPUB和质量报告。
 
+### 第二版能力
+
+第二版可以把逐段对应的旧DOCX译文作为只读基线。导入默认要求英文源文与DOCX的非空段落数完全一致；基线只用于人工对照，不会进入模型提示词：
+
+```powershell
+.\.venv\Scripts\python.exe main.py import-baseline-v4 new_sun_omnibus "D:\path\legacy_translation.docx" --name legacy_docx
+.\.venv\Scripts\python.exe main.py compare-v4 new_sun_omnibus --baseline legacy_docx
+```
+
+高影响术语或翻译约束需要两个互相独立的核验调用都支持，才能自动标记为已验证：
+
+```powershell
+.\.venv\Scripts\python.exe main.py verify-v4 new_sun_omnibus
+```
+
+人工校验界面位于翻译数据库之后、最终导出之前，也可以在交互模式暂停后立即打开。服务只监听本机回环地址，写操作使用每次启动生成的随机令牌：
+
+```powershell
+.\.venv\Scripts\python.exe main.py serve-v4 new_sun_omnibus
+```
+
+确定性校验发现单块问题后，可以把问题交给局部修复器。修复成功会新增译文版本并保留旧版本；修复失败不会覆盖当前译文：
+
+```powershell
+.\.venv\Scripts\python.exe main.py validate-v4 new_sun_omnibus
+.\.venv\Scripts\python.exe main.py repair-v4 new_sun_omnibus
+.\.venv\Scripts\python.exe main.py repair-v4 new_sun_omnibus --block v01_ch01_000 --issue "修复漏译"
+```
+
+注释独立于正文，默认不导出。只有明确使用 `--include-annotations` 时，已批准注释才会进入TXT和EPUB：
+
+```powershell
+.\.venv\Scripts\python.exe main.py annotate-v4 new_sun_omnibus --add "此处重复了前文意象。" --block v01_ch01_000 --paragraph 0
+.\.venv\Scripts\python.exe main.py export-v4 new_sun_omnibus --include-annotations
+```
+
+完整的第二版约束与实施范围见 `docs/PARALLEL_V4_V2_SPEC.md`。
+
 ## 项目数据
 
 每本书位于 `projects/<book_id>/`：

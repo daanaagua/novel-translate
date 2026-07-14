@@ -314,6 +314,7 @@ class V4TranslationPipeline:
                 warnings=list(result.quality_warnings),
                 term_proposals=term_proposals,
                 relation_proposals=relation_proposals,
+                claim_dependencies=list(packet.matched_claim_ids),
                 audit_calls=block_audits,
                 attempts=attempts,
                 elapsed_ms=int((time.perf_counter() - started) * 1000),

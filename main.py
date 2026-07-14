@@ -20,12 +20,16 @@ from src.agents.glossary_manager import GlossaryManager
 from src.core.schemas import ChunkStatus
 from src.core.v4 import (
     ParallelV4BookExporter,
+    DocxBaselineImporter,
     V4Database,
     V4Migrator,
     V4PipelineConfig,
+    V4Repairer,
     V4Scanner,
     V4TranslationPipeline,
     V4Validator,
+    V4Verifier,
+    serve_review_ui,
     write_shadow_comparison,
 )
 from rich.console import Console
@@ -251,6 +255,24 @@ def cmd_migrate_v4(args):
     return 0
 
 
+def cmd_import_baseline_v4(args):
+    project = _load_project_or_error(args.book_id)
+    if not project:
+        return 1
+    V4Migrator(project).migrate()
+    try:
+        result = DocxBaselineImporter(V4Database(project.root_dir), project).import_docx(
+            args.docx,
+            name=args.name,
+            require_exact_count=not args.allow_count_mismatch,
+        )
+    except Exception as exc:
+        print(f"[ERROR] 基线导入失败: {exc}")
+        return 1
+    print(json.dumps(result, ensure_ascii=False, indent=2))
+    return 0
+
+
 def cmd_scan_v4(args):
     project = _load_project_or_error(args.book_id)
     if not project:
@@ -281,6 +303,20 @@ def cmd_reconcile_v4(args):
     print(f"[OK] knowledge_version={version}")
     print(json.dumps(database.status_summary(), ensure_ascii=False, indent=2))
     return 0
+
+
+def cmd_verify_v4(args):
+    project = _load_project_or_error(args.book_id)
+    if not project:
+        return 1
+    config = config_loader.load_config()
+    result = V4Verifier(
+        V4Database(project.root_dir),
+        llm_factory=lambda: LLMManager(config["llm"]),
+        max_attempts=args.max_attempts,
+    ).run(max_tasks=args.max_tasks)
+    print(json.dumps(result, ensure_ascii=False, indent=2))
+    return 1 if result["needs_human"] else 0
 
 
 def cmd_translate_v4(args):
@@ -331,11 +367,34 @@ def cmd_status_v4(args):
     return 0
 
 
+def cmd_serve_v4(args):
+    project = _load_project_or_error(args.book_id)
+    if not project:
+        return 1
+    serve_review_ui(
+        V4Database(project.root_dir),
+        port=args.port,
+        open_browser=not args.no_open,
+    )
+    return 0
+
+
 def cmd_review_v4(args):
     project = _load_project_or_error(args.book_id)
     if not project:
         return 1
     database = V4Database(project.root_dir)
+    if args.edit is not None:
+        if not args.replacement:
+            print("[ERROR] --edit 必须同时提供 --replacement")
+            return 1
+        try:
+            result = database.amend_human_item(args.edit, args.replacement)
+        except Exception as exc:
+            print(f"[ERROR] 编辑失败: {exc}")
+            return 1
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+        return 0
     if args.accept is not None or args.reject is not None or args.retry is not None:
         if args.accept is not None:
             item_id, action = args.accept, "accept"
@@ -370,6 +429,82 @@ def cmd_review_v4(args):
     return 0
 
 
+def cmd_claim_v4(args):
+    project = _load_project_or_error(args.book_id)
+    if not project:
+        return 1
+    database = V4Database(project.root_dir)
+    if args.add:
+        claim_id = database.create_claim(
+            kind=args.kind,
+            statement=args.add,
+            reveal_global_index=args.reveal_index,
+            subject_form=args.subject or "",
+            scope=args.scope,
+            confidence=args.confidence,
+            high_impact=args.high_impact,
+        )
+        print(f"[OK] claim_id={claim_id}")
+        return 0
+    print(json.dumps(database.list_claims(), ensure_ascii=False, indent=2))
+    return 0
+
+
+def cmd_annotate_v4(args):
+    project = _load_project_or_error(args.book_id)
+    if not project:
+        return 1
+    database = V4Database(project.root_dir)
+    try:
+        if args.add:
+            if not args.block:
+                raise ValueError("新增注释时必须提供--block")
+            annotation_id = database.add_annotation(
+                args.block,
+                args.paragraph,
+                args.add,
+                status="approved" if args.approved else "proposed",
+            )
+            print(f"[OK] annotation_id={annotation_id}")
+            return 0
+        if args.approve or args.reject:
+            annotation_id = args.approve or args.reject
+            action = "approve" if args.approve else "reject"
+            print(json.dumps(database.resolve_annotation(annotation_id, action), ensure_ascii=False, indent=2))
+            return 0
+        print(json.dumps(database.list_annotations(args.status), ensure_ascii=False, indent=2))
+        return 0
+    except Exception as exc:
+        print(f"[ERROR] 注释操作失败: {exc}")
+        return 1
+
+
+def cmd_repair_v4(args):
+    project = _load_project_or_error(args.book_id)
+    if not project:
+        return 1
+    config = config_loader.load_config()
+    settings = config.get("parallel_v4", {})
+    polish = config.get("translation", {}).get("polish", {})
+    try:
+        result = V4Repairer(
+            V4Database(project.root_dir),
+            llm_factory=lambda: LLMManager(config["llm"]),
+            max_attempts=args.max_attempts,
+            max_tokens=int(polish.get("max_tokens", 37200)),
+            max_context_chars=int(settings.get("max_context_chars", 24000)),
+        ).run(
+            max_tasks=args.max_tasks,
+            block_identifier=args.block,
+            issues=args.issue,
+        )
+    except Exception as exc:
+        print(f"[ERROR] 局部修复失败: {exc}")
+        return 1
+    print(json.dumps(result, ensure_ascii=False, indent=2))
+    return 1 if result["needs_human"] else 0
+
+
 def cmd_validate_v4(args):
     project = _load_project_or_error(args.book_id)
     if not project:
@@ -387,6 +522,7 @@ def cmd_export_v4(args):
         result = ParallelV4BookExporter(project).export_v4(
             output_dir=args.output_dir,
             allow_warnings=args.allow_warnings,
+            include_annotations=args.include_annotations,
         )
     except Exception as exc:
         print(f"[ERROR] 导出失败: {exc}")
@@ -411,6 +547,7 @@ def cmd_compare_v4(args):
             V4Database(project.root_dir),
             output,
             max_blocks=args.max_blocks,
+            baseline_name=args.baseline,
         )
     except Exception as exc:
         print(f"[ERROR] 生成对照失败: {exc}")
@@ -460,6 +597,13 @@ def main():
     p_migrate_v4.add_argument("book_id", help="项目ID")
     p_migrate_v4.set_defaults(func=cmd_migrate_v4)
 
+    p_baseline_v4 = subparsers.add_parser("import-baseline-v4", help="导入逐段DOCX外部译文基线")
+    p_baseline_v4.add_argument("book_id", help="项目ID")
+    p_baseline_v4.add_argument("docx", help="逐段对应英文源文的DOCX")
+    p_baseline_v4.add_argument("--name", default="legacy_docx")
+    p_baseline_v4.add_argument("--allow-count-mismatch", action="store_true")
+    p_baseline_v4.set_defaults(func=cmd_import_baseline_v4)
+
     p_scan_v4 = subparsers.add_parser("scan-v4", help="执行证据式并行预扫描")
     p_scan_v4.add_argument("book_id", help="项目ID")
     p_scan_v4.add_argument("--initial-workers", type=int, default=2)
@@ -474,6 +618,12 @@ def main():
     p_reconcile_v4 = subparsers.add_parser("reconcile-v4", help="保守归并完全相同的英文词形")
     p_reconcile_v4.add_argument("book_id", help="项目ID")
     p_reconcile_v4.set_defaults(func=cmd_reconcile_v4)
+
+    p_verify_v4 = subparsers.add_parser("verify-v4", help="对高影响知识执行两个独立核验")
+    p_verify_v4.add_argument("book_id", help="项目ID")
+    p_verify_v4.add_argument("--max-tasks", type=int)
+    p_verify_v4.add_argument("--max-attempts", type=int, default=2)
+    p_verify_v4.set_defaults(func=cmd_verify_v4)
 
     p_translate_v4 = subparsers.add_parser("translate-v4", help="执行带屏障的并行两层翻译")
     p_translate_v4.add_argument("book_id", help="项目ID")
@@ -499,13 +649,62 @@ def main():
     p_status_v4.add_argument("book_id", help="项目ID")
     p_status_v4.set_defaults(func=cmd_status_v4)
 
+    p_serve_v4 = subparsers.add_parser("serve-v4", help="启动仅限本机访问的parallel_v4裁决界面")
+    p_serve_v4.add_argument("book_id", help="项目ID")
+    p_serve_v4.add_argument("--port", type=int, default=8765)
+    p_serve_v4.add_argument("--no-open", action="store_true", help="不自动打开浏览器")
+    p_serve_v4.set_defaults(func=cmd_serve_v4)
+
     p_review_v4 = subparsers.add_parser("review-v4", help="查看或裁决parallel_v4人工队列")
     p_review_v4.add_argument("book_id", help="项目ID")
     review_action = p_review_v4.add_mutually_exclusive_group()
     review_action.add_argument("--accept", type=int, metavar="ID")
     review_action.add_argument("--reject", type=int, metavar="ID")
     review_action.add_argument("--retry", type=int, metavar="ID")
+    review_action.add_argument("--edit", type=int, metavar="ID")
+    p_review_v4.add_argument("--replacement")
     p_review_v4.set_defaults(func=cmd_review_v4)
+
+    p_claim_v4 = subparsers.add_parser("claim-v4", help="查看或添加可并存的翻译声明与假说")
+    p_claim_v4.add_argument("book_id", help="项目ID")
+    p_claim_v4.add_argument("--add", help="新增声明文本；省略时列出声明")
+    p_claim_v4.add_argument(
+        "--kind",
+        choices=[
+            "translation_constraint",
+            "temporal_constraint",
+            "identity_hypothesis",
+            "reveal_boundary",
+            "interpretation_hypothesis",
+        ],
+        default="interpretation_hypothesis",
+    )
+    p_claim_v4.add_argument("--reveal-index", type=int, default=0)
+    p_claim_v4.add_argument("--subject")
+    p_claim_v4.add_argument("--scope", choices=["book", "occurrence"], default="book")
+    p_claim_v4.add_argument("--confidence", type=float, default=0.5)
+    p_claim_v4.add_argument("--high-impact", action="store_true")
+    p_claim_v4.set_defaults(func=cmd_claim_v4)
+
+    p_annotate_v4 = subparsers.add_parser("annotate-v4", help="管理独立于正文的可选注释")
+    p_annotate_v4.add_argument("book_id", help="项目ID")
+    annotation_action = p_annotate_v4.add_mutually_exclusive_group()
+    annotation_action.add_argument("--add", help="新增注释正文")
+    annotation_action.add_argument("--approve", metavar="ID")
+    annotation_action.add_argument("--reject", metavar="ID")
+    p_annotate_v4.add_argument("--block", help="新增注释时指定文本块ID")
+    p_annotate_v4.add_argument("--paragraph", type=int, default=0, help="块内译文段落序号，从0开始")
+    p_annotate_v4.add_argument("--approved", action="store_true", help="新增时直接批准")
+    p_annotate_v4.add_argument("--status", choices=["proposed", "approved", "rejected"])
+    p_annotate_v4.set_defaults(func=cmd_annotate_v4)
+
+    p_repair_v4 = subparsers.add_parser("repair-v4", help="执行块级局部修复并保留旧译文版本")
+    p_repair_v4.add_argument("book_id", help="项目ID")
+    p_repair_v4.add_argument("--block", help="指定文本块；省略时处理开放修复队列")
+    p_repair_v4.add_argument("--issue", action="append", help="指定需要修复的问题，可重复")
+    p_repair_v4.add_argument("--max-tasks", type=int)
+    p_repair_v4.add_argument("--max-attempts", type=int, default=2)
+    p_repair_v4.set_defaults(func=cmd_repair_v4)
 
     p_validate_v4 = subparsers.add_parser("validate-v4", help="执行确定性完整性校验")
     p_validate_v4.add_argument("book_id", help="项目ID")
@@ -515,12 +714,14 @@ def main():
     p_export_v4.add_argument("book_id", help="项目ID")
     p_export_v4.add_argument("--output-dir")
     p_export_v4.add_argument("--allow-warnings", action="store_true")
+    p_export_v4.add_argument("--include-annotations", action="store_true")
     p_export_v4.set_defaults(func=cmd_export_v4)
 
     p_compare_v4 = subparsers.add_parser("compare-v4", help="生成串行基线与parallel_v4人工对照")
     p_compare_v4.add_argument("book_id", help="项目ID")
     p_compare_v4.add_argument("--output")
     p_compare_v4.add_argument("--max-blocks", type=int)
+    p_compare_v4.add_argument("--baseline", help="指定外部基线名称")
     p_compare_v4.set_defaults(func=cmd_compare_v4)
     
     args = parser.parse_args()

@@ -10,6 +10,7 @@ llm:
         scan: "deepseek-v4-flash"
         reconcile: "deepseek-v4-flash"
         verify: "deepseek-v4-flash"
+        repair: "deepseek-v4-flash"
         draft: "deepseek-v4-flash"
         polish: "deepseek-v4-flash"
       request_options:
@@ -22,6 +23,14 @@ llm:
           thinking:
             type: "enabled"
         scan:
+          reasoning_effort: "high"
+          thinking:
+            type: "enabled"
+        verify:
+          reasoning_effort: "high"
+          thinking:
+            type: "enabled"
+        repair:
           reasoning_effort: "high"
           thinking:
             type: "enabled"

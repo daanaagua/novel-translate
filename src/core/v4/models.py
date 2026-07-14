@@ -58,6 +58,17 @@ class ScanResponse(StrictModel):
     ambiguities: List[ScanAmbiguity] = Field(default_factory=list)
 
 
+class VerificationResponse(StrictModel):
+    verdict: str = Field(pattern=r"^(support|reject|uncertain)$")
+    rationale: str = Field(min_length=1, max_length=1200)
+    evidence_quotes: List[str] = Field(default_factory=list, max_length=10)
+
+
+class RepairResponse(StrictModel):
+    paragraphs: List[str] = Field(min_length=1)
+    repair_notes: List[str] = Field(default_factory=list, max_length=20)
+
+
 @dataclass(frozen=True)
 class V4Block:
     id: str
@@ -92,6 +103,7 @@ class ContextPacket:
     rendered: str
     required_chars: int
     matched_concept_ids: List[str] = field(default_factory=list)
+    matched_claim_ids: List[str] = field(default_factory=list)
 
 
 @dataclass
@@ -106,6 +118,7 @@ class TranslationOutcome:
     warnings: List[str] = field(default_factory=list)
     term_proposals: List[Dict[str, Any]] = field(default_factory=list)
     relation_proposals: List[Dict[str, Any]] = field(default_factory=list)
+    claim_dependencies: List[str] = field(default_factory=list)
     audit_calls: List[Dict[str, Any]] = field(default_factory=list)
     attempts: int = 1
     elapsed_ms: int = 0

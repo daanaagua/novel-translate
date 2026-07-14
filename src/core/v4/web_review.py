@@ -1,0 +1,222 @@
+"""Localhost-only review dashboard for parallel_v4."""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import secrets
+import threading
+import webbrowser
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from typing import Any, Dict
+from urllib.parse import parse_qs, urlparse
+
+from .database import V4Database
+
+
+REVIEW_HTML = r"""<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>parallel_v4 本地裁决</title>
+<style>
+:root{color-scheme:dark;--bg:#111318;--panel:#1a1e26;--line:#303744;--text:#edf1f7;--muted:#9aa7b8;--accent:#79b8ff;--ok:#78dba9;--warn:#ffca70;--bad:#ff8585}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font:15px/1.55 system-ui,"Microsoft YaHei",sans-serif}
+header{position:sticky;top:0;z-index:3;padding:14px 20px;background:#111318ee;border-bottom:1px solid var(--line);display:flex;gap:18px;align-items:center}
+header h1{font-size:17px;margin:0}.muted{color:var(--muted)}button,input,textarea,select{font:inherit;color:var(--text);background:#11151c;border:1px solid var(--line);border-radius:6px;padding:7px 9px}button{cursor:pointer}button:hover{border-color:var(--accent)}
+main{display:grid;grid-template-columns:minmax(280px,360px) 1fr;min-height:calc(100vh - 58px)}aside{padding:16px;border-right:1px solid var(--line);overflow:auto}.content{padding:20px;overflow:auto}.card{background:var(--panel);border:1px solid var(--line);border-radius:9px;padding:12px;margin-bottom:12px}.card h3{margin:0 0 8px;font-size:15px}.pill{display:inline-block;padding:2px 7px;border-radius:99px;background:#2a3340;color:var(--muted);font-size:12px}.queue-actions{display:flex;gap:6px;flex-wrap:wrap;margin-top:8px}.block{cursor:pointer}.block:hover{border-color:var(--accent)}
+.columns{display:grid;grid-template-columns:1fr 1fr;gap:14px}.prose{white-space:pre-wrap;background:#12161d;border:1px solid var(--line);padding:14px;border-radius:8px;max-height:58vh;overflow:auto}.source{max-height:35vh}.section-title{display:flex;justify-content:space-between;align-items:center;margin:24px 0 9px}h2{font-size:18px;margin:0}.ok{color:var(--ok)}.warn{color:var(--warn)}.bad{color:var(--bad)}
+@media(max-width:900px){main{grid-template-columns:1fr}aside{border-right:0;border-bottom:1px solid var(--line)}.columns{grid-template-columns:1fr}}
+</style></head><body>
+<header><h1>parallel_v4 本地裁决</h1><span id="summary" class="muted">载入中</span><button onclick="loadState()">刷新</button></header>
+<main><aside><div class="section-title"><h2>人工队列</h2></div><div id="queue"></div><div class="section-title"><h2>声明与假说</h2></div><div id="claims"></div><div class="section-title"><h2>核验与修复</h2></div><div id="tasks"></div><div class="section-title"><h2>文本块</h2></div><div id="blocks"></div></aside>
+<section class="content"><div id="empty" class="card muted">选择左侧文本块查看原文、盲评候选、证据和注释。</div><div id="detail" hidden>
+<div class="section-title"><h2 id="blockTitle"></h2><button id="revealBtn">揭示来源</button></div><div id="blockMeta" class="muted"></div>
+<div class="section-title"><h2>原文</h2></div><div id="source" class="prose source"></div>
+<div class="section-title"><h2>译文对照</h2></div><div id="candidates" class="columns"></div>
+<div class="section-title"><h2>证据</h2></div><div id="evidence"></div>
+<div class="section-title"><h2>注释</h2></div><div id="annotations"></div><div class="card"><input id="annIndex" type="number" min="0" value="0" style="width:90px"><input id="annBody" placeholder="注释正文" style="width:min(560px,70%)"><button onclick="addAnnotation()">添加待审注释</button></div>
+<div class="section-title"><h2>局部修复</h2></div><div class="card"><textarea id="repairIssues" rows="3" style="width:100%" placeholder="每行一个需要修复的问题"></textarea><button onclick="requestRepair()">加入局部修复队列</button></div>
+</div></section></main>
+<script>
+const TOKEN=__TOKEN__;let currentBlock=null;let revealed=false;
+async function api(path,opt={}){opt.headers={...(opt.headers||{}),'Content-Type':'application/json','X-Review-Token':TOKEN};const r=await fetch(path,opt);const data=await r.json();if(!r.ok)throw new Error(data.error||r.statusText);return data}
+function escText(el,text){el.textContent=text??''}
+async function loadState(){const s=await api('/api/state');escText(document.querySelector('#summary'),`队列 ${s.queue.length} · 核验 ${s.verification_tasks.length} · 修复 ${s.repair_tasks.length}`);renderQueue(s.queue);renderClaims(s.claims);renderTasks(s.verification_tasks,s.repair_tasks);renderBlocks(s.blocks)}
+function renderQueue(rows){const root=document.querySelector('#queue');root.innerHTML='';if(!rows.length){root.innerHTML='<div class="muted">暂无待裁决项目</div>';return}for(const q of rows){const c=document.createElement('div');c.className='card';const h=document.createElement('h3');h.textContent=`#${q.id} ${q.kind}`;c.append(h);const p=document.createElement('div');p.className='muted';p.textContent=JSON.stringify(q.payload);c.append(p);const a=document.createElement('div');a.className='queue-actions';const actions=(q.kind==='context_overflow'||q.kind==='repair_failed')?['retry']:['accept','reject'];for(const action of actions){const b=document.createElement('button');b.textContent={accept:'接受并锁定',reject:'拒绝',retry:'重试'}[action];b.onclick=()=>queueAction(q.id,action);a.append(b)}if(q.kind==='translation_proposal'||q.kind==='high_impact_verification'){const e=document.createElement('button');e.textContent='编辑后接受';e.onclick=()=>editAccept(q.id);a.append(e)}c.append(a);root.append(c)}}
+function renderClaims(rows){const root=document.querySelector('#claims');root.innerHTML='';if(!rows.length){root.innerHTML='<div class="muted">暂无声明</div>';return}for(const x of rows.slice(0,50)){const c=document.createElement('div');c.className='card';const h=document.createElement('h3');h.textContent=`${x.kind} · ${x.status}`;c.append(h);const p=document.createElement('div');p.textContent=x.statement;c.append(p);const m=document.createElement('div');m.className='muted';m.textContent=`揭示位置 ${x.reveal_global_index} · ${x.scope}${x.locked?' · 已锁定':''}`;c.append(m);root.append(c)}}
+function renderTasks(verify,repair){const root=document.querySelector('#tasks');root.innerHTML='';for(const x of verify){const c=document.createElement('div');c.className='card';c.textContent=`核验 ${x.subject_type}:${x.subject_id} · ${x.status}`;root.append(c)}for(const x of repair){const c=document.createElement('div');c.className='card';c.textContent=`修复 ${x.legacy_id} · ${x.status}`;root.append(c)}if(!root.children.length)root.innerHTML='<div class="muted">暂无开放任务</div>'}
+function renderBlocks(rows){const root=document.querySelector('#blocks');root.innerHTML='';for(const b of rows){const c=document.createElement('div');c.className='card block';c.onclick=()=>loadBlock(b.legacy_id,true);c.innerHTML=`<h3></h3><span class="pill"></span>`;c.querySelector('h3').textContent=`${b.legacy_id} · ${b.chapter_title}`;c.querySelector('.pill').textContent=b.translation_status||b.status;root.append(c)}}
+async function queueAction(id,action){try{await api(`/api/queue/${id}`,{method:'POST',body:JSON.stringify({action})});await loadState()}catch(e){alert(e.message)}}
+async function editAccept(id){const replacement=prompt('输入替换后的译法或声明：');if(!replacement)return;try{await api(`/api/queue/${id}`,{method:'POST',body:JSON.stringify({action:'accept',replacement})});await loadState()}catch(e){alert(e.message)}}
+async function loadBlock(id,blind=true){currentBlock=id;revealed=!blind;const d=await api(`/api/block?id=${encodeURIComponent(id)}&blind=${blind?'1':'0'}`);document.querySelector('#empty').hidden=true;document.querySelector('#detail').hidden=false;escText(document.querySelector('#blockTitle'),`${d.legacy_id} · ${d.chapter_title}`);const warnings=JSON.parse(d.warnings_json||'[]');escText(document.querySelector('#blockMeta'),`${d.v4_status||d.status} · global_index=${d.global_index}${warnings.length?' · 警告：'+warnings.join('；'):''}`);escText(document.querySelector('#source'),d.source_text);const cr=document.querySelector('#candidates');cr.innerHTML='';for(const x of d.candidates){const box=document.createElement('div');box.innerHTML='<h3></h3><div class="prose"></div>';box.querySelector('h3').textContent=x.label+(x.origin?` · ${x.origin}`:'');box.querySelector('.prose').textContent=x.text||'（无译文）';cr.append(box)}const er=document.querySelector('#evidence');er.innerHTML='';for(const e of d.evidence){const c=document.createElement('div');c.className='card';c.textContent=`[${e.kind}] ${e.paragraph_id}: ${e.evidence_quote}`;er.append(c)}renderAnnotations(d.annotations);document.querySelector('#revealBtn').onclick=()=>loadBlock(id,revealed);document.querySelector('#revealBtn').textContent=revealed?'恢复盲评':'揭示来源'}
+function renderAnnotations(rows){const root=document.querySelector('#annotations');root.innerHTML='';for(const a of rows){const c=document.createElement('div');c.className='card';c.textContent=`P${a.paragraph_index} [${a.status}] ${a.body}`;if(a.status==='proposed'){for(const action of ['approve','reject']){const b=document.createElement('button');b.textContent=action==='approve'?'批准':'拒绝';b.onclick=()=>resolveAnnotation(a.id,action);c.append(b)}}root.append(c)}}
+async function resolveAnnotation(id,action){await api(`/api/annotations/${id}`,{method:'POST',body:JSON.stringify({action})});await loadBlock(currentBlock,!revealed)}
+async function addAnnotation(){const paragraph_index=Number(document.querySelector('#annIndex').value);const body=document.querySelector('#annBody').value;await api('/api/annotations',{method:'POST',body:JSON.stringify({block:currentBlock,paragraph_index,body})});document.querySelector('#annBody').value='';await loadBlock(currentBlock,!revealed)}
+async function requestRepair(){const issues=document.querySelector('#repairIssues').value.split('\n').filter(Boolean);await api('/api/repair',{method:'POST',body:JSON.stringify({block:currentBlock,issues})});alert('已加入局部修复队列');await loadState()}
+loadState().catch(e=>alert(e.message));
+</script></body></html>"""
+
+
+def _json_safe_queue(rows):
+    result = []
+    for row in rows:
+        item = dict(row)
+        item["payload"] = json.loads(item.pop("payload_json"))
+        result.append(item)
+    return result
+
+
+def _json_safe_tasks(rows):
+    result = []
+    for row in rows:
+        item = dict(row)
+        if "payload_json" in item:
+            item["payload"] = json.loads(item.pop("payload_json"))
+        if "issues_json" in item:
+            item["issues"] = json.loads(item.pop("issues_json"))
+        result.append(item)
+    return result
+
+
+def create_review_server(database: V4Database, port: int = 8765):
+    token = secrets.token_urlsafe(24)
+
+    class Handler(BaseHTTPRequestHandler):
+        server_version = "ParallelV4Review/2"
+
+        def log_message(self, format, *args):
+            return
+
+        def _send_json(self, value: Any, status: int = 200):
+            payload = json.dumps(value, ensure_ascii=False).encode("utf-8")
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Length", str(len(payload)))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(payload)
+
+        def _error(self, exc: Exception, status: int = 400):
+            self._send_json({"error": str(exc)}, status)
+
+        def _body(self) -> Dict[str, Any]:
+            size = int(self.headers.get("Content-Length") or 0)
+            if size > 1024 * 1024:
+                raise ValueError("请求体超过1MB")
+            return json.loads(self.rfile.read(size) or b"{}")
+
+        def _authorized(self) -> bool:
+            supplied = self.headers.get("X-Review-Token") or ""
+            return secrets.compare_digest(supplied, token)
+
+        def do_GET(self):
+            parsed = urlparse(self.path)
+            try:
+                if parsed.path == "/":
+                    payload = REVIEW_HTML.replace("__TOKEN__", json.dumps(token)).encode("utf-8")
+                    self.send_response(200)
+                    self.send_header("Content-Type", "text/html; charset=utf-8")
+                    self.send_header("Content-Security-Policy", "default-src 'self'; style-src 'unsafe-inline'; script-src 'unsafe-inline'")
+                    self.send_header("Cache-Control", "no-store")
+                    self.send_header("Content-Length", str(len(payload)))
+                    self.end_headers()
+                    self.wfile.write(payload)
+                    return
+                if parsed.path == "/api/state":
+                    self._send_json(
+                        {
+                            "summary": database.status_summary(),
+                            "queue": _json_safe_queue(database.list_human_queue()),
+                            "blocks": database.review_blocks(),
+                            "claims": database.list_claims(),
+                            "baselines": database.list_baseline_documents(),
+                            "verification_tasks": _json_safe_tasks(database.list_verification_tasks()),
+                            "annotations": database.list_annotations("proposed"),
+                            "repair_tasks": _json_safe_tasks(database.list_repair_tasks()),
+                        }
+                    )
+                    return
+                if parsed.path == "/api/block":
+                    query = parse_qs(parsed.query)
+                    identifier = (query.get("id") or [""])[0]
+                    blind = (query.get("blind") or ["1"])[0] != "0"
+                    data = database.get_review_block(identifier)
+                    baseline = data.pop("baseline", None)
+                    candidates = [
+                        {"origin": "parallel_v4", "text": data.get("v4_translation") or ""},
+                        {
+                            "origin": (baseline or {}).get("document", {}).get("name", "serial_v3"),
+                            "text": (baseline or {}).get("text")
+                            or data.get("serial_translation")
+                            or "",
+                        },
+                    ]
+                    if int(hashlib.sha256(data["id"].encode()).hexdigest(), 16) % 2:
+                        candidates.reverse()
+                    for index, candidate in enumerate(candidates):
+                        candidate["label"] = chr(ord("A") + index)
+                        if blind:
+                            candidate.pop("origin", None)
+                    data["candidates"] = candidates
+                    data.pop("v4_translation", None)
+                    data.pop("serial_translation", None)
+                    self._send_json(data)
+                    return
+                self._send_json({"error": "not found"}, 404)
+            except Exception as exc:
+                self._error(exc)
+
+        def do_POST(self):
+            if not self._authorized():
+                self._send_json({"error": "invalid review token"}, 403)
+                return
+            parsed = urlparse(self.path)
+            try:
+                body = self._body()
+                if parsed.path.startswith("/api/queue/"):
+                    item_id = int(parsed.path.rsplit("/", 1)[-1])
+                    replacement = str(body.get("replacement") or "").strip()
+                    if replacement:
+                        database.amend_human_item(item_id, replacement)
+                    self._send_json(database.resolve_human_item(item_id, body["action"]))
+                    return
+                if parsed.path == "/api/annotations":
+                    annotation_id = database.add_annotation(
+                        body["block"], int(body["paragraph_index"]), body["body"]
+                    )
+                    self._send_json({"id": annotation_id}, 201)
+                    return
+                if parsed.path.startswith("/api/annotations/"):
+                    annotation_id = parsed.path.rsplit("/", 1)[-1]
+                    self._send_json(database.resolve_annotation(annotation_id, body["action"]))
+                    return
+                if parsed.path == "/api/repair":
+                    task_id = database.request_repair(body["block"], body.get("issues") or [])
+                    self._send_json({"id": task_id}, 201)
+                    return
+                if parsed.path == "/api/claims":
+                    claim_id = database.create_claim(**body)
+                    self._send_json({"id": claim_id}, 201)
+                    return
+                self._send_json({"error": "not found"}, 404)
+            except Exception as exc:
+                self._error(exc)
+
+    server = ThreadingHTTPServer(("127.0.0.1", port), Handler)
+    server.review_token = token
+    return server
+
+
+def serve_review_ui(database: V4Database, port: int = 8765, open_browser: bool = True):
+    server = create_review_server(database, port)
+    host, actual_port = server.server_address
+    url = f"http://{host}:{actual_port}/"
+    if open_browser:
+        threading.Timer(0.4, lambda: webbrowser.open(url)).start()
+    print(f"本地裁决界面: {url}")
+    print("仅绑定127.0.0.1；按 Ctrl+C 停止。")
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        server.server_close()

@@ -340,6 +340,40 @@ class ParallelV4Tests(unittest.TestCase):
             self.assertEqual(connection.execute("SELECT COUNT(*) FROM source_editions").fetchone()[0], 2)
             self.assertEqual(connection.execute("SELECT COUNT(*) FROM blocks").fetchone()[0], 2)
 
+    def test_migration_orders_chapters_by_book_index_not_filename(self):
+        root = Path(self.temp.name) / "chapter-order"
+        root.mkdir()
+        (root / "source.txt").write_text("First.\n\nSecond.", encoding="utf-8")
+        (root / "glossary").mkdir()
+        memory = TranslationMemory(root)
+        memory.initialize_chapter(
+            Chapter(
+                id="z_first",
+                title="First",
+                index=0,
+                source_text="First.",
+                chunks=[TextChunk(id="z_first_000", chapter_id="z_first", index=0, source_text="First.")],
+            )
+        )
+        memory.initialize_chapter(
+            Chapter(
+                id="a_second",
+                title="Second",
+                index=1,
+                source_text="Second.",
+                chunks=[TextChunk(id="a_second_000", chapter_id="a_second", index=0, source_text="Second.")],
+            )
+        )
+        project = SimpleNamespace(
+            root_dir=root,
+            source_file=root / "source.txt",
+            glossary_dir=root / "glossary",
+            memory=memory,
+        )
+        V4Migrator(project).migrate()
+        blocks = V4Database(root).list_blocks()
+        self.assertEqual([block.source_text for block in blocks], ["First.", "Second."])
+
 
 if __name__ == "__main__":
     unittest.main()

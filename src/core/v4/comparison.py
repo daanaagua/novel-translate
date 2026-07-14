@@ -14,10 +14,11 @@ def write_shadow_comparison(
     database: V4Database,
     output_path: str | Path,
     max_blocks: Optional[int] = None,
+    baseline_name: Optional[str] = None,
 ) -> Path:
     with closing(database.connect()) as connection:
         rows = connection.execute(
-            """SELECT b.legacy_id, b.chapter_title, b.global_index, b.source_text,
+            """SELECT b.id block_id, b.legacy_id, b.chapter_title, b.global_index, b.source_text,
                       serial.final_translation serial_translation,
                       v4.status v4_status, v4.final_translation v4_translation,
                       v4.warnings_json
@@ -41,6 +42,19 @@ def write_shadow_comparison(
     ]
     for row in rows:
         warnings = json.loads(row["warnings_json"] or "[]")
+        external = database.baseline_for_block(row["block_id"], baseline_name)
+        if external:
+            baseline_label = external["document"]["name"]
+            baseline_text = external["text"]
+            boundary_note = (
+                "（该文本块在原书段落内部切分；外部基线显示相交的完整段落。）"
+                if external["has_partial_boundary"]
+                else ""
+            )
+        else:
+            baseline_label = "serial_v3"
+            baseline_text = row["serial_translation"] or "（无可用基线译文）"
+            boundary_note = ""
         lines.extend(
             [
                 f"## {row['legacy_id']} · {row['chapter_title']}",
@@ -59,9 +73,11 @@ def write_shadow_comparison(
                 "",
                 row["source_text"].strip(),
                 "",
-                "### serial_v3",
+                f"### {baseline_label}",
                 "",
-                (row["serial_translation"] or "（无串行基线译文）").strip(),
+                boundary_note,
+                "" if not boundary_note else "",
+                baseline_text.strip(),
                 "",
                 "### parallel_v4",
                 "",
