@@ -307,6 +307,7 @@ def cmd_translate_v4(args):
         polish_temperature=float(polish.get("temperature", 0.2)),
         polish_max_tokens=int(polish.get("max_tokens", 6144)),
         audit_mode=args.audit_mode or settings.get("audit_mode", "full"),
+        force=args.force,
     )
     database = V4Database(project.root_dir)
     result = V4TranslationPipeline(
@@ -491,6 +492,7 @@ def main():
         help="interactive在出现新知识建议的批次后暂停；unattended自动继续",
     )
     p_translate_v4.add_argument("--no-polish", action="store_true")
+    p_translate_v4.add_argument("--force", "-f", action="store_true", help="强制重翻已完成块")
     p_translate_v4.set_defaults(func=cmd_translate_v4)
 
     p_status_v4 = subparsers.add_parser("status-v4", help="查看parallel_v4状态")

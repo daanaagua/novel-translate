@@ -231,6 +231,12 @@ class ParallelV4Tests(unittest.TestCase):
             config=V4PipelineConfig(enable_polish=False),
         ).run()
         self.assertEqual(second["completed"], 0)
+        forced = V4TranslationPipeline(
+            self.database,
+            llm_factory=FakeTranslationLLM,
+            config=V4PipelineConfig(enable_polish=False, force=True, max_blocks=1),
+        ).run()
+        self.assertEqual(forced["completed"], 1)
 
     def test_interactive_mode_pauses_only_for_a_new_decision(self):
         self.add_blocks(["The Archon spoke.", "The Archon waited."], status="ready")

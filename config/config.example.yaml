@@ -35,7 +35,7 @@ translation:
     max_tokens: 6144
   polish:
     temperature: 0.2
-    max_tokens: 6144
+    max_tokens: 37200
   memory:
     rolling_summary_max_chars: 1200
     recent_chunks: 2

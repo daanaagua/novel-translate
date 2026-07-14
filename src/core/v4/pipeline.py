@@ -41,6 +41,7 @@ class V4PipelineConfig:
     polish_max_tokens: int = 6144
     style_reference: Optional[str] = None
     audit_mode: str = "full"
+    force: bool = False
 
     def __post_init__(self) -> None:
         if self.decision_mode not in {"interactive", "unattended"}:
@@ -294,7 +295,10 @@ class V4TranslationPipeline:
                     "memory_summary": result.memory_summary or "",
                 }
             if polish_audits:
-                polish_audits[-1]["accepted"] = bool(result.final_translation)
+                polish_audits[-1]["accepted"] = bool(
+                    result.polished_translation
+                    and result.final_translation == result.polished_translation
+                )
                 polish_audits[-1]["parsed"] = {
                     "final_translation": result.final_translation or "",
                     "warnings": list(result.quality_warnings),
@@ -324,18 +328,24 @@ class V4TranslationPipeline:
         return outcomes
 
     def run(self) -> Dict[str, Any]:
-        eligible = self.database.list_blocks(
-            [
-                V4BlockStatus.READY.value,
-                V4BlockStatus.FAILED_RETRYABLE.value,
-                V4BlockStatus.NEEDS_REVALIDATE.value,
-            ]
-        )
+        eligible_statuses = [
+            V4BlockStatus.READY.value,
+            V4BlockStatus.FAILED_RETRYABLE.value,
+            V4BlockStatus.NEEDS_REVALIDATE.value,
+        ]
+        if self.config.force:
+            eligible_statuses.extend(
+                [
+                    V4BlockStatus.COMPLETED.value,
+                    V4BlockStatus.COMPLETED_WITH_WARNINGS.value,
+                ]
+            )
+        eligible = self.database.list_blocks(eligible_statuses)
         active = self.database.active_translations("parallel_v4")
         candidates = [
             block
             for block in eligible
-            if not (
+            if self.config.force or not (
                 block.id in active
                 and active[block.id]["status"]
                 in {

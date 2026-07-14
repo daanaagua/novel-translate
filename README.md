@@ -95,5 +95,6 @@ Copy-Item config\config.example.yaml config\config.yaml
 - 全书滚动摘要：最多1200个汉字。
 - 最近上下文：2个块，每块最多600个原文字符和1000个译文字符。
 - 第一层温度：0.1；第二层温度：0.2。
+- 第一层输出上限：6144；第二层输出上限：37200，以容纳高强度思考和完整润色稿。
 - 两层模型：`deepseek-v4-flash`，Thinking开启，`reasoning_effort=high`。
 
