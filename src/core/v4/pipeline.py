@@ -318,6 +318,7 @@ class V4TranslationPipeline:
                 }
                 draft_audits[-1]["parsed"] = {
                     "analysis": result.analysis or "",
+                    "semantic_obligations": result.semantic_obligations or "",
                     "translation": result.draft_translation or "",
                     "memory_summary": result.memory_summary or "",
                 }
@@ -340,6 +341,7 @@ class V4TranslationPipeline:
                 draft_translation=result.draft_translation or "",
                 final_translation=result.final_translation or "",
                 analysis=result.analysis or "",
+                semantic_obligations=result.semantic_obligations or "",
                 memory_summary=result.memory_summary or "",
                 warnings=list(result.quality_warnings),
                 term_proposals=term_proposals,

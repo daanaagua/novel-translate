@@ -171,6 +171,10 @@ class TextChunk(BaseModel):
     status: ChunkStatus = Field(ChunkStatus.PENDING)
     logic_analysis: Optional[LogicAnalysisResult] = None # Deprecated
     analysis: Optional[str] = Field(None, description="思维链/逻辑推演过程")
+    semantic_obligations: Optional[str] = Field(
+        None,
+        description="当前块必须保留的跨句关系、视角层级和显隐强度",
+    )
     draft_translation: Optional[str] = None
     polished_translation: Optional[str] = None
     final_translation: Optional[str] = None

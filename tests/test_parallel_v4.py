@@ -77,7 +77,10 @@ class FakeReferencePolishLLM:
         if purpose == "draft":
             payload = json.dumps(
                 {
-                    "analysis": "逐句核对",
+                    "analysis": "FIRST_LAYER_SELF_EVALUATION",
+                    "semantic_obligations": (
+                        "同一事件在不同感知层中呈现；保持暗示，不得直接宣布等同。"
+                    ),
                     "translation": "这是完整的第一层译文。",
                     "memory_summary": "阿尔法开始。",
                     "new_terms": [],
@@ -258,6 +261,43 @@ class ParallelV4Tests(unittest.TestCase):
         retried = self.database.resolve_human_item(queued[0]["id"], "retry")
         self.assertEqual(retried["status"], "retried")
 
+    def test_context_retrieves_grounded_prior_concept_evidence(self):
+        blocks = self.add_blocks(
+            [
+                "The scape was rendered differently for every observer.\n\nNothing else.",
+                "They waited without speaking.",
+                "She entered the scape.",
+            ],
+            status="ready",
+        )
+        self.database.import_legacy_concept(
+            "scape",
+            "拟景",
+            "concept",
+            "由计算系统生成、可按观察者分别呈现的感知环境",
+        )
+        packet = ContextBuilder(self.database, max_context_chars=5000).build(blocks[2])
+        self.assertIn("<prior_concept_evidence>", packet.rendered)
+        self.assertIn(
+            "The scape was rendered differently for every observer.",
+            packet.rendered,
+        )
+        self.assertNotIn("They waited without speaking.", packet.rendered)
+
+    def test_human_can_merge_inflected_concept_forms(self):
+        self.database.import_legacy_concept(
+            "scape", "拟景", "concept", "计算生成的感知环境"
+        )
+        self.database.import_legacy_concept(
+            "scapes", "虚拟场景", "concept", "scape的复数形式"
+        )
+        result = self.database.merge_concept_forms("scape", ["scapes"])
+        self.assertEqual(result["aliases"], ["scapes"])
+        matched = self.database.concepts_for_text("Several scapes were available.")
+        self.assertEqual(len(matched), 1)
+        self.assertEqual(matched[0]["source"], "scape")
+        self.assertIn("scapes", matched[0]["forms"])
+
     def test_parallel_pipeline_commits_at_barrier_and_can_export(self):
         self.add_blocks(["The Archon spoke.", "The hall answered."], status="ready")
         result = V4TranslationPipeline(
@@ -353,6 +393,8 @@ class ParallelV4Tests(unittest.TestCase):
         polish = next(call for call in fake.calls if call["purpose"] == "polish")
         self.assertIn("旧译文供逐句查漏。", polish["messages"][-1]["content"])
         self.assertIn("逐句查漏和比较措辞", polish["messages"][-1]["content"])
+        self.assertIn("同一事件在不同感知层中呈现", polish["messages"][-1]["content"])
+        self.assertNotIn("FIRST_LAYER_SELF_EVALUATION", polish["messages"][-1]["content"])
         final = self.database.active_translations()[block.id]["final_translation"]
         self.assertEqual(final, "“这是综合两稿后的完整译文。”")
         with closing(self.database.connect()) as connection:

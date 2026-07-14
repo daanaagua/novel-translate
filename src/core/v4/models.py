@@ -114,6 +114,7 @@ class TranslationOutcome:
     draft_translation: str = ""
     final_translation: str = ""
     analysis: str = ""
+    semantic_obligations: str = ""
     memory_summary: str = ""
     warnings: List[str] = field(default_factory=list)
     term_proposals: List[Dict[str, Any]] = field(default_factory=list)

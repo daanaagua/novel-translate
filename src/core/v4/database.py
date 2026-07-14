@@ -13,7 +13,7 @@ from typing import Any, Dict, Iterable, Iterator, List, Optional, Sequence
 from .models import ScanOutcome, TranslationOutcome, V4Block, V4BlockStatus
 
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 
 
 def utc_now() -> str:
@@ -230,6 +230,7 @@ class V4Database:
                     draft_translation TEXT NOT NULL DEFAULT '',
                     final_translation TEXT NOT NULL DEFAULT '',
                     analysis TEXT NOT NULL DEFAULT '',
+                    semantic_obligations TEXT NOT NULL DEFAULT '',
                     memory_summary TEXT NOT NULL DEFAULT '',
                     warnings_json TEXT NOT NULL DEFAULT '[]',
                     active INTEGER NOT NULL DEFAULT 1,
@@ -440,6 +441,17 @@ class V4Database:
             if "subject_form" not in claim_columns:
                 connection.execute(
                     "ALTER TABLE claims ADD COLUMN subject_form TEXT NOT NULL DEFAULT ''"
+                )
+            translation_columns = {
+                row[1]
+                for row in connection.execute(
+                    "PRAGMA table_info(translation_versions)"
+                ).fetchall()
+            }
+            if "semantic_obligations" not in translation_columns:
+                connection.execute(
+                    """ALTER TABLE translation_versions
+                       ADD COLUMN semantic_obligations TEXT NOT NULL DEFAULT ''"""
                 )
             vote_columns = {
                 row[1]
@@ -1033,6 +1045,154 @@ class V4Database:
             "affected_translations": len(affected_rows),
         }
 
+    def merge_concept_forms(
+        self,
+        canonical_source: str,
+        aliases: Sequence[str],
+    ) -> Dict[str, Any]:
+        """Human-confirmed merge of inflections or spelling variants.
+
+        Automatic reconciliation intentionally remains exact-only.  This method
+        supplies the explicit human decision needed to join forms such as a
+        singular and plural without teaching the scanner unsafe alias guesses.
+        """
+        canonical_source = canonical_source.strip()
+        alias_values = [value.strip() for value in aliases if value.strip()]
+        if not canonical_source or not alias_values:
+            raise ValueError("合并概念词形时必须提供核心词形和至少一个别名")
+        canonical_id = stable_id(
+            "concept", normalize_english_form(canonical_source)
+        )
+        with self.transaction() as connection:
+            canonical = connection.execute(
+                """SELECT * FROM concepts
+                   WHERE id=? AND retired_version IS NULL""",
+                (canonical_id,),
+            ).fetchone()
+            if canonical is None:
+                raise KeyError(f"核心概念不存在: {canonical_source}")
+            version = self.create_knowledge_version(
+                f"human merge concept forms: {canonical_source}", connection
+            )
+            merged_ids: List[str] = []
+            affected_translation_ids: set[int] = set()
+            for alias in dict.fromkeys(alias_values):
+                normalized_alias = normalize_english_form(alias)
+                alias_id = stable_id("concept", normalized_alias)
+                connection.execute(
+                    """INSERT OR IGNORE INTO source_forms(
+                           concept_id, form, normalized_form, grammar_json
+                       ) VALUES(?, ?, ?, '{}')""",
+                    (canonical_id, alias, normalized_alias),
+                )
+                if alias_id == canonical_id:
+                    continue
+                alias_concept = connection.execute(
+                    """SELECT id FROM concepts
+                       WHERE id=? AND retired_version IS NULL""",
+                    (alias_id,),
+                ).fetchone()
+                if alias_concept is None:
+                    continue
+                for form in connection.execute(
+                    """SELECT form, normalized_form, grammar_json
+                       FROM source_forms WHERE concept_id=?""",
+                    (alias_id,),
+                ).fetchall():
+                    connection.execute(
+                        """INSERT OR IGNORE INTO source_forms(
+                               concept_id, form, normalized_form, grammar_json
+                           ) VALUES(?, ?, ?, ?)""",
+                        (
+                            canonical_id,
+                            form["form"],
+                            form["normalized_form"],
+                            form["grammar_json"],
+                        ),
+                    )
+                dependent_rows = connection.execute(
+                    """SELECT DISTINCT translation_id FROM dependencies
+                       WHERE dependency_type='concept' AND dependency_id=?""",
+                    (alias_id,),
+                ).fetchall()
+                for dependent in dependent_rows:
+                    translation_id = int(dependent["translation_id"])
+                    affected_translation_ids.add(translation_id)
+                    connection.execute(
+                        """INSERT OR IGNORE INTO dependencies(
+                               translation_id, dependency_type, dependency_id,
+                               knowledge_version
+                           ) SELECT translation_id, dependency_type, ?, ?
+                             FROM dependencies
+                            WHERE translation_id=? AND dependency_type='concept'
+                              AND dependency_id=?""",
+                        (
+                            canonical_id,
+                            version,
+                            translation_id,
+                            alias_id,
+                        ),
+                    )
+                connection.execute(
+                    "DELETE FROM dependencies WHERE dependency_type='concept' AND dependency_id=?",
+                    (alias_id,),
+                )
+                connection.execute(
+                    "UPDATE mentions SET concept_id=? WHERE concept_id=?",
+                    (canonical_id, alias_id),
+                )
+                connection.execute(
+                    "DELETE FROM source_forms WHERE concept_id=?",
+                    (alias_id,),
+                )
+                connection.execute(
+                    """UPDATE rendering_rules SET retired_version=?
+                       WHERE concept_id=? AND retired_version IS NULL""",
+                    (version, alias_id),
+                )
+                connection.execute(
+                    """UPDATE concepts SET status='merged', retired_version=?
+                       WHERE id=?""",
+                    (version, alias_id),
+                )
+                connection.execute(
+                    """UPDATE verification_tasks
+                       SET status='resolved', resolved_at=?
+                       WHERE subject_type='concept' AND subject_id=?
+                         AND status IN ('open','needs_human')""",
+                    (utc_now(), alias_id),
+                )
+                merged_ids.append(alias_id)
+            if affected_translation_ids:
+                placeholders = ",".join("?" for _ in affected_translation_ids)
+                rows = connection.execute(
+                    f"""SELECT id, block_id FROM translation_versions
+                        WHERE id IN ({placeholders}) AND active=1
+                          AND pipeline='parallel_v4'""",
+                    list(affected_translation_ids),
+                ).fetchall()
+                for row in rows:
+                    connection.execute(
+                        "UPDATE translation_versions SET status=? WHERE id=?",
+                        (V4BlockStatus.NEEDS_REVALIDATE.value, row["id"]),
+                    )
+                    connection.execute(
+                        "UPDATE blocks SET status=?, updated_at=? WHERE id=?",
+                        (
+                            V4BlockStatus.NEEDS_REVALIDATE.value,
+                            utc_now(),
+                            row["block_id"],
+                        ),
+                    )
+        return {
+            "canonical_id": canonical_id,
+            "canonical_source": canonical_source,
+            "aliases": list(dict.fromkeys(alias_values)),
+            "merged_concept_ids": merged_ids,
+            "knowledge_version": version,
+            "affected_translations": len(affected_translation_ids),
+        }
+
     def import_legacy_translation(
         self,
         block_id: str,
@@ -1123,6 +1283,86 @@ class V4Database:
                 )
             return list(matched.values())
 
+    def prior_concept_source_evidence(
+        self,
+        block: V4Block,
+        concepts: Sequence[Dict[str, Any]],
+        max_chars: int = 3600,
+        max_paragraphs_per_concept: int = 2,
+    ) -> List[Dict[str, Any]]:
+        """Retrieve grounded prior paragraphs for concepts used by the current block.
+
+        The earliest occurrence often defines a coined term; the latest occurrence
+        shows its current use.  Keeping both is more reliable than asking a rolling
+        plot summary to preserve every world-mechanism detail.
+        """
+        import re
+
+        if not concepts or max_chars <= 0 or max_paragraphs_per_concept <= 0:
+            return []
+        with closing(self.connect()) as connection:
+            rows = connection.execute(
+                """SELECT legacy_id, global_index, source_text
+                   FROM blocks
+                   WHERE source_edition_id=? AND global_index<?
+                   ORDER BY global_index""",
+                (block.source_edition_id, block.global_index),
+            ).fetchall()
+
+        results: List[Dict[str, Any]] = []
+        seen_paragraphs: set[tuple[int, int]] = set()
+        used_chars = 0
+        for concept in concepts:
+            forms = sorted(
+                {str(form).strip() for form in concept.get("forms", []) if str(form).strip()},
+                key=len,
+                reverse=True,
+            )
+            if not forms:
+                continue
+            patterns = [
+                re.compile(rf"(?<!\w){re.escape(form)}(?!\w)", re.IGNORECASE)
+                for form in forms
+            ]
+            matches: List[Dict[str, Any]] = []
+            for row in rows:
+                paragraphs = [
+                    part.strip()
+                    for part in re.split(r"\n\s*\n", row["source_text"].strip())
+                    if part.strip()
+                ]
+                for paragraph_index, paragraph in enumerate(paragraphs):
+                    if any(pattern.search(paragraph) for pattern in patterns):
+                        matches.append(
+                            {
+                                "concept_id": concept["id"],
+                                "concept_source": concept["source"],
+                                "legacy_id": row["legacy_id"],
+                                "global_index": int(row["global_index"]),
+                                "paragraph_id": f"P{paragraph_index:03d}",
+                                "source_text": paragraph,
+                            }
+                        )
+            if not matches:
+                continue
+            selected = [matches[0]]
+            for candidate in reversed(matches[1:]):
+                if len(selected) >= max_paragraphs_per_concept:
+                    break
+                selected.append(candidate)
+            selected.sort(key=lambda item: (item["global_index"], item["paragraph_id"]))
+            for item in selected:
+                paragraph_key = (item["global_index"], int(item["paragraph_id"][1:]))
+                if paragraph_key in seen_paragraphs:
+                    continue
+                added_chars = len(item["source_text"])
+                if results and used_chars + added_chars > max_chars:
+                    return results
+                results.append(item)
+                seen_paragraphs.add(paragraph_key)
+                used_chars += added_chars
+        return results
+
     def commit_translation_batch(
         self,
         run_id: str,
@@ -1149,13 +1389,15 @@ class V4Database:
                 cursor = connection.execute(
                     """INSERT INTO translation_versions(
                            block_id, pipeline, run_id, knowledge_version, status,
-                           draft_translation, final_translation, analysis, memory_summary,
-                           warnings_json, active, created_at
-                       ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?)""",
+                           draft_translation, final_translation, analysis,
+                           semantic_obligations, memory_summary, warnings_json,
+                           active, created_at
+                       ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?)""",
                     (
                         outcome.block.id, pipeline, run_id, outcome.knowledge_version,
                         outcome.status, outcome.draft_translation, outcome.final_translation,
-                        outcome.analysis, outcome.memory_summary,
+                        outcome.analysis, outcome.semantic_obligations,
+                        outcome.memory_summary,
                         json.dumps(outcome.warnings, ensure_ascii=False), utc_now(),
                     ),
                 )
@@ -2061,9 +2303,10 @@ class V4Database:
             cursor = connection.execute(
                 """INSERT INTO translation_versions(
                        block_id, pipeline, run_id, knowledge_version, status,
-                       draft_translation, final_translation, analysis, memory_summary,
-                       warnings_json, active, created_at
-                   ) VALUES(?, 'parallel_v4', ?, ?, 'completed', ?, ?, ?, ?, '[]', 1, ?)""",
+                       draft_translation, final_translation, analysis,
+                       semantic_obligations, memory_summary, warnings_json,
+                       active, created_at
+                    ) VALUES(?, 'parallel_v4', ?, ?, 'completed', ?, ?, ?, ?, ?, '[]', 1, ?)""",
                 (
                     task["block_id"],
                     run_id,
@@ -2071,6 +2314,7 @@ class V4Database:
                     previous["draft_translation"],
                     final_translation,
                     previous["analysis"],
+                    previous["semantic_obligations"],
                     previous["memory_summary"],
                     utc_now(),
                 ),

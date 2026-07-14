@@ -55,6 +55,7 @@ class TranslationEngine:
         import re
         result = {
             "analysis": "",
+            "semantic_obligations": "",
             "translation": "",
             "memory_summary": "",
             "new_terms": [],
@@ -67,6 +68,9 @@ class TranslationEngine:
             return match.group(1).strip() if match else ""
 
         result["analysis"] = get_tag_content("analysis", text)
+        result["semantic_obligations"] = get_tag_content(
+            "semantic_obligations", text
+        )
         result["translation"] = get_tag_content("translation", text)
         result["memory_summary"] = get_tag_content("memory_summary", text)
         
@@ -212,6 +216,9 @@ class TranslationEngine:
                         response_data["analysis"] = response_data["thinking"]
                 
                 chunk.analysis = response_data.get("analysis", "")
+                chunk.semantic_obligations = response_data.get(
+                    "semantic_obligations", ""
+                )
                 chunk.draft_translation = response_data.get("translation", "")
                 chunk.memory_summary = response_data.get("memory_summary", "")
                 
@@ -250,7 +257,7 @@ class TranslationEngine:
                 polish_gen = self._polish_translate(
                     source_text=chunk.source_text,
                     draft_translation=chunk.draft_translation,
-                    analysis=chunk.analysis or "",
+                    semantic_obligations=chunk.semantic_obligations or "",
                     memory_context=memory_context or previous_summary or "",
                     comparison_reference=comparison_reference or "",
                 )
@@ -287,7 +294,7 @@ class TranslationEngine:
                     retry_gen = self._polish_translate(
                         source_text=chunk.source_text,
                         draft_translation=chunk.draft_translation or "",
-                        analysis=chunk.analysis or "",
+                        semantic_obligations=chunk.semantic_obligations or "",
                         memory_context=memory_context or previous_summary or "",
                         comparison_reference=comparison_reference or "",
                         retry_reason="；".join(polish_problems),
@@ -645,7 +652,7 @@ class TranslationEngine:
         self,
         source_text: str,
         draft_translation: str,
-        analysis: str = "",
+        semantic_obligations: str = "",
         memory_context: str = "",
         comparison_reference: str = "",
         retry_reason: str = "",
@@ -682,13 +689,14 @@ class TranslationEngine:
         # 构建 User Prompt
         user_template = self.prompts.get("polish", {}).get("user", 
             "## 原文\n{source_text}\n\n## 初译稿\n{draft_translation}"
+            "\n\n## 必须保留的语义义务\n{semantic_obligations}"
             "\n\n## 旧译文对照\n{comparison_reference}"
             "\n\n旧译文只用于逐句查漏和比较措辞，英文原文是唯一事实依据。"
             "请综合两稿各自较好的部分，输出最终译文。")
         user_prompt = user_template.format(
             source_text=source_text,
             draft_translation=draft_translation,
-            analysis=analysis,
+            semantic_obligations=semantic_obligations or "（无特殊语义义务）",
             memory_context=memory_context,
             comparison_reference=comparison_reference or "（无旧译文对照）",
         )
@@ -740,6 +748,7 @@ class TranslationEngine:
         return {
             "source": source_text,
             "analysis": result_chunk.analysis,
+            "semantic_obligations": result_chunk.semantic_obligations,
             "draft": result_chunk.draft_translation,
             "final": result_chunk.final_translation
         }
@@ -752,8 +761,9 @@ class TranslationEngine:
 1. **术语一致**：严格遵守提供的术语表规则。
 2. **逻辑准确**：识别从句依附、指代、比较对象、观察者视角和因果关系，不得把尚未揭示的信息擅自讲明。
 3. **科学准确**：物理概念、计量单位、空间关系和人造术语优先于辞藻；不确定处在 analysis 中简短注明。
-4. **记忆更新**：根据旧摘要和本段，输出一份不超过1200个汉字、可以独立替代旧摘要的全书滚动摘要。只记录已经明示的事实、人物状态、概念定义和未解决问题。
-5. **格式严格**：必须输出合法的 XML 格式。
+4. **语义义务**：识别跨句指代、同一事件的不同呈现、现实层或感知层切换，以及关系的显隐强度；不要在其中评价初稿或决定具体措辞。
+5. **记忆更新**：根据旧摘要和本段，输出一份不超过1200个汉字、可以独立替代旧摘要的全书滚动摘要。只记录已经明示的事实、人物状态、概念定义和未解决问题。
+6. **格式严格**：必须输出合法的 XML 格式。
 
 ## 术语表 (仅参考)
 {glossary_rules}
@@ -767,6 +777,10 @@ class TranslationEngine:
     <analysis>
     这里写下你的思考过程。1. 分析难句结构... 2. 确认代词指代... 3. 决定意译策略...
     </analysis>
+
+    <semantic_obligations>
+    必须保留的跨句关系、视角或呈现层切换及其显隐强度；没有则写“无”
+    </semantic_obligations>
     
     <translation>
     忠实、通顺的第一层中文译文（保持原文分段）
@@ -787,7 +801,7 @@ class TranslationEngine:
     
     def _default_polish_system(self) -> str:
         """默认润色 System Prompt"""
-        return """你是第二层中文定稿译者。请逐句对照英文原文、第一层译稿和分析提示，输出准确而自然的最终译文。
+        return """你是独立的第二层中文定稿译者。请逐句对照英文原文、前文证据、语义义务和第一层候选稿，输出准确而自然的最终译文。
 
 ## 核心优化原则
 
@@ -797,6 +811,8 @@ class TranslationEngine:
 4. 中文应清楚、克制、有文学节奏，避免无依据的古雅化、诗化和增添形容词。
 5. 外层引语统一使用“……”，嵌套引语使用‘……’，不得使用「……」或『……』。
 6. 若提供旧译文对照，只能用于逐句查漏和比较措辞；英文原文是唯一事实依据，不得整段照抄或机械二选一。
+7. 中文读者必须能够恢复原文的跨句关系、视角层级和隐含对应；原文只作暗示时，不得直接宣布谜底。
+8. 第一层译文是不可信的候选稿，必须独立核验，不得默认采纳。
 
 ## 铁律（不可违反）
 1. **禁止修改人名、地名、专有名词**：它们已在直译阶段被锁定。

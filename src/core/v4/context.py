@@ -31,7 +31,8 @@ class ContextBuilder:
         rendered = []
         for concept in concepts:
             lines = [
-                f"- {concept['source']} → "
+                f"- {concept['source']}",
+                "  核心译名: "
                 + (
                     "（高影响项待核验，不提供候选译法）"
                     if concept.get("verification_pending")
@@ -40,7 +41,7 @@ class ContextBuilder:
                 f"  concept_id: {concept['id']}",
             ]
             if concept.get("description"):
-                lines.append(f"  说明: {concept['description']}")
+                lines.append(f"  概念含义: {concept['description']}")
             for rule in concept.get("rules", []):
                 condition = rule.get("condition") or {}
                 lines.append(
@@ -48,6 +49,19 @@ class ContextBuilder:
                 )
             rendered.append("\n".join(lines))
         return "\n".join(rendered)
+
+    @staticmethod
+    def _render_prior_concept_evidence(evidence: List[dict]) -> str:
+        if not evidence:
+            return "（没有命中的前文概念证据）"
+        return "\n\n".join(
+            (
+                f"- [{item['legacy_id']} {item['paragraph_id']}] "
+                f"与 {item['concept_source']} 相关的前文原文：\n"
+                f"  {item['source_text']}"
+            )
+            for item in evidence
+        )
 
     def build(
         self,
@@ -60,13 +74,19 @@ class ContextBuilder:
         version = knowledge_version or self.database.current_knowledge_version()
         concepts = self.database.concepts_for_text(block.source_text)
         claims = self.database.claims_for_block(block)
+        prior_evidence = self.database.prior_concept_source_evidence(block, concepts)
         parts = [
             "<translation_constraints>",
             "只使用当前位置可知的信息；不得根据后文推断身份、性别或谜底。",
+            "概念含义用于理解世界机制，不得把定义逐字扩写进正文；核心译名可按中文句法添加方位、所属、量词等成分。",
             self._render_concepts(concepts),
             "可用的保守翻译约束：",
             *(f"- {claim['statement']}" for claim in claims),
             "</translation_constraints>",
+            "<prior_concept_evidence>",
+            "以下是当前概念在当前位置之前的原文用例，只用于恢复已明示的机制和用法，不构成后文解释：",
+            self._render_prior_concept_evidence(prior_evidence),
+            "</prior_concept_evidence>",
         ]
         if local_summary:
             parts.extend(["<island_summary>", local_summary, "</island_summary>"])
