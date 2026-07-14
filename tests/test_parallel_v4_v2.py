@@ -383,6 +383,8 @@ class ParallelV4V2Tests(unittest.TestCase):
             page = urlopen(f"http://{host}:{port}/").read().decode("utf-8")
             self.assertIn('oninput="saveVoteDraft()"', page)
             self.assertIn("localStorage.setItem(DRAFT_KEY", page)
+            self.assertIn("保存理由/更新评价", page)
+            self.assertIn("saveCurrentVote()", page)
             block = self.database.list_blocks()[0]
             blind = json.loads(
                 urlopen(
