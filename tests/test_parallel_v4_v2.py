@@ -313,6 +313,11 @@ class ParallelV4V2Tests(unittest.TestCase):
         self.assertNotIn("未批准的注释", annotated_text)
 
     def test_web_server_is_loopback_and_post_requires_token(self):
+        docx = self.root / "web-baseline.docx"
+        self.write_docx(docx, ["阿尔法开始。", "贝塔继续。", "伽马结束。"])
+        DocxBaselineImporter(self.database, self.project).import_docx(
+            docx, name="web_baseline"
+        )
         server = create_review_server(self.database, port=0)
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()
@@ -322,6 +327,16 @@ class ParallelV4V2Tests(unittest.TestCase):
             state = json.loads(urlopen(f"http://{host}:{port}/api/state").read())
             self.assertIn("blocks", state)
             block = self.database.list_blocks()[0]
+            detail = json.loads(
+                urlopen(
+                    f"http://{host}:{port}/api/block?id={block.id}&blind=1"
+                ).read()
+            )
+            self.assertFalse(detail["blind_available"])
+            self.assertEqual(detail["candidates"][0]["origin"], "web_baseline")
+            self.assertEqual(
+                detail["candidates"][1]["origin"], "parallel_v4（尚未生成）"
+            )
             payload = json.dumps(
                 {"block": block.id, "paragraph_index": 0, "body": "测试注释"}
             ).encode()

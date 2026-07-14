@@ -47,7 +47,7 @@ function renderTasks(verify,repair){const root=document.querySelector('#tasks');
 function renderBlocks(rows){const root=document.querySelector('#blocks');root.innerHTML='';for(const b of rows){const c=document.createElement('div');c.className='card block';c.onclick=()=>loadBlock(b.legacy_id,true);c.innerHTML=`<h3></h3><span class="pill"></span>`;c.querySelector('h3').textContent=`${b.legacy_id} · ${b.chapter_title}`;c.querySelector('.pill').textContent=b.translation_status||b.status;root.append(c)}}
 async function queueAction(id,action){try{await api(`/api/queue/${id}`,{method:'POST',body:JSON.stringify({action})});await loadState()}catch(e){alert(e.message)}}
 async function editAccept(id){const replacement=prompt('输入替换后的译法或声明：');if(!replacement)return;try{await api(`/api/queue/${id}`,{method:'POST',body:JSON.stringify({action:'accept',replacement})});await loadState()}catch(e){alert(e.message)}}
-async function loadBlock(id,blind=true){currentBlock=id;revealed=!blind;const d=await api(`/api/block?id=${encodeURIComponent(id)}&blind=${blind?'1':'0'}`);document.querySelector('#empty').hidden=true;document.querySelector('#detail').hidden=false;escText(document.querySelector('#blockTitle'),`${d.legacy_id} · ${d.chapter_title}`);const warnings=JSON.parse(d.warnings_json||'[]');escText(document.querySelector('#blockMeta'),`${d.v4_status||d.status} · global_index=${d.global_index}${warnings.length?' · 警告：'+warnings.join('；'):''}`);escText(document.querySelector('#source'),d.source_text);const cr=document.querySelector('#candidates');cr.innerHTML='';for(const x of d.candidates){const box=document.createElement('div');box.innerHTML='<h3></h3><div class="prose"></div>';box.querySelector('h3').textContent=x.label+(x.origin?` · ${x.origin}`:'');box.querySelector('.prose').textContent=x.text||'（无译文）';cr.append(box)}const er=document.querySelector('#evidence');er.innerHTML='';for(const e of d.evidence){const c=document.createElement('div');c.className='card';c.textContent=`[${e.kind}] ${e.paragraph_id}: ${e.evidence_quote}`;er.append(c)}renderAnnotations(d.annotations);document.querySelector('#revealBtn').onclick=()=>loadBlock(id,revealed);document.querySelector('#revealBtn').textContent=revealed?'恢复盲评':'揭示来源'}
+async function loadBlock(id,blind=true){currentBlock=id;const d=await api(`/api/block?id=${encodeURIComponent(id)}&blind=${blind?'1':'0'}`);revealed=d.blind_available?!blind:true;document.querySelector('#empty').hidden=true;document.querySelector('#detail').hidden=false;escText(document.querySelector('#blockTitle'),`${d.legacy_id} · ${d.chapter_title}`);const warnings=JSON.parse(d.warnings_json||'[]');escText(document.querySelector('#blockMeta'),`${d.v4_status||d.status} · global_index=${d.global_index}${warnings.length?' · 警告：'+warnings.join('；'):''}`);escText(document.querySelector('#source'),d.source_text);const cr=document.querySelector('#candidates');cr.innerHTML='';for(const x of d.candidates){const box=document.createElement('div');box.innerHTML='<h3></h3><div class="prose"></div>';box.querySelector('h3').textContent=x.label+(x.origin?` · ${x.origin}`:'');box.querySelector('.prose').textContent=x.text||'（无译文）';cr.append(box)}const er=document.querySelector('#evidence');er.innerHTML='';for(const e of d.evidence){const c=document.createElement('div');c.className='card';c.textContent=`[${e.kind}] ${e.paragraph_id}: ${e.evidence_quote}`;er.append(c)}renderAnnotations(d.annotations);const reveal=document.querySelector('#revealBtn');reveal.hidden=!d.blind_available;reveal.onclick=()=>loadBlock(id,revealed);reveal.textContent=revealed?'恢复盲评':'揭示来源'}
 function renderAnnotations(rows){const root=document.querySelector('#annotations');root.innerHTML='';for(const a of rows){const c=document.createElement('div');c.className='card';c.textContent=`P${a.paragraph_index} [${a.status}] ${a.body}`;if(a.status==='proposed'){for(const action of ['approve','reject']){const b=document.createElement('button');b.textContent=action==='approve'?'批准':'拒绝';b.onclick=()=>resolveAnnotation(a.id,action);c.append(b)}}root.append(c)}}
 async function resolveAnnotation(id,action){await api(`/api/annotations/${id}`,{method:'POST',body:JSON.stringify({action})});await loadBlock(currentBlock,!revealed)}
 async function addAnnotation(){const paragraph_index=Number(document.querySelector('#annIndex').value);const body=document.querySelector('#annBody').value;await api('/api/annotations',{method:'POST',body:JSON.stringify({block:currentBlock,paragraph_index,body})});document.querySelector('#annBody').value='';await loadBlock(currentBlock,!revealed)}
@@ -141,21 +141,41 @@ def create_review_server(database: V4Database, port: int = 8765):
                     blind = (query.get("blind") or ["1"])[0] != "0"
                     data = database.get_review_block(identifier)
                     baseline = data.pop("baseline", None)
-                    candidates = [
-                        {"origin": "parallel_v4", "text": data.get("v4_translation") or ""},
-                        {
-                            "origin": (baseline or {}).get("document", {}).get("name", "serial_v3"),
-                            "text": (baseline or {}).get("text")
-                            or data.get("serial_translation")
-                            or "",
-                        },
-                    ]
-                    if int(hashlib.sha256(data["id"].encode()).hexdigest(), 16) % 2:
-                        candidates.reverse()
-                    for index, candidate in enumerate(candidates):
-                        candidate["label"] = chr(ord("A") + index)
-                        if blind:
-                            candidate.pop("origin", None)
+                    baseline_candidate = {
+                        "origin": (baseline or {}).get("document", {}).get(
+                            "name", "serial_v3"
+                        ),
+                        "text": (baseline or {}).get("text")
+                        or data.get("serial_translation")
+                        or "",
+                    }
+                    v4_candidate = {
+                        "origin": "parallel_v4",
+                        "text": data.get("v4_translation") or "",
+                    }
+                    blind_available = bool(
+                        baseline_candidate["text"].strip()
+                        and v4_candidate["text"].strip()
+                    )
+                    if blind_available:
+                        candidates = [v4_candidate, baseline_candidate]
+                        if int(hashlib.sha256(data["id"].encode()).hexdigest(), 16) % 2:
+                            candidates.reverse()
+                        for index, candidate in enumerate(candidates):
+                            candidate["label"] = chr(ord("A") + index)
+                            if blind:
+                                candidate.pop("origin", None)
+                    else:
+                        # 只有一个实际候选时不能进行盲评，否则候选会在A/B间
+                        # 交替，看起来像译文错位。固定显示基线在左、V4在右。
+                        baseline_candidate["label"] = "旧译文基线"
+                        v4_candidate["label"] = "parallel_v4"
+                        if not baseline_candidate["text"].strip():
+                            baseline_candidate["origin"] += "（尚无译文）"
+                        if not v4_candidate["text"].strip():
+                            v4_candidate["origin"] += "（尚未生成）"
+                        candidates = [baseline_candidate, v4_candidate]
+                    data["blind_available"] = blind_available
                     data["candidates"] = candidates
                     data.pop("v4_translation", None)
                     data.pop("serial_translation", None)
