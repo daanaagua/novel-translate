@@ -13,7 +13,7 @@ from src.core.v4.exporter import ParallelV4BookExporter
 from src.core.v4.migration import V4Migrator
 from src.core.v4.models import ScanOutcome, ScanResponse
 from src.core.v4.pipeline import V4PipelineConfig, V4TranslationPipeline
-from src.core.v4.scanner import V4Scanner
+from src.core.v4.scanner import ScanProtocolError, V4Scanner
 from src.core.v4.validation import V4Validator
 
 
@@ -191,6 +191,42 @@ class ParallelV4Tests(unittest.TestCase):
             ).fetchall()
         self.assertEqual(concepts[0]["concept_id"], concepts[1]["concept_id"])
         self.assertNotEqual(concepts[0]["concept_id"], concepts[2]["concept_id"])
+
+    def test_scan_repairs_only_uniquely_mislocated_evidence(self):
+        response = ScanResponse.model_validate(
+            {
+                "mentions": [
+                    {
+                        "paragraph_id": "P000",
+                        "source_form": "Zak",
+                        "evidence_quote": "Zak",
+                    }
+                ],
+                "ambiguities": [],
+            }
+        )
+        paragraphs = {"P000": "No name here.", "P001": "Zak answered."}
+        V4Scanner._repair_unique_evidence_locations(response, paragraphs)
+        self.assertEqual(response.mentions[0].paragraph_id, "P001")
+        V4Scanner._validate_evidence(response, paragraphs)
+
+        ambiguous = ScanResponse.model_validate(
+            {
+                "mentions": [
+                    {
+                        "paragraph_id": "P000",
+                        "source_form": "Zak",
+                        "evidence_quote": "Zak",
+                    }
+                ],
+                "ambiguities": [],
+            }
+        )
+        duplicate_paragraphs = {"P001": "Zak answered.", "P002": "Zak left."}
+        V4Scanner._repair_unique_evidence_locations(ambiguous, duplicate_paragraphs)
+        self.assertEqual(ambiguous.mentions[0].paragraph_id, "P000")
+        with self.assertRaises(ScanProtocolError):
+            V4Scanner._validate_evidence(ambiguous, duplicate_paragraphs)
 
     def test_context_only_injects_matched_terms_and_overflow_is_terminal_for_worker(self):
         blocks = self.add_blocks(["The Archon spoke.", "Nothing happened."], status="ready")

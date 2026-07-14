@@ -116,6 +116,28 @@ class V4Scanner:
                     f"证据不在 {item.paragraph_id} 原文中: {item.evidence_quote!r}"
                 )
 
+    @staticmethod
+    def _repair_unique_evidence_locations(
+        response: ScanResponse, paragraphs: Dict[str, str]
+    ) -> None:
+        """Repair a wrong paragraph locator only when the quote has one exact home."""
+        normalized_paragraphs = {
+            paragraph_id: " ".join(paragraph.split())
+            for paragraph_id, paragraph in paragraphs.items()
+        }
+        for item in [*response.mentions, *response.ambiguities]:
+            quote = " ".join(item.evidence_quote.split())
+            declared = normalized_paragraphs.get(item.paragraph_id, "")
+            if quote in declared:
+                continue
+            matches = [
+                paragraph_id
+                for paragraph_id, paragraph in normalized_paragraphs.items()
+                if quote in paragraph
+            ]
+            if len(matches) == 1:
+                item.paragraph_id = matches[0]
+
     def scan_block(self, block: V4Block) -> ScanOutcome:
         paragraphs = paragraph_map(block.source_text)
         request = {
@@ -161,6 +183,7 @@ class V4Scanner:
                 )
                 data = json.loads(self._clean_json(last_raw))
                 response = ScanResponse.model_validate(data)
+                self._repair_unique_evidence_locations(response, paragraphs)
                 self._validate_evidence(response, paragraphs)
                 audit_calls.append(
                     {
