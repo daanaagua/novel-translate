@@ -316,10 +316,34 @@ class ParallelV4Tests(unittest.TestCase):
         self.assertEqual(result["completed"], 1)
         polish = next(call for call in fake.calls if call["purpose"] == "polish")
         self.assertIn("旧译文供逐句查漏。", polish["messages"][-1]["content"])
-        self.assertIn("原样保留", polish["messages"][0]["content"])
-        self.assertIn("不得为了替换同义词", polish["messages"][-1]["content"])
+        self.assertIn("逐句查漏和比较措辞", polish["messages"][-1]["content"])
         final = self.database.active_translations()[block.id]["final_translation"]
         self.assertEqual(final, "“这是综合两稿后的完整译文。”")
+
+    def test_polish_falls_back_to_aligned_serial_translation(self):
+        block = self.add_blocks(["Alpha begins."], status="ready")[0]
+        with self.database.transaction() as connection:
+            connection.execute(
+                """INSERT INTO translation_versions(
+                       block_id, pipeline, knowledge_version, status,
+                       draft_translation, final_translation, active, created_at
+                   ) VALUES(?, 'serial_v3', 1, 'completed', ?, ?, 1, 'now')""",
+                (block.id, "串行旧稿供对照。", "串行旧稿供对照。"),
+            )
+        fake = FakeReferencePolishLLM()
+        result = V4TranslationPipeline(
+            self.database,
+            llm_factory=lambda: fake,
+            config=V4PipelineConfig(
+                island_size=1,
+                initial_workers=1,
+                max_workers=1,
+                use_baseline_reference=True,
+            ),
+        ).run()
+        self.assertEqual(result["completed"], 1)
+        polish = next(call for call in fake.calls if call["purpose"] == "polish")
+        self.assertIn("串行旧稿供对照。", polish["messages"][-1]["content"])
 
     def test_force_run_can_target_specific_block_ids(self):
         blocks = self.add_blocks(["First block.", "Second block."], status="ready")

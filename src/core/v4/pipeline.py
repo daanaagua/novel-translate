@@ -257,13 +257,9 @@ class V4TranslationPipeline:
             proposal_start = len(proposals)
             comparison_reference = ""
             if self.config.use_baseline_reference:
-                baseline = self.database.baseline_for_block(block.id)
-                if (
-                    baseline
-                    and not baseline.get("has_partial_boundary")
-                    and not baseline.get("has_ambiguous_alignment")
-                ):
-                    comparison_reference = str(baseline.get("text") or "").strip()
+                reference = self.database.comparison_reference_for_block(block.id)
+                if reference:
+                    comparison_reference = str(reference.get("text") or "").strip()
                 if (
                     comparison_reference
                     and packet.required_chars + len(comparison_reference)

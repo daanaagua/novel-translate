@@ -1564,6 +1564,35 @@ class V4Database:
                 ),
             }
 
+    def comparison_reference_for_block(
+        self,
+        block_id: str,
+        baseline_name: Optional[str] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """返回与当前文本块严格对齐的外部基线或串行译文。"""
+        baseline = self.baseline_for_block(block_id, baseline_name)
+        if (
+            baseline
+            and not baseline.get("has_partial_boundary")
+            and not baseline.get("has_ambiguous_alignment")
+            and str(baseline.get("text") or "").strip()
+        ):
+            return {
+                "origin": baseline["document"]["name"],
+                "text": str(baseline["text"]).strip(),
+            }
+        with closing(self.connect()) as connection:
+            row = connection.execute(
+                """SELECT final_translation FROM translation_versions
+                   WHERE block_id=? AND pipeline='serial_v3' AND active=1
+                     AND final_translation!=''
+                   ORDER BY id DESC LIMIT 1""",
+                (block_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        return {"origin": "serial_v3", "text": row["final_translation"].strip()}
+
     def create_claim(
         self,
         kind: str,
