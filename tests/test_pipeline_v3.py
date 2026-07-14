@@ -11,6 +11,7 @@ from src.core.exporter import BookExporter
 from src.core.history import TranslationMemory
 from src.core.preprocessor import TextPreprocessor
 from src.core.schemas import Chapter, ChunkStatus, TextChunk
+from src.core.text_normalization import normalize_chinese_quote_style
 from src.core.translator import TranslationConfig, TranslationEngine
 
 
@@ -81,6 +82,13 @@ class RetryingPolishLLM:
 
 
 class PipelineTests(unittest.TestCase):
+    def test_chinese_quote_normalization_preserves_word_apostrophes(self):
+        text = "「'Everything is done.'」don't \"again\""
+        self.assertEqual(
+            normalize_chinese_quote_style(text),
+            "“‘Everything is done.’”don't “again”",
+        )
+
     def test_epub_spine_and_chapter_markers(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             epub = Path(temp_dir) / "book.epub"

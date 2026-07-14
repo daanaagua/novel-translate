@@ -7,6 +7,7 @@ from contextlib import closing
 from pathlib import Path
 from typing import Optional
 
+from ..text_normalization import normalize_chinese_quote_style
 from .database import V4Database
 
 
@@ -45,7 +46,7 @@ def write_shadow_comparison(
         external = database.baseline_for_block(row["block_id"], baseline_name)
         if external:
             baseline_label = external["document"]["name"]
-            baseline_text = external["text"]
+            baseline_text = normalize_chinese_quote_style(external["text"])
             boundary_note = (
                 "（该文本块在原书段落内部切分；外部基线显示相交的完整段落。）"
                 if external["has_partial_boundary"]
@@ -53,7 +54,9 @@ def write_shadow_comparison(
             )
         else:
             baseline_label = "serial_v3"
-            baseline_text = row["serial_translation"] or "（无可用基线译文）"
+            baseline_text = normalize_chinese_quote_style(
+                row["serial_translation"] or "（无可用基线译文）"
+            )
             boundary_note = ""
         lines.extend(
             [
@@ -81,7 +84,7 @@ def write_shadow_comparison(
                 "",
                 "### parallel_v4",
                 "",
-                row["v4_translation"].strip(),
+                normalize_chinese_quote_style(row["v4_translation"]).strip(),
                 "",
             ]
         )

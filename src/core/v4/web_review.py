@@ -11,6 +11,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Dict
 from urllib.parse import parse_qs, urlparse
 
+from ..text_normalization import normalize_chinese_quote_style
 from .database import V4Database
 
 
@@ -154,13 +155,17 @@ def create_review_server(database: V4Database, port: int = 8765):
                         "origin": (baseline or {}).get("document", {}).get(
                             "name", "serial_v3"
                         ),
-                        "text": (baseline or {}).get("text")
-                        or data.get("serial_translation")
-                        or "",
+                        "text": normalize_chinese_quote_style(
+                            (baseline or {}).get("text")
+                            or data.get("serial_translation")
+                            or ""
+                        ),
                     }
                     v4_candidate = {
                         "origin": "parallel_v4",
-                        "text": data.get("v4_translation") or "",
+                        "text": normalize_chinese_quote_style(
+                            data.get("v4_translation") or ""
+                        ),
                     }
                     blind_available = bool(
                         baseline_candidate["text"].strip()
@@ -252,7 +257,10 @@ def create_review_server(database: V4Database, port: int = 8765):
                         or detail.get("serial_translation")
                         or ""
                     )
-                    v4_text = detail.get("v4_translation") or ""
+                    baseline_text = normalize_chinese_quote_style(baseline_text)
+                    v4_text = normalize_chinese_quote_style(
+                        detail.get("v4_translation") or ""
+                    )
                     if not baseline_text.strip() or not v4_text.strip():
                         raise ValueError("只有两份候选译文都存在时才能提交盲评")
                     candidate_pairs = [

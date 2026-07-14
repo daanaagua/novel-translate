@@ -9,6 +9,7 @@ from .schemas import TextChunk, ChunkStatus, TermStatus
 from .llm_client import LLMManager
 from ..agents.glossary_manager import GlossaryManager
 from .knowledge_base import KnowledgeBase
+from .text_normalization import normalize_chinese_quote_style
 
 @dataclass
 class TranslationConfig:
@@ -433,9 +434,7 @@ class TranslationEngine:
     @staticmethod
     def _normalize_chinese_punctuation(text: str) -> str:
         """统一项目要求的中文引号，不改动普通ASCII字符。"""
-        return (text or "").translate(
-            str.maketrans({"「": "“", "」": "”", "『": "‘", "』": "’"})
-        )
+        return normalize_chinese_quote_style(text)
     
     def _process_relations(self, relations: List[dict], callback: Optional[callable]):
         """处理新发现的实体关系"""

@@ -410,6 +410,12 @@ class ParallelV4V2Tests(unittest.TestCase):
         DocxBaselineImporter(self.database, self.project).import_docx(
             docx, name="vote_baseline"
         )
+        with self.database.transaction() as connection:
+            connection.execute(
+                """UPDATE baseline_paragraphs
+                   SET target_text='「''Alpha done.''」'
+                   WHERE paragraph_index=0"""
+            )
         self.insert_translations()
         server = create_review_server(self.database, port=0)
         thread = threading.Thread(target=server.serve_forever, daemon=True)
@@ -434,6 +440,12 @@ class ParallelV4V2Tests(unittest.TestCase):
             )
             self.assertTrue(blind["blind_available"])
             self.assertTrue(all("origin" not in item for item in blind["candidates"]))
+            baseline_candidate = next(
+                item for item in revealed["candidates"]
+                if item["origin"] == "vote_baseline"
+            )
+            self.assertIn("“‘Alpha done.’”", baseline_candidate["text"])
+            self.assertNotIn("「", baseline_candidate["text"])
             payload = json.dumps(
                 {
                     "block": block.id,
