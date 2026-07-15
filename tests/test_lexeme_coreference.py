@@ -3035,6 +3035,22 @@ class _DualModelClient:
         return response
 
 
+class _ExplosiveText:
+    def __str__(self):
+        raise TypeError("malicious __str__")
+
+    def __repr__(self):
+        raise TypeError("malicious __repr__")
+
+
+class _ExplosiveError(Exception):
+    def __str__(self):
+        raise TypeError("malicious exception __str__")
+
+    def __repr__(self):
+        raise TypeError("malicious exception __repr__")
+
+
 def _dual_model_response(case, relation, *, rationale=None):
     return json.dumps(
         {
@@ -3188,6 +3204,54 @@ def test_dual_model_protocol_failure_retries_and_finishes_nonblocking(
         2,
     ]
     assert all(row["accepted"] == 0 for row in audits if row["model"] == "model-a")
+
+
+@pytest.mark.parametrize(
+    "bad_response",
+    [
+        {"votes": [{"not_json_serializable": object()}]},
+        _ExplosiveText(),
+        _ExplosiveError(),
+    ],
+    ids=["unserializable-mapping", "malicious-text", "malicious-error"],
+)
+def test_dual_model_unserializable_responses_are_bounded_protocol_failures(
+    tmp_path, bad_response
+):
+    database, _, _, _, case = _coreference_case(tmp_path)
+    coordinator, clients_a, clients_b = _dual_model_coordinator(
+        database,
+        case,
+        [bad_response, bad_response],
+        [bad_response, bad_response],
+        max_attempts=2,
+    )
+
+    assert coordinator.resolve_dual_model(case) == (
+        "uncertain",
+        "model_protocol_failure",
+    )
+    assert len(clients_a[0].calls) == len(clients_b[0].calls) == 2
+    with closing(database.connect()) as connection:
+        audits = connection.execute(
+            """SELECT model, raw_response, parsed_json, error
+               FROM audit_calls WHERE purpose='dual_model_coreference'
+               ORDER BY id"""
+        ).fetchall()
+        decision = connection.execute(
+            """SELECT relation, decision_source, votes_json
+               FROM coreference_decisions"""
+        ).fetchone()
+    assert len(audits) == 4
+    assert all(len(row["raw_response"]) <= 512 for row in audits)
+    assert all(len(row["error"] or "") <= 2_000 for row in audits)
+    terminal = [json.loads(row["parsed_json"]) for row in audits[1::2]]
+    assert all(item["reason"] == "model_protocol_failure" for item in terminal)
+    assert tuple(decision)[:2] == ("uncertain", "dual_model")
+    assert any(
+        vote.get("reason") == "model_protocol_failure"
+        for vote in json.loads(decision["votes_json"])
+    )
 
 
 def test_dual_model_payloads_are_isolated_and_cached_without_recalling(tmp_path):
@@ -3501,6 +3565,39 @@ def test_dual_model_fallback_verified_precedes_consistency(tmp_path):
     assert result["reason"] == "verified"
 
 
+@pytest.mark.parametrize("owner", ["lexeme", "concept"])
+def test_dual_model_fallback_only_verified_target_marks_verified(
+    tmp_path, owner
+):
+    database, lexeme_id, mention_ids, _, _ = _coreference_case(tmp_path)
+    if owner == "lexeme":
+        with database.transaction() as connection:
+            connection.execute(
+                """UPDATE lexemes SET status='verified', default_target='old',
+                          working_target='old', verified_target='verified'
+                   WHERE id=?""",
+                (lexeme_id,),
+            )
+    else:
+        _insert_test_concept(
+            database, lexeme_id, "concept-status-verified", status="verified"
+        )
+        with database.transaction() as connection:
+            connection.execute(
+                """UPDATE concepts SET default_target='old', working_target='old',
+                          verified_target='verified'
+                   WHERE id='concept-status-verified'"""
+            )
+
+    result = database.apply_coreference_fallback(lexeme_id, mention_ids)
+
+    assert result["selected"] == "verified"
+    assert result["reason"] == "verified"
+    by_target = {item["target"]: item for item in result["candidates"]}
+    assert by_target["old"]["verified"] is False
+    assert by_target["verified"]["verified"] is True
+
+
 def test_dual_model_fallback_block_majority_precedes_unicode_order(tmp_path):
     database, lexeme_id, mention_ids = _dual_model_fallback_block_votes(tmp_path)
 
@@ -3532,6 +3629,99 @@ def test_dual_model_run_summary_is_exact_and_honors_max_cases(tmp_path):
         "fallbacks": 0,
     }
     assert len(clients_a[0].calls) == len(clients_b[0].calls) == 1
+
+
+def test_dual_model_run_counts_only_an_actual_safe_single_anchor_binding(tmp_path):
+    database, lexeme_id, mention_ids, _, _ = _coreference_case(tmp_path)
+    concept_id = "concept-single-anchor"
+    _insert_test_concept(
+        database,
+        lexeme_id,
+        concept_id,
+        anchor_mention_id=mention_ids[0],
+    )
+    _bind_test_mention(database, mention_ids[0], concept_id)
+    case = CoreferenceCoordinator(database).freeze_cases()[0]
+    coordinator, _, _ = _dual_model_coordinator(
+        database,
+        case,
+        [_dual_model_response(case, "same")],
+        [_dual_model_response(case, "same")],
+    )
+
+    summary = coordinator.run(max_cases=1)
+
+    assert summary["model_merges"] == 1
+    with closing(database.connect()) as connection:
+        assert {
+            row[0]
+            for row in connection.execute(
+                "SELECT concept_id FROM mentions ORDER BY id"
+            )
+        } == {concept_id}
+
+
+def test_dual_model_run_does_not_count_multi_anchor_same_without_binding(tmp_path):
+    database, lexeme_id, mention_ids, _, _ = _coreference_case(tmp_path)
+    concept_ids = ("concept-run-left", "concept-run-right")
+    for concept_id, mention_id in zip(concept_ids, mention_ids):
+        _insert_test_concept(
+            database, lexeme_id, concept_id, anchor_mention_id=mention_id
+        )
+        _bind_test_mention(database, mention_id, concept_id)
+    case = CoreferenceCoordinator(database).freeze_cases()[0]
+    coordinator, _, _ = _dual_model_coordinator(
+        database,
+        case,
+        [_dual_model_response(case, "same")],
+        [_dual_model_response(case, "same")],
+    )
+
+    summary = coordinator.run(max_cases=1)
+
+    assert summary["model_merges"] == 0
+    assert summary["deterministic_merges"] == 0
+    with closing(database.connect()) as connection:
+        assert [
+            row[0]
+            for row in connection.execute(
+                "SELECT concept_id FROM mentions ORDER BY id"
+            )
+        ] == list(concept_ids)
+
+
+def test_dual_model_run_cached_same_reports_zero_changes(tmp_path):
+    database, lexeme_id, mention_ids, _, _ = _coreference_case(tmp_path)
+    concept_ids = ("concept-cache-left", "concept-cache-right")
+    for concept_id, mention_id in zip(concept_ids, mention_ids):
+        _insert_test_concept(
+            database, lexeme_id, concept_id, anchor_mention_id=mention_id
+        )
+        _bind_test_mention(database, mention_id, concept_id)
+    case = CoreferenceCoordinator(database).freeze_cases()[0]
+    first, _, _ = _dual_model_coordinator(
+        database,
+        case,
+        [_dual_model_response(case, "same")],
+        [_dual_model_response(case, "same")],
+    )
+    assert first.resolve_dual_model(case) == ("same", "model_agreement")
+    cached_a = []
+    cached_b = []
+    cached = CoreferenceCoordinator(
+        database,
+        llm_factory_a=_dual_model_factory(
+            "model-a", [AssertionError("must not call A")], cached_a
+        ),
+        llm_factory_b=_dual_model_factory(
+            "model-b", [AssertionError("must not call B")], cached_b
+        ),
+    )
+
+    summary = cached.run(max_cases=1)
+
+    assert summary["model_merges"] == 0
+    assert cached_a[0].calls == cached_b[0].calls == []
 
 
 def test_dual_model_persistence_failure_rolls_back_decision_binding_and_audits(

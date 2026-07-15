@@ -37,6 +37,8 @@ MAX_CONCEPT_ANCHORS = 8
 MAX_FREE_TEXT_CHARS = 200
 MAX_OBSERVATION_SOURCE_CHARS = 160
 MAX_KIND_CHARS = 80
+MAX_RAW_RESPONSE_CHARS = 64 * 1024
+MAX_AUDIT_ERROR_CHARS = 2_000
 # The capped request contains at most 20,320 free-text characters.  JSON may
 # escape each as six bytes; 192 KiB leaves a fixed envelope for keys and IDs.
 MAX_CASE_PAYLOAD_BYTES = 192 * 1024
@@ -1774,16 +1776,52 @@ class CoreferenceCoordinator:
         return (relation, rule)
 
     @staticmethod
-    def _raw_response_text(raw_response: Any) -> str:
-        if isinstance(raw_response, bytes):
-            return raw_response.decode("utf-8", errors="replace")
-        if isinstance(raw_response, str):
-            return raw_response
-        if isinstance(raw_response, BaseModel):
-            return raw_response.model_dump_json()
-        if isinstance(raw_response, Mapping):
-            return json.dumps(raw_response, ensure_ascii=False, sort_keys=True)
-        return str(raw_response)
+    def _safe_type_name(value: Any) -> str:
+        try:
+            name = type(value).__name__
+        except BaseException:
+            return "unknown"
+        return name if isinstance(name, str) and name else "unknown"
+
+    @classmethod
+    def _raw_response_text(cls, raw_response: Any) -> str:
+        try:
+            if isinstance(raw_response, bytes):
+                text = raw_response.decode("utf-8", errors="replace")
+            elif isinstance(raw_response, str):
+                text = raw_response
+            elif isinstance(raw_response, BaseModel):
+                text = raw_response.model_dump_json()
+            elif isinstance(raw_response, Mapping):
+                text = json.dumps(
+                    raw_response, ensure_ascii=False, sort_keys=True
+                )
+            else:
+                text = str(raw_response)
+            if not isinstance(text, str):
+                raise TypeError("response serializer did not return text")
+        except BaseException:
+            text = (
+                "<unserializable-response: "
+                f"{cls._safe_type_name(raw_response)}>"
+            )
+        if len(text) <= MAX_RAW_RESPONSE_CHARS:
+            return text
+        return text[: MAX_RAW_RESPONSE_CHARS - 1] + "…"
+
+    @classmethod
+    def _safe_error_text(cls, error: BaseException) -> str:
+        name = cls._safe_type_name(error)
+        try:
+            detail = str(error)
+            if not isinstance(detail, str):
+                raise TypeError("error serializer did not return text")
+        except BaseException:
+            detail = "<unprintable-error>"
+        text = f"{name}: {detail}"
+        if len(text) <= MAX_AUDIT_ERROR_CHARS:
+            return text
+        return text[: MAX_AUDIT_ERROR_CHARS - 1] + "…"
 
     @staticmethod
     def _cached_reason(votes_json: Any) -> str:
@@ -1910,7 +1948,7 @@ class CoreferenceCoordinator:
                 accepted_vote = parsed
             except Exception as exc:
                 raw_text = self._raw_response_text(raw_response)
-                error = f"{type(exc).__name__}: {exc}"
+                error = self._safe_error_text(exc)
             attempts.append(
                 {
                     "side": side,
@@ -1993,10 +2031,10 @@ class CoreferenceCoordinator:
         self,
         case: CoreferenceCase,
         connection: sqlite3.Connection,
-    ) -> str | None:
+    ) -> tuple[str | None, int]:
         related = self._related_active_concepts(case, connection)
         if len(related) > 1:
-            return None
+            return None, 0
         mention_ids = tuple(mention.mention_id for mention in case.mentions)
         try:
             with self.database._method_savepoint(connection, "dual_model_same"):
@@ -2023,9 +2061,9 @@ class CoreferenceCoordinator:
                     raise _ProtectedBindingConflict(
                         "dual-model same cannot safely bind every mention"
                     )
-                return target
+                return target, changed
         except (_ProtectedBindingConflict, ValueError):
-            return None
+            return None, 0
 
     @staticmethod
     def _model_vote_payload(
@@ -2060,6 +2098,15 @@ class CoreferenceCoordinator:
     ) -> tuple[str, str]:
         """Resolve one case after deterministic rules, never creating a queue item."""
 
+        relation, reason, _, _ = self._resolve_dual_model_with_effect(case)
+        return relation, reason
+
+    def _resolve_dual_model_with_effect(
+        self,
+        case: CoreferenceCase,
+    ) -> tuple[str, str, int, bool]:
+        """Return relation, reason, bindings changed, and dual-decision source."""
+
         preflight = self._deterministic_relation(case)
         if (
             preflight == ("same", "same_anchor_or_duplicate_subset")
@@ -2070,21 +2117,21 @@ class CoreferenceCoordinator:
                 case, cache_key(case, model_names)
             )
             if cached is not None:
-                return cached
+                return cached[0], cached[1], 0, True
         deterministic = self.resolve_deterministic(case)
         if deterministic[0] is not None:
-            return deterministic[0], str(deterministic[1])
+            return deterministic[0], str(deterministic[1]), 0, False
         return self._resolve_dual_models_only(case)
 
     def _resolve_dual_models_only(
         self,
         case: CoreferenceCase,
-    ) -> tuple[str, str]:
+    ) -> tuple[str, str, int, bool]:
         client_a, client_b, model_names = self._model_clients()
         decision_payload_hash = cache_key(case, model_names)
         cached = self._cached_dual_decision(case, decision_payload_hash)
         if cached is not None:
-            return cached
+            return cached[0], cached[1], 0, True
 
         frozen_payload_a, frozen_payload_b = self.model_payloads(
             case, model_names
@@ -2130,16 +2177,15 @@ class CoreferenceCoordinator:
                 "B", model_names[1], vote_b, attempts_b
             ),
         ]
-        model_votes.append(
-            {
-                "source": "dual_model",
-                "relation": relation,
-                "reason": reason,
-                "models": list(model_names),
-                "protocol_version": COREFERENCE_PROTOCOL_VERSION,
-                "frozen_payload_hash": frozen_payload_hash,
-            }
-        )
+        resolution_vote = {
+            "source": "dual_model",
+            "relation": relation,
+            "reason": reason,
+            "models": list(model_names),
+            "protocol_version": COREFERENCE_PROTOCOL_VERSION,
+            "frozen_payload_hash": frozen_payload_hash,
+        }
+        model_votes.append(resolution_vote)
 
         mention_ids = tuple(mention.mention_id for mention in case.mentions)
         evidence_ids = tuple(mention.evidence_id for mention in case.mentions)
@@ -2150,22 +2196,29 @@ class CoreferenceCoordinator:
                 # Revalidate every persisted identity immediately before writes.
                 evaluation = self._deterministic_evaluation(case, connection)
                 if evaluation["relation"] is not None:
-                    return self._resolve_deterministic_in_transaction(
+                    deterministic = self._resolve_deterministic_in_transaction(
                         case, connection
                     )
+                    return deterministic[0], str(deterministic[1]), 0, False
                 raced = self._cached_dual_decision(
                     case,
                     decision_payload_hash,
                     connection=connection,
                 )
                 if raced is not None:
-                    return raced
+                    return raced[0], raced[1], 0, True
 
                 target_concept_id = None
+                bindings_changed = 0
                 if relation == "same":
-                    target_concept_id = self._safe_model_same_binding(
-                        case, connection
-                    )
+                    (
+                        target_concept_id,
+                        bindings_changed,
+                    ) = self._safe_model_same_binding(case, connection)
+                resolution_vote["effect"] = {
+                    "bindings_changed": bindings_changed,
+                    "unified_identity": target_concept_id is not None,
+                }
 
                 fallback = None
                 if relation == "uncertain":
@@ -2285,7 +2338,7 @@ class CoreferenceCoordinator:
                         connection=connection,
                         archive_payload=False,
                     )
-        return relation, reason
+        return relation, reason, bindings_changed, True
 
     def run(self, max_cases: int | None = None) -> dict[str, int]:
         """Resolve frozen cases without producing blocking human work."""
@@ -2302,16 +2355,14 @@ class CoreferenceCoordinator:
             "fallbacks": 0,
         }
         for case in cases:
-            relation, rule = self.resolve_dual_model(case)
-            model_result = rule in {
-                "model_agreement",
-                "model_conflict",
-                "model_uncertain",
-                "model_protocol_failure",
-            }
+            relation, rule, bindings_changed, model_result = (
+                self._resolve_dual_model_with_effect(case)
+            )
             if relation == "same":
-                key = "model_merges" if model_result else "deterministic_merges"
-                summary[key] += 1
+                if model_result:
+                    summary["model_merges"] += int(bindings_changed > 0)
+                else:
+                    summary["deterministic_merges"] += 1
             elif relation == "different":
                 summary["different"] += 1
             elif relation == "non_entity":

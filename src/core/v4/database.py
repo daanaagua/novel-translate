@@ -881,7 +881,7 @@ class V4Database:
                 lexeme[field],
                 source=f"lexeme.{field}",
                 locked=lexeme_locked,
-                verified=(field == "verified_target" or lexeme_verified),
+                verified=(field == "verified_target"),
             )
 
         placeholders = ",".join("?" for _ in ordered_ids)
@@ -906,13 +906,12 @@ class V4Database:
         ).fetchall()
         for row in concept_rows:
             concept_locked = bool(row["locked"])
-            concept_verified = str(row["status"]) == "verified"
             for field in ("default_target", "working_target", "verified_target"):
                 add_candidate(
                     row[field],
                     source=f"concept:{row['id']}.{field}",
                     locked=concept_locked,
-                    verified=(field == "verified_target" or concept_verified),
+                    verified=(field == "verified_target"),
                 )
 
         if ordered_ids:
@@ -937,10 +936,7 @@ class V4Database:
                     target,
                     source=f"block:{row['block_id']}:concept:{row['concept_id']}",
                     locked=bool(row["locked"]),
-                    verified=(
-                        bool(row["verified_target"])
-                        or str(row["status"]) == "verified"
-                    ),
+                    verified=bool(row["verified_target"]),
                     block_id=str(row["block_id"]),
                 )
 
