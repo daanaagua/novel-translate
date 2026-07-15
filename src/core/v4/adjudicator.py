@@ -13,7 +13,7 @@ from .models import AdjudicationDecision, AdjudicationResponse
 
 ADJUDICATION_SYSTEM = """You adjudicate bounded lexical candidate spans.
 Return one decision for every cluster as strict JSON: {"decisions":[...]}.
-Use only the local Kxx and KxxA aliases in this request. Never invent a span.
+Use only the local Kxx and Kxx[A-D] aliases in this request. Never invent a span.
 promote selects exactly one existing span; reject/defer select none; split selects
 two or more non-overlapping existing spans; supersede selects one existing span
 that contains the span it replaces. If the correct span is absent, return defer
@@ -109,7 +109,10 @@ class V4Adjudicator:
             rendered_alternatives = []
             local_aliases = []
             for alternative_index, alternative in enumerate(alternatives):
-                alias = f"{cluster_alias}{chr(ord('A') + alternative_index)}"
+                alias_letter = chr(ord("A") + alternative_index)
+                if reverse_alternatives and len(alternatives) == 1:
+                    alias_letter = "D"
+                alias = f"{cluster_alias}{alias_letter}"
                 candidate_by_alias[alias] = alternative
                 local_aliases.append(alias)
                 rendered_alternatives.append(
@@ -173,22 +176,17 @@ class V4Adjudicator:
         selected: LexicalCandidate,
         alternatives: Sequence[LexicalCandidate],
     ) -> bool:
-        contains_replaced_span = False
         for other in alternatives:
-            if other.id == selected.id or not cls._overlap(selected, other):
+            if other.id == selected.id:
                 continue
-            contains = (
-                selected.start_offset <= other.start_offset
-                and other.end_offset <= selected.end_offset
-            )
-            if not contains:
-                return False
             if (
-                selected.start_offset < other.start_offset
-                or other.end_offset < selected.end_offset
+                selected.block_id == other.block_id
+                and selected.paragraph_id == other.paragraph_id
+                and selected.start_offset <= other.start_offset
+                and other.end_offset <= selected.end_offset
             ):
-                contains_replaced_span = True
-        return contains_replaced_span
+                return True
+        return False
 
     @classmethod
     def _resolve_decisions(

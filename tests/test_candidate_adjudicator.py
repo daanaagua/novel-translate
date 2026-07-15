@@ -263,6 +263,29 @@ def test_legal_split_and_supersede_survive_realiased_independent_review():
     assert supersede_result[0].selected_candidate_ids == ("candidate-long",)
 
 
+def test_supersede_can_ignore_a_different_partially_overlapping_alternative():
+    source = "Alpha Beta Gamma waited."
+    selected = candidate("candidate-selected", source, 0, 10)
+    contained = candidate("candidate-contained", source, 0, 5)
+    partial = candidate("candidate-partial", source, 6, 16)
+    item = cluster(
+        "cluster-a",
+        [selected, contained, partial],
+        risk_flags=("span_competition",),
+    )
+    llm = FakeLLM(
+        [
+            response(verdict="supersede", selected_ids=["K01A"]),
+            response(verdict="supersede", selected_ids=["K01C"]),
+        ]
+    )
+
+    result = V4Adjudicator(llm).adjudicate(batch(item), {"block-1": source})
+
+    assert result[0].verdict == "supersede"
+    assert result[0].selected_candidate_ids == ("candidate-selected",)
+
+
 @pytest.mark.parametrize("verdict", ["reject", "defer"])
 def test_reject_and_defer_cannot_carry_selected_spans(verdict):
     source = "Alpha waited."
@@ -382,6 +405,32 @@ def test_second_round_reverses_alternatives_and_regenerates_alias_mapping():
     assert second_aliases["K01C"] == "Alpha and Beta"
     assert result[0].verdict == "promote"
     assert result[0].selected_candidate_ids == ("candidate-whole",)
+    assert result[0].rounds == 2
+
+
+def test_single_alternative_risk_review_uses_a_different_alias_mapping():
+    source = "Alpha waited."
+    item = cluster(
+        "cluster-a",
+        [candidate("candidate-alpha", source, 0, 5)],
+        affected_blocks=3,
+    )
+    llm = FakeLLM(
+        [
+            response(selected_ids=["K01A"]),
+            response(selected_ids=["K01D"]),
+        ]
+    )
+
+    result = V4Adjudicator(llm).adjudicate(batch(item), {"block-1": source})
+
+    first, second = map(user_payload, llm.requests)
+    first_alternative = first["clusters"][0]["alternatives"][0]
+    second_alternative = second["clusters"][0]["alternatives"][0]
+    assert first_alternative == {"id": "K01A", "text": "Alpha", "risk_flags": []}
+    assert second_alternative == {"id": "K01D", "text": "Alpha", "risk_flags": []}
+    assert result[0].verdict == "promote"
+    assert result[0].selected_candidate_ids == ("candidate-alpha",)
     assert result[0].rounds == 2
 
 
