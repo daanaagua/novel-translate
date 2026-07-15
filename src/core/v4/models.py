@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Dict, List, Optional
+from typing import Annotated, Any, Dict, List, Literal, Optional
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -84,6 +84,41 @@ class CandidateMentionDecision(StrictModel):
 
 class CandidateScanResponse(StrictModel):
     mentions: List[CandidateMentionDecision] = Field(default_factory=list)
+
+
+AdjudicationAlias = Annotated[
+    str,
+    Field(pattern=r"^K(?:0[1-9]|1[0-2])[A-D]$"),
+]
+
+
+class AdjudicationDecision(StrictModel):
+    cluster_id: str = Field(pattern=r"^K(?:0[1-9]|1[0-2])$")
+    verdict: Literal["promote", "reject", "split", "supersede", "defer"]
+    selected_ids: List[AdjudicationAlias] = Field(default_factory=list, max_length=4)
+    entity_kind: Literal[
+        "person",
+        "place",
+        "organization",
+        "group",
+        "item",
+        "concept",
+        "unit",
+        "title",
+        "event",
+        "species",
+        "technology",
+        "work",
+        "artwork",
+        "personification",
+        "unknown_named_entity",
+    ]
+    confidence: float = Field(ge=0.0, le=1.0)
+    reason: str = Field(default="", max_length=200)
+
+
+class AdjudicationResponse(StrictModel):
+    decisions: List[AdjudicationDecision] = Field(default_factory=list, max_length=12)
 
 
 class VerificationResponse(StrictModel):
