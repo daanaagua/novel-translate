@@ -375,6 +375,99 @@ def test_concept_rules_are_attached_to_every_active_lexeme_binding(tmp_path):
     )] == ["RULE", "RULE"]
 
 
+def test_locked_usage_decision_is_frozen_as_exact_highest_layer_rule(tmp_path):
+    db = _db(tmp_path, ["Archon spoke."])
+    concept_id = db.import_legacy_concept("Archon", "", "title", "office")
+    version = db.current_knowledge_version()
+    with db.transaction() as connection:
+        lexeme_id = connection.execute(
+            "SELECT primary_lexeme_id FROM concepts WHERE id=?", (concept_id,)
+        ).fetchone()[0]
+        connection.execute(
+            """UPDATE concepts SET verified_target='ORDINARY', status='verified'
+                 WHERE id=?""",
+            (concept_id,),
+        )
+        connection.execute(
+            """UPDATE concept_lexemes SET status='verified', confidence=1.0
+                 WHERE concept_id=? AND lexeme_id=?""",
+            (concept_id, lexeme_id),
+        )
+        evidence_id = connection.execute(
+            """INSERT INTO evidence(
+                   block_id, paragraph_id, kind, source_form, evidence_quote,
+                   payload_json, confidence, extractor, run_id, created_at)
+               VALUES('block_0', 'P000', 'test', 'Archon', 'Archon',
+                      ?, 1.0, 'test', NULL, 'now')""",
+            (json.dumps({"speaker_id": "sev", "thread_id": "court"}),),
+        ).lastrowid
+        mention_id = connection.execute(
+            """INSERT INTO mentions(
+                   block_id, paragraph_id, source_form, normalized_form,
+                   discourse_function, lexeme_id, concept_id, evidence_id)
+               VALUES('block_0', 'P000', 'Archon', 'archon', 'vocative', ?, ?, ?)""",
+            (lexeme_id, concept_id, evidence_id),
+        ).lastrowid
+        connection.execute(
+            """INSERT INTO form_occurrences(
+                   lexeme_id, block_id, start_offset, end_offset,
+                   source_form, source_hash, created_at)
+               VALUES(?, 'block_0', 0, 6, 'Archon', 'hash-0', 'now')""",
+            (lexeme_id,),
+        )
+        usage_id = connection.execute(
+            """INSERT INTO usage_decisions(
+                   mention_id, rendering, status, scope, locked,
+                   created_version, created_at)
+               VALUES(?, 'VOCATIVE', 'verified', 'occurrence', 1, ?, 'now')""",
+            (mention_id, version),
+        ).lastrowid
+        connection.execute(
+            """INSERT INTO usage_decisions(
+                   mention_id, rendering, status, scope, locked,
+                   created_version, retired_version, created_at)
+               VALUES(?, 'RETIRED', 'verified', 'occurrence', 1, ?, ?, 'now')""",
+            (mention_id, version, version),
+        )
+
+    _, frozen, _ = db.freeze_translation_knowledge()
+    ordinary = frozen.matched_renderings("Archon spoke.", block_id="block_0")[0]
+    contexts = db.rendering_contexts_for_blocks(["block_0"])["block_0"]
+    contextual = frozen.matched_renderings(
+        "Archon spoke.", block_id="block_0", occurrence_contexts=contexts
+    )[0]
+
+    assert ordinary.rendered_target == "ORDINARY"
+    assert contextual.rendered_target == "VOCATIVE"
+    assert contextual.applied_rule_ids == (f"usage:{usage_id}",)
+    assert contextual.dependency_fingerprint != ordinary.dependency_fingerprint
+
+
+def test_lexeme_winner_fingerprint_ignores_nonwinning_selected_concept():
+    snapshot = _render_snapshot(
+        concept_verified="", concept_working="", lexeme_verified="LEXEME"
+    )
+    first = snapshot[0]["concepts"][0]
+    second = json.loads(json.dumps(first, ensure_ascii=False))
+    second["id"] = "concept-other"
+    snapshot[0]["concepts"].append(second)
+    index = _compile_render(snapshot)
+
+    selected_first = index.matched_renderings(
+        "Archon", mention={"concept_id": first["id"], "confidence": 1.0}
+    )[0]
+    selected_second = index.matched_renderings(
+        "Archon", mention={"concept_id": second["id"], "confidence": 1.0}
+    )[0]
+
+    assert selected_first.concept_id != selected_second.concept_id
+    assert selected_first.rendered_target == selected_second.rendered_target == "LEXEME"
+    assert (
+        selected_first.dependency_fingerprint
+        == selected_second.dependency_fingerprint
+    )
+
+
 def test_render_snapshot_and_compile_use_constant_query_count(tmp_path):
     db = _db(tmp_path, ["Name1999 spoke."])
     version = db.current_knowledge_version()

@@ -448,10 +448,11 @@ class FrozenRenderIndex(Sequence[Mapping[str, Any]]):
     ) -> str:
         payload: Dict[str, Any] = {
             "lexeme_id": lexeme_id,
-            "concept_id": concept_id,
             "layer": winner.layer if winner else 6,
         }
         if winner is not None:
+            if winner.subject_type == "concept":
+                payload["concept_id"] = concept_id or winner.subject_id
             payload["winner"] = {
                 "subject_type": winner.subject_type,
                 "subject_id": winner.subject_id,

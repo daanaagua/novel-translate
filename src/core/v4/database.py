@@ -7952,6 +7952,103 @@ class V4Database:
                     if owner is not None:
                         owner["rules"].append(rule)
 
+        usage_rows = connection.execute(
+            """SELECT ud.id, ud.rendering, ud.status, ud.scope, ud.locked,
+                      ud.created_version, ud.created_at,
+                      m.id mention_id, m.block_id, m.paragraph_id,
+                      m.source_form, m.discourse_function, m.lexeme_id,
+                      m.concept_id, e.payload_json,
+                      fo.start_offset, fo.end_offset
+               FROM usage_decisions ud
+               JOIN mentions m ON m.id=ud.mention_id
+               JOIN evidence e ON e.id=m.evidence_id
+               JOIN lexemes l ON l.id=m.lexeme_id
+               LEFT JOIN form_occurrences fo
+                 ON fo.block_id=m.block_id
+                AND fo.lexeme_id=m.lexeme_id
+                AND fo.source_form=m.source_form
+               WHERE ud.retired_version IS NULL
+                 AND l.retired_version IS NULL
+                 AND ud.locked=1
+                 AND (ud.scope IN ('occurrence','speaker','thread')
+                      OR ud.status='verified')
+               ORDER BY ud.id, fo.start_offset, fo.end_offset"""
+        ).fetchall()
+        usage_groups: Dict[int, List[sqlite3.Row]] = {}
+        for row in usage_rows:
+            usage_groups.setdefault(int(row["id"]), []).append(row)
+        for usage_id in sorted(usage_groups):
+            grouped_rows = usage_groups[usage_id]
+            row = grouped_rows[0]
+            target = str(row["rendering"] or "").strip()
+            lexeme_id = str(row["lexeme_id"])
+            lexeme = lexemes.get(lexeme_id)
+            if not target or lexeme is None:
+                continue
+            try:
+                payload = json.loads(str(row["payload_json"] or "{}"))
+            except (json.JSONDecodeError, TypeError):
+                payload = {}
+            if not isinstance(payload, dict):
+                payload = {}
+            spans = sorted(
+                {
+                    (int(value["start_offset"]), int(value["end_offset"]))
+                    for value in grouped_rows
+                    if value["start_offset"] is not None
+                }
+            )
+            payload_span: tuple[int, int] | None = None
+            try:
+                if (
+                    payload.get("start_offset") is not None
+                    and payload.get("end_offset") is not None
+                ):
+                    payload_span = (
+                        int(payload["start_offset"]),
+                        int(payload["end_offset"]),
+                    )
+            except (TypeError, ValueError):
+                payload_span = None
+            span = payload_span or (spans[0] if len(spans) == 1 else None)
+            if str(row["scope"]) == "occurrence" and span is None:
+                continue
+            condition: Dict[str, Any] = {
+                "mention_id": int(row["mention_id"]),
+                "block_id": str(row["block_id"]),
+                "paragraph_id": str(row["paragraph_id"]),
+                "discourse_function": str(row["discourse_function"]),
+            }
+            if span is not None:
+                condition["start_offset"], condition["end_offset"] = span
+            raw_concept_id = str(row["concept_id"] or "")
+            if raw_concept_id:
+                canonical_id = raw_concept_id
+                visited: set[str] = set()
+                while canonical_id in redirects and canonical_id not in visited:
+                    visited.add(canonical_id)
+                    canonical_id = redirects[canonical_id]
+                if canonical_id in concepts_by_id:
+                    condition["concept_id"] = canonical_id
+            for key in ("speaker", "speaker_id", "thread", "thread_id"):
+                if payload.get(key) not in (None, ""):
+                    condition[key] = payload[key]
+            rule = {
+                "id": f"usage:{usage_id}",
+                "condition": condition,
+                "target": target,
+                "priority": 1_000_000,
+                "status": str(row["status"]),
+                "scope": str(row["scope"]),
+                "locked": True,
+                "created_version": int(row["created_version"]),
+                "created_at": str(row["created_at"]),
+                "subject_type": "lexeme",
+                "subject_id": lexeme_id,
+            }
+            lexeme["lexeme_rules"].append(rule)
+            lexeme["rules"].append(rule)
+
         for lexeme in lexemes.values():
             lexeme["forms"].sort(key=lambda value: (value.casefold(), value))
             lexeme["concepts"].sort(key=lambda item: str(item["id"]))
@@ -8008,37 +8105,74 @@ class V4Database:
     def rendering_contexts_for_block(self, block_id: str) -> List[Dict[str, Any]]:
         """Return persisted occurrence evidence used by rendering conditions."""
 
+        return self.rendering_contexts_for_blocks([block_id]).get(str(block_id), [])
+
+    def rendering_contexts_for_blocks(
+        self, block_ids: Sequence[str]
+    ) -> Dict[str, List[Dict[str, Any]]]:
+        """Batch-load immutable rendering contexts with one bounded SQL query."""
+
+        ordered_ids = list(dict.fromkeys(str(value) for value in block_ids))
+        grouped: Dict[str, List[Dict[str, Any]]] = {
+            block_id: [] for block_id in ordered_ids
+        }
+        if not ordered_ids:
+            return grouped
+        placeholders = ",".join("?" for _ in ordered_ids)
         with closing(self.connect()) as connection:
             rows = connection.execute(
-                """SELECT m.id mention_id, m.lexeme_id, m.concept_id,
-                          m.paragraph_id, m.source_form, m.discourse_function,
-                          e.confidence, e.payload_json,
-                          fo.start_offset, fo.end_offset
-                   FROM mentions m
-                   JOIN evidence e ON e.id=m.evidence_id
-                   LEFT JOIN form_occurrences fo
-                     ON fo.block_id=m.block_id
-                    AND fo.lexeme_id=m.lexeme_id
-                    AND fo.source_form=m.source_form
-                   WHERE m.block_id=?
-                   ORDER BY m.id, fo.start_offset, fo.end_offset""",
-                (block_id,),
+                f"""SELECT m.id mention_id, m.block_id, m.lexeme_id, m.concept_id,
+                           m.paragraph_id, m.source_form, m.discourse_function,
+                           e.confidence, e.payload_json,
+                           fo.start_offset, fo.end_offset
+                    FROM mentions m
+                    JOIN evidence e ON e.id=m.evidence_id
+                    LEFT JOIN form_occurrences fo
+                      ON fo.block_id=m.block_id
+                     AND fo.lexeme_id=m.lexeme_id
+                     AND fo.source_form=m.source_form
+                    WHERE m.block_id IN ({placeholders})
+                    ORDER BY m.block_id, m.id, fo.start_offset, fo.end_offset""",
+                ordered_ids,
             ).fetchall()
-        contexts: List[Dict[str, Any]] = []
-        seen: set[str] = set()
+        seen: Dict[str, set[str]] = {block_id: set() for block_id in ordered_ids}
         for row in rows:
+            block_id = str(row["block_id"])
             try:
                 payload = json.loads(str(row["payload_json"] or "{}"))
             except (json.JSONDecodeError, TypeError):
                 payload = {}
             if not isinstance(payload, dict):
                 payload = {}
+            payload_start = payload.get("start_offset")
+            payload_end = payload.get("end_offset")
+            try:
+                payload_span = (
+                    (int(payload_start), int(payload_end))
+                    if payload_start is not None and payload_end is not None
+                    else None
+                )
+            except (TypeError, ValueError):
+                payload_span = None
+            row_span = (
+                (int(row["start_offset"]), int(row["end_offset"]))
+                if row["start_offset"] is not None
+                else None
+            )
+            if (
+                payload_span is not None
+                and row_span is not None
+                and payload_span != row_span
+            ):
+                continue
+            span = payload_span or row_span
             concept_id = str(row["concept_id"] or "")
             confidence = float(row["confidence"] or 0.0)
             context: Dict[str, Any] = {
-                "block_id": str(block_id),
+                "block_id": block_id,
                 "lexeme_id": str(row["lexeme_id"]),
                 "source_form": str(row["source_form"]),
+                "mention_id": int(row["mention_id"]),
                 "paragraph_id": str(row["paragraph_id"]),
                 "paragraph": str(row["paragraph_id"]),
                 "discourse_function": str(row["discourse_function"]),
@@ -8051,19 +8185,18 @@ class V4Database:
             }
             if concept_id:
                 context["concept_id"] = concept_id
-            if row["start_offset"] is not None:
-                context["start_offset"] = int(row["start_offset"])
-                context["end_offset"] = int(row["end_offset"])
+            if span is not None:
+                context["start_offset"], context["end_offset"] = span
             for key in ("speaker", "speaker_id", "thread", "thread_id"):
                 if payload.get(key) not in (None, ""):
                     context[key] = payload[key]
             signature = json.dumps(
                 context, ensure_ascii=False, sort_keys=True, separators=(",", ":")
             )
-            if signature not in seen:
-                seen.add(signature)
-                contexts.append(context)
-        return contexts
+            if signature not in seen[block_id]:
+                seen[block_id].add(signature)
+                grouped[block_id].append(context)
+        return grouped
 
     def concept_snapshot(self) -> List[Dict[str, Any]]:
         """Materialize active rendering state from one SQLite read snapshot."""

@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 import json
+import re
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
-from typing import Any, Callable, Dict, List, Optional, Sequence
+from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence
 from uuid import uuid4
 
 from ...agents.glossary_manager import GlossaryManager
@@ -164,72 +165,126 @@ class V4TranslationPipeline:
         self,
         blocks: Sequence[V4Block],
         concept_snapshot: Optional[Sequence[Dict[str, Any]]] = None,
+        rendering_contexts_by_block: Optional[
+            Mapping[str, Sequence[Mapping[str, Any]]]
+        ] = None,
     ) -> GlossaryManager:
         if isinstance(concept_snapshot, FrozenRenderIndex):
+            if rendering_contexts_by_block is None:
+                batch_loader = getattr(
+                    self.database, "rendering_contexts_for_blocks", None
+                )
+                rendering_contexts_by_block = (
+                    batch_loader([block.id for block in blocks])
+                    if batch_loader is not None
+                    else {}
+                )
             items: List[GlossaryItem] = []
-            seen: set[tuple[str, str]] = set()
+            pattern_sources: Dict[str, str] = {}
             for block in blocks:
-                context_loader = getattr(
-                    self.database, "rendering_contexts_for_block", None
+                occurrence_contexts = list(
+                    rendering_contexts_by_block.get(block.id, [])
                 )
-                occurrence_contexts = (
-                    context_loader(block.id) if context_loader is not None else []
-                )
-                for matched in concept_snapshot.matched_renderings(
+                matched_items = concept_snapshot.matched_renderings(
                     block.source_text,
                     block_id=block.id,
                     occurrence_contexts=occurrence_contexts,
-                ):
-                    target = str(matched.rendered_target or "").strip()
-                    if not target:
-                        continue
-                    key = (matched.lexeme_id, target)
-                    if key in seen:
-                        continue
-                    seen.add(key)
-                    lexeme = concept_snapshot.get_lexeme(matched.lexeme_id) or {}
-                    concept = next(
-                        (
-                            value
-                            for value in lexeme.get("concepts", []) or []
-                            if str(value.get("id") or "") == matched.concept_id
-                        ),
-                        None,
-                    )
-                    if concept is None:
-                        concept = next(iter(lexeme.get("concepts", []) or []), {})
-                    winning_rules = {
-                        str(rule.get("id") or ""): rule
-                        for rule in list(lexeme.get("rules", []) or [])
-                        + list(concept.get("rules", []) or [])
-                    }
-                    rule_verified = any(
-                        bool(winning_rules.get(rule_id, {}).get("locked"))
-                        or str(winning_rules.get(rule_id, {}).get("status") or "")
-                        == "verified"
-                        for rule_id in matched.applied_rule_ids
-                    )
-                    verified = rule_verified or target in {
-                        str(lexeme.get("verified_target") or "").strip(),
-                        str(concept.get("verified_target") or "").strip(),
-                    }
-                    status = TermStatus.VERIFIED if verified else TermStatus.WORKING
-                    items.append(
-                        GlossaryItem(
-                            id=str(matched.concept_id or matched.lexeme_id),
-                            src=str(matched.matched_form or lexeme.get("source") or ""),
-                            default_target=target,
-                            category=self._category(
-                                str(concept.get("kind") or "concept")
-                            ),
-                            status=status,
-                            description=str(concept.get("description") or "") or None,
-                            rules=[],
+                )
+                grouped: Dict[tuple[str, str], List[Any]] = {}
+                for matched in matched_items:
+                    if str(matched.rendered_target or "").strip():
+                        key = (matched.lexeme_id, matched.matched_form.casefold())
+                        grouped.setdefault(key, []).append(matched)
+                for group in grouped.values():
+                    by_target: Dict[str, List[Any]] = {}
+                    for matched in group:
+                        target = str(matched.rendered_target or "").strip()
+                        by_target.setdefault(target, []).append(matched)
+                    multiple_targets = len(by_target) > 1
+                    for target, target_matches in by_target.items():
+                        matched = target_matches[0]
+                        offsets = sorted(
+                            {
+                                (value.start_offset, value.end_offset)
+                                for value in target_matches
+                            }
                         )
-                    )
+                        shown_offsets = offsets[:8]
+                        offset_label = "、".join(
+                            f"{start}:{end}" for start, end in shown_offsets
+                        )
+                        if len(offsets) > len(shown_offsets):
+                            offset_label += "、等"
+                        matched_form = str(matched.matched_form or "").strip()
+                        source = matched_form
+                        location_note = ""
+                        if multiple_targets:
+                            source = f"{matched_form}（原文字符{offset_label}）"
+                            location_note = (
+                                f"仅适用于原文字符位置 {offset_label}；"
+                                "不得用于同块其他同形词。"
+                            )
+                            pattern_sources[source] = matched_form
+                        lexeme = concept_snapshot.get_lexeme(matched.lexeme_id) or {}
+                        concept = next(
+                            (
+                                value
+                                for value in lexeme.get("concepts", []) or []
+                                if str(value.get("id") or "") == matched.concept_id
+                            ),
+                            None,
+                        )
+                        if concept is None:
+                            concept = next(iter(lexeme.get("concepts", []) or []), {})
+                        winning_rules = {
+                            str(rule.get("id") or ""): rule
+                            for rule in list(lexeme.get("rules", []) or [])
+                            + list(concept.get("rules", []) or [])
+                        }
+                        rule_verified = any(
+                            bool(winning_rules.get(rule_id, {}).get("locked"))
+                            or str(winning_rules.get(rule_id, {}).get("status") or "")
+                            == "verified"
+                            for rule_id in matched.applied_rule_ids
+                        )
+                        verified = rule_verified or target in {
+                            str(lexeme.get("verified_target") or "").strip(),
+                            str(concept.get("verified_target") or "").strip(),
+                        }
+                        status = (
+                            TermStatus.VERIFIED if verified else TermStatus.WORKING
+                        )
+                        base_description = str(
+                            concept.get("description") or ""
+                        ).strip()
+                        description = " ".join(
+                            value
+                            for value in (base_description, location_note)
+                            if value
+                        ) or None
+                        items.append(
+                            GlossaryItem(
+                                id=(
+                                    f"{matched.concept_id or matched.lexeme_id}:"
+                                    f"{block.id}:{offset_label}"
+                                ),
+                                src=source or str(lexeme.get("source") or ""),
+                                default_target=target,
+                                category=self._category(
+                                    str(concept.get("kind") or "concept")
+                                ),
+                                status=status,
+                                description=description,
+                                rules=[],
+                            )
+                        )
             manager = GlossaryManager(str(self.database.root / "readonly_glossary"))
             manager.glossary = Glossary(items=items)
             manager._build_patterns()
+            for annotated_source, matched_form in pattern_sources.items():
+                manager._term_patterns[annotated_source] = re.compile(
+                    rf"(?<!\w){re.escape(matched_form)}(?!\w)", re.IGNORECASE
+                )
             return manager
 
         source = "\n".join(block.source_text for block in blocks)
@@ -323,10 +378,21 @@ class V4TranslationPipeline:
             ),
         )
         proposals: List[tuple[str, Dict[str, Any]]] = []
+        rendering_contexts_by_block: Mapping[
+            str, Sequence[Mapping[str, Any]]
+        ] = {}
+        if isinstance(concept_snapshot, FrozenRenderIndex):
+            rendering_contexts_by_block = (
+                self.database.rendering_contexts_for_blocks(
+                    [block.id for block in island.blocks]
+                )
+            )
         engine = TranslationEngine(
             llm_manager=audited_llm,
             glossary_manager=self._glossary_for(
-                island.blocks, concept_snapshot=concept_snapshot
+                island.blocks,
+                concept_snapshot=concept_snapshot,
+                rendering_contexts_by_block=rendering_contexts_by_block,
             ),
             knowledge_base=None,
             prompts=self.prompts,
@@ -340,7 +406,9 @@ class V4TranslationPipeline:
         for block in island.blocks:
             if isinstance(concept_snapshot, FrozenRenderIndex):
                 engine.glossary = self._glossary_for(
-                    [block], concept_snapshot=concept_snapshot
+                    [block],
+                    concept_snapshot=concept_snapshot,
+                    rendering_contexts_by_block=rendering_contexts_by_block,
                 )
             frozen_block_concept_ids = [
                 str(concept["id"])

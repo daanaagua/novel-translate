@@ -9,7 +9,8 @@ from types import SimpleNamespace
 from unittest.mock import ANY, patch
 
 from src.core.history import TranslationMemory
-from src.core.schemas import Chapter, ChunkStatus, TextChunk
+from src.core.schemas import Chapter, ChunkStatus, TermStatus, TextChunk
+from src.core.translator import TranslationEngine
 from src.core.v4.context import ContextBuilder, ContextOverflow
 from src.core.v4.database import V4Database
 from src.core.v4.exporter import ParallelV4BookExporter
@@ -266,6 +267,117 @@ class ParallelV4Tests(unittest.TestCase):
         self.assertEqual([item.default_target for item in vocative], ["阁下"])
         self.assertEqual([item.default_target for item in tavern], ["执政官"])
         self.assertEqual(vocative[0].rules, [])
+
+    def test_same_form_occurrence_targets_are_both_visible_in_final_glossary_prompt(self):
+        block = self.add_blocks(
+            ["Archon called; Archon answered."], status="ready"
+        )[0]
+        concept_id = self.database.import_legacy_concept(
+            "Archon", "", "title", "office"
+        )
+        self.database.apply_working_target_decisions(
+            [{"concept_id": concept_id, "target": "ORDINARY", "rules": []}]
+        )
+        version = self.database.current_knowledge_version()
+        with self.database.transaction() as connection:
+            lexeme_id = connection.execute(
+                "SELECT primary_lexeme_id FROM concepts WHERE id=?", (concept_id,)
+            ).fetchone()[0]
+            for start, end, discourse in (
+                (0, 6, "vocative"),
+                (15, 21, "referential"),
+            ):
+                payload = json.dumps(
+                    {"start_offset": start, "end_offset": end},
+                    separators=(",", ":"),
+                )
+                evidence_id = connection.execute(
+                    """INSERT INTO evidence(
+                           block_id, paragraph_id, kind, source_form,
+                           evidence_quote, payload_json, confidence, extractor,
+                           run_id, created_at)
+                       VALUES(?, 'P000', 'test', 'Archon', 'Archon', ?, 1.0,
+                              'test', NULL, 'now')""",
+                    (block.id, payload),
+                ).lastrowid
+                connection.execute(
+                    """INSERT INTO mentions(
+                           block_id, paragraph_id, source_form, normalized_form,
+                           discourse_function, lexeme_id, concept_id, evidence_id)
+                       VALUES(?, 'P000', 'Archon', 'archon', ?, ?, ?, ?)""",
+                    (block.id, discourse, lexeme_id, concept_id, evidence_id),
+                )
+                connection.execute(
+                    """INSERT OR IGNORE INTO form_occurrences(
+                           lexeme_id, block_id, start_offset, end_offset,
+                           source_form, source_hash, created_at)
+                       VALUES(?, ?, ?, ?, 'Archon', ?, 'now')""",
+                    (lexeme_id, block.id, start, end, block.source_hash),
+                )
+            connection.execute(
+                """INSERT INTO rendering_rules(
+                       id, lexeme_id, condition_json, target, priority, status,
+                       scope, locked, created_version, created_at)
+                   VALUES('archon-first-vocative', ?, ?, 'VOCATIVE', 100,
+                          'verified', 'book', 1, ?, 'now')""",
+                (
+                    lexeme_id,
+                    json.dumps(
+                        {
+                            "discourse_function": "vocative",
+                            "start_offset": 0,
+                            "end_offset": 6,
+                        },
+                        separators=(",", ":"),
+                    ),
+                    version,
+                ),
+            )
+
+        _, frozen, _ = self.database.freeze_translation_knowledge()
+        manager = V4TranslationPipeline(self.database, lambda: None)._glossary_for(
+            [block], concept_snapshot=frozen
+        )
+        visible = manager.find_terms_in_text(
+            block.source_text, status_filter=list(TermStatus)
+        )
+        rendered = "\n".join(
+            TranslationEngine._render_glossary_term(item) for item in visible
+        )
+
+        self.assertEqual(len(visible), 2)
+        self.assertIn("VOCATIVE", rendered)
+        self.assertIn("ORDINARY", rendered)
+        self.assertIn("0:6", rendered)
+        self.assertIn("15:21", rendered)
+
+    def test_island_prefetches_rendering_contexts_once(self):
+        self.add_blocks([f"Block {index}." for index in range(5)], status="ready")
+        original = self.database.rendering_contexts_for_blocks
+        calls = []
+
+        def counted(block_ids):
+            calls.append(tuple(block_ids))
+            return original(block_ids)
+
+        self.database.rendering_contexts_for_blocks = counted
+        pipeline = V4TranslationPipeline(
+            self.database,
+            lambda: FakeTranslationLLM(),
+            config=V4PipelineConfig(
+                island_size=5,
+                initial_workers=1,
+                max_workers=1,
+                enable_polish=False,
+                enable_semantic_mapper=False,
+            ),
+        )
+
+        result = pipeline.run()
+
+        self.assertEqual(result["status"], "completed")
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(len(calls[0]), 5)
 
     def test_local_scan_indexes_candidates_and_legacy_reconcile_is_conservative(self):
         blocks = self.add_blocks(["Archon spoke.", "archon waited.", "Archons gathered."])
