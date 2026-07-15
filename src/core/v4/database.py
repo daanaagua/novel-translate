@@ -262,10 +262,6 @@ class V4Database:
                     FOREIGN KEY(cluster_id)
                         REFERENCES candidate_clusters(id) ON DELETE CASCADE
                 );
-                CREATE INDEX IF NOT EXISTS idx_candidate_adjudications_cluster
-                    ON candidate_adjudications(run_id, cluster_id, active, created_at);
-                CREATE UNIQUE INDEX IF NOT EXISTS idx_candidate_adjudications_active
-                    ON candidate_adjudications(run_id, cluster_id) WHERE active=1;
 
                 CREATE TABLE IF NOT EXISTS candidate_resolutions (
                     id TEXT PRIMARY KEY,
@@ -545,6 +541,7 @@ class V4Database:
                     "INSERT INTO knowledge_versions(parent_id, reason, created_at) VALUES(NULL, ?, ?)",
                     ("initialize parallel_v4", utc_now()),
                 )
+            self._migrate_candidate_adjudication_schema(connection)
             columns = {
                 row[1] for row in connection.execute("PRAGMA table_info(blocks)").fetchall()
             }
@@ -640,6 +637,204 @@ class V4Database:
                 (str(SCHEMA_VERSION),),
             )
             connection.commit()
+
+    @staticmethod
+    def _candidate_adjudication_table_sql() -> str:
+        return """CREATE TABLE candidate_adjudications (
+            id TEXT PRIMARY KEY,
+            run_id TEXT NOT NULL REFERENCES runs(id),
+            cluster_id TEXT NOT NULL,
+            verdict TEXT NOT NULL,
+            payload_hash TEXT NOT NULL,
+            selected_candidate_ids_json TEXT NOT NULL DEFAULT '[]',
+            entity_kind TEXT NOT NULL DEFAULT '',
+            confidence REAL NOT NULL DEFAULT 0.0,
+            reason TEXT NOT NULL DEFAULT '',
+            rounds INTEGER NOT NULL DEFAULT 1,
+            payload_json TEXT NOT NULL DEFAULT '{}',
+            knowledge_version INTEGER NOT NULL REFERENCES knowledge_versions(id),
+            active INTEGER NOT NULL DEFAULT 1,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            superseded_at TEXT,
+            FOREIGN KEY(cluster_id)
+                REFERENCES candidate_clusters(id) ON DELETE CASCADE
+        )"""
+
+    @staticmethod
+    def _candidate_resolution_table_sql() -> str:
+        return """CREATE TABLE candidate_resolutions (
+            id TEXT PRIMARY KEY,
+            adjudication_id TEXT NOT NULL REFERENCES candidate_adjudications(id)
+                ON DELETE CASCADE,
+            run_id TEXT NOT NULL REFERENCES runs(id),
+            cluster_id TEXT NOT NULL,
+            candidate_id TEXT REFERENCES lexical_candidates(id),
+            concept_id TEXT REFERENCES concepts(id),
+            evidence_id INTEGER REFERENCES evidence(id),
+            decision TEXT NOT NULL,
+            ordinal INTEGER NOT NULL DEFAULT 0,
+            payload_json TEXT NOT NULL DEFAULT '{}',
+            created_at TEXT NOT NULL,
+            UNIQUE(adjudication_id, ordinal),
+            FOREIGN KEY(cluster_id)
+                REFERENCES candidate_clusters(id) ON DELETE CASCADE
+        )"""
+
+    def _migrate_candidate_adjudication_schema(
+        self, connection: sqlite3.Connection
+    ) -> None:
+        columns = {
+            row["name"]
+            for row in connection.execute(
+                "PRAGMA table_info(candidate_adjudications)"
+            ).fetchall()
+        }
+        additions = {
+            "payload_hash": "TEXT NOT NULL DEFAULT ''",
+            "knowledge_version": "INTEGER REFERENCES knowledge_versions(id)",
+            "active": "INTEGER NOT NULL DEFAULT 1",
+            "superseded_at": "TEXT",
+        }
+        missing_columns = set(additions).difference(columns)
+        for name, declaration in additions.items():
+            if name not in columns:
+                connection.execute(
+                    f"ALTER TABLE candidate_adjudications ADD COLUMN {name} {declaration}"
+                )
+
+        valid_versions = {
+            int(row[0])
+            for row in connection.execute("SELECT id FROM knowledge_versions")
+        }
+        fallback_version = max(valid_versions)
+        rows = connection.execute(
+            """SELECT ca.id, ca.run_id, ca.cluster_id, ca.payload_json,
+                      ca.payload_hash, ca.knowledge_version, ca.created_at,
+                      ca.updated_at, ca.superseded_at, r.knowledge_version run_version
+               FROM candidate_adjudications ca
+               LEFT JOIN runs r ON r.id=ca.run_id
+               ORDER BY ca.run_id, ca.cluster_id, ca.updated_at DESC,
+                        ca.created_at DESC, ca.id DESC"""
+        ).fetchall()
+        newest_by_cluster: set[tuple[str, str]] = set()
+        for row in rows:
+            raw_payload = row["payload_json"] or "{}"
+            try:
+                payload = json.loads(raw_payload)
+            except (TypeError, ValueError):
+                payload = {"legacy_payload": str(raw_payload)}
+            canonical_payload = json.dumps(
+                payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+            )
+            payload_hash = row["payload_hash"]
+            if "payload_hash" in missing_columns or not payload_hash:
+                payload_hash = hashlib.sha256(
+                    canonical_payload.encode("utf-8")
+                ).hexdigest()
+            knowledge_version = row["knowledge_version"]
+            if knowledge_version not in valid_versions:
+                knowledge_version = row["run_version"]
+            if knowledge_version not in valid_versions:
+                knowledge_version = fallback_version
+            cluster_key = (str(row["run_id"]), str(row["cluster_id"]))
+            if "active" in missing_columns:
+                active = int(cluster_key not in newest_by_cluster)
+            else:
+                active = int(row["active"])
+            newest_by_cluster.add(cluster_key)
+            superseded_at = row["superseded_at"]
+            if (
+                "superseded_at" in missing_columns
+                and not active
+                and superseded_at is None
+            ):
+                superseded_at = row["updated_at"]
+            connection.execute(
+                """UPDATE candidate_adjudications
+                   SET payload_hash=?, knowledge_version=?, active=?, superseded_at=?
+                   WHERE id=?""",
+                (
+                    payload_hash,
+                    int(knowledge_version),
+                    active,
+                    superseded_at,
+                    row["id"],
+                ),
+            )
+
+        has_legacy_unique = False
+        for index in connection.execute(
+            "PRAGMA index_list(candidate_adjudications)"
+        ).fetchall():
+            if not bool(index["unique"]) or bool(index["partial"]):
+                continue
+            index_columns = tuple(
+                row["name"]
+                for row in connection.execute(
+                    f"PRAGMA index_info('{index['name']}')"
+                ).fetchall()
+            )
+            if index_columns == ("run_id", "cluster_id"):
+                has_legacy_unique = True
+                break
+
+        if has_legacy_unique:
+            connection.execute(
+                "ALTER TABLE candidate_resolutions RENAME TO legacy_candidate_resolutions"
+            )
+            connection.execute(
+                "ALTER TABLE candidate_adjudications RENAME TO legacy_candidate_adjudications"
+            )
+            connection.execute(self._candidate_adjudication_table_sql())
+            connection.execute(self._candidate_resolution_table_sql())
+            connection.execute(
+                """INSERT INTO candidate_adjudications(
+                       id, run_id, cluster_id, verdict, payload_hash,
+                       selected_candidate_ids_json, entity_kind, confidence,
+                       reason, rounds, payload_json, knowledge_version, active,
+                       created_at, updated_at, superseded_at)
+                   SELECT id, run_id, cluster_id, verdict, payload_hash,
+                          selected_candidate_ids_json, entity_kind, confidence,
+                          reason, rounds, payload_json, knowledge_version, active,
+                          created_at, updated_at, superseded_at
+                   FROM legacy_candidate_adjudications"""
+            )
+            connection.execute(
+                """INSERT INTO candidate_resolutions(
+                       id, adjudication_id, run_id, cluster_id, candidate_id,
+                       concept_id, evidence_id, decision, ordinal, payload_json,
+                       created_at)
+                   SELECT id, adjudication_id, run_id, cluster_id, candidate_id,
+                          concept_id, evidence_id, decision, ordinal, payload_json,
+                          created_at
+                   FROM legacy_candidate_resolutions"""
+            )
+            connection.execute("DROP TABLE legacy_candidate_resolutions")
+            connection.execute("DROP TABLE legacy_candidate_adjudications")
+
+        connection.execute("DROP INDEX IF EXISTS idx_candidate_adjudications_cluster")
+        connection.execute("DROP INDEX IF EXISTS idx_candidate_adjudications_active")
+        connection.execute(
+            """CREATE INDEX idx_candidate_adjudications_cluster
+               ON candidate_adjudications(run_id, cluster_id, active, created_at)"""
+        )
+        connection.execute(
+            """CREATE UNIQUE INDEX idx_candidate_adjudications_active
+               ON candidate_adjudications(run_id, cluster_id) WHERE active=1"""
+        )
+        connection.execute(
+            """CREATE INDEX IF NOT EXISTS idx_candidate_resolutions_cluster
+               ON candidate_resolutions(run_id, cluster_id, ordinal)"""
+        )
+        connection.execute(
+            """CREATE INDEX IF NOT EXISTS idx_candidate_resolutions_candidate
+               ON candidate_resolutions(candidate_id, decision)"""
+        )
+        connection.execute(
+            """CREATE INDEX IF NOT EXISTS idx_candidate_resolutions_concept
+               ON candidate_resolutions(concept_id, decision)"""
+        )
 
     def current_knowledge_version(self) -> int:
         with closing(self.connect()) as connection:
@@ -1572,6 +1767,9 @@ class V4Database:
     def _prepare_scan_reset_selection(self, connection: sqlite3.Connection) -> None:
         evidence_where = self._scan_evidence_where("e")
         statements = (
+            """CREATE TEMP TABLE reset_scan_blocks AS
+               SELECT id FROM blocks
+               WHERE status!='pending' OR last_error IS NOT NULL""",
             """CREATE TEMP TABLE reset_protected_mentions AS
                SELECT DISTINCT m.id FROM mentions m
                JOIN usage_decisions ud ON ud.mention_id=m.id
@@ -1641,6 +1839,7 @@ class V4Database:
     @staticmethod
     def _scan_reset_queries() -> Dict[str, str]:
         return {
+            "blocks_reset": "SELECT id,status,last_error,updated_at FROM blocks WHERE id IN (SELECT id FROM reset_scan_blocks) ORDER BY id",
             "lexical_candidates": "SELECT id,updated_at,resolution_status,selected FROM lexical_candidates ORDER BY id",
             "candidate_clusters": "SELECT id,run_id,updated_at FROM candidate_clusters ORDER BY id",
             "candidate_cluster_members": "SELECT cluster_id,candidate_id,role FROM candidate_cluster_members ORDER BY cluster_id,candidate_id",
@@ -1760,15 +1959,14 @@ class V4Database:
             deleted["lexical_candidates"] = connection.execute(
                 "DELETE FROM lexical_candidates"
             ).rowcount
-            connection.execute(
+            deleted["blocks_reset"] = connection.execute(
                 """UPDATE blocks SET status=?, last_error=NULL, updated_at=?
-                   WHERE status!=? OR last_error IS NOT NULL""",
+                   WHERE id IN (SELECT id FROM reset_scan_blocks)""",
                 (
                     V4BlockStatus.PENDING.value,
                     utc_now(),
-                    V4BlockStatus.PENDING.value,
                 ),
-            )
+            ).rowcount
             return deleted
 
     def source_block_count(self) -> int:

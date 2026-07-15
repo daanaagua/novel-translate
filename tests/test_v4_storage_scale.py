@@ -1,3 +1,4 @@
+import hashlib
 import json
 import sqlite3
 from contextlib import closing
@@ -203,6 +204,108 @@ def test_schema6_migration_backfills_locked_targets_without_overwriting_values(t
             "SELECT working_target, verified_target FROM concepts WHERE id='locked-old'"
         ).fetchone()
     assert tuple(preserved) == ("人工工作译名", "人工审定译名")
+
+
+def test_unreleased_legacy_schema7_adjudication_table_is_migrated_in_place(tmp_path):
+    root = tmp_path / "legacy-schema7"
+    path = root / "artifacts" / "parallel_v4" / "book.db"
+    path.parent.mkdir(parents=True)
+    payload = {
+        "cluster_id": "cluster-old",
+        "verdict": "defer",
+        "selected_candidate_ids": [],
+        "entity_kind": "concept",
+        "confidence": 0.4,
+        "reason": "model_protocol_failure",
+        "rounds": 1,
+    }
+    payload_json = json.dumps(payload, ensure_ascii=False, sort_keys=True)
+    with closing(sqlite3.connect(path)) as connection:
+        connection.executescript(
+            f"""
+            CREATE TABLE schema_meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);
+            INSERT INTO schema_meta VALUES('schema_version', '7');
+            CREATE TABLE knowledge_versions(
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                parent_id INTEGER REFERENCES knowledge_versions(id),
+                reason TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            );
+            INSERT INTO knowledge_versions(parent_id, reason, created_at)
+            VALUES(NULL, 'legacy', 'now');
+            CREATE TABLE runs(
+                id TEXT PRIMARY KEY, stage TEXT NOT NULL, status TEXT NOT NULL,
+                knowledge_version INTEGER, config_json TEXT NOT NULL,
+                started_at TEXT NOT NULL, finished_at TEXT, error TEXT
+            );
+            INSERT INTO runs VALUES(
+                'run-old', 'candidate_adjudication', 'completed', 1, '{{}}',
+                'now', 'now', NULL
+            );
+            CREATE TABLE candidate_clusters(
+                id TEXT PRIMARY KEY,
+                run_id TEXT NOT NULL REFERENCES runs(id),
+                risk_flags_json TEXT NOT NULL DEFAULT '[]',
+                affected_blocks_json TEXT NOT NULL DEFAULT '[]',
+                affected_block_count INTEGER NOT NULL DEFAULT 0,
+                ordinal INTEGER NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                UNIQUE(run_id, id)
+            );
+            INSERT INTO candidate_clusters VALUES(
+                'cluster-old', 'run-old', '[]', '[]', 0, 0, 'now', 'now'
+            );
+            CREATE TABLE candidate_adjudications(
+                id TEXT PRIMARY KEY,
+                run_id TEXT NOT NULL,
+                cluster_id TEXT NOT NULL,
+                verdict TEXT NOT NULL,
+                selected_candidate_ids_json TEXT NOT NULL DEFAULT '[]',
+                entity_kind TEXT NOT NULL DEFAULT '',
+                confidence REAL NOT NULL DEFAULT 0.0,
+                reason TEXT NOT NULL DEFAULT '',
+                rounds INTEGER NOT NULL DEFAULT 1,
+                payload_json TEXT NOT NULL DEFAULT '{{}}',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                UNIQUE(run_id, cluster_id),
+                FOREIGN KEY(cluster_id) REFERENCES candidate_clusters(id) ON DELETE CASCADE
+            );
+            """
+        )
+        connection.execute(
+            """INSERT INTO candidate_adjudications(
+                   id, run_id, cluster_id, verdict, selected_candidate_ids_json,
+                   entity_kind, confidence, reason, rounds, payload_json,
+                   created_at, updated_at
+               ) VALUES('adjud-old', 'run-old', 'cluster-old', 'defer', '[]',
+                        'concept', 0.4, 'model_protocol_failure', 1, ?, 'now', 'now')""",
+            (payload_json,),
+        )
+        connection.commit()
+
+    db = V4Database(root)
+    canonical = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    expected_hash = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+    with closing(db.connect()) as connection:
+        columns = {
+            row["name"]
+            for row in connection.execute("PRAGMA table_info(candidate_adjudications)")
+        }
+        row = connection.execute(
+            """SELECT payload_hash, knowledge_version, active, superseded_at
+               FROM candidate_adjudications WHERE id='adjud-old'"""
+        ).fetchone()
+        table_sql = connection.execute(
+            """SELECT sql FROM sqlite_master
+               WHERE type='table' AND name='candidate_adjudications'"""
+        ).fetchone()[0]
+        assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
+        assert connection.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+    assert {"payload_hash", "knowledge_version", "active", "superseded_at"} <= columns
+    assert tuple(row) == (expected_hash, 1, 1, None)
+    assert "UNIQUE(run_id, cluster_id)" not in table_sql.replace("\n", " ")
 
 
 def test_cluster_persistence_and_adjudication_promotion_are_atomic(tmp_path):
@@ -677,6 +780,7 @@ def test_reset_token_guards_snapshot_and_preserves_sources_baseline_and_locks(tm
         "verification_votes",
         "verification_tasks",
         "concepts",
+        "blocks_reset",
     }
     assert {key: fresh[key] for key in deletion_keys} == deleted
     assert db.source_block_count() == 1
@@ -767,6 +871,57 @@ def test_reset_token_tracks_usage_lock_and_preserves_locked_occurrence_dependenc
         assert connection.execute("SELECT COUNT(*) FROM source_forms WHERE concept_id=?", (concept_id,)).fetchone()[0] == 1
         assert connection.execute("SELECT COUNT(*) FROM concepts WHERE id=?", (concept_id,)).fetchone()[0] == 1
         assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
+
+
+def test_reset_token_tracks_exact_block_status_rows(tmp_path):
+    db, edition, block, _ = _seed_database(tmp_path)
+    db.upsert_blocks(
+        edition,
+        [
+            {
+                "id": "block-pending",
+                "chapter_id": "ch01",
+                "chapter_title": "I",
+                "chapter_index": 0,
+                "block_index": 1,
+                "global_index": 1,
+                "block_type": "prose",
+                "source_text": "Pending.",
+                "source_hash": "pending-hash",
+                "token_count": 1,
+                "status": "pending",
+            }
+        ],
+    )
+    with db.transaction() as connection:
+        pending_before = connection.execute(
+            "SELECT updated_at FROM blocks WHERE id='block-pending'"
+        ).fetchone()[0]
+
+    preview = db.preview_scan_reset()
+    assert preview["blocks_reset"] == 1
+    with db.transaction() as connection:
+        connection.execute(
+            """UPDATE blocks SET status='ready', last_error='changed',
+               updated_at='changed' WHERE id=?""",
+            (block.id,),
+        )
+    with pytest.raises(ValueError, match="token"):
+        db.reset_scan_derivatives(preview["token"])
+
+    fresh = db.preview_scan_reset()
+    assert fresh["blocks_reset"] == 1
+    deleted = db.reset_scan_derivatives(fresh["token"])
+    assert deleted["blocks_reset"] == 1
+    with closing(db.connect()) as connection:
+        reset_row = connection.execute(
+            "SELECT status, last_error FROM blocks WHERE id=?", (block.id,)
+        ).fetchone()
+        pending_after = connection.execute(
+            "SELECT status, last_error, updated_at FROM blocks WHERE id='block-pending'"
+        ).fetchone()
+    assert tuple(reset_row) == ("pending", None)
+    assert tuple(pending_after) == ("pending", None, pending_before)
 
 
 def test_moderate_candidate_storage_scale_keeps_integrity(tmp_path):
