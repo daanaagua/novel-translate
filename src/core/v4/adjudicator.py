@@ -53,6 +53,28 @@ Be conservative: extraction merely proposes spans and does not prove termhood.
 {ADJUDICATION_PROTOCOL}"""
 
 
+def _external_error_kind(exc: Exception) -> Optional[str]:
+    """Classify only provider pressure and transport failures."""
+
+    status_code = getattr(exc, "status_code", None)
+    text = f"{type(exc).__name__}: {exc}".lower()
+    if (
+        status_code == 429
+        or "rate limit" in text
+        or "too many requests" in text
+    ):
+        return "rate_limit"
+    if isinstance(exc, TimeoutError) or "timeout" in text or "timed out" in text:
+        return "timeout"
+    if (
+        "connection" in text
+        or "temporarily unavailable" in text
+        or "service unavailable" in text
+    ):
+        return "transient_network"
+    return None
+
+
 def _adjudication_retry_message(last_error: str) -> str:
     return (
         "The previous JSON failed strict local validation. Correct the complete "
@@ -397,6 +419,7 @@ class V4Adjudicator:
                 resolved = self._resolve_decisions(parsed, round_batch)
             except Exception as exc:
                 last_error = str(exc)
+                error_kind = _external_error_kind(exc)
                 audit_attempts.append(
                     AdjudicationAuditAttempt(
                         messages=tuple(dict(message) for message in messages),
@@ -406,7 +429,7 @@ class V4Adjudicator:
                         attempt=_attempt,
                         elapsed_ms=int((time.perf_counter() - started) * 1000),
                         error=last_error,
-                        error_kind=None,
+                        error_kind=error_kind,
                         model=model,
                         knowledge_version=int(knowledge_version),
                         audit_mode=self.audit_mode,
@@ -705,6 +728,8 @@ class V4Adjudicator:
         workers = initial_workers
         waves = batches = model_calls = model_elapsed_ms_sum = 0
         peak_workers = 0
+        rate_limit_events = transient_error_events = worker_reductions = 0
+        worker_history: list[int] = []
         started = time.perf_counter()
         try:
             if remaining == 0:
@@ -728,6 +753,7 @@ class V4Adjudicator:
                     store.finalize_adjudication_run(run_id, status)
                     break
                 waves += 1
+                worker_history.append(workers)
                 batches += len(claimed_batches)
                 peak_workers = max(peak_workers, len(claimed_batches))
                 source_texts = store.source_texts_for_candidate_clusters(
@@ -802,10 +828,29 @@ class V4Adjudicator:
                     model_elapsed_ms_sum += outcome.model_elapsed_ms_sum
                     concept_ids.update(committed.get("concept_ids", []))
                     knowledge_version = committed.get("knowledge_version")
+                wave_error_kinds = [
+                    error_kind
+                    for outcome in ordered_outcomes
+                    for error_kind in outcome.error_kinds
+                ]
+                rate_limit_events += wave_error_kinds.count("rate_limit")
+                transient_error_events += sum(
+                    error_kind in {"timeout", "transient_network"}
+                    for error_kind in wave_error_kinds
+                )
                 if worker_errors:
                     raise worker_errors[0]
                 if no_more:
                     break
+                previous_workers = workers
+                if "rate_limit" in wave_error_kinds:
+                    workers = max(1, workers // 2)
+                elif {"timeout", "transient_network"} & set(wave_error_kinds):
+                    workers = max(1, workers - 1)
+                elif workers < max_workers:
+                    workers += 1
+                if workers < previous_workers:
+                    worker_reductions += 1
             return {
                 "run_id": run_id,
                 "adjudicated": adjudicated,
@@ -821,6 +866,10 @@ class V4Adjudicator:
                 "model_calls": model_calls,
                 "model_elapsed_ms_sum": model_elapsed_ms_sum,
                 "elapsed_ms": int((time.perf_counter() - started) * 1000),
+                "rate_limit_events": rate_limit_events,
+                "transient_error_events": transient_error_events,
+                "worker_reductions": worker_reductions,
+                "worker_history": worker_history,
             }
         except Exception as exc:
             store.finalize_adjudication_run(run_id, "failed", str(exc))

@@ -116,6 +116,33 @@ class ConcurrentPromotingLLM(PromotingLLM):
                 self.tracker.active -= 1
 
 
+class RateLimitSignal(RuntimeError):
+    status_code = 429
+
+
+class OneRateLimitFactory:
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.calls = 0
+
+    def __call__(self):
+        return OneRateLimitLLM(self)
+
+
+class OneRateLimitLLM(PromotingLLM):
+    def __init__(self, tracker):
+        super().__init__()
+        self.tracker = tracker
+
+    def chat(self, *, messages, **kwargs):
+        with self.tracker.lock:
+            call_index = self.tracker.calls
+            self.tracker.calls += 1
+        if call_index == 0:
+            raise RateLimitSignal("too many requests")
+        return super().chat(messages=messages, **kwargs)
+
+
 def make_database(tmp_path, texts):
     db = V4Database(tmp_path / "book")
     edition = db.ensure_source_edition("raw", "normalized", "test", "source.txt")
@@ -642,6 +669,24 @@ def test_adjudicator_run_executes_four_batches_and_commits_in_order(
         expected_ids[start : start + 12] for start in range(0, 48, 12)
     ]
     assert set(write_threads) == {threading.get_ident()}
+
+
+def test_adjudicator_halves_workers_after_rate_limit_then_recovers(tmp_path):
+    db = make_candidate_cluster_database(tmp_path, 132)
+    factory = OneRateLimitFactory()
+
+    result = V4Adjudicator(
+        factory(),
+        database=db,
+        max_attempts=1,
+        llm_factory=factory,
+    ).run(initial_workers=4, max_workers=4)
+
+    assert result["worker_history"][:3] == [4, 2, 3]
+    assert result["rate_limit_events"] == 1
+    assert result["worker_reductions"] == 1
+    assert result["failed"] == 12
+    assert result["adjudicated"] == 132
 
 
 def test_deferred_adjudication_is_active_but_creates_no_concept(database):
