@@ -133,6 +133,22 @@ def seed_incomplete_schema8(tmp_path, corruption):
                     DROP TABLE old_translation_versions;
                     """
                 )
+            elif corruption == "translation_literal_case":
+                schema_version = connection.execute(
+                    "PRAGMA schema_version"
+                ).fetchone()[0]
+                connection.execute("PRAGMA writable_schema = ON")
+                connection.execute(
+                    """UPDATE sqlite_master
+                       SET sql=replace(
+                           sql,
+                           '''clean'', ''pending''',
+                           '''CLEAN'', ''pending'''
+                       )
+                       WHERE type='table' AND name='translation_versions'"""
+                )
+                connection.execute("PRAGMA writable_schema = OFF")
+                connection.execute(f"PRAGMA schema_version = {schema_version + 1}")
             elif corruption == "revalidation_check":
                 connection.executescript(
                     """
@@ -169,6 +185,7 @@ def test_schema7_requires_explicit_preview_and_confirm(tmp_path):
         "legacy_dependencies",
         "rendering_check",
         "translation_check",
+        "translation_literal_case",
         "revalidation_check",
     ),
 )

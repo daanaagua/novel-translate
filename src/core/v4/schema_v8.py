@@ -48,9 +48,9 @@ def inspect_schema(path: Path) -> int | None:
 
 
 def _normalize_schema_sql(sql: str) -> str:
-    """Normalize only case and whitespace for deterministic DDL comparison."""
+    """Preserve DDL semantics while ignoring sqlite_master edge whitespace."""
 
-    return " ".join(sql.casefold().split())
+    return sql.strip()
 
 
 def _schema_signature(connection: sqlite3.Connection) -> dict[tuple[str, str], str]:
