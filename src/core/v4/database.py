@@ -3273,109 +3273,10 @@ class V4Database:
         return getattr(result, field, default)
 
     @staticmethod
-    def _active_concept_for_form(
-        connection: sqlite3.Connection, normalized_form: str, entity_kind: str
-    ) -> Optional[sqlite3.Row]:
-        return connection.execute(
-            """SELECT DISTINCT c.*
-               FROM concepts c
-               LEFT JOIN concept_lexemes cl
-                 ON cl.concept_id=c.id AND cl.retired_version IS NULL
-               LEFT JOIN source_forms sf ON sf.lexeme_id=cl.lexeme_id
-               WHERE c.retired_version IS NULL
-                 AND (sf.normalized_form=? OR lower(c.canonical_source)=?)
-                 AND (c.locked=1 OR c.kind=?)
-               ORDER BY c.locked DESC, c.id
-               LIMIT 1""",
-            (normalized_form, normalized_form, entity_kind),
-        ).fetchone()
-
-    def _ensure_automatic_concept(
-        self,
-        connection: sqlite3.Connection,
-        *,
-        normalized_form: str,
-        entity_kind: str,
-        source_form: str,
-        knowledge_version: int,
-        created_at: str,
-    ) -> str:
-        active = self._active_concept_for_form(
-            connection, normalized_form, entity_kind
-        )
-        if active is not None and bool(active["locked"]):
-            return str(active["id"])
-
-        base_identity = f"{entity_kind}:{normalized_form}"
-        base_concept_id = stable_id("concept", base_identity)
-        base = connection.execute(
-            """SELECT id, locked, retired_version FROM concepts
-               WHERE id=?""",
-            (base_concept_id,),
-        ).fetchone()
-        if base is None and active is not None:
-            return str(active["id"])
-
-        for collision_index in range(100):
-            identity = base_identity
-            if collision_index:
-                identity = f"automatic:{base_identity}:{collision_index}"
-            concept_id = stable_id("concept", identity)
-            existing = connection.execute(
-                """SELECT id, locked, retired_version FROM concepts
-                   WHERE id=?""",
-                (concept_id,),
-            ).fetchone()
-            if existing is None:
-                connection.execute(
-                    """INSERT INTO concepts(
-                           id, kind, canonical_source, default_target,
-                           working_target, verified_target, description,
-                           status, scope, locked, created_version, created_at
-                       ) VALUES(?, ?, ?, '', '', '', '', 'provisional',
-                                'book', 0, ?, ?)""",
-                    (
-                        concept_id,
-                        entity_kind,
-                        source_form,
-                        knowledge_version,
-                        created_at,
-                    ),
-                )
-                return concept_id
-            if not bool(existing["locked"]):
-                if existing["retired_version"] is not None:
-                    connection.execute(
-                        """UPDATE concepts
-                           SET status='provisional', retired_version=NULL
-                           WHERE id=? AND locked=0""",
-                        (concept_id,),
-                    )
-                return concept_id
-        raise ValueError("could not allocate an automatic concept id")
-
-    @staticmethod
-    def _cluster_member_representative_id(member: sqlite3.Row) -> Optional[str]:
-        try:
-            payload = json.loads(member["member_context_json"] or "{}")
-        except (TypeError, ValueError, json.JSONDecodeError):
-            payload = {}
-        if isinstance(payload, dict):
-            representative_id = payload.get("representative_candidate_id")
-            if isinstance(representative_id, str) and representative_id:
-                return representative_id
-        if member["member_role"] in {"alternative", "both"}:
-            return str(member["id"])
-        return None
-
-    @classmethod
     def _cluster_member_is_selected(
-        cls, member: sqlite3.Row, selected_ids: set[str]
+        member: sqlite3.Row, selected_ids: set[str]
     ) -> bool:
-        representative_id = cls._cluster_member_representative_id(member)
-        return str(member["id"]) in selected_ids or (
-            representative_id is not None and representative_id in selected_ids
-        )
+        return str(member["id"]) in selected_ids
 
     @staticmethod
     def _active_adjudication_matches(
@@ -3384,13 +3285,14 @@ class V4Database:
         result: Dict[str, Any],
         members: Sequence[sqlite3.Row],
     ) -> bool:
+        resolution_rows = connection.execute(
+            """SELECT candidate_id, decision, lexeme_id, concept_id, evidence_id
+               FROM candidate_resolutions WHERE adjudication_id=?""",
+            (adjudication_id,),
+        ).fetchall()
         resolutions = {
             row["candidate_id"]: row
-            for row in connection.execute(
-                """SELECT candidate_id, decision, concept_id, evidence_id
-                   FROM candidate_resolutions WHERE adjudication_id=?""",
-                (adjudication_id,),
-            ).fetchall()
+            for row in resolution_rows
         }
         if set(resolutions) != {row["id"] for row in members}:
             return False
@@ -3399,14 +3301,63 @@ class V4Database:
             candidate_id = member["id"]
             resolution = resolutions[candidate_id]
             if V4Database._cluster_member_is_selected(member, selected):
+                expected_lexeme_id = stable_id(
+                    "lexeme",
+                    f"en:{normalize_english_form(member['original_text'])}",
+                )
                 if (
                     resolution["decision"] != result["verdict"]
-                    or resolution["concept_id"] is None
+                    or resolution["lexeme_id"] != expected_lexeme_id
+                    or resolution["concept_id"] is not None
                     or resolution["evidence_id"] is None
                     or member["resolution_status"] != "promoted"
                     or member["model_status"] != "accepted"
                     or not member["selected"]
                 ):
+                    return False
+                evidence = connection.execute(
+                    """SELECT 1 FROM evidence
+                       WHERE id=? AND block_id=? AND source_form=?
+                             AND extractor='candidate_adjudication'""",
+                    (
+                        resolution["evidence_id"],
+                        member["block_id"],
+                        member["original_text"],
+                    ),
+                ).fetchone()
+                occurrence = connection.execute(
+                    """SELECT 1 FROM form_occurrences
+                       WHERE lexeme_id=? AND block_id=? AND start_offset=?
+                             AND end_offset=? AND source_form=? AND source_hash=?""",
+                    (
+                        resolution["lexeme_id"],
+                        member["block_id"],
+                        member["start_offset"],
+                        member["end_offset"],
+                        member["original_text"],
+                        member["block_source_hash"],
+                    ),
+                ).fetchone()
+                observation = connection.execute(
+                    """SELECT 1
+                       FROM concept_type_observations cto
+                       JOIN mentions m ON m.id=cto.mention_id
+                       WHERE cto.adjudication_id=? AND cto.lexeme_id=?
+                             AND cto.kind=? AND cto.confidence=?
+                             AND cto.source='candidate_adjudication'
+                             AND cto.evidence_id=? AND cto.concept_id IS NULL
+                             AND cto.retired_version IS NULL
+                             AND m.lexeme_id=cto.lexeme_id
+                             AND m.concept_id IS NULL""",
+                    (
+                        adjudication_id,
+                        resolution["lexeme_id"],
+                        result["entity_kind"],
+                        result["confidence"],
+                        resolution["evidence_id"],
+                    ),
+                ).fetchone()
+                if evidence is None or occurrence is None or observation is None:
                     return False
             else:
                 expected = (
@@ -3418,6 +3369,9 @@ class V4Database:
                 )
                 if (
                     resolution["decision"] != expected
+                    or resolution["lexeme_id"] is not None
+                    or resolution["concept_id"] is not None
+                    or resolution["evidence_id"] is not None
                     or member["resolution_status"] != expected
                     or member["model_status"] != expected
                     or member["selected"]
@@ -3434,7 +3388,7 @@ class V4Database:
         require_lease: bool = False,
         finalize_run_status: Optional[str] = None,
     ) -> Dict[str, Any]:
-        """Atomically persist every final adjudication and promote existing spans."""
+        """Atomically persist adjudications as lexeme-owned span/type evidence."""
         ordered = sorted(
             results,
             key=lambda result: str(self._adjudication_value(result, "cluster_id", "")),
@@ -3446,7 +3400,6 @@ class V4Database:
         if not all(cluster_ids) or len(set(cluster_ids)) != len(cluster_ids):
             raise ValueError("adjudication results require unique cluster ids")
         valid_verdicts = {"promote", "split", "supersede", "reject", "defer"}
-        concept_ids: List[str] = []
         with self.transaction() as connection:
             if connection.execute("SELECT 1 FROM runs WHERE id=?", (run_id,)).fetchone() is None:
                 raise ValueError(f"unknown run: {run_id}")
@@ -3484,9 +3437,11 @@ class V4Database:
                         )
                 rows = connection.execute(
                     """SELECT lc.*, cm.role AS member_role,
-                              cm.context_json AS member_context_json
+                              cm.context_json AS member_context_json,
+                              b.source_hash AS block_source_hash
                        FROM candidate_cluster_members cm
                        JOIN lexical_candidates lc ON lc.id=cm.candidate_id
+                       JOIN blocks b ON b.id=lc.block_id
                        WHERE cm.cluster_id=?
                          AND (
                              cm.role IN ('alternative', 'both')
@@ -3669,17 +3624,6 @@ class V4Database:
                     if normalized_results
                     else int(connection.execute("SELECT MAX(id) FROM knowledge_versions").fetchone()[0])
                 )
-                active_concepts = [
-                    row[0]
-                    for row in connection.execute(
-                        """SELECT DISTINCT cr.concept_id
-                           FROM candidate_resolutions cr
-                           JOIN candidate_adjudications ca ON ca.id=cr.adjudication_id
-                           WHERE ca.run_id=? AND ca.active=1 AND cr.concept_id IS NOT NULL
-                           ORDER BY cr.concept_id""",
-                        (run_id,),
-                    ).fetchall()
-                ]
                 self._complete_committed_clusters(
                     connection,
                     run_id,
@@ -3689,7 +3633,7 @@ class V4Database:
                 return {
                     "knowledge_version": version,
                     "adjudications": len(normalized_results),
-                    "concept_ids": active_concepts,
+                    "concept_ids": [],
                     "changed": 0,
                 }
 
@@ -3748,35 +3692,13 @@ class V4Database:
                 member_rows = cluster_members[cluster_id]
                 for ordinal, candidate in enumerate(member_rows):
                     candidate_id = candidate["id"]
-                    candidate_concept_id: Optional[str] = None
+                    candidate_lexeme_id: Optional[str] = None
                     evidence_id: Optional[int] = None
                     if self._cluster_member_is_selected(candidate, selected):
                         normalized_form = normalize_english_form(candidate["original_text"])
-                        candidate_concept_id = self._ensure_automatic_concept(
-                            connection,
-                            normalized_form=normalized_form,
-                            entity_kind=result["entity_kind"],
-                            source_form=candidate["original_text"],
-                            knowledge_version=version,
-                            created_at=now,
-                        )
-                        candidate_lexeme_id = self._ensure_schema8_lexeme(
-                            connection,
+                        candidate_lexeme_id = self.ensure_lexeme(
                             candidate["original_text"],
-                            normalized_form=normalized_form,
-                            concept_id=candidate_concept_id,
-                            knowledge_version=version,
-                            created_at=now,
-                        )
-                        connection.execute(
-                            """INSERT OR IGNORE INTO source_forms(
-                                   lexeme_id, form, normalized_form, grammar_json
-                               ) VALUES(?, ?, ?, '{}')""",
-                            (
-                                candidate_lexeme_id,
-                                candidate["original_text"],
-                                normalized_form,
-                            ),
+                            connection=connection,
                         )
                         cursor = connection.execute(
                             """INSERT INTO evidence(
@@ -3797,21 +3719,56 @@ class V4Database:
                             ),
                         )
                         evidence_id = int(cursor.lastrowid)
-                        connection.execute(
-                            """INSERT INTO mentions(
-                                   block_id, paragraph_id, source_form,
-                                   normalized_form, discourse_function,
-                                   lexeme_id, concept_id, evidence_id
-                               ) VALUES(?, ?, ?, ?, 'referential', ?, ?, ?)""",
-                            (
-                                candidate["block_id"],
-                                candidate["paragraph_id"],
-                                candidate["original_text"],
-                                normalized_form,
-                                candidate_lexeme_id,
-                                candidate_concept_id,
-                                evidence_id,
-                            ),
+                        existing_mention = connection.execute(
+                            """SELECT m.id
+                               FROM candidate_resolutions cr
+                               JOIN mentions m ON m.evidence_id=cr.evidence_id
+                               WHERE cr.candidate_id=? AND m.lexeme_id=?
+                                     AND m.concept_id IS NULL
+                               ORDER BY m.id LIMIT 1""",
+                            (candidate_id, candidate_lexeme_id),
+                        ).fetchone()
+                        if existing_mention is None:
+                            mention_cursor = connection.execute(
+                                """INSERT INTO mentions(
+                                       block_id, paragraph_id, source_form,
+                                       normalized_form, discourse_function,
+                                       lexeme_id, concept_id, evidence_id
+                                   ) VALUES(?, ?, ?, ?, 'referential', ?, NULL, ?)""",
+                                (
+                                    candidate["block_id"],
+                                    candidate["paragraph_id"],
+                                    candidate["original_text"],
+                                    normalized_form,
+                                    candidate_lexeme_id,
+                                    evidence_id,
+                                ),
+                            )
+                            mention_id = int(mention_cursor.lastrowid)
+                        else:
+                            mention_id = int(existing_mention["id"])
+                        self.record_form_occurrences(
+                            [
+                                FormOccurrence(
+                                    lexeme_id=candidate_lexeme_id,
+                                    block_id=str(candidate["block_id"]),
+                                    start_offset=int(candidate["start_offset"]),
+                                    end_offset=int(candidate["end_offset"]),
+                                    source_form=str(candidate["original_text"]),
+                                    source_hash=str(candidate["block_source_hash"]),
+                                )
+                            ],
+                            connection=connection,
+                        )
+                        self.record_type_observation(
+                            candidate_lexeme_id,
+                            result["entity_kind"],
+                            confidence=result["confidence"],
+                            source="candidate_adjudication",
+                            mention_id=mention_id,
+                            evidence_id=evidence_id,
+                            adjudication_id=adjudication_id,
+                            connection=connection,
                         )
                         connection.execute(
                             """UPDATE lexical_candidates
@@ -3820,7 +3777,6 @@ class V4Database:
                                WHERE id=?""",
                             (now, candidate_id),
                         )
-                        concept_ids.append(candidate_concept_id)
                         member_decision = result["verdict"]
                     else:
                         if result["verdict"] == "defer":
@@ -3844,16 +3800,16 @@ class V4Database:
                     connection.execute(
                         """INSERT INTO candidate_resolutions(
                                id, adjudication_id, run_id, cluster_id, candidate_id,
-                               concept_id, evidence_id, decision, ordinal,
+                               lexeme_id, concept_id, evidence_id, decision, ordinal,
                                payload_json, created_at
-                           ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                            ) VALUES(?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?)""",
                         (
                             resolution_id,
                             adjudication_id,
                             run_id,
                             cluster_id,
                             candidate_id,
-                            candidate_concept_id,
+                            candidate_lexeme_id,
                             evidence_id,
                             member_decision,
                             ordinal,
@@ -3892,7 +3848,7 @@ class V4Database:
             return {
                 "knowledge_version": version,
                 "adjudications": len(changed_results),
-                "concept_ids": sorted(set(concept_ids)),
+                "concept_ids": [],
                 "changed": len(changed_results),
             }
 
@@ -3976,6 +3932,17 @@ class V4Database:
             """CREATE TEMP TABLE reset_scan_mentions AS
                SELECT m.id FROM mentions m
                WHERE m.evidence_id IN (SELECT id FROM reset_scan_evidence)""",
+            """CREATE TEMP TABLE reset_scan_form_occurrences AS
+               SELECT fo.lexeme_id, fo.block_id, fo.start_offset, fo.end_offset
+               FROM form_occurrences fo
+               WHERE EXISTS(
+                   SELECT 1
+                   FROM candidate_resolutions cr
+                   JOIN lexical_candidates lc ON lc.id=cr.candidate_id
+                   WHERE cr.lexeme_id=fo.lexeme_id
+                     AND lc.block_id=fo.block_id
+                     AND lc.start_offset=fo.start_offset
+                     AND lc.end_offset=fo.end_offset)""",
             """CREATE TEMP TABLE reset_scan_claims AS
                SELECT DISTINCT c.id FROM claims c
                JOIN claim_evidence ce ON ce.claim_id=c.id
@@ -3991,7 +3958,54 @@ class V4Database:
                                 ON e.id=m.evidence_id
                                 WHERE m.concept_id=c.id
                                   AND (e.extractor LIKE 'scan_%'
-                                       OR e.extractor='candidate_adjudication')))""",
+                                        OR e.extractor='candidate_adjudication')))""",
+            """CREATE TEMP TABLE reset_scan_type_observations AS
+               SELECT cto.id FROM concept_type_observations cto
+               WHERE cto.adjudication_id IN (
+                         SELECT id FROM candidate_adjudications)
+                  OR cto.mention_id IN (SELECT id FROM reset_scan_mentions)
+                  OR cto.evidence_id IN (SELECT id FROM reset_scan_evidence)
+                  OR cto.concept_id IN (SELECT id FROM reset_scan_concepts)""",
+            """CREATE TEMP TABLE reset_scan_lexemes AS
+               SELECT DISTINCT l.id FROM lexemes l
+               WHERE (
+                   EXISTS(SELECT 1 FROM candidate_resolutions cr
+                          WHERE cr.lexeme_id=l.id)
+                   OR EXISTS(SELECT 1 FROM mentions m
+                             WHERE m.lexeme_id=l.id
+                               AND m.id IN (SELECT id FROM reset_scan_mentions))
+                   OR EXISTS(SELECT 1 FROM reset_scan_form_occurrences r
+                             WHERE r.lexeme_id=l.id)
+                   OR EXISTS(SELECT 1 FROM concept_type_observations cto
+                             WHERE cto.lexeme_id=l.id
+                               AND cto.id IN (
+                                   SELECT id FROM reset_scan_type_observations)))
+                 AND NOT EXISTS(
+                     SELECT 1 FROM concepts c
+                     WHERE c.primary_lexeme_id=l.id
+                       AND c.id NOT IN (SELECT id FROM reset_scan_concepts))
+                 AND NOT EXISTS(
+                     SELECT 1 FROM concept_lexemes cl
+                     WHERE cl.lexeme_id=l.id
+                       AND cl.concept_id NOT IN (SELECT id FROM reset_scan_concepts))
+                 AND NOT EXISTS(
+                     SELECT 1 FROM mentions m
+                     WHERE m.lexeme_id=l.id
+                       AND m.id NOT IN (SELECT id FROM reset_scan_mentions))
+                 AND NOT EXISTS(
+                     SELECT 1 FROM form_occurrences fo
+                     WHERE fo.lexeme_id=l.id
+                       AND NOT EXISTS(
+                           SELECT 1 FROM reset_scan_form_occurrences r
+                           WHERE r.lexeme_id=fo.lexeme_id
+                             AND r.block_id=fo.block_id
+                             AND r.start_offset=fo.start_offset
+                             AND r.end_offset=fo.end_offset))
+                 AND NOT EXISTS(
+                     SELECT 1 FROM concept_type_observations cto
+                     WHERE cto.lexeme_id=l.id
+                       AND cto.id NOT IN (
+                           SELECT id FROM reset_scan_type_observations))""",
             """CREATE TEMP TABLE reset_scan_usage_decisions AS
                SELECT ud.id FROM usage_decisions ud
                WHERE ud.mention_id IN (SELECT id FROM reset_scan_mentions)
@@ -4005,7 +4019,8 @@ class V4Database:
                JOIN claims c ON c.id=ce.claim_id WHERE c.locked=1""",
             """CREATE TEMP TABLE reset_scan_source_forms AS
                SELECT sf.id FROM source_forms sf
-               WHERE EXISTS(
+               WHERE sf.lexeme_id IN (SELECT id FROM reset_scan_lexemes)
+                  OR (EXISTS(
                    SELECT 1 FROM concept_lexemes cl
                    WHERE cl.lexeme_id=sf.lexeme_id
                      AND cl.concept_id IN (SELECT id FROM reset_scan_concepts))
@@ -4013,7 +4028,7 @@ class V4Database:
                    SELECT 1 FROM concept_lexemes cl
                    WHERE cl.lexeme_id=sf.lexeme_id
                      AND cl.concept_id NOT IN (SELECT id FROM reset_scan_concepts)
-                     AND cl.retired_version IS NULL)""",
+                     AND cl.retired_version IS NULL))""",
             """CREATE TEMP TABLE reset_scan_rendering_rules AS
                SELECT id FROM rendering_rules
                WHERE concept_id IN (SELECT id FROM reset_scan_concepts)""",
@@ -4080,12 +4095,20 @@ class V4Database:
             "candidate_cluster_members": "SELECT cluster_id,candidate_id,role FROM candidate_cluster_members ORDER BY cluster_id,candidate_id",
             "candidate_adjudications": "SELECT id,active,payload_hash,updated_at FROM candidate_adjudications ORDER BY id",
             "candidate_resolutions": "SELECT id,adjudication_id,decision FROM candidate_resolutions ORDER BY id",
+            "concept_type_observations": "SELECT id,lexeme_id,mention_id,evidence_id,adjudication_id FROM concept_type_observations WHERE id IN (SELECT id FROM reset_scan_type_observations) ORDER BY id",
+            "form_occurrences": """SELECT lexeme_id,block_id,start_offset,end_offset,source_hash
+                FROM form_occurrences fo WHERE EXISTS(
+                    SELECT 1 FROM reset_scan_form_occurrences r
+                    WHERE r.lexeme_id=fo.lexeme_id AND r.block_id=fo.block_id
+                      AND r.start_offset=fo.start_offset AND r.end_offset=fo.end_offset)
+                ORDER BY lexeme_id,block_id,start_offset,end_offset""",
             "usage_decisions": "SELECT id,mention_id,status,locked,created_at FROM usage_decisions WHERE id IN (SELECT id FROM reset_scan_usage_decisions) ORDER BY id",
             "mentions": "SELECT id,evidence_id,concept_id FROM mentions WHERE id IN (SELECT id FROM reset_scan_mentions) ORDER BY id",
             "evidence": "SELECT id,extractor,created_at FROM evidence WHERE id IN (SELECT id FROM reset_scan_evidence) ORDER BY id",
             "claim_evidence": "SELECT claim_id,evidence_id FROM reset_scan_claim_evidence ORDER BY claim_id,evidence_id",
             "claims": "SELECT id,status,created_at FROM claims WHERE id IN (SELECT id FROM reset_scan_claims) ORDER BY id",
             "source_forms": "SELECT id,lexeme_id,normalized_form FROM source_forms WHERE id IN (SELECT id FROM reset_scan_source_forms) ORDER BY id",
+            "lexemes": "SELECT id,normalized_form,created_version FROM lexemes WHERE id IN (SELECT id FROM reset_scan_lexemes) ORDER BY id",
             "rendering_rules": "SELECT id,concept_id,status,locked FROM rendering_rules WHERE id IN (SELECT id FROM reset_scan_rendering_rules) ORDER BY id",
             "verification_votes": "SELECT id,task_id,verdict FROM verification_votes WHERE id IN (SELECT id FROM reset_scan_verification_votes) ORDER BY id",
             "verification_tasks": "SELECT id,subject_type,subject_id,status FROM verification_tasks WHERE id IN (SELECT id FROM reset_scan_verification_tasks) ORDER BY id",
@@ -4168,10 +4191,15 @@ class V4Database:
             deletion_statements = (
                 ("verification_votes", "DELETE FROM verification_votes WHERE id IN (SELECT id FROM reset_scan_verification_votes)"),
                 ("verification_tasks", "DELETE FROM verification_tasks WHERE id IN (SELECT id FROM reset_scan_verification_tasks)"),
+                ("concept_type_observations", "DELETE FROM concept_type_observations WHERE id IN (SELECT id FROM reset_scan_type_observations)"),
                 ("candidate_resolutions", "DELETE FROM candidate_resolutions"),
                 ("candidate_adjudications", "DELETE FROM candidate_adjudications"),
                 ("candidate_cluster_members", "DELETE FROM candidate_cluster_members"),
                 ("candidate_clusters", "DELETE FROM candidate_clusters"),
+                ("form_occurrences", """DELETE FROM form_occurrences AS fo WHERE EXISTS(
+                    SELECT 1 FROM reset_scan_form_occurrences r
+                    WHERE r.lexeme_id=fo.lexeme_id AND r.block_id=fo.block_id
+                      AND r.start_offset=fo.start_offset AND r.end_offset=fo.end_offset)"""),
                 ("usage_decisions", "DELETE FROM usage_decisions WHERE id IN (SELECT id FROM reset_scan_usage_decisions)"),
                 ("mentions", "DELETE FROM mentions WHERE id IN (SELECT id FROM reset_scan_mentions)"),
                 ("claim_evidence", """DELETE FROM claim_evidence WHERE EXISTS(
@@ -4197,6 +4225,9 @@ class V4Database:
             ).rowcount
             deleted["evidence"] = connection.execute(
                 "DELETE FROM evidence WHERE id IN (SELECT id FROM reset_scan_evidence)"
+            ).rowcount
+            deleted["lexemes"] = connection.execute(
+                "DELETE FROM lexemes WHERE id IN (SELECT id FROM reset_scan_lexemes)"
             ).rowcount
             deleted["lexical_candidates"] = connection.execute(
                 "DELETE FROM lexical_candidates"

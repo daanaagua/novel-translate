@@ -317,7 +317,7 @@ def test_adjudication_prompt_rejects_ordinary_lexical_noise_and_defers_weak_evid
         llm.requests[0]["messages"][0]["content"]
     )
 
-    weak_source = "Maybe waited."
+    weak_source = "Night waited."
     weak_item = cluster(
         "cluster-weak", [candidate("candidate-weak", weak_source, 0, 5)]
     )
@@ -633,11 +633,11 @@ def test_low_risk_legal_decision_is_accepted_without_a_second_round():
     assert len(llm.requests) == 1
 
 
-def test_independent_promote_vs_split_conflict_is_deferred():
-    source = "Alpha and Beta waited."
-    whole = candidate("candidate-whole", source, 0, 14, risk_flags=("coordination",))
-    alpha = candidate("candidate-alpha", source, 0, 5)
-    beta = candidate("candidate-beta", source, 10, 14)
+def test_drotte_and_roche_promote_vs_split_conflict_is_deferred():
+    source = "Drotte and Roche waited."
+    whole = candidate("candidate-whole", source, 0, 16, risk_flags=("coordination",))
+    alpha = candidate("candidate-drotte", source, 0, 6)
+    beta = candidate("candidate-roche", source, 11, 16)
     item = cluster(
         "cluster-a",
         [whole, alpha, beta],
@@ -654,6 +654,29 @@ def test_independent_promote_vs_split_conflict_is_deferred():
 
     assert result[0].verdict == "defer"
     assert result[0].reason == "independent_verdict_conflict"
+    assert result[0].rounds == 2
+
+
+def test_corpse_does_not_replace_the_full_corpse_door_span_after_review():
+    source = "The Corpse Door opened."
+    whole = candidate("candidate-door", source, 4, 15)
+    subspan = candidate("candidate-corpse", source, 4, 10)
+    item = cluster(
+        "cluster-a",
+        [whole, subspan],
+        risk_flags=("span_competition",),
+    )
+    llm = FakeLLM(
+        [
+            response(selected_ids=["K01A"]),
+            response(selected_ids=["K01B"]),
+        ]
+    )
+
+    result = V4Adjudicator(llm).adjudicate(batch(item), {"block-1": source})
+
+    assert result[0].verdict == "promote"
+    assert result[0].selected_candidate_ids == ("candidate-door",)
     assert result[0].rounds == 2
 
 

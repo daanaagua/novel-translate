@@ -469,7 +469,9 @@ def test_pending_cluster_loader_roundtrips_roles_contexts_and_offsets(database):
     assert candidate.risk_flags == ()
 
 
-def test_six_block_occurrence_cluster_persists_and_resolves_every_member(tmp_path):
+def test_six_block_cluster_resolves_members_but_only_selected_candidate_writes_evidence(
+    tmp_path,
+):
     database = make_database(
         tmp_path,
         [f"Severian waited at marker {index}." for index in range(6)],
@@ -507,10 +509,42 @@ def test_six_block_occurrence_cluster_persists_and_resolves_every_member(tmp_pat
         ).fetchone()[0] == 0
         assert connection.execute(
             """SELECT COUNT(*) FROM candidate_resolutions cr
-               JOIN candidate_cluster_members cm ON cm.candidate_id=cr.candidate_id
-               WHERE cm.cluster_id=?""",
+                JOIN candidate_cluster_members cm ON cm.candidate_id=cr.candidate_id
+                WHERE cm.cluster_id=?""",
             (cluster.id,),
         ).fetchone()[0] == 6
+        assert connection.execute(
+            """SELECT COUNT(*) FROM candidate_resolutions cr
+               JOIN candidate_cluster_members cm ON cm.candidate_id=cr.candidate_id
+               WHERE cm.cluster_id=? AND cr.decision='promote'
+                     AND cr.lexeme_id IS NOT NULL AND cr.concept_id IS NULL""",
+            (cluster.id,),
+        ).fetchone()[0] == 1
+        assert connection.execute(
+            """SELECT COUNT(*) FROM candidate_resolutions cr
+               JOIN candidate_cluster_members cm ON cm.candidate_id=cr.candidate_id
+               WHERE cm.cluster_id=? AND cm.role='context'
+                     AND (cr.decision='promote' OR cr.lexeme_id IS NOT NULL)""",
+            (cluster.id,),
+        ).fetchone()[0] == 0
+        assert connection.execute(
+            """SELECT COUNT(DISTINCT m.id)
+               FROM mentions m
+               JOIN candidate_resolutions cr ON cr.evidence_id=m.evidence_id
+               WHERE cr.cluster_id=? AND cr.decision='promote'""",
+            (cluster.id,),
+        ).fetchone()[0] == 1
+        assert connection.execute(
+            """SELECT COUNT(*)
+               FROM candidate_resolutions cr
+               JOIN lexical_candidates lc ON lc.id=cr.candidate_id
+               JOIN form_occurrences fo
+                 ON fo.lexeme_id=cr.lexeme_id AND fo.block_id=lc.block_id
+                    AND fo.start_offset=lc.start_offset
+                    AND fo.end_offset=lc.end_offset
+               WHERE cr.cluster_id=? AND cr.decision='promote'""",
+            (cluster.id,),
+        ).fetchone()[0] == 1
 
 
 def test_preparation_advances_only_fully_resolved_scanned_blocks(tmp_path):
@@ -616,18 +650,21 @@ def test_indexing_failure_does_not_partially_advance_a_wave(database, monkeypatc
     assert tuple(run) == ("scan", "failed", "extractor failed")
 
 
-def test_adjudicator_run_calls_model_commits_concepts_and_does_not_repeat(database):
+def test_adjudicator_run_calls_model_commits_lexemes_and_does_not_repeat(database):
     V4Scanner(database, ExplodingLLM()).scan_project(max_blocks=3)
     llm = PromotingLLM()
     pending_count = len(database.load_pending_candidate_clusters())
     result = V4Adjudicator(llm, database=database).run()
 
     assert result["adjudicated"] == pending_count
-    assert result["concepts"] >= 1
+    assert result["concepts"] == 0
     first_call_count = llm.calls
     assert first_call_count >= 1
     with closing(database.connect()) as connection:
-        assert connection.execute("SELECT COUNT(*) FROM concepts").fetchone()[0] >= 1
+        assert connection.execute("SELECT COUNT(*) FROM concepts").fetchone()[0] == 0
+        assert connection.execute("SELECT COUNT(*) FROM lexemes").fetchone()[0] >= 1
+        assert connection.execute("SELECT COUNT(*) FROM mentions").fetchone()[0] >= 1
+        assert connection.execute("SELECT COUNT(*) FROM form_occurrences").fetchone()[0] >= 1
         run = connection.execute(
             "SELECT stage, status FROM runs WHERE id=?", (result["run_id"],)
         ).fetchone()

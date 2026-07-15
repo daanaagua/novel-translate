@@ -365,7 +365,9 @@ def test_legacy_schema7_migration_recovers_adjudication_version_for_exact_retry(
     assert after_versions == before_versions == 2
 
 
-def test_cluster_persistence_and_adjudication_promotion_are_atomic(tmp_path):
+def test_cluster_persistence_and_adjudication_promotion_commits_lexeme_evidence_atomically(
+    tmp_path,
+):
     db, _, _, candidates = _seed_database(tmp_path)
     item = _cluster("cluster-1", candidates)
     summary = db.persist_candidate_clusters("scan-run", [item])
@@ -389,26 +391,58 @@ def test_cluster_persistence_and_adjudication_promotion_are_atomic(tmp_path):
             "FROM lexical_candidates WHERE id=?",
             (candidates[0].id,),
         ).fetchone()
-        concept = connection.execute(
-            "SELECT canonical_source, kind, working_target, verified_target, locked "
-            "FROM concepts WHERE id=?",
-            (committed["concept_ids"][0],),
-        ).fetchone()
         resolution = connection.execute(
-            "SELECT cluster_id, candidate_id, concept_id, evidence_id, decision "
+            "SELECT cluster_id, candidate_id, lexeme_id, concept_id, evidence_id, decision "
             "FROM candidate_resolutions"
         ).fetchone()
+        mention = connection.execute(
+            "SELECT lexeme_id, concept_id, evidence_id FROM mentions"
+        ).fetchone()
+        occurrence = connection.execute(
+            """SELECT lexeme_id, block_id, start_offset, end_offset,
+                      source_form, source_hash FROM form_occurrences"""
+        ).fetchone()
+        observation = connection.execute(
+            """SELECT lexeme_id, mention_id, concept_id, evidence_id, kind,
+                      confidence, source, adjudication_id
+               FROM concept_type_observations"""
+        ).fetchone()
+        adjudication_id = connection.execute(
+            "SELECT id FROM candidate_adjudications WHERE active=1"
+        ).fetchone()[0]
 
     assert selected["selected"] == 1
     assert selected["model_status"] == "accepted"
     assert selected["resolution_status"] == "promoted"
     assert json.loads(selected["risk_flags_json"]) == ["span_competition"]
-    assert tuple(concept) == ("Drotte", "person", "", "", 0)
+    assert committed["concept_ids"] == []
     assert resolution["cluster_id"] == "cluster-1"
     assert resolution["candidate_id"] == candidates[0].id
-    assert resolution["concept_id"] == committed["concept_ids"][0]
+    assert resolution["lexeme_id"] is not None
+    assert resolution["concept_id"] is None
     assert resolution["evidence_id"] is not None
     assert resolution["decision"] == "promote"
+    assert tuple(mention) == (
+        resolution["lexeme_id"],
+        None,
+        resolution["evidence_id"],
+    )
+    assert tuple(occurrence) == (
+        resolution["lexeme_id"],
+        candidates[0].block_id,
+        candidates[0].start_offset,
+        candidates[0].end_offset,
+        candidates[0].original_text,
+        "hash-1",
+    )
+    assert observation["lexeme_id"] == resolution["lexeme_id"]
+    assert observation["mention_id"] is not None
+    assert observation["concept_id"] is None
+    assert observation["evidence_id"] == resolution["evidence_id"]
+    assert observation["kind"] == "person"
+    assert observation["confidence"] == pytest.approx(0.97)
+    assert observation["source"] == "candidate_adjudication"
+    assert observation["adjudication_id"] == adjudication_id
 
     # Re-indexing must refresh evidence flags without undoing a final decision.
     block = db.list_blocks()[0]
@@ -484,6 +518,12 @@ def test_context_only_member_cannot_be_selected_or_resolved(tmp_path):
         assert connection.execute("SELECT COUNT(*) FROM candidate_adjudications").fetchone()[0] == 0
         assert connection.execute("SELECT COUNT(*) FROM candidate_resolutions").fetchone()[0] == 0
         assert connection.execute("SELECT COUNT(*) FROM concepts").fetchone()[0] == 0
+        assert connection.execute("SELECT COUNT(*) FROM lexemes").fetchone()[0] == 0
+        assert connection.execute("SELECT COUNT(*) FROM mentions").fetchone()[0] == 0
+        assert connection.execute("SELECT COUNT(*) FROM form_occurrences").fetchone()[0] == 0
+        assert connection.execute(
+            "SELECT COUNT(*) FROM concept_type_observations"
+        ).fetchone()[0] == 0
 
     db.commit_adjudications(
         "judge-run",
@@ -503,25 +543,82 @@ def test_context_only_member_cannot_be_selected_or_resolved(tmp_path):
     assert tuple(by_id[context_only.id])[1:] == ("pending", "context", 0)
 
 
-def test_promotion_keeps_entity_kinds_distinct_but_never_overwrites_human_lock(tmp_path):
+def test_promotions_with_different_entity_kinds_share_lexeme_and_keep_observations(
+    tmp_path,
+):
     db, _, _, candidates = _seed_database(tmp_path)
-    place_id = db.import_legacy_concept("Drotte", "", "place", "legacy guess")
     db.persist_candidate_clusters("scan-run", [_cluster("cluster-1", candidates)])
 
     first = db.commit_adjudications(
         "judge-run",
         [AdjudicationResult("cluster-1", "promote", (candidates[0].id,), "person", 0.9)],
     )
-    person_id = first["concept_ids"][0]
-    assert person_id != place_id
+    second = db.commit_adjudications(
+        "judge-run",
+        [AdjudicationResult("cluster-1", "promote", (candidates[0].id,), "place", 0.8)],
+    )
+    with closing(db.connect()) as connection:
+        selected_resolutions = connection.execute(
+            """SELECT cr.lexeme_id, cr.concept_id, cr.decision
+               FROM candidate_resolutions cr
+               JOIN candidate_adjudications ca ON ca.id=cr.adjudication_id
+               WHERE cr.candidate_id=? AND cr.decision='promote'
+               ORDER BY ca.knowledge_version""",
+            (candidates[0].id,),
+        ).fetchall()
+        observations = connection.execute(
+            """SELECT lexeme_id, kind, confidence, concept_id, mention_id,
+                      evidence_id, adjudication_id
+               FROM concept_type_observations ORDER BY created_version, id"""
+        ).fetchall()
+        counts = {
+            "concepts": connection.execute("SELECT COUNT(*) FROM concepts").fetchone()[0],
+            "lexemes": connection.execute("SELECT COUNT(*) FROM lexemes").fetchone()[0],
+            "mentions": connection.execute("SELECT COUNT(*) FROM mentions").fetchone()[0],
+            "occurrences": connection.execute(
+                "SELECT COUNT(*) FROM form_occurrences"
+            ).fetchone()[0],
+        }
 
-    # An explicit human lock wins identity resolution and remains untouched.
-    locked_db, _, _, locked_candidates = _seed_database(tmp_path / "locked")
+    assert first["concept_ids"] == second["concept_ids"] == []
+    assert len(selected_resolutions) == 2
+    assert len({row["lexeme_id"] for row in selected_resolutions}) == 1
+    assert all(row["concept_id"] is None for row in selected_resolutions)
+    assert [(row["kind"], row["confidence"]) for row in observations] == [
+        ("person", 0.9),
+        ("place", 0.8),
+    ]
+    assert {row["lexeme_id"] for row in observations} == {
+        selected_resolutions[0]["lexeme_id"]
+    }
+    assert all(row["concept_id"] is None for row in observations)
+    assert all(row["mention_id"] is not None for row in observations)
+    assert all(row["evidence_id"] is not None for row in observations)
+    assert all(row["adjudication_id"] is not None for row in observations)
+    assert counts == {"concepts": 0, "lexemes": 1, "mentions": 1, "occurrences": 1}
+
+
+def test_promotion_reuses_locked_concept_lexeme_without_binding_or_modifying_concept(
+    tmp_path,
+):
+    locked_db, _, _, locked_candidates = _seed_database(tmp_path)
     locked = locked_db.lock_concept_translation("Drotte", "德罗特", kind="title")
     locked_db.persist_candidate_clusters(
         "scan-run", [_cluster("cluster-locked", locked_candidates)]
     )
-    locked_db.commit_adjudications(
+    with closing(locked_db.connect()) as connection:
+        before = tuple(
+            connection.execute(
+                """SELECT kind, canonical_source, default_target, working_target,
+                          verified_target, description, status, scope, locked,
+                          created_version, retired_version, created_at,
+                          primary_lexeme_id
+                   FROM concepts WHERE id=?""",
+                (locked["concept_id"],),
+            ).fetchone()
+        )
+
+    committed = locked_db.commit_adjudications(
         "judge-run",
         [
             AdjudicationResult(
@@ -534,17 +631,24 @@ def test_promotion_keeps_entity_kinds_distinct_but_never_overwrites_human_lock(t
         ],
     )
     with closing(locked_db.connect()) as connection:
-        row = connection.execute(
-            """SELECT kind, default_target, working_target, verified_target, locked
-               FROM concepts WHERE id=?""",
-            (locked["concept_id"],),
-        ).fetchone()
+        after = tuple(
+            connection.execute(
+                """SELECT kind, canonical_source, default_target, working_target,
+                          verified_target, description, status, scope, locked,
+                          created_version, retired_version, created_at,
+                          primary_lexeme_id
+                   FROM concepts WHERE id=?""",
+                (locked["concept_id"],),
+            ).fetchone()
+        )
         latest_resolution = connection.execute(
-            "SELECT concept_id FROM candidate_resolutions WHERE candidate_id=?",
+            "SELECT lexeme_id, concept_id FROM candidate_resolutions WHERE candidate_id=?",
             (locked_candidates[0].id,),
         ).fetchone()
-    assert tuple(row) == ("title", "德罗特", "德罗特", "德罗特", 1)
-    assert latest_resolution["concept_id"] == locked["concept_id"]
+    assert committed["concept_ids"] == []
+    assert after == before
+    assert latest_resolution["lexeme_id"] == before[-1]
+    assert latest_resolution["concept_id"] is None
 
 
 def test_invalid_adjudication_rolls_back_every_result_in_batch(tmp_path):
@@ -591,6 +695,13 @@ def test_database_failure_halfway_through_promotion_rolls_back_all_writes(tmp_pa
         assert connection.execute("SELECT COUNT(*) FROM candidate_resolutions").fetchone()[0] == 0
         assert connection.execute("SELECT COUNT(*) FROM concepts").fetchone()[0] == 0
         assert connection.execute("SELECT COUNT(*) FROM evidence").fetchone()[0] == 0
+        assert connection.execute("SELECT COUNT(*) FROM lexemes").fetchone()[0] == 0
+        assert connection.execute("SELECT COUNT(*) FROM source_forms").fetchone()[0] == 0
+        assert connection.execute("SELECT COUNT(*) FROM mentions").fetchone()[0] == 0
+        assert connection.execute("SELECT COUNT(*) FROM form_occurrences").fetchone()[0] == 0
+        assert connection.execute(
+            "SELECT COUNT(*) FROM concept_type_observations"
+        ).fetchone()[0] == 0
         statuses = connection.execute(
             "SELECT resolution_status, selected FROM lexical_candidates ORDER BY id"
         ).fetchall()
@@ -655,6 +766,12 @@ def test_changed_adjudication_keeps_history_and_exact_retry_is_idempotent(tmp_pa
             ).fetchone()[0],
             "evidence": connection.execute("SELECT COUNT(*) FROM evidence").fetchone()[0],
             "mentions": connection.execute("SELECT COUNT(*) FROM mentions").fetchone()[0],
+            "occurrences": connection.execute(
+                "SELECT COUNT(*) FROM form_occurrences"
+            ).fetchone()[0],
+            "observations": connection.execute(
+                "SELECT COUNT(*) FROM concept_type_observations"
+            ).fetchone()[0],
             "concepts": connection.execute("SELECT COUNT(*) FROM concepts").fetchone()[0],
             "adjudication_row": tuple(
                 connection.execute(
@@ -672,6 +789,8 @@ def test_changed_adjudication_keeps_history_and_exact_retry_is_idempotent(tmp_pa
         assert connection.execute("SELECT COUNT(*) FROM candidate_resolutions").fetchone()[0] == before["resolutions"]
         assert connection.execute("SELECT COUNT(*) FROM evidence").fetchone()[0] == before["evidence"]
         assert connection.execute("SELECT COUNT(*) FROM mentions").fetchone()[0] == before["mentions"]
+        assert connection.execute("SELECT COUNT(*) FROM form_occurrences").fetchone()[0] == before["occurrences"]
+        assert connection.execute("SELECT COUNT(*) FROM concept_type_observations").fetchone()[0] == before["observations"]
         assert connection.execute("SELECT COUNT(*) FROM concepts").fetchone()[0] == before["concepts"]
         assert tuple(
             connection.execute(
@@ -697,10 +816,6 @@ def test_changed_adjudication_keeps_history_and_exact_retry_is_idempotent(tmp_pa
                JOIN evidence e ON e.id=cr.evidence_id
                WHERE ca.active=0 AND ca.verdict='promote'"""
         ).fetchone()[0]
-        concept = connection.execute(
-            "SELECT status, retired_version FROM concepts WHERE id=?",
-            (first["concept_ids"][0],),
-        ).fetchone()
         candidate_rows = connection.execute(
             "SELECT resolution_status, selected FROM lexical_candidates ORDER BY id"
         ).fetchall()
@@ -712,8 +827,7 @@ def test_changed_adjudication_keeps_history_and_exact_retry_is_idempotent(tmp_pa
     ]
     assert [row[0] for row in active_resolutions] == ["rejected", "rejected"]
     assert old_evidence == 1
-    assert concept["status"] == "retired"
-    assert concept["retired_version"] == changed["knowledge_version"]
+    assert first["concept_ids"] == changed["concept_ids"] == []
     assert [tuple(row) for row in candidate_rows] == [("rejected", 0), ("rejected", 0)]
 
     before_retry = db.current_knowledge_version()
@@ -724,7 +838,7 @@ def test_changed_adjudication_keeps_history_and_exact_retry_is_idempotent(tmp_pa
         assert connection.execute("SELECT COUNT(*) FROM candidate_adjudications").fetchone()[0] == 2
 
 
-def test_retired_automatic_concept_is_reactivated_when_promoted_again(tmp_path):
+def test_promote_reject_promote_reuses_exact_span_mention_and_occurrence(tmp_path):
     db, _, _, candidates = _seed_database(tmp_path)
     db.persist_candidate_clusters("scan-run", [_cluster("cluster-1", candidates)])
     promote = AdjudicationResult(
@@ -734,122 +848,203 @@ def test_retired_automatic_concept_is_reactivated_when_promoted_again(tmp_path):
         "cluster-1", "reject", (), "person", 0.8, "not_an_entity"
     )
 
-    first = db.commit_adjudications("judge-run", [promote])
+    db.commit_adjudications("judge-run", [promote])
     db.commit_adjudications("judge-run", [reject])
     third = db.commit_adjudications("judge-run", [promote])
 
     with closing(db.connect()) as connection:
         active_resolution = connection.execute(
-            """SELECT cr.concept_id, c.status, c.retired_version
+            """SELECT cr.lexeme_id, cr.concept_id
                FROM candidate_resolutions cr
                JOIN candidate_adjudications ca ON ca.id=cr.adjudication_id
-               JOIN concepts c ON c.id=cr.concept_id
                WHERE ca.active=1 AND cr.candidate_id=?""",
             (candidates[0].id,),
         ).fetchone()
+        counts = {
+            "concepts": connection.execute("SELECT COUNT(*) FROM concepts").fetchone()[0],
+            "mentions": connection.execute("SELECT COUNT(*) FROM mentions").fetchone()[0],
+            "occurrences": connection.execute(
+                "SELECT COUNT(*) FROM form_occurrences"
+            ).fetchone()[0],
+            "observations": connection.execute(
+                "SELECT COUNT(*) FROM concept_type_observations"
+            ).fetchone()[0],
+        }
         assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
 
-    assert third["concept_ids"] == first["concept_ids"]
-    assert active_resolution["concept_id"] == first["concept_ids"][0]
-    assert active_resolution["status"] == "provisional"
-    assert active_resolution["retired_version"] is None
+    assert third["concept_ids"] == []
+    assert active_resolution["lexeme_id"] is not None
+    assert active_resolution["concept_id"] is None
+    assert counts == {"concepts": 0, "mentions": 1, "occurrences": 1, "observations": 2}
 
 
-def test_active_human_lock_wins_over_retired_automatic_identity(tmp_path):
-    db, _, _, candidates = _seed_database(tmp_path)
-    db.persist_candidate_clusters("scan-run", [_cluster("cluster-1", candidates)])
-    promote = AdjudicationResult(
-        "cluster-1", "promote", (candidates[0].id,), "person", 0.9
+def test_split_reuses_each_existing_lexeme_without_creating_composite_identity(tmp_path):
+    db, _, block, candidates = _seed_database(
+        tmp_path, names=("Malrubius", "and", "Triskele")
     )
-    reject = AdjudicationResult(
-        "cluster-1", "reject", (), "person", 0.8, "not_an_entity"
+    composite = _candidate(
+        "candidate-composite",
+        block,
+        0,
+        "Malrubius and Triskele",
+        risk_flags=("coordination",),
     )
-    automatic_id = db.commit_adjudications("judge-run", [promote])["concept_ids"][0]
-    db.commit_adjudications("judge-run", [reject])
-    human = db.lock_concept_translation(
-        candidates[0].original_text,
-        "人工译名",
-        kind="title",
-        description="人工说明",
+    db.commit_scan_batch(
+        "scan-run",
+        [
+            ScanOutcome(
+                block=block,
+                response=None,
+                lexical_candidates=[composite.storage_payload()],
+            )
+        ],
+        "fake",
+    )
+    malrubius_lexeme = db.ensure_lexeme("Malrubius")
+    triskele_lexeme = db.ensure_lexeme("Triskele")
+    selected = (candidates[0], candidates[2])
+    db.persist_candidate_clusters(
+        "scan-run",
+        [_cluster("cluster-split", [composite, *selected])],
     )
 
-    promoted = db.commit_adjudications("judge-run", [promote])
+    committed = db.commit_adjudications(
+        "judge-run",
+        [
+            AdjudicationResult(
+                "cluster-split",
+                "split",
+                tuple(candidate.id for candidate in selected),
+                "person",
+                0.95,
+            )
+        ],
+    )
     with closing(db.connect()) as connection:
-        active_concept_id = connection.execute(
-            """SELECT cr.concept_id FROM candidate_resolutions cr
-               JOIN candidate_adjudications ca ON ca.id=cr.adjudication_id
-               WHERE ca.active=1 AND cr.candidate_id=?""",
-            (candidates[0].id,),
-        ).fetchone()[0]
-        automatic = connection.execute(
-            """SELECT status, locked, retired_version FROM concepts WHERE id=?""",
-            (automatic_id,),
-        ).fetchone()
-        human_row = connection.execute(
-            """SELECT kind, default_target, working_target, verified_target,
-                      description, status, locked, retired_version
-               FROM concepts WHERE id=?""",
-            (human["concept_id"],),
-        ).fetchone()
+        resolutions = {
+            row["candidate_id"]: row
+            for row in connection.execute(
+                """SELECT candidate_id, lexeme_id, concept_id, decision
+                   FROM candidate_resolutions ORDER BY ordinal"""
+            )
+        }
+        normalized_lexemes = {
+            row[0]
+            for row in connection.execute(
+                "SELECT normalized_form FROM lexemes ORDER BY normalized_form"
+            )
+        }
+        mention_lexemes = {
+            row[0] for row in connection.execute("SELECT lexeme_id FROM mentions")
+        }
+        occurrence_lexemes = {
+            row[0] for row in connection.execute("SELECT lexeme_id FROM form_occurrences")
+        }
 
-    assert promoted["concept_ids"] == [human["concept_id"]]
-    assert active_concept_id == human["concept_id"]
-    assert tuple(automatic) == ("retired", 0, 3)
-    assert tuple(human_row) == (
-        "title",
-        "人工译名",
-        "人工译名",
-        "人工译名",
-        "人工说明",
-        "verified",
-        1,
-        None,
-    )
+    assert committed["concept_ids"] == []
+    assert resolutions[candidates[0].id]["lexeme_id"] == malrubius_lexeme
+    assert resolutions[candidates[2].id]["lexeme_id"] == triskele_lexeme
+    assert resolutions[candidates[0].id]["decision"] == "split"
+    assert resolutions[candidates[2].id]["decision"] == "split"
+    assert resolutions[composite.id]["lexeme_id"] is None
+    assert resolutions[composite.id]["decision"] == "rejected"
+    assert all(row["concept_id"] is None for row in resolutions.values())
+    assert normalized_lexemes == {"malrubius", "triskele"}
+    assert mention_lexemes == occurrence_lexemes == {
+        malrubius_lexeme,
+        triskele_lexeme,
+    }
 
 
-def test_locked_automatic_base_id_is_reused_without_collision(tmp_path):
+def test_legacy_concept_owned_active_resolution_is_superseded_by_lexeme_resolution(
+    tmp_path,
+):
     db, _, _, candidates = _seed_database(tmp_path)
     db.persist_candidate_clusters("scan-run", [_cluster("cluster-1", candidates)])
     promote = AdjudicationResult(
         "cluster-1", "promote", (candidates[0].id,), "person", 0.9
     )
-    automatic_id = db.commit_adjudications("judge-run", [promote])["concept_ids"][0]
+    first = db.commit_adjudications("judge-run", [promote])
+    locked = db.lock_concept_translation("Drotte", "德罗特", kind="person")
     with db.transaction() as connection:
         connection.execute(
-            """UPDATE concepts SET locked=1, status='verified',
-                      default_target='人工译名', working_target='人工译名',
-                      verified_target='人工译名'
-               WHERE id=?""",
-            (automatic_id,),
+            """UPDATE candidate_resolutions
+               SET lexeme_id=NULL, concept_id=?
+               WHERE adjudication_id=(
+                   SELECT id FROM candidate_adjudications WHERE active=1
+               ) AND candidate_id=?""",
+            (locked["concept_id"], candidates[0].id),
         )
-        connection.execute(
-            """UPDATE lexical_candidates SET resolution_status='rejected',
-                      model_status='rejected', selected=0 WHERE id=?""",
-            (candidates[0].id,),
+        locked_before = tuple(
+            connection.execute(
+                """SELECT default_target, working_target, verified_target,
+                          description, status, locked, retired_version
+                   FROM concepts WHERE id=?""",
+                (locked["concept_id"],),
+            ).fetchone()
         )
 
     repaired = db.commit_adjudications("judge-run", [promote])
     with closing(db.connect()) as connection:
-        concept_ids = connection.execute(
-            "SELECT id FROM concepts ORDER BY id"
+        adjudications = connection.execute(
+            "SELECT active FROM candidate_adjudications ORDER BY knowledge_version"
         ).fetchall()
-        locked_row = connection.execute(
-            """SELECT default_target, working_target, verified_target,
-                      status, locked, retired_version
-               FROM concepts WHERE id=?""",
-            (automatic_id,),
+        active_resolution = connection.execute(
+            """SELECT cr.lexeme_id, cr.concept_id
+               FROM candidate_resolutions cr
+               JOIN candidate_adjudications ca ON ca.id=cr.adjudication_id
+               WHERE ca.active=1 AND cr.candidate_id=?""",
+            (candidates[0].id,),
         ).fetchone()
+        locked_after = tuple(
+            connection.execute(
+                """SELECT default_target, working_target, verified_target,
+                          description, status, locked, retired_version
+                   FROM concepts WHERE id=?""",
+                (locked["concept_id"],),
+            ).fetchone()
+        )
 
-    assert repaired["concept_ids"] == [automatic_id]
-    assert [row[0] for row in concept_ids] == [automatic_id]
-    assert tuple(locked_row) == (
-        "人工译名",
-        "人工译名",
-        "人工译名",
-        "verified",
-        1,
-        None,
-    )
+    assert repaired["knowledge_version"] != first["knowledge_version"]
+    assert repaired["changed"] == 1
+    assert repaired["concept_ids"] == []
+    assert [row["active"] for row in adjudications] == [0, 1]
+    assert active_resolution["lexeme_id"] is not None
+    assert active_resolution["concept_id"] is None
+    assert locked_after == locked_before
+
+
+def test_candidate_source_form_must_match_exact_persisted_span(tmp_path):
+    db, _, _, candidates = _seed_database(tmp_path)
+    db.persist_candidate_clusters("scan-run", [_cluster("cluster-1", candidates)])
+    before_version = db.current_knowledge_version()
+    with db.transaction() as connection:
+        connection.execute(
+            "UPDATE lexical_candidates SET original_text='drotte' WHERE id=?",
+            (candidates[0].id,),
+        )
+
+    with pytest.raises(ValueError, match="source form does not match block slice"):
+        db.commit_adjudications(
+            "judge-run",
+            [
+                AdjudicationResult(
+                    "cluster-1", "promote", (candidates[0].id,), "person", 0.9
+                )
+            ],
+        )
+
+    with closing(db.connect()) as connection:
+        assert db.current_knowledge_version() == before_version
+        assert connection.execute("SELECT COUNT(*) FROM lexemes").fetchone()[0] == 0
+        assert connection.execute("SELECT COUNT(*) FROM mentions").fetchone()[0] == 0
+        assert connection.execute("SELECT COUNT(*) FROM form_occurrences").fetchone()[0] == 0
+        assert connection.execute(
+            "SELECT COUNT(*) FROM concept_type_observations"
+        ).fetchone()[0] == 0
+        assert connection.execute(
+            "SELECT COUNT(*) FROM candidate_adjudications"
+        ).fetchone()[0] == 0
 
 
 @pytest.mark.parametrize(
@@ -986,7 +1181,7 @@ def test_reset_token_guards_snapshot_and_preserves_sources_baseline_and_locks(tm
 
     preview = db.preview_scan_reset()
     assert preview["lexical_candidates"] == 2
-    assert preview["concepts"] == 1
+    assert preview["concepts"] == 0
     assert preview["preserved_locked_concepts"] == 1
 
     with db.transaction() as connection:
@@ -1007,12 +1202,15 @@ def test_reset_token_guards_snapshot_and_preserves_sources_baseline_and_locks(tm
         "candidate_cluster_members",
         "candidate_adjudications",
         "candidate_resolutions",
+        "concept_type_observations",
+        "form_occurrences",
         "usage_decisions",
         "mentions",
         "evidence",
         "claim_evidence",
         "claims",
         "source_forms",
+        "lexemes",
         "rendering_rules",
         "verification_votes",
         "verification_tasks",
@@ -1047,11 +1245,13 @@ def test_reset_token_guards_snapshot_and_preserves_sources_baseline_and_locks(tm
 def test_reset_token_tracks_usage_lock_and_preserves_locked_occurrence_dependencies(tmp_path):
     db, _, block, candidates = _seed_database(tmp_path)
     db.persist_candidate_clusters("scan-run", [_cluster("cluster-1", candidates)])
-    committed = db.commit_adjudications(
+    db.commit_adjudications(
         "judge-run",
         [AdjudicationResult("cluster-1", "promote", (candidates[0].id,), "person", 0.9)],
     )
-    concept_id = committed["concept_ids"][0]
+    concept_id = db.import_legacy_concept(
+        "Drotte", "", "person", "post-adjudication identity fixture"
+    )
     with db.transaction() as connection:
         version = connection.execute("SELECT MAX(id) FROM knowledge_versions").fetchone()[0]
         cursor = connection.execute(
