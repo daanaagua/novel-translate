@@ -156,6 +156,13 @@ class V4Database:
                 pass
             raise
 
+    @staticmethod
+    def _require_active_transaction(connection: sqlite3.Connection) -> None:
+        if not connection.in_transaction:
+            raise ValueError(
+                "external database connection requires an active transaction"
+            )
+
     def _audit_transaction_for(
         self, connection: sqlite3.Connection
     ) -> AuditArchiveTransaction:
@@ -291,6 +298,7 @@ class V4Database:
                     language=language,
                     connection=owned_connection,
                 )
+        self._require_active_transaction(connection)
         lexeme_id, normalized = self._ensure_lexeme_record(
             connection,
             source_form,
@@ -317,6 +325,8 @@ class V4Database:
         adjudication_id: str | None = None,
         connection: sqlite3.Connection | None = None,
     ) -> int:
+        if connection is not None:
+            self._require_active_transaction(connection)
         if not isinstance(kind, str) or not kind.strip():
             raise ValueError("type observation kind cannot be empty")
         if not isinstance(source, str) or not source.strip():
@@ -392,6 +402,8 @@ class V4Database:
         *,
         connection: sqlite3.Connection | None = None,
     ) -> int:
+        if connection is not None:
+            self._require_active_transaction(connection)
         rows = tuple(rows)
         if connection is None:
             with self.transaction() as owned_connection:

@@ -411,6 +411,65 @@ def test_occurrence_batch_rejects_empty_lexeme_without_partial_writes(
     assert count == 0
 
 
+@pytest.mark.parametrize(
+    "api_name",
+    ["ensure_lexeme", "record_type_observation", "record_form_occurrences"],
+)
+def test_persistence_api_rejects_external_connection_without_active_transaction(
+    tmp_path, api_name
+):
+    database = _db(tmp_path)
+    lexeme_id = database.ensure_lexeme("Briah")
+
+    def counts():
+        with closing(database.connect()) as inspection:
+            return tuple(
+                inspection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+                for table in (
+                    "lexemes",
+                    "source_forms",
+                    "concept_type_observations",
+                    "form_occurrences",
+                )
+            )
+
+    before = counts()
+    connection = database.connect()
+    assert not connection.in_transaction
+    try:
+        with pytest.raises(ValueError, match=r"(?i)active transaction|transaction"):
+            if api_name == "ensure_lexeme":
+                database.ensure_lexeme("Raw Connection", connection=connection)
+            elif api_name == "record_type_observation":
+                database.record_type_observation(
+                    lexeme_id,
+                    "place",
+                    confidence=0.8,
+                    source="scanner",
+                    connection=connection,
+                )
+            else:
+                database.record_form_occurrences(
+                    [
+                        _occurrence(
+                            lexeme_id=lexeme_id,
+                            block_id="block-1",
+                            start_offset=0,
+                            end_offset=5,
+                            source_form="Briah",
+                            source_hash="hash-1",
+                        )
+                    ],
+                    connection=connection,
+                )
+        assert not connection.in_transaction
+        connection.rollback()
+    finally:
+        connection.close()
+
+    assert counts() == before
+
+
 def test_persistence_apis_join_the_callers_transaction(tmp_path):
     database = _db(tmp_path)
     ensure_lexeme = _require_method(database, "ensure_lexeme")
