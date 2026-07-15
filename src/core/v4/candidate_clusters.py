@@ -246,24 +246,10 @@ class CandidateClusterBuilder:
 
         union_find = _UnionFind(len(ordered))
         by_paragraph: Dict[tuple[str, str], list[int]] = {}
-        by_signature: Dict[str, list[int]] = {}
         for index, candidate in enumerate(ordered):
             by_paragraph.setdefault((candidate.block_id, candidate.paragraph_id), []).append(index)
-            by_signature.setdefault(self._span_signature(candidate), []).append(index)
-
-        cross_block_signatures = {
-            signature
-            for signature, indexes in by_signature.items()
-            if len({ordered[index].block_id for index in indexes}) >= 2
-        }
-        cross_block_indexes = {
-            index
-            for signature in cross_block_signatures
-            for index in by_signature[signature]
-        }
 
         for indexes in by_paragraph.values():
-            indexes = [index for index in indexes if index not in cross_block_indexes]
             for offset, left_index in enumerate(indexes):
                 left = ordered[left_index]
                 for right_index in indexes[offset + 1 :]:
@@ -275,18 +261,35 @@ class CandidateClusterBuilder:
 
         members_by_root: Dict[int, list[LexicalCandidate]] = {}
         for index, candidate in enumerate(ordered):
-            if index in cross_block_indexes:
-                continue
             members_by_root.setdefault(union_find.find(index), []).append(candidate)
 
-        for signature in sorted(cross_block_signatures):
-            indexes = by_signature[signature]
-            members_by_root[-(len(members_by_root) + 1)] = [
-                ordered[index] for index in indexes
-            ]
+        local_components = list(members_by_root.values())
+        components_by_signature_set: Dict[
+            tuple[str, ...], list[list[LexicalCandidate]]
+        ] = {}
+        for members in local_components:
+            signature_set = tuple(
+                sorted({self._span_signature(candidate) for candidate in members})
+            )
+            components_by_signature_set.setdefault(signature_set, []).append(members)
+
+        member_groups: list[list[LexicalCandidate]] = []
+        for signature_set in sorted(components_by_signature_set):
+            components = components_by_signature_set[signature_set]
+            block_ids = {
+                candidate.block_id
+                for component in components
+                for candidate in component
+            }
+            if len(block_ids) >= 2:
+                member_groups.append(
+                    [candidate for component in components for candidate in component]
+                )
+            else:
+                member_groups.extend(components)
 
         clusters = []
-        for members in members_by_root.values():
+        for members in member_groups:
             members.sort(key=self._candidate_key)
             clusters.append(
                 CandidateCluster(

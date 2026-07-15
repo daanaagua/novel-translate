@@ -150,7 +150,7 @@ def test_cross_block_clustering_requires_an_exact_normalized_span_signature():
     assert drottes.affected_blocks == 1
 
 
-def test_cross_block_exact_signature_does_not_spread_local_overlap_alternatives():
+def test_cross_block_exact_signature_preserves_the_complete_local_overlap_component():
     blocks = [
         make_block("Drotte and Roche waited.", block_id="block-a"),
         make_block("Drotte answered.", block_id="block-b"),
@@ -159,14 +159,40 @@ def test_cross_block_exact_signature_does_not_spread_local_overlap_alternatives(
     candidates = [candidate for block in blocks for candidate in extractor.extract(block)]
 
     clusters = CandidateClusterBuilder().build(candidates)
-    cross_block_clusters = [cluster for cluster in clusters if cluster.affected_blocks == 2]
-
-    assert len(cross_block_clusters) == 1
-    assert set(cross_block_clusters[0].texts) == {"Drotte"}
-    assert all(
-        "Roche" not in cluster.texts and "Drotte and Roche" not in cluster.texts
-        for cluster in cross_block_clusters
+    block_a_cluster = next(
+        cluster
+        for cluster in clusters
+        if {"Drotte", "Roche", "Drotte and Roche"} <= set(cluster.texts)
     )
+
+    assert block_a_cluster.affected_blocks == 1
+    assert {alternative.block_id for alternative in block_a_cluster.alternatives} == {
+        "block-a"
+    }
+    assert any(
+        set(cluster.texts) == {"Drotte"}
+        and cluster.affected_blocks == 1
+        and {alternative.block_id for alternative in cluster.alternatives} == {"block-b"}
+        for cluster in clusters
+    )
+
+
+def test_isolated_exact_local_components_merge_across_blocks():
+    block = make_block("Drotte waited.", block_id="block-a")
+    base = LexicalCandidateExtractor([block], max_candidates=80).extract(block)[0]
+    candidates = [
+        replace(base, id="candidate-a", block_id="block-a"),
+        replace(base, id="candidate-b", block_id="block-b"),
+    ]
+
+    clusters = CandidateClusterBuilder().build(candidates)
+
+    assert len(clusters) == 1
+    assert clusters[0].affected_blocks == 2
+    assert {alternative.id for alternative in clusters[0].alternatives} == {
+        "candidate-a",
+        "candidate-b",
+    }
 
 
 def test_alternative_selection_uses_the_longest_full_cluster_member():
