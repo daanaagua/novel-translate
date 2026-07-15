@@ -738,6 +738,84 @@ def test_changed_adjudication_keeps_history_and_exact_retry_is_idempotent(tmp_pa
         assert connection.execute("SELECT COUNT(*) FROM candidate_adjudications").fetchone()[0] == 2
 
 
+def test_retired_automatic_concept_is_reactivated_when_promoted_again(tmp_path):
+    db, _, _, candidates = _seed_database(tmp_path)
+    db.persist_candidate_clusters("scan-run", [_cluster("cluster-1", candidates)])
+    promote = AdjudicationResult(
+        "cluster-1", "promote", (candidates[0].id,), "person", 0.9
+    )
+    reject = AdjudicationResult(
+        "cluster-1", "reject", (), "person", 0.8, "not_an_entity"
+    )
+
+    first = db.commit_adjudications("judge-run", [promote])
+    db.commit_adjudications("judge-run", [reject])
+    third = db.commit_adjudications("judge-run", [promote])
+
+    with closing(db.connect()) as connection:
+        active_resolution = connection.execute(
+            """SELECT cr.concept_id, c.status, c.retired_version
+               FROM candidate_resolutions cr
+               JOIN candidate_adjudications ca ON ca.id=cr.adjudication_id
+               JOIN concepts c ON c.id=cr.concept_id
+               WHERE ca.active=1 AND cr.candidate_id=?""",
+            (candidates[0].id,),
+        ).fetchone()
+        assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
+
+    assert third["concept_ids"] == first["concept_ids"]
+    assert active_resolution["concept_id"] == first["concept_ids"][0]
+    assert active_resolution["status"] == "provisional"
+    assert active_resolution["retired_version"] is None
+
+
+@pytest.mark.parametrize(
+    ("verdict", "selected_indexes", "reason", "overlap"),
+    [
+        ("promote", (0, 1), "", False),
+        ("split", (0,), "", False),
+        ("split", (0, 1), "", True),
+        ("supersede", (0, 1), "", False),
+        ("supersede", (0,), "", False),
+        ("promote", (0,), "missing_span", False),
+    ],
+)
+def test_commit_adjudications_revalidates_protocol_atomically(
+    tmp_path, verdict, selected_indexes, reason, overlap
+):
+    db, _, _, candidates = _seed_database(tmp_path)
+    db.persist_candidate_clusters("scan-run", [_cluster("cluster-1", candidates)])
+    if overlap:
+        with db.transaction() as connection:
+            connection.execute(
+                """UPDATE lexical_candidates SET start_offset=3, end_offset=9
+                   WHERE id=?""",
+                (candidates[1].id,),
+            )
+    before_version = db.current_knowledge_version()
+    selected = tuple(candidates[index].id for index in selected_indexes)
+
+    with pytest.raises(ValueError):
+        db.commit_adjudications(
+            "judge-run",
+            [
+                AdjudicationResult(
+                    "cluster-1", verdict, selected, "concept", 0.9, reason
+                )
+            ],
+        )
+
+    with closing(db.connect()) as connection:
+        assert connection.execute("SELECT COUNT(*) FROM candidate_adjudications").fetchone()[0] == 0
+        assert connection.execute("SELECT COUNT(*) FROM candidate_resolutions").fetchone()[0] == 0
+        assert connection.execute("SELECT COUNT(*) FROM concepts").fetchone()[0] == 0
+        statuses = connection.execute(
+            "SELECT resolution_status, selected FROM lexical_candidates ORDER BY id"
+        ).fetchall()
+    assert db.current_knowledge_version() == before_version
+    assert [tuple(row) for row in statuses] == [("pending", 0), ("pending", 0)]
+
+
 def test_identical_payload_repairs_drifted_active_candidate_state(tmp_path):
     db, _, _, candidates = _seed_database(tmp_path)
     db.persist_candidate_clusters("scan-run", [_cluster("cluster-1", candidates)])
@@ -941,6 +1019,56 @@ def test_reset_token_tracks_usage_lock_and_preserves_locked_occurrence_dependenc
         assert connection.execute("SELECT COUNT(*) FROM evidence WHERE id=?", (evidence_id,)).fetchone()[0] == 1
         assert connection.execute("SELECT COUNT(*) FROM source_forms WHERE concept_id=?", (concept_id,)).fetchone()[0] == 1
         assert connection.execute("SELECT COUNT(*) FROM concepts WHERE id=?", (concept_id,)).fetchone()[0] == 1
+        assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
+
+
+def test_reset_preserves_locked_claim_and_its_scan_evidence_chain(tmp_path):
+    db, _, block, _ = _seed_database(tmp_path)
+    version = db.current_knowledge_version()
+    with db.transaction() as connection:
+        evidence_id = connection.execute(
+            """INSERT INTO evidence(
+                   block_id, paragraph_id, kind, source_form, evidence_quote,
+                   payload_json, confidence, extractor, run_id, created_at)
+               VALUES(?, 'P000', 'claim', 'Drotte', 'Drotte', '{}', 1.0,
+                      'scan_full', 'scan-run', 'now')""",
+            (block.id,),
+        ).lastrowid
+        connection.execute(
+            """INSERT INTO claims(
+                   id, kind, statement, subject_form, status, scope, confidence,
+                   reveal_global_index, high_impact, locked, created_version,
+                   created_at)
+               VALUES('claim-locked', 'identity', 'Drotte is Drotte', 'Drotte',
+                      'verified', 'book', 1.0, 0, 1, 1, ?, 'now')""",
+            (version,),
+        )
+        connection.execute(
+            "INSERT INTO claim_evidence(claim_id, evidence_id) VALUES('claim-locked', ?)",
+            (evidence_id,),
+        )
+
+    preview = db.preview_scan_reset()
+    assert preview["claims"] == 0
+    assert preview["claim_evidence"] == 0
+    assert preview["evidence"] == 0
+    deleted = db.reset_scan_derivatives(preview["token"])
+
+    assert deleted["claims"] == preview["claims"]
+    assert deleted["claim_evidence"] == preview["claim_evidence"]
+    assert deleted["evidence"] == preview["evidence"]
+    with closing(db.connect()) as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM claims WHERE id='claim-locked'"
+        ).fetchone()[0] == 1
+        assert connection.execute(
+            """SELECT COUNT(*) FROM claim_evidence
+               WHERE claim_id='claim-locked' AND evidence_id=?""",
+            (evidence_id,),
+        ).fetchone()[0] == 1
+        assert connection.execute(
+            "SELECT COUNT(*) FROM evidence WHERE id=?", (evidence_id,)
+        ).fetchone()[0] == 1
         assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
 
 

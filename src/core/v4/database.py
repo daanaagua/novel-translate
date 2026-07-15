@@ -1378,6 +1378,68 @@ class V4Database:
             (normalized_form, normalized_form, entity_kind),
         ).fetchone()
 
+    def _ensure_automatic_concept(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        normalized_form: str,
+        entity_kind: str,
+        source_form: str,
+        knowledge_version: int,
+        created_at: str,
+    ) -> str:
+        base_identity = f"{entity_kind}:{normalized_form}"
+        base_concept_id = stable_id("concept", base_identity)
+        base = connection.execute(
+            """SELECT id, locked, retired_version FROM concepts
+               WHERE id=?""",
+            (base_concept_id,),
+        ).fetchone()
+        if base is None:
+            active = self._active_concept_for_form(
+                connection, normalized_form, entity_kind
+            )
+            if active is not None:
+                return str(active["id"])
+
+        for collision_index in range(100):
+            identity = base_identity
+            if collision_index:
+                identity = f"automatic:{base_identity}:{collision_index}"
+            concept_id = stable_id("concept", identity)
+            existing = connection.execute(
+                """SELECT id, locked, retired_version FROM concepts
+                   WHERE id=?""",
+                (concept_id,),
+            ).fetchone()
+            if existing is None:
+                connection.execute(
+                    """INSERT INTO concepts(
+                           id, kind, canonical_source, default_target,
+                           working_target, verified_target, description,
+                           status, scope, locked, created_version, created_at
+                       ) VALUES(?, ?, ?, '', '', '', '', 'provisional',
+                                'book', 0, ?, ?)""",
+                    (
+                        concept_id,
+                        entity_kind,
+                        source_form,
+                        knowledge_version,
+                        created_at,
+                    ),
+                )
+                return concept_id
+            if not bool(existing["locked"]):
+                if existing["retired_version"] is not None:
+                    connection.execute(
+                        """UPDATE concepts
+                           SET status='provisional', retired_version=NULL
+                           WHERE id=? AND locked=0""",
+                        (concept_id,),
+                    )
+                return concept_id
+        raise ValueError("could not allocate an automatic concept id")
+
     @staticmethod
     def _active_adjudication_matches(
         connection: sqlite3.Connection,
@@ -1469,6 +1531,7 @@ class V4Database:
             normalized_results: List[Dict[str, Any]] = []
             for result, cluster_id in zip(ordered, cluster_ids):
                 verdict = str(self._adjudication_value(result, "verdict", ""))
+                reason = str(self._adjudication_value(result, "reason", "") or "")
                 selected_ids = tuple(
                     str(value)
                     for value in self._adjudication_value(
@@ -1479,17 +1542,50 @@ class V4Database:
                     raise ValueError(f"invalid adjudication verdict: {verdict}")
                 if len(set(selected_ids)) != len(selected_ids):
                     raise ValueError(f"duplicate selected candidate in cluster {cluster_id}")
+                selected_id_set = set(selected_ids)
                 member_ids = {row["id"] for row in cluster_members[cluster_id]}
-                missing = sorted(set(selected_ids) - member_ids)
+                missing = sorted(selected_id_set - member_ids)
                 if missing:
                     raise ValueError(
                         f"selected candidate(s) are not alternatives in cluster "
                         f"{cluster_id}: {', '.join(missing)}"
                     )
-                if verdict in {"promote", "split", "supersede"} and not selected_ids:
-                    raise ValueError(f"{verdict} requires selected candidates")
-                if verdict in {"reject", "defer"} and selected_ids:
+                selected_rows = [
+                    row
+                    for row in cluster_members[cluster_id]
+                    if row["id"] in selected_id_set
+                ]
+                if reason == "missing_span" and verdict != "defer":
+                    raise ValueError("missing_span requires defer")
+                if verdict == "promote" and len(selected_rows) != 1:
+                    raise ValueError("promote requires exactly one candidate")
+                if verdict in {"reject", "defer"} and selected_rows:
                     raise ValueError(f"{verdict} cannot select candidates")
+                if verdict == "split":
+                    if len(selected_rows) < 2:
+                        raise ValueError("split requires at least two candidates")
+                    if any(
+                        left["block_id"] == right["block_id"]
+                        and left["start_offset"] < right["end_offset"]
+                        and right["start_offset"] < left["end_offset"]
+                        for index, left in enumerate(selected_rows)
+                        for right in selected_rows[index + 1 :]
+                    ):
+                        raise ValueError("split candidates overlap")
+                if verdict == "supersede":
+                    if len(selected_rows) != 1:
+                        raise ValueError("supersede requires exactly one candidate")
+                    selected_row = selected_rows[0]
+                    if not any(
+                        other["id"] not in selected_id_set
+                        and selected_row["block_id"] == other["block_id"]
+                        and selected_row["start_offset"] <= other["start_offset"]
+                        and other["end_offset"] <= selected_row["end_offset"]
+                        for other in cluster_members[cluster_id]
+                    ):
+                        raise ValueError(
+                            "supersede candidate does not contain an unselected alternative"
+                        )
                 normalized = {
                     "cluster_id": cluster_id,
                     "verdict": verdict,
@@ -1500,7 +1596,7 @@ class V4Database:
                     "confidence": float(
                         self._adjudication_value(result, "confidence", 0.0)
                     ),
-                    "reason": str(self._adjudication_value(result, "reason", "") or ""),
+                    "reason": reason,
                     "rounds": max(
                         1, int(self._adjudication_value(result, "rounds", 1) or 1)
                     ),
@@ -1629,31 +1725,14 @@ class V4Database:
                     evidence_id: Optional[int] = None
                     if candidate_id in selected:
                         normalized_form = normalize_english_form(candidate["original_text"])
-                        existing = self._active_concept_for_form(
-                            connection, normalized_form, result["entity_kind"]
+                        candidate_concept_id = self._ensure_automatic_concept(
+                            connection,
+                            normalized_form=normalized_form,
+                            entity_kind=result["entity_kind"],
+                            source_form=candidate["original_text"],
+                            knowledge_version=version,
+                            created_at=now,
                         )
-                        if existing is not None:
-                            candidate_concept_id = str(existing["id"])
-                        else:
-                            candidate_concept_id = stable_id(
-                                "concept",
-                                f"{result['entity_kind']}:{normalized_form}",
-                            )
-                            connection.execute(
-                                """INSERT OR IGNORE INTO concepts(
-                                       id, kind, canonical_source, default_target,
-                                       working_target, verified_target, description,
-                                       status, scope, locked, created_version, created_at
-                                   ) VALUES(?, ?, ?, '', '', '', '', 'provisional',
-                                            'book', 0, ?, ?)""",
-                                (
-                                    candidate_concept_id,
-                                    result["entity_kind"],
-                                    candidate["original_text"],
-                                    version,
-                                    now,
-                                ),
-                            )
                         connection.execute(
                             """INSERT OR IGNORE INTO source_forms(
                                    concept_id, form, normalized_form, grammar_json
@@ -1792,6 +1871,13 @@ class V4Database:
                SELECT DISTINCT m.id FROM mentions m
                JOIN usage_decisions ud ON ud.mention_id=m.id
                WHERE ud.locked=1 OR ud.status='verified'""",
+            """CREATE TEMP TABLE reset_protected_evidence AS
+               SELECT ce.evidence_id FROM claim_evidence ce
+               JOIN claims c ON c.id=ce.claim_id
+               WHERE c.locked=1
+               UNION
+               SELECT m.evidence_id FROM mentions m
+               WHERE m.id IN (SELECT id FROM reset_protected_mentions)""",
             f"""CREATE TEMP TABLE reset_protected_concepts AS
                 SELECT id FROM concepts WHERE locked=1
                 UNION SELECT m.concept_id FROM mentions m
@@ -1804,6 +1890,7 @@ class V4Database:
                       WHERE locked=1 OR status='verified'""",
             f"""CREATE TEMP TABLE reset_scan_evidence AS
                 SELECT e.id FROM evidence e WHERE {evidence_where}
+                  AND e.id NOT IN (SELECT evidence_id FROM reset_protected_evidence)
                   AND NOT EXISTS(
                       SELECT 1 FROM mentions m
                       WHERE m.evidence_id=e.id
@@ -1834,7 +1921,10 @@ class V4Database:
             """CREATE TEMP TABLE reset_scan_claim_evidence AS
                SELECT ce.claim_id, ce.evidence_id FROM claim_evidence ce
                WHERE ce.evidence_id IN (SELECT id FROM reset_scan_evidence)
-                  OR ce.claim_id IN (SELECT id FROM reset_scan_claims)""",
+                  OR ce.claim_id IN (SELECT id FROM reset_scan_claims)
+               EXCEPT
+               SELECT ce.claim_id, ce.evidence_id FROM claim_evidence ce
+               JOIN claims c ON c.id=ce.claim_id WHERE c.locked=1""",
             """CREATE TEMP TABLE reset_scan_source_forms AS
                SELECT id FROM source_forms
                WHERE concept_id IN (SELECT id FROM reset_scan_concepts)""",
