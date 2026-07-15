@@ -3258,6 +3258,11 @@ class V4Database:
     def _prepare_scan_reset_selection(self, connection: sqlite3.Connection) -> None:
         evidence_where = self._scan_evidence_where("e")
         statements = (
+            """CREATE TEMP TABLE reset_scan_audit_runs AS
+               SELECT id FROM runs
+               WHERE stage IN (
+                   'scan', 'candidate_adjudication', 'adjudicate', 'working_target'
+               )""",
             """CREATE TEMP TABLE reset_scan_blocks AS
                SELECT id FROM blocks
                WHERE status!='pending' OR last_error IS NOT NULL""",
@@ -3334,6 +3339,15 @@ class V4Database:
             """CREATE TEMP TABLE reset_scan_verification_votes AS
                SELECT id FROM verification_votes
                WHERE task_id IN (SELECT id FROM reset_scan_verification_tasks)""",
+            """CREATE TEMP TABLE reset_scan_runs AS
+               SELECT r.id FROM runs r
+               WHERE r.id IN (SELECT id FROM reset_scan_audit_runs)
+                 AND NOT EXISTS(
+                     SELECT 1 FROM evidence e
+                     WHERE e.run_id=r.id
+                       AND e.id NOT IN (SELECT id FROM reset_scan_evidence))
+                 AND NOT EXISTS(
+                     SELECT 1 FROM translation_versions t WHERE t.run_id=r.id)""",
         )
         for statement in statements:
             connection.execute(statement)
@@ -3341,6 +3355,8 @@ class V4Database:
     @staticmethod
     def _scan_reset_queries() -> Dict[str, str]:
         return {
+            "audit_calls": "SELECT id,run_id,purpose,accepted,created_at FROM audit_calls WHERE run_id IN (SELECT id FROM reset_scan_audit_runs) ORDER BY id",
+            "runs": "SELECT id,stage,status,started_at,finished_at FROM runs WHERE id IN (SELECT id FROM reset_scan_runs) ORDER BY id",
             "blocks_reset": "SELECT id,status,last_error,updated_at FROM blocks WHERE id IN (SELECT id FROM reset_scan_blocks) ORDER BY id",
             "lexical_candidates": "SELECT id,updated_at,resolution_status,selected FROM lexical_candidates ORDER BY id",
             "candidate_clusters": "SELECT id,run_id,updated_at FROM candidate_clusters ORDER BY id",
@@ -3429,6 +3445,9 @@ class V4Database:
                     "scan reset token mismatch; request a fresh preview before retrying"
                 )
             deleted: Dict[str, int] = {}
+            connection.execute(
+                "DELETE FROM audit_calls WHERE run_id IN (SELECT id FROM reset_scan_audit_runs)"
+            )
             deletion_statements = (
                 ("verification_votes", "DELETE FROM verification_votes WHERE id IN (SELECT id FROM reset_scan_verification_votes)"),
                 ("verification_tasks", "DELETE FROM verification_tasks WHERE id IN (SELECT id FROM reset_scan_verification_tasks)"),
@@ -3469,6 +3488,23 @@ class V4Database:
                     utc_now(),
                 ),
             ).rowcount
+            connection.execute(
+                """DELETE FROM runs
+                   WHERE id IN (SELECT id FROM reset_scan_runs)
+                     AND NOT EXISTS(SELECT 1 FROM audit_calls a WHERE a.run_id=runs.id)
+                     AND NOT EXISTS(SELECT 1 FROM evidence e WHERE e.run_id=runs.id)
+                     AND NOT EXISTS(SELECT 1 FROM lexical_candidates l WHERE l.run_id=runs.id)
+                     AND NOT EXISTS(SELECT 1 FROM candidate_clusters c
+                                    WHERE c.run_id=runs.id OR c.lease_run_id=runs.id)
+                     AND NOT EXISTS(SELECT 1 FROM candidate_cluster_members m
+                                    WHERE m.run_id=runs.id)
+                     AND NOT EXISTS(SELECT 1 FROM candidate_adjudications a
+                                    WHERE a.run_id=runs.id)
+                     AND NOT EXISTS(SELECT 1 FROM candidate_resolutions r
+                                    WHERE r.run_id=runs.id)
+                     AND NOT EXISTS(SELECT 1 FROM translation_versions t
+                                    WHERE t.run_id=runs.id)"""
+            )
             return deleted
 
     def source_block_count(self) -> int:

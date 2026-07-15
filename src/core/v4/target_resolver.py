@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import time
 from typing import Any, Dict, List, Sequence
 from uuid import uuid4
 
@@ -30,11 +31,15 @@ class TargetResolver:
         llm: Any,
         max_attempts: int = 2,
         max_tokens: int = 8192,
+        audit_mode: str = "full",
     ):
+        if audit_mode not in {"full", "response", "minimal"}:
+            raise ValueError("audit_mode must be full, response, or minimal")
         self.database = database
         self.llm = llm
         self.max_attempts = max(1, int(max_attempts))
         self.max_tokens = max(1, int(max_tokens))
+        self.audit_mode = audit_mode
 
     @staticmethod
     def _clean_json(raw: str) -> str:
@@ -100,6 +105,9 @@ class TargetResolver:
     def _call_batch(
         self,
         concepts: Sequence[Dict[str, Any]],
+        *,
+        run_id: str | None = None,
+        knowledge_version: int | None = None,
     ) -> tuple[List[Dict[str, Any]] | None, str]:
         alias_map, payload = self._aliased_batch(concepts)
         base_messages = [
@@ -119,6 +127,9 @@ class TargetResolver:
                         ),
                     }
                 )
+            started = time.perf_counter()
+            raw = ""
+            parsed_payload = None
             try:
                 raw = self.llm.chat(
                     messages=messages,
@@ -131,10 +142,74 @@ class TargetResolver:
                 parsed = WorkingTargetResponse.model_validate_json(
                     self._clean_json(raw)
                 )
-                return self._resolve_response(parsed, alias_map), ""
+                parsed_payload = parsed.model_dump(mode="json")
+                decisions = self._resolve_response(parsed, alias_map)
             except Exception as exc:
                 last_error = str(exc)
+                if run_id:
+                    self._record_audit_attempt(
+                        run_id,
+                        messages,
+                        raw,
+                        parsed_payload,
+                        accepted=False,
+                        attempt=_attempt,
+                        elapsed_ms=int((time.perf_counter() - started) * 1000),
+                        error=last_error,
+                        knowledge_version=knowledge_version,
+                    )
+                continue
+            if run_id:
+                self._record_audit_attempt(
+                    run_id,
+                    messages,
+                    raw,
+                    parsed_payload,
+                    accepted=True,
+                    attempt=_attempt,
+                    elapsed_ms=int((time.perf_counter() - started) * 1000),
+                    error=None,
+                    knowledge_version=knowledge_version,
+                )
+            return decisions, ""
         return None, last_error or "model protocol failure"
+
+    def _record_audit_attempt(
+        self,
+        run_id: str,
+        messages: Sequence[Dict[str, str]],
+        raw_response: str,
+        parsed: Dict[str, Any] | None,
+        *,
+        accepted: bool,
+        attempt: int,
+        elapsed_ms: int,
+        error: str | None,
+        knowledge_version: int | None,
+    ) -> None:
+        version = (
+            int(knowledge_version)
+            if knowledge_version is not None
+            else int(self.database.current_knowledge_version())
+        )
+        try:
+            model = self.llm.get_model("working_target")
+        except (AttributeError, KeyError, TypeError):
+            model = type(self.llm).__name__
+        self.database.record_audit_call(
+            run_id=run_id,
+            block_id=None,
+            purpose="working_target",
+            model=str(model),
+            knowledge_version=version,
+            request={"messages": list(messages), "audit_mode": self.audit_mode},
+            raw_response=str(raw_response or ""),
+            parsed=parsed,
+            accepted=accepted,
+            attempts=attempt,
+            elapsed_ms=elapsed_ms,
+            error=error,
+        )
 
     def run(self, max_concepts: int | None = None) -> Dict[str, Any]:
         candidates = self.database.working_target_candidates()
@@ -150,13 +225,18 @@ class TargetResolver:
                 "max_attempts": self.max_attempts,
             },
         )
+        knowledge_version = int(self.database.current_knowledge_version())
         resolved = queued = changed = 0
         last_version = None
         affected_blocks = 0
         try:
             for start in range(0, len(candidates), 24):
                 batch = candidates[start : start + 24]
-                decisions, error = self._call_batch(batch)
+                decisions, error = self._call_batch(
+                    batch,
+                    run_id=run_id,
+                    knowledge_version=knowledge_version,
+                )
                 if decisions is None:
                     self.database.enqueue_working_target_review(
                         [item["concept_id"] for item in batch], error

@@ -571,6 +571,45 @@ def test_invalid_first_attempt_can_retry_with_the_same_local_aliases():
     assert user_payload(llm.requests[0]) == user_payload(llm.requests[1])
 
 
+def test_full_audit_records_each_adjudication_attempt_without_stable_ids():
+    source = "Alpha waited."
+    item = cluster("cluster-a", [candidate("candidate-a", source, 0, 5)])
+    llm = FakeLLM([response(selected_ids=["K01D"]), response()])
+
+    class RecordingDatabase:
+        def __init__(self):
+            self.calls = []
+
+        def current_knowledge_version(self):
+            return 7
+
+        def record_audit_call(self, **kwargs):
+            self.calls.append(kwargs)
+            return len(self.calls)
+
+    database = RecordingDatabase()
+    result = V4Adjudicator(
+        llm,
+        max_attempts=2,
+        audit_mode="full",
+    ).adjudicate(
+        batch(item),
+        {"block-1": source},
+        run_id="adjudicate-run",
+        database=database,
+    )
+
+    assert result[0].verdict == "promote"
+    assert [call["accepted"] for call in database.calls] == [False, True]
+    assert database.calls[0]["error"]
+    assert database.calls[1]["parsed"]["decisions"][0]["cluster_id"] == "K01"
+    assert database.calls[1]["purpose"] == "candidate_adjudication"
+    assert database.calls[1]["knowledge_version"] == 7
+    rendered_request = json.dumps(database.calls[1]["request"])
+    assert "cluster-a" not in rendered_request
+    assert "candidate-a" not in rendered_request
+
+
 def test_request_order_is_deterministic_for_reversed_cluster_input():
     sources = {"block-1": "Alpha waited.", "block-2": "Beta waited."}
     first = cluster("cluster-a", [candidate("candidate-a", sources["block-1"], 0, 5)])

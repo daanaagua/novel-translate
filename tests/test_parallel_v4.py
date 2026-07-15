@@ -1,9 +1,12 @@
 import json
+import io
 import tempfile
 import unittest
 from contextlib import closing
+from contextlib import redirect_stdout
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import ANY, patch
 
 from src.core.history import TranslationMemory
 from src.core.schemas import Chapter, ChunkStatus, TextChunk
@@ -698,6 +701,265 @@ class ParallelV4Tests(unittest.TestCase):
         V4Migrator(project).migrate()
         blocks = V4Database(root).list_blocks()
         self.assertEqual([block.source_text for block in blocks], ["First.", "Second."])
+
+
+class ParallelV4CliTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.root = Path(self.temp.name) / "book"
+        self.root.mkdir(parents=True)
+        self.project = SimpleNamespace(root_dir=self.root)
+
+    def tearDown(self):
+        self.temp.cleanup()
+
+    def invoke(self, *arguments):
+        import main as cli_main
+
+        output = io.StringIO()
+        with (
+            patch.object(cli_main.project_manager, "load_project", return_value=self.project),
+            redirect_stdout(output),
+        ):
+            exit_code = cli_main.main(list(arguments))
+        return exit_code, output.getvalue()
+
+    def test_scan_v4_is_local_and_does_not_construct_an_llm(self):
+        import main as cli_main
+
+        calls = []
+
+        class FakeScanner:
+            def __init__(self, database, **kwargs):
+                calls.append((database.project_root, kwargs))
+
+            def scan_project(self, **kwargs):
+                calls.append(kwargs)
+                return {"indexed": 3, "clusters": 2, "failed": 0}
+
+        with (
+            patch.object(cli_main, "V4Migrator") as migrator,
+            patch.object(cli_main, "V4Scanner", FakeScanner),
+            patch.object(cli_main, "LLMManager", side_effect=AssertionError("local scan must not create an LLM")),
+        ):
+            exit_code, output = self.invoke(
+                "scan-v4", "book", "--max-blocks", "3", "--max-attempts", "7"
+            )
+
+        self.assertEqual(exit_code, 0)
+        migrator.assert_called_once_with(self.project)
+        self.assertEqual(calls[0], (self.root, {"max_attempts": 7}))
+        self.assertEqual(calls[1]["max_blocks"], 3)
+        self.assertEqual(json.loads(output)["indexed"], 3)
+
+    def test_prepare_v4_runs_stages_in_order_and_forwards_limits(self):
+        import main as cli_main
+
+        calls = []
+
+        def stage(name, result):
+            def invoke(project, args):
+                calls.append(
+                    (
+                        name,
+                        project.root_dir,
+                        args.max_blocks,
+                        args.max_clusters,
+                        args.max_attempts,
+                        args.audit_mode,
+                    )
+                )
+                return result
+
+            return invoke
+
+        with (
+            patch.object(cli_main, "V4Migrator") as migrator,
+            patch.object(cli_main, "_run_scan_v4", stage("scan", {"failed": 0})),
+            patch.object(cli_main, "_run_adjudicate_v4", stage("adjudicate", {"failed": 0})),
+            patch.object(cli_main, "_run_resolve_targets_v4", stage("resolve", {"queued": 0})),
+        ):
+            exit_code, output = self.invoke(
+                "prepare-v4",
+                "book",
+                "--max-blocks",
+                "8",
+                "--max-clusters",
+                "13",
+                "--max-attempts",
+                "2",
+                "--audit-mode",
+                "full",
+            )
+
+        self.assertEqual(exit_code, 0)
+        migrator.assert_called_once_with(self.project)
+        self.assertEqual([item[0] for item in calls], ["scan", "adjudicate", "resolve"])
+        self.assertTrue(all(item[2:] == (8, 13, 2, "full") for item in calls))
+        self.assertEqual(json.loads(output)["status"], "completed")
+
+    def test_prepare_v4_stops_after_first_failed_stage(self):
+        import main as cli_main
+
+        calls = []
+
+        def failed_scan(project, args):
+            calls.append("scan")
+            return {"failed": 1}
+
+        def must_not_run(project, args):
+            calls.append("unexpected")
+            return {"failed": 0}
+
+        with (
+            patch.object(cli_main, "V4Migrator"),
+            patch.object(cli_main, "_run_scan_v4", failed_scan),
+            patch.object(cli_main, "_run_adjudicate_v4", must_not_run),
+            patch.object(cli_main, "_run_resolve_targets_v4", must_not_run),
+        ):
+            exit_code, output = self.invoke("prepare-v4", "book")
+
+        self.assertEqual(exit_code, 1)
+        self.assertEqual(calls, ["scan"])
+        result = json.loads(output)
+        self.assertEqual(result["status"], "failed")
+        self.assertEqual(result["failed_stage"], "scan")
+
+    def test_model_preparation_commands_forward_audit_and_attempt_limits(self):
+        import main as cli_main
+
+        constructed = []
+
+        class FakeAdjudicator:
+            def __init__(self, llm, **kwargs):
+                constructed.append(("adjudicate", kwargs))
+
+            def run(self, *, max_clusters=None):
+                constructed.append(("adjudicate-run", max_clusters))
+                return {"adjudicated": 4, "failed": 0, "deferred": 1}
+
+        class FakeResolver:
+            def __init__(self, database, llm, **kwargs):
+                constructed.append(("resolve", kwargs))
+
+            def run(self, max_concepts=None):
+                constructed.append(("resolve-run", max_concepts))
+                return {"resolved": 3, "queued": 0}
+
+        with (
+            patch.object(cli_main, "V4Migrator"),
+            patch.object(cli_main, "V4Adjudicator", FakeAdjudicator),
+            patch.object(cli_main, "TargetResolver", FakeResolver),
+            patch.object(cli_main, "LLMManager", return_value=object()),
+            patch.object(cli_main.config_loader, "load_config", return_value={"llm": {}}),
+        ):
+            adjudicate_code, _ = self.invoke(
+                "adjudicate-v4",
+                "book",
+                "--max-clusters",
+                "4",
+                "--max-attempts",
+                "5",
+                "--audit-mode",
+                "response",
+            )
+            resolve_code, _ = self.invoke(
+                "resolve-targets-v4",
+                "book",
+                "--max-concepts",
+                "3",
+                "--max-attempts",
+                "6",
+                "--audit-mode",
+                "minimal",
+            )
+
+        self.assertEqual((adjudicate_code, resolve_code), (0, 0))
+        self.assertIn(
+            ("adjudicate", {"database": ANY, "max_attempts": 5, "audit_mode": "response"}),
+            constructed,
+        )
+        self.assertIn(("adjudicate-run", 4), constructed)
+        self.assertIn(
+            ("resolve", {"max_attempts": 6, "audit_mode": "minimal"}),
+            constructed,
+        )
+        self.assertIn(("resolve-run", 3), constructed)
+
+    def test_reset_scan_v4_requires_current_preview_token_and_prints_clean_json(self):
+        database = V4Database(self.root)
+        edition = database.ensure_source_edition("raw", "normalized", "test", "source.txt")
+        database.upsert_blocks(
+            edition,
+            [
+                {
+                    "id": "block-1",
+                    "legacy_id": "ch01_000",
+                    "chapter_id": "ch01",
+                    "chapter_title": "One",
+                    "chapter_index": 0,
+                    "block_index": 0,
+                    "global_index": 0,
+                    "block_type": "prose",
+                    "source_text": "Severian waited.",
+                    "source_hash": "hash",
+                    "token_count": 2,
+                    "status": "pending",
+                }
+            ]
+        )
+
+        preview_code, preview_output = self.invoke("reset-scan-v4", "book", "--preview")
+        preview = json.loads(preview_output)
+        self.assertEqual(preview_code, 0)
+        self.assertTrue(preview["token"])
+
+        wrong_code, wrong_output = self.invoke(
+            "reset-scan-v4", "book", "--confirm", "wrong"
+        )
+        self.assertEqual(wrong_code, 1)
+        self.assertIn("token", wrong_output.casefold())
+
+        confirm_code, confirm_output = self.invoke(
+            "reset-scan-v4", "book", "--confirm", preview["token"]
+        )
+        self.assertEqual(confirm_code, 0)
+        self.assertIn("blocks_reset", json.loads(confirm_output))
+
+    def test_reset_scan_v4_clears_only_preparation_audit_runs(self):
+        database = V4Database(self.root)
+        for run_id, stage in (
+            ("scan-run", "scan"),
+            ("judge-run", "adjudicate"),
+            ("target-run", "working_target"),
+            ("translate-run", "translate"),
+        ):
+            database.start_run(run_id, stage, {})
+            database.record_audit_call(
+                run_id=run_id,
+                block_id=None,
+                purpose=stage,
+                model="fake",
+                knowledge_version=database.current_knowledge_version(),
+                request={"run": run_id},
+                raw_response="failure",
+                parsed=None,
+                accepted=False,
+                attempts=1,
+                elapsed_ms=1,
+                error="test",
+            )
+            database.finish_run(run_id, "completed_with_errors")
+
+        preview = database.preview_scan_reset()
+        self.assertEqual(preview["audit_calls"], 3)
+        self.assertEqual(preview["runs"], 3)
+        database.reset_scan_derivatives(preview["token"])
+        with closing(database.connect()) as connection:
+            remaining = connection.execute(
+                "SELECT r.stage, a.purpose FROM runs r JOIN audit_calls a ON a.run_id=r.id"
+            ).fetchall()
+        self.assertEqual([tuple(row) for row in remaining], [("translate", "translate")])
 
 
 if __name__ == "__main__":

@@ -173,6 +173,47 @@ def test_resolver_assigns_one_working_target_to_four_occurrences(tmp_path):
     assert len(payload["concepts"][0]["baseline_translations"]) <= 2
 
 
+def test_resolver_full_audit_persists_the_complete_aliased_exchange(tmp_path):
+    database = _database(
+        tmp_path,
+        [
+            "Severian waited at the gate.",
+            "Severian entered the tower.",
+            "Severian spoke to the guard.",
+        ],
+    )
+    _seed_concept(database, "Severian")
+    llm = FakeTargetLLM(
+        [
+            _response(
+                {
+                    "concept_id": "Q01",
+                    "working_target": "塞万里安",
+                    "rules": [],
+                    "confidence": 0.98,
+                }
+            )
+        ]
+    )
+
+    result = TargetResolver(
+        database,
+        llm,
+        max_attempts=1,
+        audit_mode="full",
+    ).run()
+
+    with closing(database.connect()) as connection:
+        audit = connection.execute(
+            "SELECT id, purpose, accepted FROM audit_calls WHERE run_id=?",
+            (result["run_id"],),
+        ).fetchone()
+    assert tuple(audit)[1:] == ("working_target", 1)
+    payload = database.read_audit_payload(audit["id"])
+    assert payload["request"]["messages"][1]["content"]
+    assert json.loads(payload["raw_response"])["decisions"][0]["concept_id"] == "Q01"
+
+
 def test_verified_and_locked_targets_are_never_overwritten(tmp_path):
     database = _database(tmp_path, ["Severian waited.", "Severian spoke."])
     concept_id = _seed_concept(database, "Severian")

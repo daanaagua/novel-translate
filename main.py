@@ -32,6 +32,8 @@ from src.core.v4 import (
     serve_review_ui,
     write_shadow_comparison,
 )
+from src.core.v4.adjudicator import V4Adjudicator
+from src.core.v4.target_resolver import TargetResolver
 from rich.console import Console
 from rich.theme import Theme
 
@@ -273,25 +275,157 @@ def cmd_import_baseline_v4(args):
     return 0
 
 
+def _run_scan_v4(project, args):
+    scanner = V4Scanner(
+        V4Database(project.root_dir),
+        max_attempts=args.max_attempts,
+    )
+    return scanner.scan_project(
+        initial_workers=getattr(args, "initial_workers", 2),
+        max_workers=getattr(args, "max_workers", 4),
+        max_blocks=getattr(args, "max_blocks", None),
+    )
+
+
+def _preparation_audit_mode(args, config):
+    return getattr(args, "audit_mode", None) or config.get(
+        "parallel_v4", {}
+    ).get("audit_mode", "full")
+
+
+def _run_adjudicate_v4(project, args):
+    config = config_loader.load_config()
+    database = V4Database(project.root_dir)
+    return V4Adjudicator(
+        LLMManager(config["llm"]),
+        database=database,
+        max_attempts=args.max_attempts,
+        audit_mode=_preparation_audit_mode(args, config),
+    ).run(max_clusters=getattr(args, "max_clusters", None))
+
+
+def _run_resolve_targets_v4(project, args):
+    config = config_loader.load_config()
+    return TargetResolver(
+        V4Database(project.root_dir),
+        LLMManager(config["llm"]),
+        max_attempts=args.max_attempts,
+        audit_mode=_preparation_audit_mode(args, config),
+    ).run(max_concepts=getattr(args, "max_concepts", None))
+
+
+def _print_stage_error(stage, exc):
+    print(json.dumps({"status": "failed", "stage": stage, "error": str(exc)}, ensure_ascii=False))
+
+
 def cmd_scan_v4(args):
     project = _load_project_or_error(args.book_id)
     if not project:
         return 1
-    V4Migrator(project).migrate()
-    config = config_loader.load_config()
-    scanner = V4Scanner(
-        V4Database(project.root_dir),
-        LLMManager(config["llm"]),
-        max_attempts=args.max_attempts,
-        audit_mode=args.audit_mode or config.get("parallel_v4", {}).get("audit_mode", "full"),
-    )
-    result = scanner.scan_project(
-        initial_workers=args.initial_workers,
-        max_workers=args.max_workers,
-        max_blocks=args.max_blocks,
-    )
+    try:
+        V4Migrator(project).migrate()
+        result = _run_scan_v4(project, args)
+    except Exception as exc:
+        _print_stage_error("scan", exc)
+        return 1
     print(json.dumps(result, ensure_ascii=False, indent=2))
     return 1 if result["failed"] else 0
+
+
+def cmd_adjudicate_v4(args):
+    project = _load_project_or_error(args.book_id)
+    if not project:
+        return 1
+    try:
+        V4Migrator(project).migrate()
+        result = _run_adjudicate_v4(project, args)
+    except Exception as exc:
+        _print_stage_error("adjudicate", exc)
+        return 1
+    print(json.dumps(result, ensure_ascii=False, indent=2))
+    return 1 if result["failed"] else 0
+
+
+def cmd_resolve_targets_v4(args):
+    project = _load_project_or_error(args.book_id)
+    if not project:
+        return 1
+    try:
+        V4Migrator(project).migrate()
+        result = _run_resolve_targets_v4(project, args)
+    except Exception as exc:
+        _print_stage_error("working_target", exc)
+        return 1
+    print(json.dumps(result, ensure_ascii=False, indent=2))
+    return 1 if result["queued"] else 0
+
+
+def cmd_prepare_v4(args):
+    project = _load_project_or_error(args.book_id)
+    if not project:
+        return 1
+    try:
+        V4Migrator(project).migrate()
+    except Exception as exc:
+        _print_stage_error("migrate", exc)
+        return 1
+    stages = {}
+    for name, runner, failure_key in (
+        ("scan", _run_scan_v4, "failed"),
+        ("adjudicate", _run_adjudicate_v4, "failed"),
+        ("resolve", _run_resolve_targets_v4, "queued"),
+    ):
+        try:
+            result = runner(project, args)
+        except Exception as exc:
+            result = {"error": str(exc)}
+            stages[name] = result
+            print(
+                json.dumps(
+                    {
+                        "status": "failed",
+                        "failed_stage": name,
+                        "stages": stages,
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                )
+            )
+            return 1
+        stages[name] = result
+        if int(result.get(failure_key, 0)):
+            print(
+                json.dumps(
+                    {
+                        "status": "failed",
+                        "failed_stage": name,
+                        "stages": stages,
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                )
+            )
+            return 1
+    print(json.dumps({"status": "completed", "stages": stages}, ensure_ascii=False, indent=2))
+    return 0
+
+
+def cmd_reset_scan_v4(args):
+    project = _load_project_or_error(args.book_id)
+    if not project:
+        return 1
+    database = V4Database(project.root_dir)
+    try:
+        result = (
+            database.preview_scan_reset()
+            if args.preview
+            else database.reset_scan_derivatives(args.confirm)
+        )
+    except Exception as exc:
+        print(json.dumps({"error": str(exc)}, ensure_ascii=False))
+        return 1
+    print(json.dumps(result, ensure_ascii=False, indent=2))
+    return 0
 
 
 def cmd_reconcile_v4(args):
@@ -565,7 +699,7 @@ def cmd_compare_v4(args):
     print(f"[OK] 影子对照: {path}")
     return 0
 
-def main():
+def main(argv=None):
     parser = argparse.ArgumentParser(
         description="DeepNovel-Translator CLI (v3.0)",
         formatter_class=argparse.RawDescriptionHelpFormatter
@@ -624,6 +758,49 @@ def main():
         "--audit-mode", choices=["full", "response", "minimal"]
     )
     p_scan_v4.set_defaults(func=cmd_scan_v4)
+
+    p_adjudicate_v4 = subparsers.add_parser(
+        "adjudicate-v4", help="对本地候选簇执行严格双重裁决"
+    )
+    p_adjudicate_v4.add_argument("book_id", help="项目ID")
+    p_adjudicate_v4.add_argument("--max-clusters", type=int)
+    p_adjudicate_v4.add_argument("--max-attempts", type=int, default=2)
+    p_adjudicate_v4.add_argument(
+        "--audit-mode", choices=["full", "response", "minimal"]
+    )
+    p_adjudicate_v4.set_defaults(func=cmd_adjudicate_v4)
+
+    p_resolve_targets_v4 = subparsers.add_parser(
+        "resolve-targets-v4", help="为已裁决概念生成全书工作译名"
+    )
+    p_resolve_targets_v4.add_argument("book_id", help="项目ID")
+    p_resolve_targets_v4.add_argument("--max-concepts", type=int)
+    p_resolve_targets_v4.add_argument("--max-attempts", type=int, default=2)
+    p_resolve_targets_v4.add_argument(
+        "--audit-mode", choices=["full", "response", "minimal"]
+    )
+    p_resolve_targets_v4.set_defaults(func=cmd_resolve_targets_v4)
+
+    p_prepare_v4 = subparsers.add_parser(
+        "prepare-v4", help="依次执行本地索引、候选裁决和工作译名解析"
+    )
+    p_prepare_v4.add_argument("book_id", help="项目ID")
+    p_prepare_v4.add_argument("--max-blocks", type=int)
+    p_prepare_v4.add_argument("--max-clusters", type=int)
+    p_prepare_v4.add_argument("--max-attempts", type=int, default=2)
+    p_prepare_v4.add_argument(
+        "--audit-mode", choices=["full", "response", "minimal"]
+    )
+    p_prepare_v4.set_defaults(func=cmd_prepare_v4)
+
+    p_reset_scan_v4 = subparsers.add_parser(
+        "reset-scan-v4", help="预览或确认清除扫描派生数据"
+    )
+    p_reset_scan_v4.add_argument("book_id", help="项目ID")
+    reset_action = p_reset_scan_v4.add_mutually_exclusive_group(required=True)
+    reset_action.add_argument("--preview", action="store_true")
+    reset_action.add_argument("--confirm", metavar="TOKEN")
+    p_reset_scan_v4.set_defaults(func=cmd_reset_scan_v4)
 
     p_reconcile_v4 = subparsers.add_parser("reconcile-v4", help="保守归并完全相同的英文词形")
     p_reconcile_v4.add_argument("book_id", help="项目ID")
@@ -739,7 +916,7 @@ def main():
     p_compare_v4.add_argument("--baseline", help="指定外部基线名称")
     p_compare_v4.set_defaults(func=cmd_compare_v4)
     
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
     
     if args.command is None:
         parser.print_help()
