@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import re
 import unicodedata
 from collections import Counter
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Dict, Iterable, List, Sequence
 
 from .models import V4Block
@@ -16,7 +17,8 @@ WORD_RE = re.compile(
     r"[A-Za-z]+(?:[’'][A-Za-z]+)*(?:-[A-Za-z]+(?:[’'][A-Za-z]+)*)*|\d+(?:\.\d+)?"
 )
 SENTENCE_END_RE = re.compile(r"[.!?]+")
-CONNECTORS = {"and", "of", "for", "the", "to", "de", "del", "la", "van", "von"}
+COORDINATORS = {"and", "or", "nor"}
+CONNECTORS = COORDINATORS | {"of", "for", "the", "to", "de", "del", "la", "van", "von"}
 NUMBER_WORDS = {
     "one", "two", "three", "four", "five", "six", "seven", "eight", "nine", "ten",
     "hundred", "thousand", "million", "first", "second", "third",
@@ -127,6 +129,7 @@ class LexicalCandidate:
     extraction_reason: str
     book_frequency: int
     score: int
+    risk_flags: tuple[str, ...] = ()
 
     def model_payload(self) -> Dict[str, object]:
         context = " ".join(
@@ -151,6 +154,7 @@ class LexicalCandidate:
             "right_context": self.right_context,
             "extraction_reason": self.extraction_reason,
             "book_frequency": self.book_frequency,
+            "risk_flags_json": json.dumps(self.risk_flags, ensure_ascii=False),
             "selected": selected,
             "model_status": model_status,
         }
@@ -243,7 +247,19 @@ class LexicalCandidateExtractor:
         )
 
     def extract(self, block: V4Block) -> List[LexicalCandidate]:
-        by_key: Dict[str, LexicalCandidate] = {}
+        by_span: Dict[tuple[str, int, int, str], LexicalCandidate] = {}
+
+        def retain(candidate: LexicalCandidate) -> None:
+            candidate_key = (
+                candidate.paragraph_id,
+                candidate.start_offset,
+                candidate.end_offset,
+                lexical_key(candidate.original_text),
+            )
+            previous = by_span.get(candidate_key)
+            if previous is None or candidate.score > previous.score:
+                by_span[candidate_key] = candidate
+
         for paragraph in paragraph_spans(block.source_text):
             tokens = list(WORD_RE.finditer(paragraph.text))
             if (
@@ -280,9 +296,7 @@ class LexicalCandidateExtractor:
                         block, paragraph, absolute_start, absolute_end, "capitalized", 90
                     )
                     if candidate:
-                        previous = by_key.get(key)
-                        if previous is None or candidate.score > previous.score:
-                            by_key[key] = candidate
+                        retain(candidate)
 
                 if is_capitalized and key not in COMMON_WORDS and capitalized_like_name:
                     last = index + 1
@@ -293,7 +307,7 @@ class LexicalCandidateExtractor:
                             break
                         next_text = tokens[last].group(0)
                         next_key = lexical_key(next_text)
-                        if next_text[0].isupper() and next_key not in COMMON_WORDS:
+                        if next_text[0].isupper():
                             content_count += 1
                             last += 1
                             continue
@@ -301,7 +315,6 @@ class LexicalCandidateExtractor:
                             next_key in CONNECTORS
                             and last + 1 < len(tokens)
                             and tokens[last + 1].group(0)[0].isupper()
-                            and lexical_key(tokens[last + 1].group(0)) not in COMMON_WORDS
                         ):
                             last += 1
                             continue
@@ -312,10 +325,7 @@ class LexicalCandidateExtractor:
                             block, paragraph, absolute_start, phrase_end, "capitalized_phrase", 110
                         )
                         if candidate:
-                            phrase_key = lexical_key(candidate.original_text)
-                            previous = by_key.get(phrase_key)
-                            if previous is None or candidate.score > previous.score:
-                                by_key[phrase_key] = candidate
+                            retain(candidate)
 
                 frequency = int(self.book_frequencies.get(key, 1))
                 word_length = len(key.replace(" ", ""))
@@ -332,9 +342,7 @@ class LexicalCandidateExtractor:
                         block, paragraph, absolute_start, absolute_end, "rare_or_repeated", score
                     )
                     if candidate:
-                        previous = by_key.get(key)
-                        if previous is None or candidate.score > previous.score:
-                            by_key[key] = candidate
+                        retain(candidate)
 
                 if (
                     key in NUMBER_WORDS
@@ -346,11 +354,35 @@ class LexicalCandidateExtractor:
                         block, paragraph, absolute_start, phrase_end, "number_or_unit", 65
                     )
                     if candidate:
-                        phrase_key = lexical_key(candidate.original_text)
-                        by_key.setdefault(phrase_key, candidate)
+                        retain(candidate)
+
+        candidates = list(by_span.values())
+        flagged: List[LexicalCandidate] = []
+        for candidate in candidates:
+            flags = set(candidate.risk_flags)
+            words = lexical_key(candidate.original_text).split()
+            if any(word in COORDINATORS for word in words[1:-1]):
+                flags.add("coordination")
+            if any(
+                other.paragraph_id == candidate.paragraph_id
+                and other.id != candidate.id
+                and (
+                    (
+                        other.start_offset <= candidate.start_offset
+                        and candidate.end_offset <= other.end_offset
+                    )
+                    or (
+                        candidate.start_offset <= other.start_offset
+                        and other.end_offset <= candidate.end_offset
+                    )
+                )
+                for other in candidates
+            ):
+                flags.add("span_competition")
+            flagged.append(replace(candidate, risk_flags=tuple(sorted(flags))))
 
         ordered = sorted(
-            by_key.values(),
+            flagged,
             key=lambda item: (-item.score, item.start_offset, -len(item.original_text)),
         )
         return ordered[: self.max_candidates]
