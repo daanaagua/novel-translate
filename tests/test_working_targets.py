@@ -760,6 +760,41 @@ def test_midrun_target_change_stops_before_mixing_and_revalidates_run(tmp_path):
         ).fetchone()[0] == result["status"]
 
 
+def test_atomic_finalizer_reports_a_last_moment_knowledge_race(tmp_path, monkeypatch):
+    database = _database(tmp_path, ["Severian waited long enough."])
+    concept_id = _seed_concept(database, "Severian")
+    database.apply_working_target_decisions(
+        [{"concept_id": concept_id, "target": "塞万里安", "rules": []}]
+    )
+    pipeline = RecordingPipeline(
+        database,
+        lambda: None,
+        config=V4PipelineConfig(
+            island_size=1,
+            initial_workers=1,
+            max_workers=1,
+            enable_polish=False,
+        ),
+    )
+    original_finish = database.finish_translation_run_atomically
+
+    def race_before_final_transaction(*args, **kwargs):
+        database.apply_working_target_decisions(
+            [{"concept_id": concept_id, "target": "塞维利安", "rules": []}]
+        )
+        return original_finish(*args, **kwargs)
+
+    monkeypatch.setattr(
+        database, "finish_translation_run_atomically", race_before_final_transaction
+    )
+
+    result = pipeline.run()
+
+    assert result["status"] == "completed_with_errors"
+    assert result["knowledge_stale"] is True
+    assert database.active_translations()["block_000"]["status"] == "needs_revalidate"
+
+
 def test_working_target_candidates_use_one_connection_for_contexts_and_baselines(
     tmp_path, monkeypatch
 ):

@@ -4,7 +4,11 @@ from contextlib import closing
 import pytest
 
 from src.core.v4.database import KnowledgeSnapshotError, V4Database
-from src.core.v4.matcher import AhoConceptMatcher, ConceptMatcherCache
+from src.core.v4.matcher import (
+    AhoConceptMatcher,
+    ConceptMatcherCache,
+    FrozenConceptIndex,
+)
 from src.core.v4.models import TranslationOutcome, V4BlockStatus
 
 
@@ -88,7 +92,67 @@ def test_concepts_for_text_deepcopies_nested_rules_and_reuses_matcher(tmp_path):
     assert version > 0 and signature
     assert second[0]["rules"][0]["condition"]["mode"] == "vocative"
     assert snapshot[0]["rules"][0]["condition"]["mode"] == "vocative"
-    assert ConceptMatcherCache.build_count() == 1
+    assert ConceptMatcherCache.build_count() == 0
+
+
+def test_frozen_index_compiles_once_and_hot_matching_never_walks_vocabulary(
+    tmp_path, monkeypatch
+):
+    db = _db(tmp_path, ["Name1999 spoke.", "Name1 waited.", "Nothing happened."])
+    version = db.current_knowledge_version()
+    with db.transaction() as connection:
+        for index in range(2000):
+            concept_id = f"concept-{index:04d}"
+            source = f"Name{index}"
+            connection.execute(
+                """INSERT INTO concepts(
+                       id, kind, canonical_source, default_target, working_target,
+                       description, status, scope, locked, created_version, created_at
+                   ) VALUES(?, 'person', ?, ?, ?, '', 'provisional', 'book', 0, ?, 'now')""",
+                (concept_id, source, f"译名{index}", f"译名{index}", version),
+            )
+            connection.execute(
+                """INSERT INTO source_forms(
+                       concept_id, form, normalized_form, grammar_json
+                   ) VALUES(?, ?, lower(?), '{}')""",
+                (concept_id, source, source),
+            )
+
+    counts = {"signature": 0, "snapshot": 0, "map": 0, "matcher": 0}
+    original_signature = db.target_snapshot_signature
+    original_snapshot = FrozenConceptIndex._deep_snapshot
+    original_map = FrozenConceptIndex._build_map
+    original_matcher = FrozenConceptIndex._build_matcher
+
+    def counted_signature(snapshot):
+        counts["signature"] += 1
+        return original_signature(snapshot)
+
+    def counted_snapshot(snapshot):
+        counts["snapshot"] += 1
+        return original_snapshot(snapshot)
+
+    def counted_map(snapshot):
+        counts["map"] += 1
+        return original_map(snapshot)
+
+    def counted_matcher(snapshot):
+        counts["matcher"] += 1
+        return original_matcher(snapshot)
+
+    monkeypatch.setattr(db, "target_snapshot_signature", counted_signature)
+    monkeypatch.setattr(FrozenConceptIndex, "_deep_snapshot", staticmethod(counted_snapshot))
+    monkeypatch.setattr(FrozenConceptIndex, "_build_map", staticmethod(counted_map))
+    monkeypatch.setattr(FrozenConceptIndex, "_build_matcher", staticmethod(counted_matcher))
+
+    _, frozen, signature = db.freeze_translation_knowledge()
+    assert isinstance(frozen, FrozenConceptIndex)
+    assert frozen.signature == signature
+    assert counts == {"signature": 1, "snapshot": 1, "map": 1, "matcher": 1}
+
+    for block in db.list_blocks():
+        db.concepts_for_text(block.source_text, concept_snapshot=frozen)
+    assert counts == {"signature": 1, "snapshot": 1, "map": 1, "matcher": 1}
 
 
 def test_snapshot_signature_covers_all_prompt_and_matching_semantics(tmp_path):
@@ -110,10 +174,10 @@ def test_snapshot_signature_covers_all_prompt_and_matching_semantics(tmp_path):
         ("default_target", "有效"),
         ("verification_pending", True),
     ):
-        changed = json.loads(json.dumps(snapshot, ensure_ascii=False))
+        changed = json.loads(json.dumps(list(snapshot), ensure_ascii=False))
         changed[0][field] = value
         variants.append(db.target_snapshot_signature(changed))
-    changed_form = json.loads(json.dumps(snapshot, ensure_ascii=False))
+    changed_form = json.loads(json.dumps(list(snapshot), ensure_ascii=False))
     changed_form[0]["forms"].append("Archons")
     variants.append(db.target_snapshot_signature(changed_form))
 
@@ -207,10 +271,11 @@ def test_atomic_finish_detects_changed_signature_and_rolls_back_on_failure(
         return original(connection)
 
     monkeypatch.setattr(db, "_concept_snapshot_from_connection", change_inside_finish)
-    status = db.finish_translation_run_atomically(
+    status, knowledge_stale = db.finish_translation_run_atomically(
         "finish-run", signature, "completed"
     )
     assert status == "completed_with_errors"
+    assert knowledge_stale is True
     assert db.active_translations()[block.id]["status"] == "needs_revalidate"
 
     db.start_run("failure-run", "translate", {})

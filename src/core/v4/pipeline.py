@@ -582,12 +582,15 @@ class V4TranslationPipeline:
             desired_status = "paused_for_review" if paused else (
                 "completed_with_errors" if failed or manual else "completed"
             )
-            status = self.database.finish_translation_run_atomically(
-                run_id,
-                target_signature,
-                desired_status,
-                force_revalidate=knowledge_stale,
+            status, finalized_knowledge_stale = (
+                self.database.finish_translation_run_atomically(
+                    run_id,
+                    target_signature,
+                    desired_status,
+                    force_revalidate=knowledge_stale,
+                )
             )
+            knowledge_stale = knowledge_stale or finalized_knowledge_stale
         except KnowledgeSnapshotError as exc:
             self.database.fail_run_for_invalid_snapshot(
                 run_id, "translate", run_config, exc

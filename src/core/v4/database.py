@@ -20,7 +20,7 @@ from .models import (
     V4BlockStatus,
     WorkingTargetRule,
 )
-from .matcher import ConceptMatcherCache
+from .matcher import ConceptMatcherCache, FrozenConceptIndex
 
 
 SCHEMA_VERSION = 7
@@ -4294,7 +4294,7 @@ class V4Database:
 
     def freeze_translation_knowledge(
         self,
-    ) -> tuple[int, List[Dict[str, Any]], str]:
+    ) -> tuple[int, FrozenConceptIndex, str]:
         """Atomically freeze the version, concept rendering state, and signature."""
 
         connection = self.connect()
@@ -4306,8 +4306,10 @@ class V4Database:
                 ).fetchone()[0]
             )
             snapshot = self._concept_snapshot_from_connection(connection)
-            signature = self.target_snapshot_signature(snapshot)
-            return version, snapshot, signature
+            frozen = FrozenConceptIndex.compile(
+                snapshot, self.target_snapshot_signature
+            )
+            return version, frozen, frozen.signature
         finally:
             connection.rollback()
             connection.close()
@@ -4377,6 +4379,8 @@ class V4Database:
         text: str,
         concept_snapshot: Optional[Sequence[Dict[str, Any]]] = None,
     ) -> List[Dict[str, Any]]:
+        if isinstance(concept_snapshot, FrozenConceptIndex):
+            return concept_snapshot.matched_concepts(text)
         snapshot = (
             list(concept_snapshot)
             if concept_snapshot is not None
@@ -4398,7 +4402,7 @@ class V4Database:
         desired_status: str,
         error: Optional[str] = None,
         force_revalidate: bool = False,
-    ) -> str:
+    ) -> tuple[str, bool]:
         """Finalize a translation run against knowledge read in the same write txn."""
 
         with self.transaction() as connection:
@@ -4433,7 +4437,7 @@ class V4Database:
                 "UPDATE runs SET status=?, finished_at=?, error=? WHERE id=?",
                 (persisted_status, utc_now(), persisted_error, run_id),
             )
-            return persisted_status
+            return persisted_status, stale
 
     def invalidate_translation_run(self, run_id: str) -> int:
         """Mark all output already committed by a stale frozen run for revalidation."""

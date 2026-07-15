@@ -4,8 +4,9 @@ from __future__ import annotations
 
 import unicodedata
 from collections import deque
+from copy import deepcopy
 from threading import RLock
-from typing import Any, Dict, Iterable, Mapping, Sequence
+from typing import Any, Callable, Dict, Iterable, Iterator, Mapping, Sequence, overload
 
 
 def _normalized(value: str) -> str:
@@ -90,6 +91,79 @@ class AhoConceptMatcher:
                 if self._has_word_boundaries(normalized, start, end, form):
                     matched.update(concept_ids)
         return tuple(sorted(matched))
+
+    def scan(self, text: str) -> tuple[str, ...]:
+        return self.match(text)
+
+
+class FrozenConceptIndex(Sequence[Mapping[str, Any]]):
+    """One compiled, reusable rendering index for a translation run."""
+
+    def __init__(
+        self,
+        snapshot: tuple[Dict[str, Any], ...],
+        signature: str,
+        by_id: Dict[str, Dict[str, Any]],
+        matcher: AhoConceptMatcher,
+    ):
+        self._snapshot = snapshot
+        self.signature = signature
+        self._by_id = by_id
+        self._matcher = matcher
+
+    @staticmethod
+    def _deep_snapshot(
+        snapshot: Sequence[Mapping[str, Any]],
+    ) -> tuple[Dict[str, Any], ...]:
+        return tuple(deepcopy(dict(concept)) for concept in snapshot)
+
+    @staticmethod
+    def _build_map(
+        snapshot: Sequence[Dict[str, Any]],
+    ) -> Dict[str, Dict[str, Any]]:
+        return {
+            str(concept.get("id") or ""): concept
+            for concept in snapshot
+            if str(concept.get("id") or "")
+        }
+
+    @staticmethod
+    def _build_matcher(snapshot: Sequence[Mapping[str, Any]]) -> AhoConceptMatcher:
+        return AhoConceptMatcher.from_snapshot(snapshot)
+
+    @classmethod
+    def compile(
+        cls,
+        snapshot: Sequence[Mapping[str, Any]],
+        signature_builder: Callable[[Sequence[Dict[str, Any]]], str],
+    ) -> "FrozenConceptIndex":
+        frozen = cls._deep_snapshot(snapshot)
+        signature = signature_builder(frozen)
+        by_id = cls._build_map(frozen)
+        matcher = cls._build_matcher(frozen)
+        return cls(frozen, signature, by_id, matcher)
+
+    def matched_concepts(self, text: str) -> list[Dict[str, Any]]:
+        return [
+            deepcopy(self._by_id[concept_id])
+            for concept_id in self._matcher.scan(text)
+            if concept_id in self._by_id
+        ]
+
+    def __len__(self) -> int:
+        return len(self._snapshot)
+
+    @overload
+    def __getitem__(self, index: int) -> Mapping[str, Any]: ...
+
+    @overload
+    def __getitem__(self, index: slice) -> tuple[Dict[str, Any], ...]: ...
+
+    def __getitem__(self, index: int | slice):
+        return self._snapshot[index]
+
+    def __iter__(self) -> Iterator[Mapping[str, Any]]:
+        return iter(self._snapshot)
 
 
 class ConceptMatcherCache:
