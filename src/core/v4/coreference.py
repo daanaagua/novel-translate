@@ -1,7 +1,7 @@
-"""Frozen, deterministic contracts for future dual-model coreference voting.
+"""Frozen coreference contracts and conservative deterministic resolution.
 
-This module only prepares and validates requests.  It deliberately does not call
-models, merge votes, or persist coreference decisions.
+This module prepares and validates future model requests, but the deterministic
+path is entirely local and persists its decisions without calling a model.
 """
 
 from __future__ import annotations
@@ -11,11 +11,12 @@ from contextlib import closing
 import hashlib
 import json
 import re
+import sqlite3
 from typing import Any, Iterable, Mapping, Sequence
 
 from pydantic import BaseModel, ValidationError
 
-from .database import V4Database, stable_id
+from .database import V4Database, normalize_english_form, stable_id, utc_now
 from .models import (
     CoreferenceCase,
     CoreferenceConceptAnchor,
@@ -42,6 +43,10 @@ MAX_CASE_PAYLOAD_BYTES = 192 * 1024
 
 class CoreferenceProtocolError(ValueError):
     """A model response does not conform to its frozen request cases."""
+
+
+class _ProtectedBindingConflict(RuntimeError):
+    """A deterministic same case contains a protected, unbindable member."""
 
 
 def _pure_validation_data(value: Any) -> Any:
@@ -363,8 +368,64 @@ def _select_mentions(
     return sorted(selected.values(), key=_mention_order)
 
 
+def _decoded_mapping(value: Any) -> dict[str, Any]:
+    try:
+        decoded = json.loads(str(value or "{}"))
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return {}
+    return decoded if isinstance(decoded, dict) else {}
+
+
+def _anchor_member_ids(value: Any) -> set[int]:
+    try:
+        decoded = json.loads(str(value or "[]"))
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return set()
+    found: set[int] = set()
+
+    def collect(item: Any) -> None:
+        if isinstance(item, bool):
+            return
+        if isinstance(item, int):
+            found.add(item)
+        elif isinstance(item, str) and item.isdigit():
+            found.add(int(item))
+        elif isinstance(item, Mapping):
+            for key in ("mention_id", "id", "members", "mention_ids"):
+                if key in item:
+                    collect(item[key])
+        elif isinstance(item, (list, tuple)):
+            for nested in item:
+                collect(nested)
+
+    collect(decoded)
+    return found
+
+
+_TITLE_OBSERVATION_KINDS = {
+    "book_title",
+    "chapter_title",
+    "title",
+    "work",
+    "work_title",
+}
+_TITLE_DIRECTORY_BLOCK_KINDS = {
+    "chapter_title",
+    "contents",
+    "front_matter",
+    "heading",
+    "index",
+    "title",
+    "toc",
+}
+
+
+def _title_fingerprint(value: Any) -> str:
+    return normalize_english_form(str(value or ""))
+
+
 class CoreferenceCoordinator:
-    """Freeze same-lexeme cases and enforce their response protocol."""
+    """Freeze same-lexeme cases and coordinate their local protocol."""
 
     def __init__(self, database: V4Database):
         self.database = database
@@ -684,6 +745,668 @@ class CoreferenceCoordinator:
                 )
             )
         return tuple(cases)
+
+    @staticmethod
+    def _redirect_target(
+        connection: sqlite3.Connection,
+        concept_id: str,
+    ) -> tuple[str | None, bool]:
+        current = concept_id
+        visited: set[str] = set()
+        redirected = False
+        while current not in visited:
+            visited.add(current)
+            row = connection.execute(
+                """SELECT canonical_concept_id FROM concept_redirects
+                   WHERE retired_concept_id=?""",
+                (current,),
+            ).fetchone()
+            if row is None:
+                active = connection.execute(
+                    """SELECT 1 FROM concepts
+                       WHERE id=? AND retired_version IS NULL""",
+                    (current,),
+                ).fetchone()
+                return (current if active is not None else None, redirected)
+            current = str(row["canonical_concept_id"])
+            redirected = True
+        return (None, redirected)
+
+    @staticmethod
+    def _candidate_span(
+        connection: sqlite3.Connection,
+        row: Mapping[str, Any],
+        payload: Mapping[str, Any],
+    ) -> tuple[str, str, int, int, str] | None:
+        start = payload.get("start_offset")
+        end = payload.get("end_offset")
+        if (
+            isinstance(start, int)
+            and not isinstance(start, bool)
+            and isinstance(end, int)
+            and not isinstance(end, bool)
+            and 0 <= start < end <= len(str(row["source_text"]))
+            and normalize_english_form(str(row["source_text"])[start:end])
+            == str(row["normalized_form"])
+        ):
+            return (
+                str(row["source_edition_hash"]),
+                str(row["block_id"]),
+                start,
+                end,
+                str(row["normalized_form"]),
+            )
+
+        candidate_spans = {
+            (
+                str(row["source_edition_hash"]),
+                str(item["block_id"]),
+                int(item["start_offset"]),
+                int(item["end_offset"]),
+                str(row["normalized_form"]),
+            )
+            for item in connection.execute(
+                """SELECT lc.block_id, lc.start_offset, lc.end_offset
+                   FROM candidate_resolutions cr
+                   JOIN lexical_candidates lc ON lc.id=cr.candidate_id
+                   WHERE cr.evidence_id=? AND cr.lexeme_id=?""",
+                (row["evidence_id"], row["lexeme_id"]),
+            ).fetchall()
+        }
+        if len(candidate_spans) == 1:
+            return next(iter(candidate_spans))
+
+        occurrence_spans = {
+            (
+                str(row["source_edition_hash"]),
+                str(item["block_id"]),
+                int(item["start_offset"]),
+                int(item["end_offset"]),
+                str(row["normalized_form"]),
+            )
+            for item in connection.execute(
+                """SELECT block_id, start_offset, end_offset
+                   FROM form_occurrences
+                   WHERE lexeme_id=? AND block_id=? AND source_form=?
+                         AND source_hash=?""",
+                (
+                    row["lexeme_id"],
+                    row["block_id"],
+                    row["source_form"],
+                    row["source_hash"],
+                ),
+            ).fetchall()
+        }
+        if len(occurrence_spans) == 1:
+            return next(iter(occurrence_spans))
+        return None
+
+    def _deterministic_evaluation(
+        self,
+        case: CoreferenceCase,
+        connection: sqlite3.Connection,
+    ) -> dict[str, Any]:
+        mention_ids = tuple(mention.mention_id for mention in case.mentions)
+        if len(mention_ids) < 2 or len(set(mention_ids)) != len(mention_ids):
+            return {"relation": None, "rule": None, "target": None}
+        expected_mention_set_id = stable_id(
+            "mention-set", ":".join(sorted(str(value) for value in mention_ids))
+        )
+        if case.mention_set_id != expected_mention_set_id:
+            raise ValueError("coreference case mention_set_id is not canonical")
+
+        placeholders = ",".join("?" for _ in mention_ids)
+        rows = connection.execute(
+            f"""SELECT m.id AS mention_id, m.evidence_id, m.block_id,
+                       m.paragraph_id, m.source_form, m.normalized_form,
+                       m.lexeme_id, m.concept_id, e.kind AS evidence_kind,
+                       e.evidence_quote, e.payload_json,
+                       b.block_type, b.source_text, b.source_hash,
+                       se.normalized_sha256 AS source_edition_hash
+                FROM mentions m
+                JOIN evidence e ON e.id=m.evidence_id
+                JOIN blocks b ON b.id=m.block_id
+                JOIN source_editions se
+                  ON se.id=b.source_edition_id AND se.active=1
+                JOIN lexemes l
+                  ON l.id=m.lexeme_id AND l.retired_version IS NULL
+                WHERE m.id IN ({placeholders})
+                ORDER BY m.id""",
+            mention_ids,
+        ).fetchall()
+        if {int(row["mention_id"]) for row in rows} != set(mention_ids):
+            raise ValueError(
+                "deterministic coreference requires active persisted mentions"
+            )
+        if any(str(row["lexeme_id"]) != case.lexeme_id for row in rows):
+            raise ValueError(
+                "deterministic coreference only accepts one lexeme per mention set"
+            )
+        case_by_id = {mention.mention_id: mention for mention in case.mentions}
+        payload_by_id = {
+            int(row["mention_id"]): _decoded_mapping(row["payload_json"])
+            for row in rows
+        }
+
+        raw_anchor_ids = {
+            str(row["concept_id"])
+            for row in rows
+            if row["concept_id"] is not None
+        }
+        raw_anchor_ids.update(
+            anchor_id
+            for mention in case.mentions
+            for anchor_id in mention.concept_anchor_ids
+        )
+        raw_anchor_ids.update(
+            anchor.concept_id for anchor in case.concept_anchors
+        )
+        canonical_by_anchor: dict[str, str | None] = {}
+        redirected_any = False
+        for anchor_id in sorted(raw_anchor_ids):
+            canonical, redirected = self._redirect_target(connection, anchor_id)
+            canonical_by_anchor[anchor_id] = canonical
+            redirected_any = redirected_any or redirected
+        canonical_anchor_ids = {
+            value for value in canonical_by_anchor.values() if value is not None
+        }
+
+        protected_rows = connection.execute(
+            """SELECT DISTINCT c.id, c.kind, c.locked, c.status
+               FROM concepts c
+               LEFT JOIN concept_lexemes cl
+                 ON cl.concept_id=c.id AND cl.retired_version IS NULL
+               WHERE c.retired_version IS NULL
+                 AND (c.id IN (
+                        SELECT m.concept_id FROM mentions m
+                        WHERE m.id IN ("""
+            + placeholders
+            + """))
+                      OR (cl.lexeme_id=? AND (c.locked=1 OR c.status='verified')))
+               ORDER BY c.id""",
+            (*mention_ids, case.lexeme_id),
+        ).fetchall()
+        protected_concept_ids = {
+            str(row["id"])
+            for row in protected_rows
+            if bool(row["locked"]) or str(row["status"]) == "verified"
+        }
+
+        locked_relations: list[str] = []
+        for decision in connection.execute(
+            """SELECT relation, left_anchor_id, right_anchor_id,
+                      anchor_members_json
+               FROM coreference_decisions
+               WHERE lexeme_id=? AND retired_version IS NULL
+                 AND relation IN ('same', 'different', 'non_entity')
+                 AND (locked=1 OR decision_source='human')
+               ORDER BY CASE decision_source WHEN 'human' THEN 0 ELSE 1 END,
+                        id""",
+            (case.lexeme_id,),
+        ).fetchall():
+            members = _anchor_member_ids(decision["anchor_members_json"])
+            decision_anchors = {
+                str(decision["left_anchor_id"]),
+                str(decision["right_anchor_id"]),
+            }
+            if (
+                str(decision["relation"]) == "different"
+                and bool(set(mention_ids) & members)
+            ) or set(mention_ids) <= members or (
+                len(raw_anchor_ids & decision_anchors) >= 2
+            ) or (
+                case.mention_set_id in decision_anchors
+            ):
+                locked_relations.append(str(decision["relation"]))
+        if locked_relations:
+            unique_locked = set(locked_relations)
+            if len(unique_locked) == 1:
+                return {
+                    "relation": locked_relations[0],
+                    "rule": "locked_decision",
+                    "target": (
+                        next(iter(canonical_anchor_ids))
+                        if locked_relations[0] == "same"
+                        and len(canonical_anchor_ids) == 1
+                        else None
+                    ),
+                }
+            return {"relation": None, "rule": None, "target": None}
+
+        concept_rows = {
+            str(row["id"]): row
+            for row in connection.execute(
+                """SELECT id, kind, locked, status FROM concepts
+                   WHERE id IN ("""
+                + (",".join("?" for _ in raw_anchor_ids) or "NULL")
+                + ")",
+                tuple(sorted(raw_anchor_ids)),
+            ).fetchall()
+        }
+        protected_distinct = protected_concept_ids & raw_anchor_ids
+        person_anchor_ids = {
+            concept_id
+            for concept_id, row in concept_rows.items()
+            if str(row["kind"]).strip().casefold()
+            in {"character", "human", "person", "personage"}
+        }
+        if len(canonical_anchor_ids) > 1 and (
+            len(protected_distinct) > 1 or len(person_anchor_ids) > 1
+        ):
+            return {"relation": None, "rule": None, "target": None}
+
+        replay_candidates: set[tuple[str, str, str | None]] = set()
+        current_evidence_ids = {
+            int(row["evidence_id"]) for row in rows
+        }
+        for decision in connection.execute(
+            """SELECT left_anchor_type, left_anchor_id,
+                      right_anchor_type, right_anchor_id, relation,
+                      votes_json, evidence_ids_json, anchor_members_json
+               FROM coreference_decisions
+               WHERE lexeme_id=? AND retired_version IS NULL
+                     AND decision_source='deterministic'
+                     AND relation IN ('same', 'different', 'non_entity')
+               ORDER BY id""",
+            (case.lexeme_id,),
+        ).fetchall():
+            if _anchor_member_ids(decision["anchor_members_json"]) != set(
+                mention_ids
+            ) or _anchor_member_ids(decision["evidence_ids_json"]) != (
+                current_evidence_ids
+            ):
+                continue
+            try:
+                votes = json.loads(str(decision["votes_json"] or "[]"))
+            except (TypeError, ValueError, json.JSONDecodeError):
+                continue
+            if not isinstance(votes, list):
+                continue
+            replay_rule = next(
+                (
+                    str(vote["rule"])
+                    for vote in votes
+                    if isinstance(vote, Mapping)
+                    and isinstance(vote.get("rule"), str)
+                    and str(vote["rule"]).strip()
+                ),
+                None,
+            )
+            if replay_rule is None:
+                continue
+            replay_targets: set[str] = set()
+            for side in ("left", "right"):
+                if decision[f"{side}_anchor_type"] != "concept":
+                    continue
+                canonical, _ = self._redirect_target(
+                    connection, str(decision[f"{side}_anchor_id"])
+                )
+                if canonical is not None:
+                    replay_targets.add(canonical)
+            if len(replay_targets) > 1:
+                continue
+            replay_candidates.add(
+                (
+                    str(decision["relation"]),
+                    replay_rule,
+                    next(iter(replay_targets), None),
+                )
+            )
+        if len(replay_candidates) == 1:
+            replay_relation, replay_rule, replay_target = next(
+                iter(replay_candidates)
+            )
+            return {
+                "relation": replay_relation,
+                "rule": replay_rule,
+                "target": replay_target,
+            }
+        if len(replay_candidates) > 1:
+            return {"relation": None, "rule": None, "target": None}
+
+        spans = [
+            self._candidate_span(
+                connection,
+                row,
+                payload_by_id[int(row["mention_id"])],
+            )
+            for row in rows
+        ]
+        if all(span is not None for span in spans) and len(set(spans)) == 1:
+            return {
+                "relation": "same",
+                "rule": "same_span",
+                "target": self._preferred_target(
+                    protected_concept_ids, canonical_anchor_ids
+                ),
+            }
+
+        evidence_hashes = []
+        for row in rows:
+            payload = payload_by_id[int(row["mention_id"])]
+            explicit_hash = next(
+                (
+                    str(payload[key]).strip()
+                    for key in ("evidence_hash", "candidate_hash", "payload_hash")
+                    if key in payload and str(payload[key]).strip()
+                ),
+                "",
+            )
+            evidence_hashes.append(explicit_hash)
+        if all(evidence_hashes) and len(set(evidence_hashes)) == 1:
+            return {
+                "relation": "same",
+                "rule": "same_evidence_hash_retry",
+                "target": self._preferred_target(
+                    protected_concept_ids, canonical_anchor_ids
+                ),
+            }
+
+        if len(protected_concept_ids) == 1:
+            return {
+                "relation": "same",
+                "rule": "unique_human_locked_concept",
+                "target": next(iter(protected_concept_ids)),
+            }
+
+        title_kinds: dict[int, set[str]] = defaultdict(set)
+        for observation in connection.execute(
+            f"""SELECT mention_id, kind FROM concept_type_observations
+                WHERE mention_id IN ({placeholders})
+                  AND retired_version IS NULL""",
+            mention_ids,
+        ).fetchall():
+            title_kinds[int(observation["mention_id"])].add(
+                str(observation["kind"]).strip().casefold()
+            )
+        fingerprints: list[str] = []
+        title_eligible = True
+        for row in rows:
+            mention_id = int(row["mention_id"])
+            eligible = bool(title_kinds[mention_id] & _TITLE_OBSERVATION_KINDS)
+            title_eligible = title_eligible and eligible
+            payload = payload_by_id[mention_id]
+            fingerprints.append(
+                _title_fingerprint(
+                    payload.get("title_fingerprint")
+                    or row["evidence_quote"]
+                )
+            )
+        if (
+            title_eligible
+            and all(fingerprints)
+            and len(set(fingerprints)) == 1
+            and any(
+                str(row["block_type"]).strip().casefold()
+                in _TITLE_DIRECTORY_BLOCK_KINDS
+                for row in rows
+            )
+            and any(
+                str(row["block_type"]).strip().casefold()
+                not in _TITLE_DIRECTORY_BLOCK_KINDS
+                for row in rows
+            )
+        ):
+            return {
+                "relation": "same",
+                "rule": "exact_title_fingerprint",
+                "target": self._preferred_target(
+                    protected_concept_ids, canonical_anchor_ids
+                ),
+            }
+
+        per_mention_anchors: list[set[str]] = []
+        for row in rows:
+            mention = case_by_id[int(row["mention_id"])]
+            anchors = set(mention.concept_anchor_ids)
+            if row["concept_id"] is not None:
+                anchors.add(str(row["concept_id"]))
+            per_mention_anchors.append(anchors)
+        common_anchors = (
+            set.intersection(*per_mention_anchors)
+            if per_mention_anchors and all(per_mention_anchors)
+            else set()
+        )
+        duplicate_subset = False
+        duplicate_targets: set[str] = set()
+        for decision in connection.execute(
+            """SELECT left_anchor_type, left_anchor_id,
+                      right_anchor_type, right_anchor_id,
+                      anchor_members_json
+               FROM coreference_decisions
+               WHERE lexeme_id=? AND retired_version IS NULL
+                     AND relation='same'
+               ORDER BY id""",
+            (case.lexeme_id,),
+        ).fetchall():
+            previous = _anchor_member_ids(decision["anchor_members_json"])
+            if set(mention_ids) <= previous:
+                duplicate_subset = True
+                for side in ("left", "right"):
+                    if decision[f"{side}_anchor_type"] != "concept":
+                        continue
+                    canonical, _ = self._redirect_target(
+                        connection, str(decision[f"{side}_anchor_id"])
+                    )
+                    if canonical is not None:
+                        duplicate_targets.add(canonical)
+                break
+        if duplicate_subset and len(duplicate_targets) > 1:
+            return {"relation": None, "rule": None, "target": None}
+        if common_anchors or duplicate_subset:
+            common_canonical = {
+                self._redirect_target(connection, value)[0]
+                for value in common_anchors
+            } - {None}
+            return {
+                "relation": "same",
+                "rule": "same_anchor_or_duplicate_subset",
+                "target": self._preferred_target(
+                    protected_concept_ids,
+                    duplicate_targets
+                    or common_canonical
+                    or canonical_anchor_ids,
+                ),
+            }
+
+        if redirected_any and len(canonical_anchor_ids) == 1:
+            return {
+                "relation": "same",
+                "rule": "redirect",
+                "target": next(iter(canonical_anchor_ids)),
+            }
+        return {"relation": None, "rule": None, "target": None}
+
+    @staticmethod
+    def _preferred_target(
+        protected_concept_ids: set[str],
+        canonical_anchor_ids: set[str],
+    ) -> str | None:
+        if len(protected_concept_ids) == 1:
+            return next(iter(protected_concept_ids))
+        if canonical_anchor_ids:
+            return min(canonical_anchor_ids)
+        return None
+
+    def _deterministic_relation(
+        self,
+        case: CoreferenceCase,
+        *,
+        connection: sqlite3.Connection | None = None,
+    ) -> tuple[str | None, str | None]:
+        if connection is None:
+            with closing(self.database.connect()) as owned_connection:
+                evaluation = self._deterministic_evaluation(
+                    case, owned_connection
+                )
+        else:
+            evaluation = self._deterministic_evaluation(case, connection)
+        return evaluation["relation"], evaluation["rule"]
+
+    def resolve_deterministic(
+        self,
+        case: CoreferenceCase,
+        *,
+        connection: sqlite3.Connection | None = None,
+    ) -> tuple[str | None, str | None]:
+        """Resolve and atomically persist one conservative, model-free case."""
+
+        if connection is not None:
+            self.database._require_active_transaction(connection)
+            self.database._audit_transaction_for(connection)
+        if connection is None:
+            with self.database.transaction() as owned_connection:
+                return self.resolve_deterministic(
+                    case, connection=owned_connection
+                )
+
+        evaluation = self._deterministic_evaluation(case, connection)
+        relation = evaluation["relation"]
+        rule = evaluation["rule"]
+        if relation is None or rule is None:
+            return (None, None)
+        if rule == "locked_decision":
+            return (relation, rule)
+
+        mention_ids = tuple(mention.mention_id for mention in case.mentions)
+        evidence_ids = tuple(mention.evidence_id for mention in case.mentions)
+        target_concept_id = evaluation["target"]
+        if relation == "same":
+            try:
+                with self.database._method_savepoint(
+                    connection=connection,
+                    prefix="deterministic_same",
+                ):
+                    if target_concept_id is None:
+                        anchor_mention_id = case.mentions[0].mention_id
+                        target_concept_id = (
+                            self.database.ensure_concept_for_anchor(
+                                case.lexeme_id,
+                                anchor_mention_id,
+                                connection=connection,
+                            )
+                        )
+                    placeholders = ",".join("?" for _ in mention_ids)
+                    expected_changes = sum(
+                        row["concept_id"] != target_concept_id
+                        for row in connection.execute(
+                            f"""SELECT concept_id FROM mentions
+                                WHERE id IN ({placeholders})""",
+                            mention_ids,
+                        ).fetchall()
+                    )
+                    changed = self.database.bind_mentions(
+                        target_concept_id,
+                        mention_ids,
+                        connection=connection,
+                    )
+                    if changed != expected_changes:
+                        raise _ProtectedBindingConflict(
+                            "deterministic same cannot bind every member"
+                        )
+            except _ProtectedBindingConflict:
+                return (None, None)
+
+        decision_payload = {
+            "decision_source": "deterministic",
+            "evidence_ids": sorted(evidence_ids),
+            "left_anchor_id": target_concept_id or case.mention_set_id,
+            "left_anchor_type": (
+                "concept" if target_concept_id is not None else "mention_set"
+            ),
+            "lexeme_id": case.lexeme_id,
+            "mention_ids": sorted(mention_ids),
+            "mention_set_id": case.mention_set_id,
+            "relation": relation,
+            "right_anchor_id": case.mention_set_id,
+            "right_anchor_type": "mention_set",
+            "rule": rule,
+        }
+        frozen_payload = _canonical_json_bytes(decision_payload)
+        decision_payload_hash = hashlib.sha256(frozen_payload).hexdigest()
+        existing = connection.execute(
+            """SELECT id, relation, decision_source
+               FROM coreference_decisions
+               WHERE payload_hash=? AND retired_version IS NULL""",
+            (decision_payload_hash,),
+        ).fetchone()
+        if existing is None:
+            decision_id = stable_id(
+                "coref", decision_payload_hash, length=24
+            )
+            collision = connection.execute(
+                "SELECT payload_hash FROM coreference_decisions WHERE id=?",
+                (decision_id,),
+            ).fetchone()
+            if collision is not None:
+                raise RuntimeError(
+                    f"coreference decision id collision: {decision_id}"
+                )
+            version = int(
+                connection.execute(
+                    "SELECT MAX(id) FROM knowledge_versions"
+                ).fetchone()[0]
+            )
+            connection.execute(
+                """INSERT INTO coreference_decisions(
+                       id, lexeme_id, left_anchor_type, left_anchor_id,
+                       right_anchor_type, right_anchor_id, relation,
+                       decision_source, confidence, locked, votes_json,
+                       evidence_ids_json, anchor_members_json, payload_hash,
+                       created_version, created_at)
+                   VALUES(?, ?, ?, ?, ?, ?, ?, 'deterministic', 1.0, 0,
+                          ?, ?, ?, ?, ?, ?)""",
+                (
+                    decision_id,
+                    case.lexeme_id,
+                    decision_payload["left_anchor_type"],
+                    decision_payload["left_anchor_id"],
+                    decision_payload["right_anchor_type"],
+                    decision_payload["right_anchor_id"],
+                    relation,
+                    json.dumps(
+                        [{"source": "deterministic", "rule": rule}],
+                        ensure_ascii=False,
+                        sort_keys=True,
+                    ),
+                    json.dumps(sorted(evidence_ids)),
+                    json.dumps(sorted(mention_ids)),
+                    decision_payload_hash,
+                    version,
+                    utc_now(),
+                ),
+            )
+            self.database.record_audit_call(
+                run_id=None,
+                block_id=None,
+                purpose="deterministic_coreference",
+                model="none",
+                knowledge_version=version,
+                request={
+                    "actor_type": "deterministic",
+                    "payload_hash": decision_payload_hash,
+                },
+                raw_response="",
+                parsed={
+                    "actor_type": "deterministic",
+                    "concept_id": target_concept_id,
+                    "relation": relation,
+                    "rule": rule,
+                },
+                accepted=True,
+                attempts=1,
+                elapsed_ms=0,
+                error=None,
+                connection=connection,
+            )
+        elif (
+            str(existing["relation"]) != relation
+            or str(existing["decision_source"]) != "deterministic"
+        ):
+            raise RuntimeError(
+                "active coreference payload collides with protected decision"
+            )
+        return (relation, rule)
 
     @staticmethod
     def payload_bytes(case: CoreferenceCase) -> bytes:

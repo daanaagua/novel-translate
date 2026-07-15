@@ -524,23 +524,25 @@ def _insert_coreference_mention(
     evidence_quote,
     kind=None,
     source_form="Briah",
+    block_id="block-1",
 ):
     with database.transaction() as connection:
         cursor = connection.execute(
             """INSERT INTO evidence(
                    block_id, paragraph_id, kind, source_form, evidence_quote,
                    payload_json, confidence, extractor, created_at)
-               VALUES('block-1', ?, 'scan', ?, ?, '{}', 0.9,
+               VALUES(?, ?, 'scan', ?, ?, '{}', 0.9,
                       'test', '2000-01-01T00:00:00+00:00')""",
-            (paragraph_id, source_form, evidence_quote),
+            (block_id, paragraph_id, source_form, evidence_quote),
         )
         evidence_id = int(cursor.lastrowid)
         cursor = connection.execute(
             """INSERT INTO mentions(
                    block_id, paragraph_id, source_form, normalized_form,
                    discourse_function, lexeme_id, evidence_id)
-               VALUES('block-1', ?, ?, ?, 'referential', ?, ?)""",
+               VALUES(?, ?, ?, ?, 'referential', ?, ?)""",
             (
+                block_id,
                 paragraph_id,
                 source_form,
                 normalize_english_form(source_form),
@@ -1100,6 +1102,866 @@ def test_coreference_payload_does_not_emit_dangling_retired_anchor_ids(tmp_path)
 
     assert payload["concept_anchors"] == []
     assert payload["mentions"][0]["concept_anchor_ids"] == []
+
+
+def _set_evidence_payload(database, evidence_ids, payload):
+    encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True)
+    with database.transaction() as connection:
+        for evidence_id in evidence_ids:
+            connection.execute(
+                "UPDATE evidence SET payload_json=? WHERE id=?",
+                (encoded, evidence_id),
+            )
+
+
+def _insert_test_concept(
+    database,
+    lexeme_id,
+    concept_id,
+    *,
+    anchor_mention_id=None,
+    kind="person",
+    locked=False,
+    status="provisional",
+    retired=False,
+):
+    with database.transaction() as connection:
+        version = connection.execute(
+            "SELECT MAX(id) FROM knowledge_versions"
+        ).fetchone()[0]
+        retired_version = None
+        if retired:
+            retired_version = database.create_knowledge_version(
+                f"retire {concept_id}", connection
+            )
+        connection.execute(
+            """INSERT INTO concepts(
+                   id, kind, canonical_source, status, locked,
+                   primary_lexeme_id, anchor_mention_id, created_version,
+                   retired_version, created_at)
+               VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?,
+                      '2000-01-01T00:00:00+00:00')""",
+            (
+                concept_id,
+                kind,
+                concept_id,
+                status,
+                int(locked),
+                lexeme_id,
+                anchor_mention_id,
+                version,
+                retired_version,
+            ),
+        )
+        connection.execute(
+            """INSERT INTO concept_lexemes(
+                   concept_id, lexeme_id, role, confidence, status,
+                   created_version, retired_version, created_at)
+               VALUES(?, ?, 'primary', 1.0, ?, ?, ?,
+                      '2000-01-01T00:00:00+00:00')""",
+            (concept_id, lexeme_id, status, version, retired_version),
+        )
+
+
+def _bind_test_mention(database, mention_id, concept_id):
+    with database.transaction() as connection:
+        connection.execute(
+            "UPDATE mentions SET concept_id=? WHERE id=?",
+            (concept_id, mention_id),
+        )
+
+
+def _insert_locked_coreference_decision(
+    database,
+    lexeme_id,
+    mention_ids,
+    left_concept_id,
+    right_concept_id,
+    *,
+    relation="different",
+):
+    marker = ":".join(str(value) for value in sorted(mention_ids))
+    payload = f"human:{relation}:{left_concept_id}:{right_concept_id}:{marker}"
+    mention_set_id = stable_id("mention-set", marker)
+    with database.transaction() as connection:
+        version = connection.execute(
+            "SELECT MAX(id) FROM knowledge_versions"
+        ).fetchone()[0]
+        connection.execute(
+            """INSERT INTO coreference_decisions(
+                   id, lexeme_id, left_anchor_type, left_anchor_id,
+                   right_anchor_type, right_anchor_id, relation,
+                   decision_source, confidence, locked, votes_json,
+                   evidence_ids_json, anchor_members_json, payload_hash,
+                   created_version, created_at)
+                   VALUES(?, ?, 'concept', ?, 'mention_set', ?, ?, 'human', 1.0,
+                      1, '[]', '[]', '[]', ?, ?,
+                      '2000-01-01T00:00:00+00:00')""",
+            (
+                stable_id("coref", payload, length=24),
+                lexeme_id,
+                left_concept_id,
+                mention_set_id,
+                relation,
+                payload,
+                version,
+            ),
+        )
+
+
+def test_ensure_concept_for_anchor_is_stable_idempotent_and_anchor_immutable(
+    tmp_path,
+):
+    database, lexeme_id, mention_ids, _, _ = _coreference_case(tmp_path)
+    ensure = _require_method(database, "ensure_concept_for_anchor")
+
+    first = ensure(lexeme_id, mention_ids[0], kind="person")
+    replay = ensure(lexeme_id, mention_ids[0], kind="place")
+
+    assert first == replay == stable_id(
+        "concept", f"{lexeme_id}:{mention_ids[0]}"
+    )
+    with closing(database.connect()) as connection:
+        concept = connection.execute(
+            """SELECT kind, primary_lexeme_id, anchor_mention_id,
+                      retired_version
+               FROM concepts WHERE id=?""",
+            (first,),
+        ).fetchone()
+        links = connection.execute(
+            """SELECT role, COUNT(*) FROM concept_lexemes
+               WHERE concept_id=? AND retired_version IS NULL GROUP BY role""",
+            (first,),
+        ).fetchall()
+
+    assert tuple(concept) == ("person", lexeme_id, mention_ids[0], None)
+    assert [tuple(row) for row in links] == [("primary", 1)]
+
+
+def test_ensure_concept_for_anchor_rejects_inactive_mentions_and_collisions(tmp_path):
+    database, lexeme_id, mention_ids, _, _ = _coreference_case(tmp_path)
+    expected = stable_id("concept", f"{lexeme_id}:{mention_ids[0]}")
+    _insert_test_concept(
+        database,
+        lexeme_id,
+        expected,
+        anchor_mention_id=mention_ids[1],
+    )
+
+    with pytest.raises(RuntimeError, match="collision|anchor"):
+        database.ensure_concept_for_anchor(lexeme_id, mention_ids[0])
+
+    other_root = tmp_path / "other"
+    other_root.mkdir()
+    other = _db(other_root, source_text="John")
+    other_lexeme = other.ensure_lexeme("John")
+    other_mention, _ = _insert_coreference_mention(
+        other,
+        other_lexeme,
+        paragraph_id="P001",
+        evidence_quote="John",
+        source_form="John",
+    )
+    with other.transaction() as connection:
+        connection.execute("UPDATE source_editions SET active=0")
+    with pytest.raises(ValueError, match="active"):
+        other.ensure_concept_for_anchor(other_lexeme, other_mention)
+
+
+def test_ensure_concept_for_anchor_never_revives_retired_identity(tmp_path):
+    database, lexeme_id, mention_ids, _, _ = _coreference_case(tmp_path)
+    expected = stable_id("concept", f"{lexeme_id}:{mention_ids[0]}")
+    _insert_test_concept(
+        database,
+        lexeme_id,
+        expected,
+        anchor_mention_id=mention_ids[0],
+        retired=True,
+    )
+
+    with pytest.raises(ValueError, match="retired"):
+        database.ensure_concept_for_anchor(lexeme_id, mention_ids[0])
+
+    with closing(database.connect()) as connection:
+        assert connection.execute(
+            "SELECT retired_version FROM concepts WHERE id=?", (expected,)
+        ).fetchone()[0] is not None
+
+
+def test_ensure_concept_for_anchor_rejects_a_competing_owner_for_the_anchor(
+    tmp_path,
+):
+    database, lexeme_id, mention_ids, _, _ = _coreference_case(tmp_path)
+    expected = stable_id("concept", f"{lexeme_id}:{mention_ids[0]}")
+    _insert_test_concept(
+        database,
+        lexeme_id,
+        expected,
+        anchor_mention_id=mention_ids[0],
+    )
+    _insert_test_concept(
+        database,
+        lexeme_id,
+        "concept-competing-anchor-owner",
+        anchor_mention_id=mention_ids[0],
+    )
+
+    with pytest.raises(RuntimeError, match="anchor collision"):
+        database.ensure_concept_for_anchor(lexeme_id, mention_ids[0])
+
+
+def test_bind_mentions_is_idempotent_and_preserves_locked_conflicting_identity(
+    tmp_path,
+):
+    database, lexeme_id, mention_ids, _, _ = _coreference_case(tmp_path)
+    target = database.ensure_concept_for_anchor(lexeme_id, mention_ids[0])
+    locked = "concept-human-locked"
+    _insert_test_concept(
+        database,
+        lexeme_id,
+        locked,
+        anchor_mention_id=mention_ids[1],
+        locked=True,
+        status="verified",
+    )
+    _bind_test_mention(database, mention_ids[1], locked)
+
+    assert database.bind_mentions(target, mention_ids) == 1
+    assert database.bind_mentions(target, mention_ids) == 0
+    with closing(database.connect()) as connection:
+        bound = connection.execute(
+            "SELECT id, concept_id FROM mentions ORDER BY id"
+        ).fetchall()
+    assert [tuple(row) for row in bound] == [
+        (mention_ids[0], target),
+        (mention_ids[1], locked),
+    ]
+
+
+def test_anchor_database_apis_require_active_explicit_transactions(tmp_path):
+    database, lexeme_id, mention_ids, _, _ = _coreference_case(tmp_path)
+    with closing(database.connect()) as connection:
+        with pytest.raises(ValueError, match="active transaction"):
+            database.ensure_concept_for_anchor(
+                lexeme_id, mention_ids[0], connection=connection
+            )
+        with pytest.raises(ValueError, match="active transaction"):
+            database.bind_mentions(
+                "missing-concept", mention_ids, connection=connection
+            )
+
+
+def test_anchor_database_apis_follow_caller_rollback_atomically(tmp_path):
+    database, lexeme_id, mention_ids, _, _ = _coreference_case(tmp_path)
+    concept_id = stable_id("concept", f"{lexeme_id}:{mention_ids[0]}")
+
+    with pytest.raises(RuntimeError, match="caller rollback"):
+        with database.transaction() as connection:
+            assert database.ensure_concept_for_anchor(
+                lexeme_id, mention_ids[0], connection=connection
+            ) == concept_id
+            assert database.bind_mentions(
+                concept_id, mention_ids, connection=connection
+            ) == 2
+            raise RuntimeError("caller rollback")
+
+    with closing(database.connect()) as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM concepts WHERE id=?", (concept_id,)
+        ).fetchone()[0] == 0
+        assert connection.execute(
+            "SELECT COUNT(*) FROM mentions WHERE concept_id IS NOT NULL"
+        ).fetchone()[0] == 0
+
+
+def test_bind_mentions_validates_the_full_batch_before_writing(tmp_path):
+    database, lexeme_id, mention_ids, _, _ = _coreference_case(tmp_path)
+    other_lexeme = database.ensure_lexeme("John")
+    other_mention, _ = _insert_coreference_mention(
+        database,
+        other_lexeme,
+        paragraph_id="P999",
+        evidence_quote="John",
+        source_form="John",
+    )
+    concept_id = database.ensure_concept_for_anchor(lexeme_id, mention_ids[0])
+
+    with pytest.raises(ValueError, match="same lexeme"):
+        database.bind_mentions(concept_id, [mention_ids[0], other_mention])
+
+    with closing(database.connect()) as connection:
+        assert connection.execute(
+            "SELECT concept_id FROM mentions WHERE id=?", (mention_ids[0],)
+        ).fetchone()[0] is None
+
+
+def test_deterministic_same_span_rule_binds_a_stable_anchor(tmp_path):
+    database = _db(tmp_path, source_text="Briah")
+    lexeme_id = database.ensure_lexeme("Briah")
+    mention_ids = []
+    evidence_ids = []
+    for index in range(2):
+        mention_id, evidence_id = _insert_coreference_mention(
+            database,
+            lexeme_id,
+            paragraph_id="P001",
+            evidence_quote="Briah",
+            kind="person",
+        )
+        mention_ids.append(mention_id)
+        evidence_ids.append(evidence_id)
+    _set_evidence_payload(
+        database,
+        evidence_ids,
+        {"start_offset": 0, "end_offset": 5},
+    )
+    case = CoreferenceCoordinator(database).freeze_cases()[0]
+
+    result = CoreferenceCoordinator(database).resolve_deterministic(case)
+
+    expected = stable_id("concept", f"{lexeme_id}:{mention_ids[0]}")
+    assert result == ("same", "same_span")
+    with closing(database.connect()) as connection:
+        assert {
+            row[0]
+            for row in connection.execute(
+                "SELECT concept_id FROM mentions WHERE lexeme_id=?", (lexeme_id,)
+            )
+        } == {expected}
+
+
+def test_deterministic_same_evidence_hash_retry_rule(tmp_path):
+    database, _, _, evidence_ids, case = _coreference_case(tmp_path)
+    _set_evidence_payload(
+        database,
+        evidence_ids,
+        {"evidence_hash": "retry-evidence-001"},
+    )
+    case = CoreferenceCoordinator(database).freeze_cases()[0]
+
+    assert CoreferenceCoordinator(database).resolve_deterministic(case) == (
+        "same",
+        "same_evidence_hash_retry",
+    )
+
+
+def test_deterministic_unique_human_locked_concept_rule_reuses_human_fields(tmp_path):
+    database, lexeme_id, mention_ids, _, _ = _coreference_case(tmp_path)
+    concept_id = "concept-curated-briah"
+    _insert_test_concept(
+        database,
+        lexeme_id,
+        concept_id,
+        anchor_mention_id=mention_ids[0],
+        locked=True,
+        status="verified",
+    )
+    with database.transaction() as connection:
+        connection.execute(
+            """UPDATE concepts
+               SET verified_target='布里亚', description='human note'
+               WHERE id=?""",
+            (concept_id,),
+        )
+    case = CoreferenceCoordinator(database).freeze_cases()[0]
+
+    assert CoreferenceCoordinator(database).resolve_deterministic(case) == (
+        "same",
+        "unique_human_locked_concept",
+    )
+    with closing(database.connect()) as connection:
+        concept = connection.execute(
+            """SELECT verified_target, description, locked, anchor_mention_id
+               FROM concepts WHERE id=?""",
+            (concept_id,),
+        ).fetchone()
+        bindings = connection.execute(
+            "SELECT DISTINCT concept_id FROM mentions WHERE lexeme_id=?",
+            (lexeme_id,),
+        ).fetchall()
+    assert tuple(concept) == ("布里亚", "human note", 1, mention_ids[0])
+    assert [row[0] for row in bindings] == [concept_id]
+
+
+def test_deterministic_exact_title_fingerprint_rule(tmp_path):
+    database = _db(tmp_path, source_text="II The Fleshing")
+    lexeme_id = database.ensure_lexeme("The Fleshing")
+    with database.transaction() as connection:
+        edition_id = connection.execute(
+            "SELECT id FROM source_editions WHERE active=1"
+        ).fetchone()[0]
+        connection.execute(
+            """INSERT INTO blocks(
+                   id, legacy_id, source_edition_id, chapter_id, chapter_title,
+                   chapter_index, block_index, global_index, block_type,
+                   source_text, source_hash, token_count, status, updated_at)
+               VALUES('block-title', 'block-title', ?, 'toc', 'Contents',
+                      0, 1, 1, 'toc',
+                      'II The Fleshing', 'hash-title', 3, 'ready',
+                      '2000-01-01T00:00:00+00:00')""",
+            (edition_id,),
+        )
+    evidence_ids = []
+    for paragraph_id, block_id in (
+        ("P001", "block-title"),
+        ("P002", "block-1"),
+    ):
+        _, evidence_id = _insert_coreference_mention(
+            database,
+            lexeme_id,
+            paragraph_id=paragraph_id,
+            evidence_quote="II — The Fleshing",
+            kind="title",
+            source_form="The Fleshing",
+            block_id=block_id,
+        )
+        evidence_ids.append(evidence_id)
+    _set_evidence_payload(
+        database,
+        evidence_ids,
+        {"title_fingerprint": "ii-the-fleshing"},
+    )
+    case = CoreferenceCoordinator(database).freeze_cases()[0]
+
+    assert CoreferenceCoordinator(database).resolve_deterministic(case) == (
+        "same",
+        "exact_title_fingerprint",
+    )
+
+
+def test_deterministic_title_fingerprint_requires_directory_and_body_evidence(
+    tmp_path,
+):
+    database = _db(tmp_path, source_text="The Fleshing")
+    lexeme_id = database.ensure_lexeme("The Fleshing")
+    evidence_ids = []
+    for paragraph_id in ("P001", "P002"):
+        _, evidence_id = _insert_coreference_mention(
+            database,
+            lexeme_id,
+            paragraph_id=paragraph_id,
+            evidence_quote="The Fleshing",
+            kind="title",
+            source_form="The Fleshing",
+        )
+        evidence_ids.append(evidence_id)
+    _set_evidence_payload(
+        database,
+        evidence_ids,
+        {"title_fingerprint": "the-fleshing"},
+    )
+    case = CoreferenceCoordinator(database).freeze_cases()[0]
+
+    assert CoreferenceCoordinator(database).resolve_deterministic(case) == (
+        None,
+        None,
+    )
+
+
+def test_deterministic_same_anchor_or_duplicate_subset_rule(tmp_path):
+    database, lexeme_id, mention_ids, _, _ = _coreference_case(tmp_path)
+    concept_id = database.ensure_concept_for_anchor(lexeme_id, mention_ids[0])
+    assert database.bind_mentions(concept_id, mention_ids) == 2
+    case = CoreferenceCoordinator(database).freeze_cases()[0]
+
+    assert CoreferenceCoordinator(database).resolve_deterministic(case) == (
+        "same",
+        "same_anchor_or_duplicate_subset",
+    )
+
+
+def test_deterministic_duplicate_subset_reuses_the_prior_decision_concept(tmp_path):
+    database, lexeme_id, mention_ids, _, case = _coreference_case(
+        tmp_path, count=3
+    )
+    concept_id = "concept-prior-subset-anchor"
+    _insert_test_concept(
+        database,
+        lexeme_id,
+        concept_id,
+        anchor_mention_id=mention_ids[2],
+    )
+    previous_set_id = stable_id(
+        "mention-set", ":".join(sorted(str(value) for value in mention_ids))
+    )
+    with database.transaction() as connection:
+        version = connection.execute(
+            "SELECT MAX(id) FROM knowledge_versions"
+        ).fetchone()[0]
+        connection.execute(
+            """INSERT INTO coreference_decisions(
+                   id, lexeme_id, left_anchor_type, left_anchor_id,
+                   right_anchor_type, right_anchor_id, relation,
+                   decision_source, confidence, locked, votes_json,
+                   evidence_ids_json, anchor_members_json, payload_hash,
+                   created_version, created_at)
+               VALUES('coref-prior-subset', ?, 'concept', ?, 'mention_set', ?,
+                      'same', 'deterministic', 1.0, 0, '[]', '[]', ?,
+                      'prior-subset-payload', ?,
+                      '2000-01-01T00:00:00+00:00')""",
+            (
+                lexeme_id,
+                concept_id,
+                previous_set_id,
+                json.dumps(sorted(mention_ids)),
+                version,
+            ),
+        )
+    subset_mentions = case.mentions[:2]
+    subset = replace(
+        case,
+        mention_set_id=stable_id(
+            "mention-set",
+            ":".join(
+                sorted(str(mention.mention_id) for mention in subset_mentions)
+            ),
+        ),
+        mentions=subset_mentions,
+    )
+
+    assert CoreferenceCoordinator(database).resolve_deterministic(subset) == (
+        "same",
+        "same_anchor_or_duplicate_subset",
+    )
+    with closing(database.connect()) as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM concepts WHERE retired_version IS NULL"
+        ).fetchone()[0] == 1
+        assert {
+            row[0]
+            for row in connection.execute(
+                "SELECT concept_id FROM mentions WHERE id IN (?, ?)",
+                (mention_ids[0], mention_ids[1]),
+            )
+        } == {concept_id}
+
+
+def test_deterministic_redirect_rule_uses_active_canonical_concept(tmp_path):
+    database, lexeme_id, mention_ids, _, _ = _coreference_case(tmp_path)
+    retired_id = "concept-retired-briah"
+    canonical_id = "concept-canonical-briah"
+    _insert_test_concept(
+        database,
+        lexeme_id,
+        retired_id,
+        anchor_mention_id=mention_ids[0],
+        retired=True,
+    )
+    _insert_test_concept(
+        database,
+        lexeme_id,
+        canonical_id,
+        anchor_mention_id=mention_ids[1],
+    )
+    _bind_test_mention(database, mention_ids[0], retired_id)
+    _bind_test_mention(database, mention_ids[1], canonical_id)
+    with database.transaction() as connection:
+        version = connection.execute(
+            "SELECT MAX(id) FROM knowledge_versions"
+        ).fetchone()[0]
+        connection.execute(
+            """INSERT INTO concept_redirects(
+                   retired_concept_id, canonical_concept_id, reason,
+                   knowledge_version, created_at)
+               VALUES(?, ?, 'duplicate', ?,
+                      '2000-01-01T00:00:00+00:00')""",
+            (retired_id, canonical_id, version),
+        )
+    case = CoreferenceCoordinator(database).freeze_cases()[0]
+
+    coordinator = CoreferenceCoordinator(database)
+    assert coordinator.resolve_deterministic(case) == (
+        "same",
+        "redirect",
+    )
+    assert coordinator.resolve_deterministic(coordinator.freeze_cases()[0]) == (
+        "same",
+        "redirect",
+    )
+    with closing(database.connect()) as connection:
+        bindings = connection.execute(
+            "SELECT DISTINCT concept_id FROM mentions WHERE lexeme_id=?",
+            (lexeme_id,),
+        ).fetchall()
+        decision_count = connection.execute(
+            "SELECT COUNT(*) FROM coreference_decisions"
+        ).fetchone()[0]
+        audit_count = connection.execute(
+            """SELECT COUNT(*) FROM audit_calls
+               WHERE purpose='deterministic_coreference'"""
+        ).fetchone()[0]
+    assert [row[0] for row in bindings] == [canonical_id]
+    assert (decision_count, audit_count) == (1, 1)
+
+
+def test_deterministic_same_name_different_people_are_not_merged(tmp_path):
+    database = _db(tmp_path, source_text="John met John.")
+    lexeme_id = database.ensure_lexeme("John")
+    mention_ids = []
+    for index in range(2):
+        mention_id, _ = _insert_coreference_mention(
+            database,
+            lexeme_id,
+            paragraph_id=f"P{index + 1:03d}",
+            evidence_quote=f"John identity {index}",
+            kind="person",
+            source_form="John",
+        )
+        mention_ids.append(mention_id)
+        concept_id = f"concept-john-{index}"
+        _insert_test_concept(
+            database,
+            lexeme_id,
+            concept_id,
+            anchor_mention_id=mention_id,
+            locked=True,
+            status="verified",
+        )
+        _bind_test_mention(database, mention_id, concept_id)
+    case = CoreferenceCoordinator(database).freeze_cases()[0]
+
+    assert CoreferenceCoordinator(database).resolve_deterministic(case) == (
+        None,
+        None,
+    )
+    with closing(database.connect()) as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM coreference_decisions"
+        ).fetchone()[0] == 0
+
+
+def test_deterministic_locked_different_decision_wins_without_auto_same(tmp_path):
+    database, lexeme_id, mention_ids, _, _ = _coreference_case(tmp_path)
+    left = "concept-left-briah"
+    right = "concept-right-briah"
+    for concept_id, mention_id in zip((left, right), mention_ids):
+        _insert_test_concept(
+            database,
+            lexeme_id,
+            concept_id,
+            anchor_mention_id=mention_id,
+        )
+        _bind_test_mention(database, mention_id, concept_id)
+    _insert_locked_coreference_decision(
+        database, lexeme_id, mention_ids, left, right
+    )
+    case = CoreferenceCoordinator(database).freeze_cases()[0]
+
+    assert CoreferenceCoordinator(database).resolve_deterministic(case) == (
+        "different",
+        "locked_decision",
+    )
+    assert database.bind_mentions(left, mention_ids) == 0
+    with closing(database.connect()) as connection:
+        sources = connection.execute(
+            "SELECT decision_source, relation FROM coreference_decisions"
+        ).fetchall()
+        bindings = connection.execute(
+            "SELECT concept_id FROM mentions ORDER BY id"
+        ).fetchall()
+    assert [tuple(row) for row in sources] == [("human", "different")]
+    assert [row[0] for row in bindings] == [left, right]
+
+
+def test_deterministic_locked_different_subset_blocks_an_expanded_same_case(
+    tmp_path,
+):
+    database, lexeme_id, mention_ids, _, case = _coreference_case(
+        tmp_path, count=3
+    )
+    concept_id = "concept-human-anchor"
+    _insert_test_concept(
+        database,
+        lexeme_id,
+        concept_id,
+        anchor_mention_id=mention_ids[0],
+        locked=True,
+        status="verified",
+    )
+    _bind_test_mention(database, mention_ids[0], concept_id)
+    protected_set_id = stable_id("mention-set", str(mention_ids[1]))
+    with database.transaction() as connection:
+        version = connection.execute(
+            "SELECT MAX(id) FROM knowledge_versions"
+        ).fetchone()[0]
+        connection.execute(
+            """INSERT INTO coreference_decisions(
+                   id, lexeme_id, left_anchor_type, left_anchor_id,
+                   right_anchor_type, right_anchor_id, relation,
+                   decision_source, confidence, locked, votes_json,
+                   evidence_ids_json, anchor_members_json, payload_hash,
+                   created_version, created_at)
+               VALUES('coref-human-subset-different', ?, 'concept', ?,
+                      'mention_set', ?, 'different', 'human', 1.0, 1,
+                      '[]', '[]', ?, 'human-subset-different', ?,
+                      '2000-01-01T00:00:00+00:00')""",
+            (
+                lexeme_id,
+                concept_id,
+                protected_set_id,
+                json.dumps([mention_ids[1]]),
+                version,
+            ),
+        )
+
+    assert CoreferenceCoordinator(database).resolve_deterministic(case) == (
+        "different",
+        "locked_decision",
+    )
+    with closing(database.connect()) as connection:
+        bindings = connection.execute(
+            "SELECT concept_id FROM mentions ORDER BY id"
+        ).fetchall()
+        decisions = connection.execute(
+            "SELECT relation, decision_source FROM coreference_decisions"
+        ).fetchall()
+    assert [row[0] for row in bindings] == [concept_id, None, None]
+    assert [tuple(row) for row in decisions] == [("different", "human")]
+
+
+def test_deterministic_same_rolls_back_if_any_member_cannot_be_bound(tmp_path):
+    database, lexeme_id, mention_ids, _, case = _coreference_case(
+        tmp_path, count=3
+    )
+    target = "concept-human-target"
+    retired = "concept-retired-without-redirect"
+    _insert_test_concept(
+        database,
+        lexeme_id,
+        target,
+        anchor_mention_id=mention_ids[0],
+        locked=True,
+        status="verified",
+    )
+    _insert_test_concept(
+        database,
+        lexeme_id,
+        retired,
+        anchor_mention_id=mention_ids[1],
+        retired=True,
+    )
+    _bind_test_mention(database, mention_ids[0], target)
+    _bind_test_mention(database, mention_ids[1], retired)
+
+    assert CoreferenceCoordinator(database).resolve_deterministic(case) == (
+        None,
+        None,
+    )
+    with closing(database.connect()) as connection:
+        bindings = connection.execute(
+            "SELECT concept_id FROM mentions ORDER BY id"
+        ).fetchall()
+        assert connection.execute(
+            "SELECT COUNT(*) FROM coreference_decisions"
+        ).fetchone()[0] == 0
+    assert [row[0] for row in bindings] == [target, retired, None]
+
+
+def test_deterministic_rejects_a_forged_cross_lexeme_mention_set(tmp_path):
+    database, _, _, _, case = _coreference_case(tmp_path)
+    other_lexeme = database.ensure_lexeme("John")
+    other_mention_id, _ = _insert_coreference_mention(
+        database,
+        other_lexeme,
+        paragraph_id="P999",
+        evidence_quote="John",
+        source_form="John",
+    )
+    forged_mention = replace(
+        case.mentions[1],
+        mention_id=other_mention_id,
+    )
+    forged_mentions = (case.mentions[0], forged_mention)
+    forged = replace(
+        case,
+        mention_set_id=stable_id(
+            "mention-set",
+            ":".join(
+                sorted(str(mention.mention_id) for mention in forged_mentions)
+            ),
+        ),
+        mentions=forged_mentions,
+    )
+
+    with pytest.raises(ValueError, match="one lexeme"):
+        CoreferenceCoordinator(database).resolve_deterministic(forged)
+
+
+def test_deterministic_external_connection_fails_before_partial_writes(tmp_path):
+    database, _, _, evidence_ids, case = _coreference_case(tmp_path)
+    _set_evidence_payload(
+        database,
+        evidence_ids,
+        {"evidence_hash": "external-connection"},
+    )
+    case = CoreferenceCoordinator(database).freeze_cases()[0]
+    with closing(database.connect()) as connection:
+        connection.execute("BEGIN")
+        with pytest.raises(RuntimeError, match="managed database transaction"):
+            CoreferenceCoordinator(database).resolve_deterministic(
+                case, connection=connection
+            )
+        assert connection.execute(
+            "SELECT COUNT(*) FROM concepts"
+        ).fetchone()[0] == 0
+        assert connection.execute(
+            "SELECT COUNT(*) FROM coreference_decisions"
+        ).fetchone()[0] == 0
+        assert connection.execute(
+            "SELECT COUNT(*) FROM mentions WHERE concept_id IS NOT NULL"
+        ).fetchone()[0] == 0
+        connection.rollback()
+
+
+def test_deterministic_rerun_is_fully_idempotent_and_audited_without_model(
+    tmp_path,
+):
+    database, lexeme_id, _, evidence_ids, _ = _coreference_case(tmp_path)
+    _set_evidence_payload(
+        database,
+        evidence_ids,
+        {"evidence_hash": "stable-retry"},
+    )
+    coordinator = CoreferenceCoordinator(database)
+    first_case = coordinator.freeze_cases()[0]
+
+    assert coordinator.resolve_deterministic(first_case) == (
+        "same",
+        "same_evidence_hash_retry",
+    )
+    assert coordinator.resolve_deterministic(coordinator.freeze_cases()[0]) == (
+        "same",
+        "same_evidence_hash_retry",
+    )
+
+    with closing(database.connect()) as connection:
+        counts = {
+            "concepts": connection.execute(
+                "SELECT COUNT(*) FROM concepts WHERE retired_version IS NULL"
+            ).fetchone()[0],
+            "decisions": connection.execute(
+                "SELECT COUNT(*) FROM coreference_decisions"
+            ).fetchone()[0],
+            "audits": connection.execute(
+                """SELECT COUNT(*) FROM audit_calls
+                   WHERE purpose='deterministic_coreference'"""
+            ).fetchone()[0],
+        }
+        audit = connection.execute(
+            """SELECT id, model, accepted FROM audit_calls
+               WHERE purpose='deterministic_coreference'"""
+        ).fetchone()
+        assert connection.execute(
+            """SELECT COUNT(DISTINCT concept_id) FROM mentions
+               WHERE lexeme_id=?""",
+            (lexeme_id,),
+        ).fetchone()[0] == 1
+
+    assert counts == {"concepts": 1, "decisions": 1, "audits": 1}
+    assert tuple(audit)[1:] == ("none", 1)
+    payload = database.read_audit_payload(audit["id"])
+    assert payload["parsed"]["actor_type"] == "deterministic"
+    assert payload["parsed"]["rule"] == "same_evidence_hash_retry"
 
 
 def test_coreference_type_observations_hide_retired_concept_ids(tmp_path):

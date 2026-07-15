@@ -312,6 +312,348 @@ class V4Database:
         )
         return lexeme_id
 
+    def ensure_concept_for_anchor(
+        self,
+        lexeme_id: str,
+        anchor_mention_id: int,
+        *,
+        kind: str = "concept",
+        connection: sqlite3.Connection | None = None,
+    ) -> str:
+        """Return the stable active concept owned by one immutable mention anchor."""
+
+        if connection is not None:
+            self._require_active_transaction(connection)
+        if not isinstance(lexeme_id, str) or not lexeme_id.strip():
+            raise ValueError("concept anchor lexeme_id cannot be empty")
+        if (
+            not isinstance(anchor_mention_id, int)
+            or isinstance(anchor_mention_id, bool)
+            or anchor_mention_id <= 0
+        ):
+            raise ValueError("concept anchor mention id must be a positive integer")
+        if not isinstance(kind, str) or not kind.strip():
+            raise ValueError("concept kind cannot be empty")
+        if connection is None:
+            with self.transaction() as owned_connection:
+                return self.ensure_concept_for_anchor(
+                    lexeme_id,
+                    anchor_mention_id,
+                    kind=kind,
+                    connection=owned_connection,
+                )
+
+        mention = connection.execute(
+            """SELECT m.lexeme_id, m.concept_id
+               FROM mentions m
+               JOIN blocks b ON b.id=m.block_id
+               JOIN source_editions se
+                 ON se.id=b.source_edition_id AND se.active=1
+               JOIN lexemes l
+                 ON l.id=m.lexeme_id AND l.retired_version IS NULL
+               WHERE m.id=?""",
+            (anchor_mention_id,),
+        ).fetchone()
+        if mention is None:
+            exists = connection.execute(
+                "SELECT 1 FROM mentions WHERE id=?", (anchor_mention_id,)
+            ).fetchone()
+            if exists is None:
+                raise KeyError(f"mention does not exist: {anchor_mention_id}")
+            raise ValueError(
+                f"mention is not part of the active source edition: "
+                f"{anchor_mention_id}"
+            )
+        if str(mention["lexeme_id"]) != lexeme_id:
+            raise ValueError("anchor mention must belong to the requested lexeme")
+
+        concept_id = stable_id(
+            "concept", f"{lexeme_id}:{anchor_mention_id}"
+        )
+        existing = connection.execute(
+            """SELECT id, primary_lexeme_id, anchor_mention_id, retired_version
+               FROM concepts WHERE id=?""",
+            (concept_id,),
+        ).fetchone()
+        competing_owners = [
+            str(row["id"])
+            for row in connection.execute(
+                """SELECT id FROM concepts
+                   WHERE anchor_mention_id=? AND id!=?
+                   ORDER BY id""",
+                (anchor_mention_id, concept_id),
+            ).fetchall()
+        ]
+        if competing_owners:
+            raise RuntimeError(
+                f"concept anchor collision for mention {anchor_mention_id}: "
+                f"{', '.join(competing_owners)}"
+            )
+        if existing is not None:
+            if existing["retired_version"] is not None:
+                raise ValueError(
+                    f"stable anchor concept is retired and cannot be revived: "
+                    f"{concept_id}"
+                )
+            if (
+                str(existing["primary_lexeme_id"] or "") != lexeme_id
+                or existing["anchor_mention_id"] != anchor_mention_id
+            ):
+                raise RuntimeError(
+                    f"stable concept id collision violates immutable anchor: "
+                    f"{concept_id}"
+                )
+        else:
+            if mention["concept_id"] is not None:
+                raise RuntimeError(
+                    f"anchor mention already belongs to a different concept: "
+                    f"{mention['concept_id']}"
+                )
+
+        conflicting_primary = connection.execute(
+            """SELECT lexeme_id FROM concept_lexemes
+               WHERE concept_id=? AND role='primary'
+                     AND retired_version IS NULL AND lexeme_id!=?
+               ORDER BY lexeme_id LIMIT 1""",
+            (concept_id, lexeme_id),
+        ).fetchone()
+        if conflicting_primary is not None:
+            raise RuntimeError(
+                f"stable concept primary lexeme collision: {concept_id}"
+            )
+        active_link = connection.execute(
+            """SELECT 1 FROM concept_lexemes
+               WHERE concept_id=? AND lexeme_id=? AND role='primary'
+                     AND retired_version IS NULL""",
+            (concept_id, lexeme_id),
+        ).fetchone()
+        retired_link = connection.execute(
+            """SELECT 1 FROM concept_lexemes
+               WHERE concept_id=? AND lexeme_id=? AND role='primary'
+                     AND retired_version IS NOT NULL""",
+            (concept_id, lexeme_id),
+        ).fetchone()
+        if existing is not None and active_link is None and retired_link is not None:
+            raise ValueError(
+                f"retired concept/lexeme ownership cannot be revived: {concept_id}"
+            )
+
+        lexeme = connection.execute(
+            """SELECT canonical_form FROM lexemes
+               WHERE id=? AND retired_version IS NULL""",
+            (lexeme_id,),
+        ).fetchone()
+        if lexeme is None:
+            raise KeyError(f"active lexeme does not exist: {lexeme_id}")
+        version = int(
+            connection.execute(
+                "SELECT MAX(id) FROM knowledge_versions"
+            ).fetchone()[0]
+        )
+        with self._method_savepoint(connection, "concept_anchor"):
+            if existing is None:
+                connection.execute(
+                    """INSERT INTO concepts(
+                           id, kind, canonical_source, primary_lexeme_id,
+                           anchor_mention_id, created_version, created_at)
+                       VALUES(?, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        concept_id,
+                        kind.strip(),
+                        str(lexeme["canonical_form"]),
+                        lexeme_id,
+                        anchor_mention_id,
+                        version,
+                        utc_now(),
+                    ),
+                )
+            if active_link is None:
+                connection.execute(
+                    """INSERT INTO concept_lexemes(
+                           concept_id, lexeme_id, role, confidence, status,
+                           created_version, created_at)
+                       VALUES(?, ?, 'primary', 1.0, 'provisional', ?, ?)""",
+                    (concept_id, lexeme_id, version, utc_now()),
+                )
+        return concept_id
+
+    def bind_mentions(
+        self,
+        concept_id: str,
+        mention_ids: Sequence[int],
+        *,
+        connection: sqlite3.Connection | None = None,
+    ) -> int:
+        """Bind active same-lexeme mentions without overriding protected identity."""
+
+        if connection is not None:
+            self._require_active_transaction(connection)
+        if not isinstance(concept_id, str) or not concept_id.strip():
+            raise ValueError("concept_id cannot be empty")
+        if isinstance(mention_ids, (str, bytes)):
+            raise ValueError("mention_ids must be a sequence of integers")
+        raw_ids = tuple(mention_ids)
+        if any(
+            not isinstance(value, int)
+            or isinstance(value, bool)
+            or value <= 0
+            for value in raw_ids
+        ):
+            raise ValueError("mention_ids must contain positive integers")
+        ordered_ids = tuple(sorted(set(raw_ids)))
+        if connection is None:
+            with self.transaction() as owned_connection:
+                return self.bind_mentions(
+                    concept_id,
+                    ordered_ids,
+                    connection=owned_connection,
+                )
+
+        target = connection.execute(
+            """SELECT primary_lexeme_id, retired_version
+               FROM concepts WHERE id=?""",
+            (concept_id,),
+        ).fetchone()
+        if target is None:
+            raise KeyError(f"concept does not exist: {concept_id}")
+        if target["retired_version"] is not None:
+            raise ValueError(f"cannot bind mentions to retired concept: {concept_id}")
+        lexeme_id = str(target["primary_lexeme_id"] or "")
+        active_primary = connection.execute(
+            """SELECT lexeme_id FROM concept_lexemes
+               WHERE concept_id=? AND role='primary'
+                     AND retired_version IS NULL
+               ORDER BY lexeme_id""",
+            (concept_id,),
+        ).fetchall()
+        primary_ids = {str(row["lexeme_id"]) for row in active_primary}
+        if not lexeme_id or primary_ids != {lexeme_id}:
+            raise RuntimeError(
+                f"active concept does not have one stable primary lexeme: {concept_id}"
+            )
+        if not ordered_ids:
+            return 0
+
+        placeholders = ",".join("?" for _ in ordered_ids)
+        rows = connection.execute(
+            f"""SELECT m.id, m.lexeme_id, m.concept_id
+                FROM mentions m
+                JOIN blocks b ON b.id=m.block_id
+                JOIN source_editions se
+                  ON se.id=b.source_edition_id AND se.active=1
+                JOIN lexemes l
+                  ON l.id=m.lexeme_id AND l.retired_version IS NULL
+                WHERE m.id IN ({placeholders})
+                ORDER BY m.id""",
+            ordered_ids,
+        ).fetchall()
+        found_ids = {int(row["id"]) for row in rows}
+        missing = sorted(set(ordered_ids) - found_ids)
+        if missing:
+            raise ValueError(
+                f"mentions must exist in the active source edition: {missing}"
+            )
+        if any(str(row["lexeme_id"]) != lexeme_id for row in rows):
+            raise ValueError("all mentions must belong to the same lexeme as concept")
+
+        protected_decisions = connection.execute(
+            """SELECT left_anchor_id, right_anchor_id, anchor_members_json
+               FROM coreference_decisions
+               WHERE lexeme_id=? AND retired_version IS NULL
+                     AND relation='different'
+                     AND (locked=1 OR decision_source='human')
+               ORDER BY id""",
+            (lexeme_id,),
+        ).fetchall()
+
+        def member_ids(value: Any) -> set[int]:
+            try:
+                decoded = json.loads(str(value or "[]"))
+            except (TypeError, ValueError, json.JSONDecodeError):
+                return set()
+            found: set[int] = set()
+
+            def collect(item: Any) -> None:
+                if isinstance(item, bool):
+                    return
+                if isinstance(item, int):
+                    found.add(item)
+                elif isinstance(item, str) and item.isdigit():
+                    found.add(int(item))
+                elif isinstance(item, dict):
+                    for key in ("mention_id", "id", "members", "mention_ids"):
+                        if key in item:
+                            collect(item[key])
+                elif isinstance(item, (list, tuple)):
+                    for nested in item:
+                        collect(nested)
+
+            collect(decoded)
+            return found
+
+        requested_mention_set_id = stable_id(
+            "mention-set", ":".join(str(value) for value in ordered_ids)
+        )
+        protected_members = [
+            (
+                {str(row["left_anchor_id"]), str(row["right_anchor_id"])},
+                member_ids(row["anchor_members_json"]),
+            )
+            for row in protected_decisions
+        ]
+        bindable: list[int] = []
+        for row in rows:
+            mention_id = int(row["id"])
+            current_id = (
+                str(row["concept_id"])
+                if row["concept_id"] is not None
+                else None
+            )
+            if current_id == concept_id:
+                continue
+            if any(
+                requested_mention_set_id in anchors
+                or (
+                    current_id is not None
+                    and {current_id, concept_id} <= anchors
+                )
+                or mention_id in members
+                for anchors, members in protected_members
+            ):
+                continue
+            if current_id is not None:
+                current = connection.execute(
+                    """SELECT status, locked, retired_version
+                       FROM concepts WHERE id=?""",
+                    (current_id,),
+                ).fetchone()
+                if current is None:
+                    continue
+                if current["retired_version"] is None:
+                    if bool(current["locked"]) or str(current["status"]) == "verified":
+                        continue
+                else:
+                    redirected = connection.execute(
+                        """SELECT 1 FROM concept_redirects
+                           WHERE retired_concept_id=?
+                                 AND canonical_concept_id=?""",
+                        (current_id, concept_id),
+                    ).fetchone()
+                    if redirected is None:
+                        continue
+            bindable.append(mention_id)
+
+        with self._method_savepoint(connection, "bind_mentions"):
+            changed = 0
+            for mention_id in bindable:
+                cursor = connection.execute(
+                    """UPDATE mentions SET concept_id=?
+                       WHERE id=? AND concept_id IS NOT ?""",
+                    (concept_id, mention_id, concept_id),
+                )
+                changed += cursor.rowcount
+        return changed
+
     def record_type_observation(
         self,
         lexeme_id: str,
