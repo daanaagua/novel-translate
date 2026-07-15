@@ -1327,7 +1327,7 @@ def test_ensure_concept_for_anchor_rejects_a_competing_owner_for_the_anchor(
         database.ensure_concept_for_anchor(lexeme_id, mention_ids[0])
 
 
-def test_bind_mentions_is_idempotent_and_preserves_locked_conflicting_identity(
+def test_bind_mentions_rejects_a_batch_with_locked_conflicting_anchor_identity(
     tmp_path,
 ):
     database, lexeme_id, mention_ids, _, _ = _coreference_case(tmp_path)
@@ -1343,14 +1343,14 @@ def test_bind_mentions_is_idempotent_and_preserves_locked_conflicting_identity(
     )
     _bind_test_mention(database, mention_ids[1], locked)
 
-    assert database.bind_mentions(target, mention_ids) == 1
-    assert database.bind_mentions(target, mention_ids) == 0
+    with pytest.raises(ValueError, match="immutable|anchor"):
+        database.bind_mentions(target, mention_ids)
     with closing(database.connect()) as connection:
         bound = connection.execute(
             "SELECT id, concept_id FROM mentions ORDER BY id"
         ).fetchall()
     assert [tuple(row) for row in bound] == [
-        (mention_ids[0], target),
+        (mention_ids[0], None),
         (mention_ids[1], locked),
     ]
 
@@ -2830,3 +2830,188 @@ def test_deterministic_cross_lexeme_redirect_is_conservative(tmp_path):
             """SELECT COUNT(*) FROM audit_calls
                WHERE purpose='deterministic_coreference'"""
         ).fetchone()[0] == 0
+
+
+def test_deterministic_cannot_hide_persisted_mention_anchor_owners(tmp_path):
+    database, lexeme_id, mention_ids, evidence_ids, _ = _coreference_case(tmp_path)
+    owners = ("concept-owner-left", "concept-owner-right")
+    for concept_id, mention_id in zip(owners, mention_ids):
+        _insert_test_concept(
+            database,
+            lexeme_id,
+            concept_id,
+            anchor_mention_id=mention_id,
+            kind="place",
+        )
+    _set_evidence_payload(
+        database,
+        evidence_ids,
+        {"evidence_hash": "hidden-persisted-anchor-owners"},
+    )
+    coordinator = CoreferenceCoordinator(database)
+    case = coordinator.freeze_cases()[0]
+    hidden = replace(
+        case,
+        concept_anchors=(),
+        mentions=tuple(
+            replace(mention, concept_anchor_ids=())
+            for mention in case.mentions
+        ),
+    )
+
+    assert coordinator._deterministic_relation(hidden) == (None, None)
+    assert coordinator.resolve_deterministic(hidden) == (None, None)
+    with closing(database.connect()) as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM concepts"
+        ).fetchone()[0] == 2
+        assert connection.execute(
+            "SELECT COUNT(*) FROM mentions WHERE concept_id IS NOT NULL"
+        ).fetchone()[0] == 0
+        assert connection.execute(
+            "SELECT COUNT(*) FROM coreference_decisions"
+        ).fetchone()[0] == 0
+        assert connection.execute(
+            """SELECT COUNT(*) FROM audit_calls
+               WHERE purpose='deterministic_coreference'"""
+        ).fetchone()[0] == 0
+
+
+def test_bind_mentions_rejects_another_active_concepts_immutable_anchor(tmp_path):
+    database, lexeme_id, mention_ids, _, _ = _coreference_case(tmp_path)
+    concept_a = database.ensure_concept_for_anchor(lexeme_id, mention_ids[0])
+    assert database.bind_mentions(concept_a, [mention_ids[0]]) == 1
+    concept_b = database.ensure_concept_for_anchor(lexeme_id, mention_ids[1])
+
+    with pytest.raises(ValueError, match="immutable|anchor"):
+        database.bind_mentions(concept_b, [mention_ids[0]])
+
+    assert database.ensure_concept_for_anchor(
+        lexeme_id, mention_ids[0]
+    ) == concept_a
+    with closing(database.connect()) as connection:
+        assert connection.execute(
+            "SELECT concept_id FROM mentions WHERE id=?",
+            (mention_ids[0],),
+        ).fetchone()[0] == concept_a
+        assert connection.execute(
+            """SELECT anchor_mention_id FROM concepts
+               WHERE id=?""",
+            (concept_a,),
+        ).fetchone()[0] == mention_ids[0]
+        assert connection.execute(
+            """SELECT anchor_mention_id FROM concepts
+               WHERE id=?""",
+            (concept_b,),
+        ).fetchone()[0] == mention_ids[1]
+
+
+def test_freeze_cases_batches_span_queries_before_mention_cap(
+    tmp_path, monkeypatch
+):
+    database = _db(tmp_path, source_text="Briah " * 60)
+    lexeme_id = database.ensure_lexeme("Briah")
+    mention_ids = []
+    for index in range(50):
+        mention_id, _ = _insert_coreference_mention(
+            database,
+            lexeme_id,
+            paragraph_id=f"P{index + 1:03d}",
+            evidence_quote=f"Briah context {index}",
+            kind="person" if index % 2 == 0 else "place",
+        )
+        mention_ids.append(mention_id)
+
+    statements = []
+    real_connect = database.connect
+
+    def traced_connect():
+        connection = real_connect()
+        connection.set_trace_callback(statements.append)
+        return connection
+
+    monkeypatch.setattr(database, "connect", traced_connect)
+    case = CoreferenceCoordinator(database).freeze_cases()[0]
+    span_selects = [
+        statement
+        for statement in statements
+        if statement.lstrip().casefold().startswith("select")
+        and (
+            "from candidate_resolutions" in statement.casefold()
+            or "from form_occurrences" in statement.casefold()
+        )
+    ]
+
+    assert len(case.mentions) == coreference_module.MAX_CASE_MENTIONS
+    assert mention_ids[0] in {item.mention_id for item in case.mentions}
+    assert mention_ids[-1] in {item.mention_id for item in case.mentions}
+    assert len(span_selects) <= 2
+
+
+def test_deterministic_uses_persisted_evidence_anchor_owners(tmp_path):
+    database, lexeme_id, _, evidence_ids, _ = _coreference_case(tmp_path)
+    owners = ("concept-evidence-left", "concept-evidence-right")
+    for concept_id, evidence_id in zip(owners, evidence_ids):
+        _insert_test_concept(database, lexeme_id, concept_id, kind="place")
+        with database.transaction() as connection:
+            connection.execute(
+                """UPDATE concept_lexemes SET evidence_id=?
+                   WHERE concept_id=? AND lexeme_id=?
+                     AND retired_version IS NULL""",
+                (evidence_id, concept_id, lexeme_id),
+            )
+    _set_evidence_payload(
+        database,
+        evidence_ids,
+        {"evidence_hash": "hidden-evidence-anchor-owners"},
+    )
+    coordinator = CoreferenceCoordinator(database)
+    case = coordinator.freeze_cases()[0]
+    hidden = replace(
+        case,
+        concept_anchors=(),
+        mentions=tuple(
+            replace(mention, concept_anchor_ids=())
+            for mention in case.mentions
+        ),
+    )
+
+    assert coordinator._deterministic_relation(hidden) == (None, None)
+    assert coordinator.resolve_deterministic(hidden) == (None, None)
+
+
+def test_deterministic_ignores_unrelated_global_same_lexeme_anchors(tmp_path):
+    database, lexeme_id, _, evidence_ids, _ = _coreference_case(tmp_path)
+    _insert_test_concept(database, lexeme_id, "concept-unrelated-left")
+    _insert_test_concept(database, lexeme_id, "concept-unrelated-right")
+    _set_evidence_payload(
+        database,
+        evidence_ids,
+        {"evidence_hash": "unrelated-global-anchors"},
+    )
+    coordinator = CoreferenceCoordinator(database)
+    case = coordinator.freeze_cases()[0]
+
+    assert len(case.concept_anchors) == 2
+    assert coordinator._deterministic_relation(case) == (
+        "same",
+        "same_evidence_hash_retry",
+    )
+
+
+def test_repeated_anchor_ensure_rejects_disagreeing_mention_binding(tmp_path):
+    database, lexeme_id, mention_ids, _, _ = _coreference_case(tmp_path)
+    owner = database.ensure_concept_for_anchor(lexeme_id, mention_ids[0])
+    conflicting = database.ensure_concept_for_anchor(lexeme_id, mention_ids[1])
+    _bind_test_mention(database, mention_ids[0], conflicting)
+
+    with pytest.raises(RuntimeError, match="binding|immutable|owner"):
+        database.ensure_concept_for_anchor(lexeme_id, mention_ids[0])
+
+    with closing(database.connect()) as connection:
+        assert connection.execute(
+            "SELECT concept_id FROM mentions WHERE id=?", (mention_ids[0],)
+        ).fetchone()[0] == conflicting
+        assert connection.execute(
+            "SELECT anchor_mention_id FROM concepts WHERE id=?", (owner,)
+        ).fetchone()[0] == mention_ids[0]

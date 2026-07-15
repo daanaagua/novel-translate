@@ -564,12 +564,9 @@ class CoreferenceCoordinator:
                 selected_lexeme_ids,
             ).fetchall()
             mention_spans: dict[int, tuple[int | None, int | None]] = {}
+            candidate_spans = self._candidate_spans(connection, mention_rows)
             for row in mention_rows:
-                span = self._candidate_span(
-                    connection,
-                    row,
-                    _decoded_mapping(row["payload_json"]),
-                )
+                span = candidate_spans[int(row["mention_id"])]
                 mention_spans[int(row["mention_id"])] = (
                     (span[2], span[3]) if span is not None else (None, None)
                 )
@@ -892,6 +889,43 @@ class CoreferenceCoordinator:
                         f"{anchor_id}"
                     )
 
+    @staticmethod
+    def _persisted_related_anchor_ids(
+        case: CoreferenceCase,
+        rows: Sequence[Mapping[str, Any]],
+        connection: sqlite3.Connection,
+    ) -> set[str]:
+        """Return only persisted concepts related to this mention set."""
+
+        mention_ids = tuple(int(row["mention_id"]) for row in rows)
+        evidence_ids = tuple(int(row["evidence_id"]) for row in rows)
+        mention_placeholders = ",".join("?" for _ in mention_ids)
+        evidence_placeholders = ",".join("?" for _ in evidence_ids)
+        related = {
+            str(row["concept_id"])
+            for row in rows
+            if row["concept_id"] is not None
+        }
+        related.update(
+            str(row["concept_id"])
+            for row in connection.execute(
+                f"""SELECT DISTINCT c.id AS concept_id
+                     FROM concepts c
+                     LEFT JOIN concept_lexemes cl
+                       ON cl.concept_id=c.id
+                      AND cl.lexeme_id=?
+                      AND cl.retired_version IS NULL
+                     WHERE c.retired_version IS NULL
+                       AND (
+                           c.anchor_mention_id IN ({mention_placeholders})
+                           OR cl.evidence_id IN ({evidence_placeholders})
+                       )
+                     ORDER BY c.id""",
+                (case.lexeme_id, *mention_ids, *evidence_ids),
+            ).fetchall()
+        )
+        return related
+
     def _validate_case_mentions(
         self,
         case: CoreferenceCase,
@@ -941,8 +975,7 @@ class CoreferenceCoordinator:
                     )
 
     @staticmethod
-    def _candidate_span(
-        connection: sqlite3.Connection,
+    def _payload_candidate_span(
         row: Mapping[str, Any],
         payload: Mapping[str, Any],
     ) -> tuple[str, str, int, int, str] | None:
@@ -964,6 +997,115 @@ class CoreferenceCoordinator:
                 end,
                 str(row["normalized_form"]),
             )
+        return None
+
+    @classmethod
+    def _candidate_spans(
+        cls,
+        connection: sqlite3.Connection,
+        rows: Sequence[Mapping[str, Any]],
+    ) -> dict[int, tuple[str, str, int, int, str] | None]:
+        """Resolve all frozen mention spans with a constant number of queries."""
+
+        resolved: dict[int, tuple[str, str, int, int, str] | None] = {}
+        unresolved: list[Mapping[str, Any]] = []
+        for row in rows:
+            mention_id = int(row["mention_id"])
+            explicit = cls._payload_candidate_span(
+                row, _decoded_mapping(row["payload_json"])
+            )
+            if explicit is not None:
+                resolved[mention_id] = explicit
+            else:
+                unresolved.append(row)
+        if not unresolved:
+            return resolved
+
+        lexeme_ids = tuple(
+            sorted({str(row["lexeme_id"]) for row in unresolved})
+        )
+        placeholders = ",".join("?" for _ in lexeme_ids)
+        candidate_keys = {
+            (int(row["evidence_id"]), str(row["lexeme_id"]))
+            for row in unresolved
+        }
+        candidate_offsets: dict[
+            tuple[int, str], set[tuple[str, int, int]]
+        ] = defaultdict(set)
+        for item in connection.execute(
+            f"""SELECT cr.evidence_id, cr.lexeme_id, lc.block_id,
+                       lc.start_offset, lc.end_offset
+                FROM candidate_resolutions cr
+                JOIN lexical_candidates lc ON lc.id=cr.candidate_id
+                WHERE cr.lexeme_id IN ({placeholders})""",
+            lexeme_ids,
+        ).fetchall():
+            key = (int(item["evidence_id"]), str(item["lexeme_id"]))
+            if key in candidate_keys:
+                candidate_offsets[key].add(
+                    (
+                        str(item["block_id"]),
+                        int(item["start_offset"]),
+                        int(item["end_offset"]),
+                    )
+                )
+
+        unresolved_ids = {int(row["mention_id"]) for row in unresolved}
+        occurrence_offsets: dict[int, set[tuple[str, int, int]]] = defaultdict(
+            set
+        )
+        for item in connection.execute(
+            f"""SELECT m.id AS frozen_mention_id, fo.block_id,
+                       fo.start_offset, fo.end_offset
+                FROM form_occurrences fo
+                JOIN mentions m
+                  ON m.lexeme_id=fo.lexeme_id
+                 AND m.block_id=fo.block_id
+                 AND m.source_form=fo.source_form
+                JOIN blocks b
+                  ON b.id=m.block_id AND b.source_hash=fo.source_hash
+                WHERE m.lexeme_id IN ({placeholders})""",
+            lexeme_ids,
+        ).fetchall():
+            mention_id = int(item["frozen_mention_id"])
+            if mention_id in unresolved_ids:
+                occurrence_offsets[mention_id].add(
+                    (
+                        str(item["block_id"]),
+                        int(item["start_offset"]),
+                        int(item["end_offset"]),
+                    )
+                )
+
+        for row in unresolved:
+            mention_id = int(row["mention_id"])
+            key = (int(row["evidence_id"]), str(row["lexeme_id"]))
+            offsets = candidate_offsets[key]
+            if len(offsets) != 1:
+                offsets = occurrence_offsets[mention_id]
+            if len(offsets) == 1:
+                block_id, start_offset, end_offset = next(iter(offsets))
+                resolved[mention_id] = (
+                    str(row["source_edition_hash"]),
+                    block_id,
+                    start_offset,
+                    end_offset,
+                    str(row["normalized_form"]),
+                )
+            else:
+                resolved[mention_id] = None
+        return resolved
+
+    @classmethod
+    def _candidate_span(
+        cls,
+        connection: sqlite3.Connection,
+        row: Mapping[str, Any],
+        payload: Mapping[str, Any],
+    ) -> tuple[str, str, int, int, str] | None:
+        explicit = cls._payload_candidate_span(row, payload)
+        if explicit is not None:
+            return explicit
 
         candidate_spans = {
             (
@@ -1061,18 +1203,8 @@ class CoreferenceCoordinator:
         )
         self._validate_case_anchors(case, rows, connection)
 
-        raw_anchor_ids = {
-            str(row["concept_id"])
-            for row in rows
-            if row["concept_id"] is not None
-        }
-        raw_anchor_ids.update(
-            anchor_id
-            for mention in case.mentions
-            for anchor_id in mention.concept_anchor_ids
-        )
-        raw_anchor_ids.update(
-            anchor.concept_id for anchor in case.concept_anchors
+        raw_anchor_ids = self._persisted_related_anchor_ids(
+            case, rows, connection
         )
         canonical_by_anchor: dict[str, str | None] = {}
         redirected_any = False

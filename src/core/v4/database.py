@@ -453,6 +453,20 @@ class V4Database:
                     f"stable concept id collision violates immutable anchor: "
                     f"{concept_id}"
                 )
+            if mention["concept_id"] is not None:
+                bound_id = str(mention["concept_id"])
+                bound_canonical = bound_id
+                if bound_id != concept_id:
+                    bound_canonical, _ = self._active_canonical_concept(
+                        connection,
+                        bound_id,
+                        expected_lexeme_id=lexeme_id,
+                    )
+                if bound_canonical != concept_id:
+                    raise RuntimeError(
+                        "anchor mention binding disagrees with its immutable "
+                        f"concept owner: {anchor_mention_id}"
+                    )
         else:
             if mention["concept_id"] is not None:
                 raise RuntimeError(
@@ -697,6 +711,26 @@ class V4Database:
             for anchors, members in protected_members
         ):
             return 0
+
+        anchor_owners = connection.execute(
+            f"""SELECT id, anchor_mention_id FROM concepts
+                WHERE retired_version IS NULL
+                  AND anchor_mention_id IN ({placeholders})
+                ORDER BY id""",
+            ordered_ids,
+        ).fetchall()
+        for owner in anchor_owners:
+            owner_id = str(owner["id"])
+            owner_canonical, _ = self._active_canonical_concept(
+                connection,
+                owner_id,
+                expected_lexeme_id=lexeme_id,
+            )
+            if owner_canonical != concept_id:
+                raise ValueError(
+                    "cannot rebind an immutable concept anchor mention: "
+                    f"{owner['anchor_mention_id']}"
+                )
         bindable: list[int] = []
         for row in rows:
             mention_id = int(row["id"])
