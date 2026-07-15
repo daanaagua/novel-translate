@@ -10,14 +10,40 @@ from uuid import uuid4
 from .models import WorkingTargetResponse
 
 
-TARGET_SYSTEM = """You choose provisional Chinese working translations for recurring
-fictional names and terms. Return strict JSON as {"decisions":[...]}; each decision
-contains concept_id, working_target, rules, and confidence, with exactly
-one decision for every Q alias supplied. Never copy or invent an identifier. The
-main target must be a non-empty, stable book-wide rendering. Add a contextual rule
-only when the same source form genuinely needs a different Chinese rendering in a
-clearly expressible local condition. Use no more than six rules per concept.
+TARGET_PROTOCOL = """CANONICAL WORKING-TARGET JSON PROTOCOL
+The root object has exactly one key, "decisions". Its value is an array with one
+object for every supplied concept. Each decision object has exactly these four keys:
+"concept_id", "working_target", "rules", "confidence".
+"concept_id" must be the supplied local Qxx alias. "working_target" must be a
+non-empty Chinese string. "confidence" must be a number from 0 through 1. "rules"
+must be an array containing no more than six rule objects. Each rule object has
+exactly these two keys: "condition", "target". "condition" must be a non-empty
+JSON object whose concrete contextual property names and values are strings;
+"target" must be a non-empty Chinese string.
+
+This is a complete one-decision JSON template (use [] for rules when none apply):
+{"decisions":[{"concept_id":"Q01","working_target":"示例译名","rules":[{"condition":{"discourse_function":"vocative"},"target":"阁下"}],"confidence":0.95}]}
+
+Do not use synonym keys such as "translation", "rule", "when", "id", or
+"default_target". Never copy or invent an identifier. Do not return Markdown,
+prose, schema commentary, or any keys other than the canonical keys above.
 """
+
+
+TARGET_SYSTEM = f"""You choose provisional Chinese working translations for recurring
+fictional names and terms. The main target must be a non-empty, stable book-wide
+rendering. Add a contextual rule only when the same source form genuinely needs a
+different Chinese rendering in a clearly expressible local condition.
+
+{TARGET_PROTOCOL}"""
+
+
+def _target_retry_message(last_error: str) -> str:
+    return (
+        "The previous answer failed strict validation. Correct the complete answer "
+        "and return it again. The full validator report follows:\n"
+        f"{last_error}\n\n{TARGET_PROTOCOL}"
+    )
 
 
 class TargetResolutionProtocolError(ValueError):
@@ -121,10 +147,7 @@ class TargetResolver:
                 messages.append(
                     {
                         "role": "user",
-                        "content": (
-                            "The previous answer failed strict validation: "
-                            f"{last_error[:500]}. Return the complete JSON again."
-                        ),
+                        "content": _target_retry_message(last_error),
                     }
                 )
             started = time.perf_counter()

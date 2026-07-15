@@ -13,14 +13,51 @@ from .lexical_index import COORDINATORS, LexicalCandidate, lexical_key
 from .models import AdjudicationDecision, AdjudicationResponse
 
 
-ADJUDICATION_SYSTEM = """You adjudicate bounded lexical candidate spans.
-Return one decision for every cluster as strict JSON: {"decisions":[...]}.
-Use only the local Kxx and Kxx[A-D] aliases in this request. Never invent a span.
-promote selects exactly one existing span; reject/defer select none; split selects
-two or more non-overlapping existing spans; supersede selects one existing span
-that contains the span it replaces. If the correct span is absent, return defer
-with reason "missing_span". Prefer conservative entity types when evidence is weak.
+ADJUDICATION_PROTOCOL = """CANONICAL ADJUDICATION JSON PROTOCOL
+The root object has exactly one key, "decisions". Its value is an array with one
+object for every supplied cluster. Each decision object has exactly these six keys:
+"cluster_id", "verdict", "selected_ids", "entity_kind", "confidence", "reason".
+Do not omit "reason"; use an empty string when no explanation is needed.
+
+Allowed "verdict" values: "promote", "reject", "split", "supersede", "defer".
+Allowed "entity_kind" values: "person", "place", "organization", "group",
+"item", "concept", "unit", "title", "event", "species", "technology", "work",
+"artwork", "personification", "unknown_named_entity".
+Selection rules:
+- promote: selected_ids has exactly one local Kxx[A-D] alias.
+- reject/defer: selected_ids is [].
+- split: selected_ids has two or more non-overlapping local aliases.
+- supersede: selected_ids has exactly one local alias whose span contains the
+  smaller alternative that it replaces.
+Use only the supplied Kxx cluster aliases and their Kxx[A-D] alternative aliases.
+Never copy a stable identifier and never invent a span. If the correct span is
+absent, use "defer", [], "unknown_named_entity", and reason "missing_span".
+
+This is a complete one-decision JSON template (repeat the object for more clusters):
+{"decisions":[{"cluster_id":"K01","verdict":"promote","selected_ids":["K01A"],"entity_kind":"person","confidence":0.95,"reason":""}]}
+
+The following synonym keys are forbidden: "decision", "action", "selected_id",
+"alternative_id", "span_id", "cluster", "type". Do not return Markdown, prose,
+schema commentary, or any keys other than the canonical keys above.
 """
+
+
+ADJUDICATION_SYSTEM = f"""You adjudicate bounded lexical candidate spans.
+Promote only genuine named entities or fictional terms that need a stable translation across the book.
+Reject ordinary verbs, ordinary nouns, function words, and fragment noise.
+Treat weak evidence conservatively: when a candidate is not clearly a recurring
+named entity or fictional term, defer.
+Be conservative: extraction merely proposes spans and does not prove termhood.
+
+{ADJUDICATION_PROTOCOL}"""
+
+
+def _adjudication_retry_message(last_error: str) -> str:
+    return (
+        "The previous JSON failed strict local validation. Correct the complete "
+        "answer and return it again. The full validator report follows:\n"
+        f"{last_error}\n\n{ADJUDICATION_PROTOCOL}"
+    )
 
 
 @dataclass(frozen=True)
@@ -285,10 +322,7 @@ class V4Adjudicator:
                 messages.append(
                     {
                         "role": "user",
-                        "content": (
-                            "The previous JSON failed strict local validation: "
-                            f"{last_error[:500]}. Return the complete JSON again."
-                        ),
+                        "content": _adjudication_retry_message(last_error),
                     }
                 )
             started = time.perf_counter()

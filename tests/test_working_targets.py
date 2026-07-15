@@ -37,6 +37,74 @@ class FakeTargetLLM:
         return response
 
 
+class SchemaAwareTargetLLM:
+    """Use a valid target response only when the nested wire schema is explicit."""
+
+    def __init__(self, *, fail_first=False):
+        self.fail_first = fail_first
+        self.calls = []
+
+    @staticmethod
+    def has_contract(text):
+        normalized = " ".join(text.lower().split())
+        template = (
+            '{"decisions":[{"concept_id":"q01","working_target":"示例译名",'
+            '"rules":[{"condition":{"discourse_function":"vocative"},'
+            '"target":"阁下"}],"confidence":0.95}]}'
+        )
+        return all(
+            (
+                "exactly these four keys" in normalized,
+                template in normalized,
+                "each rule object has exactly these two keys" in normalized,
+                "concept_id" in normalized,
+                "working_target" in normalized,
+                "rules" in normalized,
+                "condition" in normalized,
+                "target" in normalized,
+                "confidence" in normalized,
+                "do not use" in normalized,
+                '"translation"' in normalized,
+                '"rule"' in normalized,
+            )
+        )
+
+    def get_model(self, purpose):
+        return "schema-aware-target"
+
+    def chat(self, **kwargs):
+        self.calls.append(kwargs)
+        messages = kwargs["messages"]
+        contract_text = messages[0]["content"]
+        if len(messages) > 2:
+            contract_text = messages[-1]["content"]
+        valid = self.has_contract(contract_text)
+        if self.fail_first and len(self.calls) == 1:
+            valid = False
+        if not valid:
+            return _response(
+                {
+                    "concept_id": "Q01",
+                    "translation": "示例译名",
+                    "rule": {"when": "vocative", "translation": "阁下"},
+                    "confidence": 0.95,
+                }
+            )
+        return _response(
+            {
+                "concept_id": "Q01",
+                "working_target": "示例译名",
+                "rules": [
+                    {
+                        "condition": {"discourse_function": "vocative"},
+                        "target": "阁下",
+                    }
+                ],
+                "confidence": 0.95,
+            }
+        )
+
+
 def _database(tmp_path, sources):
     root = tmp_path / "book"
     root.mkdir()
@@ -121,6 +189,74 @@ def test_working_target_models_are_strict_and_bounded():
         WorkingTargetResponse.model_validate(
             {"decisions": [], "unexpected": True}
         )
+
+
+def test_target_initial_and_retry_prompts_repeat_the_exact_nested_protocol():
+    llm = SchemaAwareTargetLLM(fail_first=True)
+    resolver = TargetResolver(object(), llm, max_attempts=2)
+
+    decisions, error = resolver._call_batch(
+        [
+            {
+                "concept_id": "stable-concept-id",
+                "source": "Archon",
+                "kind": "title",
+                "description": "a recurring office",
+                "contexts": ["Archon, I beg you."],
+                "baseline_translations": [],
+            }
+        ]
+    )
+
+    assert error == ""
+    assert decisions == [
+        {
+            "concept_id": "stable-concept-id",
+            "target": "示例译名",
+            "rules": [
+                {
+                    "condition": {"discourse_function": "vocative"},
+                    "target": "阁下",
+                }
+            ],
+            "confidence": 0.95,
+        }
+    ]
+    assert len(llm.calls) == 2
+    assert SchemaAwareTargetLLM.has_contract(llm.calls[0]["messages"][0]["content"])
+    assert SchemaAwareTargetLLM.has_contract(llm.calls[1]["messages"][-1]["content"])
+
+
+def test_target_retry_keeps_validation_detail_beyond_the_first_500_characters():
+    marker = "TAIL_TARGET_VALIDATION_MARKER"
+    llm = FakeTargetLLM(
+        [
+            ValueError("x" * 700 + marker),
+            _response(
+                {
+                    "concept_id": "Q01",
+                    "working_target": "执政官",
+                    "rules": [],
+                    "confidence": 0.95,
+                }
+            ),
+        ]
+    )
+    resolver = TargetResolver(object(), llm, max_attempts=2)
+
+    decisions, error = resolver._call_batch(
+        [
+            {
+                "concept_id": "stable-concept-id",
+                "source": "Archon",
+                "kind": "title",
+            }
+        ]
+    )
+
+    assert error == ""
+    assert decisions[0]["target"] == "执政官"
+    assert marker in llm.calls[1]["messages"][-1]["content"]
 
 
 def test_standalone_target_resolution_advances_safe_scanned_blocks(tmp_path):

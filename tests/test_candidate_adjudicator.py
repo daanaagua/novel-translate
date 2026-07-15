@@ -28,6 +28,152 @@ class FakeLLM:
         return json.dumps(response)
 
 
+class SchemaAwareFakeLLM:
+    """Mimic a provider that guesses field synonyms unless fully constrained."""
+
+    _FORBIDDEN_KEYS = (
+        "decision",
+        "action",
+        "selected_id",
+        "alternative_id",
+        "span_id",
+    )
+
+    def __init__(self, *, fail_first=False, ordinary_noise=False, weak_evidence=False):
+        self.fail_first = fail_first
+        self.ordinary_noise = ordinary_noise
+        self.weak_evidence = weak_evidence
+        self.requests = []
+
+    @classmethod
+    def _has_contract(cls, text):
+        normalized = " ".join(text.lower().split())
+        exact_fields = (
+            "cluster_id",
+            "verdict",
+            "selected_ids",
+            "entity_kind",
+            "confidence",
+            "reason",
+        )
+        schema_template = re.search(
+            r'\{"decisions":\[\{"cluster_id":"k01","verdict":"promote",'
+            r'"selected_ids":\["k01a"\],"entity_kind":"person",'
+            r'"confidence":0\.95,"reason":"[^"\\]*"\}\]\}',
+            normalized,
+        )
+        return all(
+            (
+                "exactly these six keys" in normalized,
+                all(field in normalized for field in exact_fields),
+                all(
+                    verdict in normalized
+                    for verdict in ("promote", "reject", "split", "supersede", "defer")
+                ),
+                all(
+                    kind in normalized
+                    for kind in (
+                        "person",
+                        "place",
+                        "organization",
+                        "group",
+                        "item",
+                        "concept",
+                        "unit",
+                        "title",
+                        "event",
+                        "species",
+                        "technology",
+                        "work",
+                        "artwork",
+                        "personification",
+                        "unknown_named_entity",
+                    )
+                ),
+                "promote: selected_ids has exactly one" in normalized,
+                "reject/defer: selected_ids is []" in normalized,
+                "split: selected_ids has two or more" in normalized,
+                "supersede: selected_ids has exactly one" in normalized,
+                all(f'"{key}"' in normalized for key in cls._FORBIDDEN_KEYS),
+                "forbidden" in normalized,
+                schema_template is not None,
+            )
+        )
+
+    @staticmethod
+    def _has_semantic_gate(text):
+        normalized = " ".join(text.lower().split())
+        return all(
+            phrase in normalized
+            for phrase in (
+                "ordinary verbs",
+                "ordinary nouns",
+                "function words",
+                "fragment noise",
+                "reject",
+                "named entities",
+                "fictional terms",
+                "stable translation across the book",
+                "weak evidence",
+                "defer",
+            )
+        )
+
+    def chat(self, **kwargs):
+        self.requests.append(kwargs)
+        messages = kwargs["messages"]
+        contract_text = messages[0]["content"]
+        if len(messages) > 2:
+            contract_text = messages[-1]["content"]
+        has_protocol = self._has_contract(contract_text)
+        has_semantics = self._has_semantic_gate(messages[0]["content"])
+        if self.fail_first and len(self.requests) == 1:
+            has_protocol = False
+        if not has_protocol:
+            return json.dumps(
+                {
+                    "decision": [
+                        {
+                            "cluster": "K01",
+                            "action": "promote",
+                            "selected_id": "K01A",
+                            "type": "person",
+                        }
+                    ]
+                }
+            )
+        if self.ordinary_noise and has_semantics:
+            verdict = "reject"
+        elif self.weak_evidence and has_semantics:
+            verdict = "defer"
+        else:
+            verdict = "promote"
+        return json.dumps(
+            {
+                "decisions": [
+                    {
+                        "cluster_id": "K01",
+                        "verdict": verdict,
+                        "selected_ids": (
+                            [] if verdict in {"reject", "defer"} else ["K01A"]
+                        ),
+                        "entity_kind": (
+                            "unknown_named_entity" if verdict == "defer"
+                            else "concept" if verdict == "reject"
+                            else "person"
+                        ),
+                        "confidence": 0.95,
+                        "reason": (
+                            "ordinary lexical noise" if verdict == "reject"
+                            else "weak evidence" if verdict == "defer"
+                            else ""
+                        ),
+                    }
+                ]
+            }
+        )
+
+
 def candidate(
     candidate_id,
     source,
@@ -121,6 +267,67 @@ def test_strict_response_contract_rejects_extra_fields_and_illegal_values():
                 ]
             }
         )
+
+
+def test_initial_and_retry_prompts_repeat_the_complete_canonical_protocol():
+    source = "Viya waited."
+    item = cluster("cluster-a", [candidate("candidate-a", source, 0, 4)])
+    llm = SchemaAwareFakeLLM(fail_first=True)
+
+    result = V4Adjudicator(llm, max_attempts=2).adjudicate(
+        batch(item), {"block-1": source}
+    )
+
+    assert result[0].verdict == "promote"
+    assert len(llm.requests) == 2
+    assert SchemaAwareFakeLLM._has_contract(
+        llm.requests[0]["messages"][0]["content"]
+    )
+    assert SchemaAwareFakeLLM._has_contract(
+        llm.requests[1]["messages"][-1]["content"]
+    )
+    assert "previous" in llm.requests[1]["messages"][-1]["content"].lower()
+
+
+def test_retry_does_not_discard_validation_detail_after_the_first_500_characters():
+    source = "Viya waited."
+    item = cluster("cluster-a", [candidate("candidate-a", source, 0, 4)])
+    marker = "TAIL_VALIDATION_MARKER"
+    llm = FakeLLM([ValueError("x" * 700 + marker), response()])
+
+    result = V4Adjudicator(llm, max_attempts=2).adjudicate(
+        batch(item), {"block-1": source}
+    )
+
+    assert result[0].verdict == "promote"
+    assert marker in llm.requests[1]["messages"][-1]["content"]
+
+
+def test_adjudication_prompt_rejects_ordinary_lexical_noise_and_defers_weak_evidence():
+    source = "walked onward."
+    item = cluster("cluster-a", [candidate("candidate-a", source, 0, 6)])
+    llm = SchemaAwareFakeLLM(ordinary_noise=True)
+
+    result = V4Adjudicator(llm, max_attempts=1).adjudicate(
+        batch(item), {"block-1": source}
+    )
+
+    assert result[0].verdict == "reject"
+    assert SchemaAwareFakeLLM._has_semantic_gate(
+        llm.requests[0]["messages"][0]["content"]
+    )
+
+    weak_source = "Maybe waited."
+    weak_item = cluster(
+        "cluster-weak", [candidate("candidate-weak", weak_source, 0, 5)]
+    )
+    weak_llm = SchemaAwareFakeLLM(weak_evidence=True)
+    weak_result = V4Adjudicator(weak_llm, max_attempts=1).adjudicate(
+        batch(weak_item), {"block-1": weak_source}
+    )
+
+    assert weak_result[0].verdict == "defer"
+    assert weak_result[0].reason == "weak evidence"
 
 
 def test_unknown_alias_never_promotes_after_protocol_failure():
