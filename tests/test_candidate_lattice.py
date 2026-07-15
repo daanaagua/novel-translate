@@ -196,6 +196,32 @@ def test_isolated_exact_local_components_merge_across_blocks():
     }
 
 
+def test_repeated_exact_occurrences_keep_full_hidden_support_but_bounded_prompt_evidence():
+    blocks = [
+        make_block("Severian waited.", block_id=f"block-{index}")
+        for index in range(6)
+    ]
+    extractor = LexicalCandidateExtractor(blocks, max_candidates=80)
+    candidates = [
+        candidate
+        for block in blocks
+        for candidate in extractor.extract(block)
+        if candidate.original_text == "Severian"
+    ]
+
+    cluster = CandidateClusterBuilder(max_contexts=3, max_alternatives=4).build(
+        candidates
+    )[0]
+
+    assert cluster.affected_blocks == 6
+    assert {member.block_id for member in cluster.members} == {
+        f"block-{index}" for index in range(6)
+    }
+    assert len(cluster.members) == 6
+    assert len(cluster.contexts) <= 3
+    assert len(cluster.alternatives) <= 4
+
+
 def test_alternative_selection_uses_the_longest_full_cluster_member():
     block = make_block("Drotte waited.")
     base = LexicalCandidateExtractor([block], max_candidates=80).extract(block)[0]

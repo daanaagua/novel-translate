@@ -326,12 +326,16 @@ def _run_adjudicate_v4(project, args):
 
 def _run_resolve_targets_v4(project, args):
     config = config_loader.load_config()
-    return TargetResolver(
+    resolver = TargetResolver(
         V4Database(project.root_dir),
         LLMManager(config["llm"]),
         max_attempts=args.max_attempts,
         audit_mode=_preparation_audit_mode(args, config),
-    ).run(max_concepts=getattr(args, "max_concepts", None))
+    )
+    run_kwargs = {"max_concepts": getattr(args, "max_concepts", None)}
+    if hasattr(args, "_prepared_block_ids"):
+        run_kwargs["prepared_block_ids"] = tuple(args._prepared_block_ids)
+    return resolver.run(**run_kwargs)
 
 
 def _print_stage_error(stage, exc):
@@ -426,6 +430,8 @@ def cmd_prepare_v4(args):
                 )
             )
             return 1
+        if name == "scan":
+            args._prepared_block_ids = tuple(result.get("block_ids", ()))
     print(json.dumps({"status": "completed", "stages": stages}, ensure_ascii=False, indent=2))
     return 0
 

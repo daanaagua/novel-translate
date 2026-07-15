@@ -37,6 +37,9 @@ class CandidateCluster:
     contexts: tuple[CandidateContext, ...]
     risk_flags: tuple[str, ...]
     affected_blocks: int
+    # Complete occurrence support is retained for persistence and propagation,
+    # but is deliberately never rendered into the adjudication prompt.
+    members: tuple[LexicalCandidate, ...] = ()
 
     @property
     def texts(self) -> tuple[str, ...]:
@@ -350,6 +353,7 @@ class CandidateClusterBuilder:
                         sorted({flag for candidate in members for flag in candidate.risk_flags})
                     ),
                     affected_blocks=len({candidate.block_id for candidate in members}),
+                    members=tuple(members),
                 )
             )
         return tuple(sorted(clusters, key=lambda cluster: cluster.id))

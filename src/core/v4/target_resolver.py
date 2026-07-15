@@ -211,7 +211,12 @@ class TargetResolver:
             error=error,
         )
 
-    def run(self, max_concepts: int | None = None) -> Dict[str, Any]:
+    def run(
+        self,
+        max_concepts: int | None = None,
+        *,
+        prepared_block_ids: Sequence[str] | None = None,
+    ) -> Dict[str, Any]:
         candidates = self.database.working_target_candidates()
         if max_concepts is not None:
             candidates = candidates[: max(0, int(max_concepts))]
@@ -254,6 +259,7 @@ class TargetResolver:
         except Exception as exc:
             self.database.finish_run(run_id, "failed", str(exc))
             raise
+        preparation = self.database.advance_prepared_blocks(prepared_block_ids)
         return {
             "run_id": run_id,
             "resolved": resolved,
@@ -261,4 +267,5 @@ class TargetResolver:
             "changed": changed,
             "knowledge_version": last_version,
             "affected_blocks": affected_blocks,
+            "prepared_blocks": preparation,
         }

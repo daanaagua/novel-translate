@@ -69,6 +69,55 @@ class FakeTranslationLLM:
         return generator() if stream else payload
 
 
+class FakePreparationLLM:
+    def get_model(self, purpose):
+        return f"fake-{purpose}"
+
+    @staticmethod
+    def _payload(messages):
+        for message in reversed(messages):
+            try:
+                return json.loads(message["content"])
+            except (KeyError, TypeError, json.JSONDecodeError):
+                continue
+        raise AssertionError("preparation request did not contain JSON")
+
+    def chat(self, *, messages, purpose, **_kwargs):
+        payload = self._payload(messages)
+        if purpose == "candidate_adjudication":
+            return json.dumps(
+                {
+                    "decisions": [
+                        {
+                            "cluster_id": cluster["cluster_id"],
+                            "verdict": "promote",
+                            "selected_ids": [cluster["alternatives"][0]["id"]],
+                            "entity_kind": "person",
+                            "confidence": 0.99,
+                            "reason": "",
+                        }
+                        for cluster in payload["clusters"]
+                    ]
+                }
+            )
+        if purpose == "working_target":
+            return json.dumps(
+                {
+                    "decisions": [
+                        {
+                            "concept_id": concept["concept_id"],
+                            "working_target": "固定译名",
+                            "rules": [],
+                            "confidence": 0.99,
+                        }
+                        for concept in payload["concepts"]
+                    ]
+                },
+                ensure_ascii=False,
+            )
+        raise AssertionError(f"unexpected preparation purpose: {purpose}")
+
+
 class FakeReferencePolishLLM:
     def __init__(self):
         self.calls = []
@@ -751,6 +800,67 @@ class ParallelV4CliTests(unittest.TestCase):
         self.assertEqual(calls[0], (self.root, {"max_attempts": 7}))
         self.assertEqual(calls[1]["max_blocks"], 3)
         self.assertEqual(json.loads(output)["indexed"], 3)
+
+    def test_prepare_cli_makes_scanned_prose_eligible_for_translation_pipeline(self):
+        database = V4Database(self.root)
+        edition = database.ensure_source_edition(
+            "raw", "normalized", "test", "source.txt"
+        )
+        database.upsert_blocks(
+            edition,
+            [
+                {
+                    "id": "block-1",
+                    "legacy_id": "v01_ch01_000",
+                    "chapter_id": "ch01",
+                    "chapter_title": "I",
+                    "chapter_index": 0,
+                    "block_index": 0,
+                    "global_index": 0,
+                    "block_type": "prose",
+                    "source_text": "Severian waited.",
+                    "source_hash": "hash-1",
+                    "token_count": 2,
+                    "status": "pending",
+                }
+            ],
+        )
+        preparation_llm = FakePreparationLLM()
+        import main as cli_main
+
+        with (
+            patch.object(cli_main, "V4Migrator") as migrator,
+            patch.object(cli_main, "LLMManager", return_value=preparation_llm),
+            patch.object(
+                cli_main.config_loader,
+                "load_config",
+                return_value={"llm": {}, "parallel_v4": {}},
+            ),
+        ):
+            exit_code, output = self.invoke(
+                "prepare-v4", "book", "--max-blocks", "1", "--max-attempts", "1"
+            )
+
+        self.assertEqual(exit_code, 0, output)
+        migrator.assert_called_once_with(self.project)
+        self.assertEqual(
+            database.get_block_by_identifier("block-1").status, "ready", output
+        )
+        counter = {"calls": 0}
+        translated = V4TranslationPipeline(
+            database,
+            llm_factory=lambda: FakeTranslationLLM(counter),
+            config=V4PipelineConfig(
+                island_size=1,
+                initial_workers=1,
+                max_workers=1,
+                max_blocks=1,
+                enable_polish=False,
+            ),
+        ).run()
+
+        self.assertEqual(translated["completed"], 1)
+        self.assertGreater(counter["calls"], 0)
 
     def test_prepare_v4_runs_stages_in_order_and_forwards_limits(self):
         import main as cli_main

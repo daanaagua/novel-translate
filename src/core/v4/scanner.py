@@ -233,6 +233,7 @@ class V4Scanner:
         self.database.start_run(run_id, "scan", config)
         workers = max(1, min(initial_workers, max_workers))
         indexed = failed = 0
+        indexed_block_ids: List[str] = []
         cluster_count = 0
         try:
             cursor = 0
@@ -250,6 +251,11 @@ class V4Scanner:
                 )
                 indexed += summary["indexed"]
                 failed += summary["failed"]
+                indexed_block_ids.extend(
+                    outcome.block.id
+                    for outcome in outcomes
+                    if outcome.error is None and outcome.response is not None
+                )
                 if summary["failed"]:
                     workers = max(1, workers - 1)
                 elif workers < max_workers:
@@ -287,4 +293,5 @@ class V4Scanner:
             "completed": indexed,
             "failed": failed,
             "final_workers": workers,
+            "block_ids": sorted(set(indexed_block_ids)),
         }

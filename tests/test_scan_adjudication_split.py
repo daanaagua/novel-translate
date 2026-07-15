@@ -32,10 +32,12 @@ class PromotingLLM:
     def __init__(self, verdict="promote"):
         self.verdict = verdict
         self.calls = 0
+        self.payloads = []
 
     def chat(self, *, messages, **_kwargs):
         self.calls += 1
         payload = json.loads(messages[-1]["content"])
+        self.payloads.append(payload)
         decisions = []
         for cluster in payload["clusters"]:
             selected = []
@@ -221,6 +223,101 @@ def test_pending_cluster_loader_roundtrips_roles_contexts_and_offsets(database):
         if item.id == candidate_id
     )
     assert candidate.risk_flags == ()
+
+
+def test_six_block_occurrence_cluster_persists_and_resolves_every_member(tmp_path):
+    database = make_database(
+        tmp_path,
+        [f"Severian waited at marker {index}." for index in range(6)],
+    )
+    scanner = V4Scanner(database, ExplodingLLM())
+    scanner.scan_project(max_blocks=6)
+
+    cluster = next(
+        item
+        for item in database.load_pending_candidate_clusters()
+        if item.texts == ("Severian",)
+    )
+    assert cluster.affected_blocks == 6
+    assert len(cluster.contexts) <= 3
+    assert len(cluster.alternatives) <= 4
+    with closing(database.connect()) as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM candidate_cluster_members WHERE cluster_id=?",
+            (cluster.id,),
+        ).fetchone()[0] == 6
+
+    llm = PromotingLLM()
+    result = V4Adjudicator(llm, database=database, max_attempts=1).run()
+
+    assert result["failed"] == 0
+    assert all(
+        "members" not in public_cluster
+        for payload in llm.payloads
+        for public_cluster in payload["clusters"]
+    )
+    with closing(database.connect()) as connection:
+        assert connection.execute(
+            """SELECT COUNT(*) FROM lexical_candidates
+               WHERE original_text='Severian' AND resolution_status='pending'"""
+        ).fetchone()[0] == 0
+        assert connection.execute(
+            """SELECT COUNT(*) FROM candidate_resolutions cr
+               JOIN candidate_cluster_members cm ON cm.candidate_id=cr.candidate_id
+               WHERE cm.cluster_id=?""",
+            (cluster.id,),
+        ).fetchone()[0] == 6
+
+
+def test_preparation_advances_only_fully_resolved_scanned_blocks(tmp_path):
+    database = make_database(
+        tmp_path,
+        ["Severian waited.", "Abaia slept.", "nothing was capitalized."],
+    )
+    scan = V4Scanner(database, ExplodingLLM()).scan_project(max_blocks=2)
+    with database.transaction() as connection:
+        connection.execute(
+            "UPDATE blocks SET status='scanned' WHERE id='block-2'"
+        )
+    adjudication = V4Adjudicator(
+        PromotingLLM(), database=database, max_attempts=1
+    ).run(max_clusters=1)
+    assert adjudication["failed"] == 0
+
+    with closing(database.connect()) as connection:
+        concept_ids = [
+            row[0]
+            for row in connection.execute(
+                "SELECT id FROM concepts WHERE retired_version IS NULL ORDER BY id"
+            )
+        ]
+    for concept_id in concept_ids:
+        database.apply_working_target_decisions(
+            [
+                {
+                    "concept_id": concept_id,
+                    "target": "固定译名",
+                    "rules": [],
+                    "confidence": 1.0,
+                }
+            ]
+        )
+
+    advanced = database.advance_prepared_blocks(scan["block_ids"])
+
+    assert advanced == {"ready": 1, "blocked": 1}
+    with closing(database.connect()) as connection:
+        statuses = [
+            row[0]
+            for row in connection.execute(
+                "SELECT status FROM blocks ORDER BY global_index"
+            )
+        ]
+        assert statuses.count("ready") == 1
+        assert statuses.count("scanned") == 2
+        assert connection.execute(
+            "SELECT COUNT(*) FROM lexical_candidates WHERE resolution_status='pending'"
+        ).fetchone()[0] > 0
 
 
 def test_reindex_rebuilds_pending_clusters_without_duplicates(database):

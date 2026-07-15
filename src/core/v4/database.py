@@ -1780,6 +1780,132 @@ class V4Database:
                 indexed += 1
         return {"indexed": indexed, "failed": failed, "candidates": lexical_count}
 
+    def advance_prepared_blocks(
+        self, block_ids: Optional[Sequence[str]] = None
+    ) -> Dict[str, int]:
+        """Move only provably complete scanned blocks into the translation queue.
+
+        A supplied scope is the successful block set from one local scan run.
+        Standalone target resolution may omit it to reconsider all still-scanned
+        blocks, but every block is checked against the same persisted invariants.
+        """
+
+        scoped_ids = tuple(sorted({str(block_id) for block_id in block_ids or ()}))
+        if block_ids is not None and not scoped_ids:
+            return {"ready": 0, "blocked": 0}
+        with self.transaction() as connection:
+            scope_join = ""
+            if block_ids is not None:
+                connection.execute(
+                    "CREATE TEMP TABLE preparation_scope(block_id TEXT PRIMARY KEY)"
+                )
+                connection.executemany(
+                    "INSERT INTO preparation_scope(block_id) VALUES(?)",
+                    ((block_id,) for block_id in scoped_ids),
+                )
+                scope_join = "JOIN preparation_scope ps ON ps.block_id=b.id"
+
+            scanned_rows = connection.execute(
+                f"""SELECT b.id
+                    FROM blocks b
+                    JOIN source_editions se
+                      ON se.id=b.source_edition_id AND se.active=1
+                    {scope_join}
+                    WHERE b.status=?
+                    ORDER BY b.global_index, b.id""",
+                (V4BlockStatus.SCANNED.value,),
+            ).fetchall()
+            scanned_ids = [str(row["id"]) for row in scanned_rows]
+            if not scanned_ids:
+                return {"ready": 0, "blocked": 0}
+
+            ready_rows = connection.execute(
+                f"""SELECT b.id
+                    FROM blocks b
+                    JOIN source_editions se
+                      ON se.id=b.source_edition_id AND se.active=1
+                    {scope_join}
+                    WHERE b.status=?
+                      AND b.last_error IS NULL
+                      AND NOT EXISTS(
+                          SELECT 1 FROM lexical_candidates lc
+                          WHERE lc.block_id=b.id
+                            AND lc.resolution_status NOT IN (
+                                'promoted', 'rejected', 'superseded', 'deferred'
+                            )
+                      )
+                      AND NOT EXISTS(
+                          SELECT 1
+                          FROM lexical_candidates lc
+                          JOIN candidate_cluster_members cm
+                            ON cm.candidate_id=lc.id
+                          JOIN candidate_clusters cc ON cc.id=cm.cluster_id
+                          WHERE lc.block_id=b.id
+                            AND cc.state IN ('pending', 'leased', 'stale')
+                      )
+                      AND NOT EXISTS(
+                          SELECT 1
+                          FROM lexical_candidates lc
+                          JOIN candidate_cluster_members cm
+                            ON cm.candidate_id=lc.id
+                          JOIN candidate_adjudications ca
+                            ON ca.cluster_id=cm.cluster_id AND ca.active=1
+                          WHERE lc.block_id=b.id
+                            AND ca.reason='model_protocol_failure'
+                      )
+                      AND NOT EXISTS(
+                          SELECT 1
+                          FROM lexical_candidates lc
+                          JOIN candidate_resolutions cr
+                            ON cr.candidate_id=lc.id
+                          JOIN candidate_adjudications ca
+                            ON ca.id=cr.adjudication_id AND ca.active=1
+                          JOIN human_queue hq
+                            ON hq.kind='working_target_required'
+                           AND hq.status='open'
+                           AND json_extract(hq.payload_json, '$.concept_id')=
+                               cr.concept_id
+                          WHERE lc.block_id=b.id
+                            AND cr.concept_id IS NOT NULL
+                      )
+                      AND NOT EXISTS(
+                          SELECT 1
+                          FROM mentions m
+                          JOIN human_queue hq
+                            ON hq.kind='working_target_required'
+                           AND hq.status='open'
+                           AND json_extract(hq.payload_json, '$.concept_id')=
+                               m.concept_id
+                          WHERE m.block_id=b.id AND m.concept_id IS NOT NULL
+                      )
+                      AND NOT EXISTS(
+                          SELECT 1 FROM human_queue hq
+                          WHERE hq.block_id=b.id AND hq.status='open'
+                            AND hq.severity='blocking'
+                      )
+                    ORDER BY b.global_index, b.id""",
+                (V4BlockStatus.SCANNED.value,),
+            ).fetchall()
+            ready_ids = [str(row["id"]) for row in ready_rows]
+            now = utc_now()
+            connection.executemany(
+                """UPDATE blocks SET status=?, last_error=NULL, updated_at=?
+                   WHERE id=? AND status=?""",
+                (
+                    (
+                        V4BlockStatus.READY.value,
+                        now,
+                        block_id,
+                        V4BlockStatus.SCANNED.value,
+                    )
+                    for block_id in ready_ids
+                ),
+            )
+            return {
+                "ready": len(ready_ids),
+                "blocked": len(scanned_ids) - len(ready_ids),
+            }
+
     @staticmethod
     def _remove_stale_pending_candidates(
         connection: sqlite3.Connection,
@@ -1923,21 +2049,51 @@ class V4Database:
 
     @staticmethod
     def _candidate_cluster_members(cluster: Any) -> List[Dict[str, Any]]:
+        from .candidate_clusters import CandidateClusterBuilder
+
         members: Dict[str, Dict[str, Any]] = {}
+        alternatives_by_key = {
+            CandidateClusterBuilder._alternative_equivalence_key(alternative): alternative.id
+            for alternative in cluster.alternatives
+        }
+        for candidate in tuple(getattr(cluster, "members", ()) or ()):
+            representative_id = alternatives_by_key.get(
+                CandidateClusterBuilder._alternative_equivalence_key(candidate)
+            )
+            members[candidate.id] = {
+                "candidate_id": candidate.id,
+                "role": "support",
+                "block_id": candidate.block_id,
+                "context": {
+                    "representative_candidate_id": representative_id,
+                    "support_member": True,
+                },
+            }
         for alternative in cluster.alternatives:
+            existing = members.get(alternative.id)
             members[alternative.id] = {
                 "candidate_id": alternative.id,
                 "role": "alternative",
                 "block_id": alternative.block_id,
-                "context": {},
+                "context": {
+                    **(existing["context"] if existing else {}),
+                    "representative_candidate_id": alternative.id,
+                    "support_member": True,
+                },
             }
         for context in cluster.contexts:
             existing = members.get(context.candidate_id)
+            existing_context = dict(existing["context"]) if existing else {}
             payload = {
                 "candidate_id": context.candidate_id,
-                "role": "both" if existing else "context",
+                "role": (
+                    "both"
+                    if existing and existing["role"] == "alternative"
+                    else "context"
+                ),
                 "block_id": context.block_id,
                 "context": {
+                    **existing_context,
                     "block_id": context.block_id,
                     "paragraph_id": context.paragraph_id,
                     "original_text": context.original_text,
@@ -2230,9 +2386,20 @@ class V4Database:
         for cluster_row in cluster_rows:
             alternatives = []
             contexts = []
+            complete_members = []
             for member in members_by_cluster.get(cluster_row["id"], []):
                 candidate = self._row_to_lexical_candidate(member)
                 role = member["role"]
+                try:
+                    context_data = json.loads(member["context_json"] or "{}")
+                except (TypeError, ValueError):
+                    context_data = {}
+                if not isinstance(context_data, dict):
+                    context_data = {}
+                if role in {"alternative", "both"} or bool(
+                    context_data.get("support_member")
+                ):
+                    complete_members.append(candidate)
                 if (
                     role in {"alternative", "both"}
                     and member["resolution_status"] == "pending"
@@ -2240,12 +2407,6 @@ class V4Database:
                     alternatives.append(candidate)
                 if role not in {"context", "both"}:
                     continue
-                try:
-                    context_data = json.loads(member["context_json"] or "{}")
-                except (TypeError, ValueError):
-                    context_data = {}
-                if not isinstance(context_data, dict):
-                    context_data = {}
 
                 def context_string(field: str, fallback: str) -> str:
                     value = context_data.get(field, fallback)
@@ -2283,6 +2444,7 @@ class V4Database:
                         cluster_row["risk_flags_json"]
                     ),
                     affected_blocks=int(cluster_row["affected_block_count"] or 0),
+                    members=tuple(complete_members),
                 )
             )
         return clusters
@@ -2364,13 +2526,12 @@ class V4Database:
                     separators=(",", ":"),
                 ),
             }
-            if member["role"] in {"alternative", "both"}:
-                lexical = lexical_by_id.get(member["candidate_id"])
-                if lexical is None:
-                    raise ValueError(
-                        f"unknown lexical candidate: {member['candidate_id']}"
-                    )
-                item["lexical"] = self._candidate_lexical_snapshot(lexical)
+            lexical = lexical_by_id.get(member["candidate_id"])
+            if lexical is None:
+                raise ValueError(
+                    f"unknown lexical candidate: {member['candidate_id']}"
+                )
+            item["lexical"] = self._candidate_lexical_snapshot(lexical)
             payload_members.append(item)
         affected_blocks = sorted({member["block_id"] for member in members})
         return self._candidate_cluster_snapshot_digest(
@@ -2426,27 +2587,26 @@ class V4Database:
                 "ordinal": int(member["ordinal"]),
                 "context_json": member["context_json"],
             }
-            if member["role"] in {"alternative", "both"}:
-                start = int(member["start_offset"])
-                end = int(member["end_offset"])
-                source_text = member["source_text"] or ""
-                original_text = member["original_text"]
-                source_slices_current = source_slices_current and (
-                    0 <= start <= end <= len(source_text)
-                    and source_text[start:end] == original_text
-                )
-                if member["role"] == "both":
-                    try:
-                        leased_context = json.loads(member["context_json"] or "{}")
-                    except (TypeError, ValueError):
-                        leased_context = {}
-                    if isinstance(leased_context, dict):
-                        leased_original = leased_context.get("original_text")
-                        if isinstance(leased_original, str):
-                            source_slices_current = source_slices_current and (
-                                leased_original == original_text
-                            )
-                item["lexical"] = V4Database._candidate_lexical_snapshot(member)
+            start = int(member["start_offset"])
+            end = int(member["end_offset"])
+            source_text = member["source_text"] or ""
+            original_text = member["original_text"]
+            source_slices_current = source_slices_current and (
+                0 <= start <= end <= len(source_text)
+                and source_text[start:end] == original_text
+            )
+            if member["role"] in {"context", "both"}:
+                try:
+                    leased_context = json.loads(member["context_json"] or "{}")
+                except (TypeError, ValueError):
+                    leased_context = {}
+                if isinstance(leased_context, dict):
+                    leased_original = leased_context.get("original_text")
+                    if isinstance(leased_original, str):
+                        source_slices_current = source_slices_current and (
+                            leased_original == original_text
+                        )
+            item["lexical"] = V4Database._candidate_lexical_snapshot(member)
             payload_members.append(item)
         return (
             V4Database._candidate_cluster_snapshot_digest(
@@ -2782,6 +2942,29 @@ class V4Database:
         raise ValueError("could not allocate an automatic concept id")
 
     @staticmethod
+    def _cluster_member_representative_id(member: sqlite3.Row) -> Optional[str]:
+        try:
+            payload = json.loads(member["member_context_json"] or "{}")
+        except (TypeError, ValueError, json.JSONDecodeError):
+            payload = {}
+        if isinstance(payload, dict):
+            representative_id = payload.get("representative_candidate_id")
+            if isinstance(representative_id, str) and representative_id:
+                return representative_id
+        if member["member_role"] in {"alternative", "both"}:
+            return str(member["id"])
+        return None
+
+    @classmethod
+    def _cluster_member_is_selected(
+        cls, member: sqlite3.Row, selected_ids: set[str]
+    ) -> bool:
+        representative_id = cls._cluster_member_representative_id(member)
+        return str(member["id"]) in selected_ids or (
+            representative_id is not None and representative_id in selected_ids
+        )
+
+    @staticmethod
     def _active_adjudication_matches(
         connection: sqlite3.Connection,
         adjudication_id: str,
@@ -2802,7 +2985,7 @@ class V4Database:
         for member in members:
             candidate_id = member["id"]
             resolution = resolutions[candidate_id]
-            if candidate_id in selected:
+            if V4Database._cluster_member_is_selected(member, selected):
                 if (
                     resolution["decision"] != result["verdict"]
                     or resolution["concept_id"] is None
@@ -2886,10 +3069,17 @@ class V4Database:
                             f"candidate/source lease snapshot changed: {cluster_id}"
                         )
                 rows = connection.execute(
-                    """SELECT lc.*, cm.role AS member_role
+                    """SELECT lc.*, cm.role AS member_role,
+                              cm.context_json AS member_context_json
                        FROM candidate_cluster_members cm
                        JOIN lexical_candidates lc ON lc.id=cm.candidate_id
-                       WHERE cm.cluster_id=? AND cm.role IN ('alternative', 'both')
+                       WHERE cm.cluster_id=?
+                         AND (
+                             cm.role IN ('alternative', 'both')
+                             OR json_extract(
+                                 cm.context_json, '$.support_member'
+                             )=1
+                         )
                        ORDER BY cm.ordinal, lc.id""",
                     (cluster_id,),
                 ).fetchall()
@@ -2914,8 +3104,13 @@ class V4Database:
                 if len(set(selected_ids)) != len(selected_ids):
                     raise ValueError(f"duplicate selected candidate in cluster {cluster_id}")
                 selected_id_set = set(selected_ids)
-                member_ids = {row["id"] for row in cluster_members[cluster_id]}
-                missing = sorted(selected_id_set - member_ids)
+                representative_rows = [
+                    row
+                    for row in cluster_members[cluster_id]
+                    if row["member_role"] in {"alternative", "both"}
+                ]
+                representative_ids = {row["id"] for row in representative_rows}
+                missing = sorted(selected_id_set - representative_ids)
                 if missing:
                     raise ValueError(
                         f"selected candidate(s) are not alternatives in cluster "
@@ -2923,7 +3118,7 @@ class V4Database:
                     )
                 selected_rows = [
                     row
-                    for row in cluster_members[cluster_id]
+                    for row in representative_rows
                     if row["id"] in selected_id_set
                 ]
                 if reason == "missing_span" and verdict != "defer":
@@ -2952,7 +3147,7 @@ class V4Database:
                         and selected_row["block_id"] == other["block_id"]
                         and selected_row["start_offset"] <= other["start_offset"]
                         and other["end_offset"] <= selected_row["end_offset"]
-                        for other in cluster_members[cluster_id]
+                        for other in representative_rows
                     ):
                         raise ValueError(
                             "supersede candidate does not contain an unselected alternative"
@@ -3107,7 +3302,7 @@ class V4Database:
                     candidate_id = candidate["id"]
                     candidate_concept_id: Optional[str] = None
                     evidence_id: Optional[int] = None
-                    if candidate_id in selected:
+                    if self._cluster_member_is_selected(candidate, selected):
                         normalized_form = normalize_english_form(candidate["original_text"])
                         candidate_concept_id = self._ensure_automatic_concept(
                             connection,

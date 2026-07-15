@@ -123,6 +123,41 @@ def test_working_target_models_are_strict_and_bounded():
         )
 
 
+def test_standalone_target_resolution_advances_safe_scanned_blocks(tmp_path):
+    database = _database(tmp_path, ["nothing requires a target"])
+    with database.transaction() as connection:
+        connection.execute("UPDATE blocks SET status='scanned'")
+
+    result = TargetResolver(database, FakeTargetLLM([])).run()
+
+    assert result["prepared_blocks"] == {"ready": 1, "blocked": 0}
+    assert database.list_blocks()[0].status == "ready"
+
+
+def test_target_resolution_error_keeps_affected_scanned_blocks_blocked(tmp_path):
+    database = _database(
+        tmp_path,
+        [
+            "Severian waited.",
+            "Severian entered.",
+            "Severian answered.",
+        ],
+    )
+    _seed_concept(database, "Severian")
+    with database.transaction() as connection:
+        connection.execute("UPDATE blocks SET status='scanned'")
+
+    result = TargetResolver(
+        database,
+        FakeTargetLLM([RuntimeError("provider unavailable")]),
+        max_attempts=1,
+    ).run()
+
+    assert result["queued"] == 1
+    assert result["prepared_blocks"] == {"ready": 0, "blocked": 3}
+    assert {block.status for block in database.list_blocks()} == {"scanned"}
+
+
 def test_resolver_assigns_one_working_target_to_four_occurrences(tmp_path):
     database = _database(
         tmp_path,
