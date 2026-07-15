@@ -5,7 +5,10 @@ import pytest
 
 from src.core.v4.adjudicator import AdjudicationResult, V4Adjudicator
 from src.core.v4.candidate_clusters import CandidateCluster
-from src.core.v4.database import V4Database
+from src.core.v4.database import (
+    StaleAdjudicationCommit,
+    V4Database,
+)
 from src.core.v4.lexical_index import LexicalCandidate
 from src.core.v4.models import ScanOutcome, ScanResponse
 from src.core.v4.scanner import V4Scanner
@@ -56,7 +59,13 @@ class PromotingLLM:
 
 
 class FailSecondBatchLLM(PromotingLLM):
+    def __init__(self):
+        super().__init__()
+        self.batch_sizes = []
+
     def chat(self, *, messages, **kwargs):
+        payload = json.loads(messages[-1]["content"])
+        self.batch_sizes.append(len(payload["clusters"]))
         if self.calls == 1:
             self.calls += 1
             return "{}"
@@ -484,9 +493,8 @@ def test_adjudicator_run_marks_second_batch_protocol_failure_completed_with_erro
     )
     db.finish_run("scan-thirteen", "completed")
 
-    result = V4Adjudicator(
-        FailSecondBatchLLM(), max_attempts=1, database=db
-    ).run()
+    llm = FailSecondBatchLLM()
+    result = V4Adjudicator(llm, max_attempts=1, database=db).run()
     assert result["adjudicated"] == 13
     assert result["failed"] == 1
     assert result["deferred"] == 1
@@ -501,3 +509,170 @@ def test_adjudicator_run_marks_second_batch_protocol_failure_completed_with_erro
         ).fetchone()[0]
     assert run["status"] == "completed_with_errors"
     assert failures == 1
+    assert llm.batch_sizes == [12, 1]
+
+
+def test_global_active_adjudication_rejects_stale_cross_run_commit(tmp_path):
+    db = make_database(tmp_path, ["Severian waited."])
+    V4Scanner(db, ExplodingLLM()).scan_project()
+    cluster = db.load_pending_candidate_clusters()[0]
+    decision = AdjudicationResult(
+        cluster_id=cluster.id,
+        verdict="promote",
+        selected_candidate_ids=(cluster.alternatives[0].id,),
+        entity_kind="person",
+        confidence=0.99,
+    )
+    db.start_run("judge-one", "adjudicate", {})
+    db.start_run("judge-two", "adjudicate", {})
+    db.commit_adjudications("judge-one", [decision])
+    with pytest.raises(StaleAdjudicationCommit, match="active"):
+        db.commit_adjudications("judge-two", [decision])
+    with closing(db.connect()) as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM candidate_adjudications WHERE active=1"
+        ).fetchone()[0] == 1
+        assert connection.execute("SELECT COUNT(*) FROM mentions").fetchone()[0] == 1
+
+
+def test_claimed_cluster_survives_concurrent_scanner_rebuild(tmp_path):
+    db = make_database(tmp_path, ["Severian waited."])
+    V4Scanner(db, ExplodingLLM()).scan_project()
+    db.start_run("judge-lease", "adjudicate", {})
+    claimed = db.claim_pending_candidate_clusters("judge-lease", 1)
+    assert len(claimed) == 1
+    member_ids = {item.id for item in claimed[0].alternatives}
+    with db.transaction() as connection:
+        connection.execute("UPDATE blocks SET status='pending'")
+    V4Scanner(db, ExplodingLLM()).scan_project()
+    with closing(db.connect()) as connection:
+        row = connection.execute(
+            "SELECT state, lease_run_id FROM candidate_clusters WHERE id=?",
+            (claimed[0].id,),
+        ).fetchone()
+        persisted_ids = {
+            item[0]
+            for item in connection.execute(
+                "SELECT candidate_id FROM candidate_cluster_members WHERE cluster_id=?",
+                (claimed[0].id,),
+            )
+        }
+    assert tuple(row) == ("leased", "judge-lease")
+    assert persisted_ids.issuperset(member_ids)
+
+
+def test_scanner_retries_stale_candidate_snapshot(database, monkeypatch):
+    real_replace = database.replace_pending_candidate_clusters
+    calls = 0
+
+    def stale_once(run_id, clusters, *, expected_snapshot_token=None):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            with database.transaction() as connection:
+                connection.execute(
+                    """UPDATE lexical_candidates
+                       SET updated_at=updated_at || '-changed'
+                       WHERE id=(SELECT id FROM lexical_candidates ORDER BY id LIMIT 1)"""
+                )
+        return real_replace(
+            run_id,
+            clusters,
+            expected_snapshot_token=expected_snapshot_token,
+        )
+
+    monkeypatch.setattr(database, "replace_pending_candidate_clusters", stale_once)
+    V4Scanner(database, ExplodingLLM()).scan_project(max_blocks=2)
+    assert calls == 2
+    assert database.load_pending_candidate_clusters()
+
+
+def test_frontmatter_reindex_removes_stale_pending_candidates_and_clusters(tmp_path):
+    db = make_database(tmp_path, ["Severian waited."])
+    V4Scanner(db, ExplodingLLM()).scan_project()
+    with db.transaction() as connection:
+        connection.execute(
+            """UPDATE blocks SET block_type='frontmatter', status='pending',
+                                 legacy_id='v00_pre_000'"""
+        )
+    V4Scanner(db, ExplodingLLM()).scan_project()
+    with closing(db.connect()) as connection:
+        assert connection.execute("SELECT COUNT(*) FROM lexical_candidates").fetchone()[0] == 0
+        assert connection.execute("SELECT COUNT(*) FROM candidate_clusters").fetchone()[0] == 0
+        assert connection.execute("SELECT status FROM blocks").fetchone()[0] == "ready"
+
+
+def test_cluster_loader_is_bulk_and_pending_indexes_are_used(database, monkeypatch):
+    V4Scanner(database, ExplodingLLM()).scan_project(max_blocks=3)
+    queries = []
+    real_connect = database.connect
+
+    def traced_connect():
+        connection = real_connect()
+        connection.set_trace_callback(queries.append)
+        return connection
+
+    monkeypatch.setattr(database, "connect", traced_connect)
+    assert database.load_pending_candidate_clusters()
+    member_selects = [
+        query
+        for query in queries
+        if query.lstrip().upper().startswith("SELECT CM.CLUSTER_ID")
+    ]
+    assert len(member_selects) == 1
+    with closing(real_connect()) as connection:
+        cluster_plan = " ".join(
+            row["detail"]
+            for row in connection.execute(
+                """EXPLAIN QUERY PLAN SELECT id FROM candidate_clusters
+                   WHERE state='pending' ORDER BY id LIMIT 12"""
+            )
+        )
+        lexical_plan = " ".join(
+            row["detail"]
+            for row in connection.execute(
+                """EXPLAIN QUERY PLAN SELECT id FROM lexical_candidates
+                   WHERE resolution_status='pending' AND block_id=?""",
+                ("prose-1",),
+            )
+        )
+    assert "idx_candidate_clusters_state" in cluster_plan
+    assert any(
+        index_name in lexical_plan
+        for index_name in (
+            "idx_lexical_candidates_pending",
+            "idx_lexical_candidates_resolution",
+        )
+    )
+
+
+def test_has_claimable_clusters_matches_claim_filter(tmp_path):
+    db = make_database(tmp_path, ["Severian waited."])
+    V4Scanner(db, ExplodingLLM()).scan_project()
+    assert db.has_claimable_candidate_clusters()
+
+    with db.transaction() as connection:
+        connection.execute(
+            """UPDATE lexical_candidates
+               SET resolution_status='rejected', model_status='rejected'"""
+        )
+
+    assert db.load_pending_candidate_clusters() == []
+    assert not db.has_claimable_candidate_clusters()
+
+
+def test_finish_run_failure_hook_cannot_leave_committed_run_running(
+    database, monkeypatch
+):
+    V4Scanner(database, ExplodingLLM()).scan_project(max_blocks=2)
+
+    def forbidden(*_args, **_kwargs):
+        raise AssertionError("normal adjudication finalization must be atomic")
+
+    monkeypatch.setattr(database, "finish_run", forbidden)
+    result = V4Adjudicator(PromotingLLM(), database=database).run(max_clusters=1)
+    with closing(database.connect()) as connection:
+        run = connection.execute(
+            "SELECT status FROM runs WHERE id=?", (result["run_id"],)
+        ).fetchone()
+    assert run["status"] == "completed"

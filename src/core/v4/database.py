@@ -45,6 +45,14 @@ def normalize_english_form(value: str) -> str:
     return normalized
 
 
+class StaleCandidateSnapshot(RuntimeError):
+    """The pending candidate set changed while clusters were being built."""
+
+
+class StaleAdjudicationCommit(RuntimeError):
+    """Another run already committed an active decision for this cluster."""
+
+
 class V4Database:
     """All writes happen through this object on the coordinator thread."""
 
@@ -202,6 +210,9 @@ class V4Database:
                     affected_blocks_json TEXT NOT NULL DEFAULT '[]',
                     affected_block_count INTEGER NOT NULL DEFAULT 0,
                     ordinal INTEGER NOT NULL,
+                    state TEXT NOT NULL DEFAULT 'pending',
+                    lease_run_id TEXT REFERENCES runs(id),
+                    lease_acquired_at TEXT,
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL,
                     UNIQUE(run_id, id)
@@ -542,6 +553,7 @@ class V4Database:
                     "INSERT INTO knowledge_versions(parent_id, reason, created_at) VALUES(NULL, ?, ?)",
                     ("initialize parallel_v4", utc_now()),
                 )
+            self._migrate_candidate_cluster_schema(connection)
             self._migrate_candidate_adjudication_schema(connection)
             columns = {
                 row[1] for row in connection.execute("PRAGMA table_info(blocks)").fetchall()
@@ -625,6 +637,10 @@ class V4Database:
                 """CREATE INDEX IF NOT EXISTS idx_lexical_candidates_resolution
                    ON lexical_candidates(resolution_status, block_id, id)"""
             )
+            connection.execute(
+                """CREATE INDEX IF NOT EXISTS idx_lexical_candidates_pending
+                   ON lexical_candidates(resolution_status, block_id, updated_at, id)"""
+            )
             legacy_votes = connection.execute(
                 """SELECT * FROM comparison_votes
                    WHERE candidate_a_hash='' OR candidate_b_hash=''"""
@@ -638,6 +654,50 @@ class V4Database:
                 (str(SCHEMA_VERSION),),
             )
             connection.commit()
+
+    def _migrate_candidate_cluster_schema(
+        self, connection: sqlite3.Connection
+    ) -> None:
+        columns = {
+            row["name"]
+            for row in connection.execute(
+                "PRAGMA table_info(candidate_clusters)"
+            ).fetchall()
+        }
+        additions = {
+            "state": "TEXT NOT NULL DEFAULT 'pending'",
+            "lease_run_id": "TEXT REFERENCES runs(id)",
+            "lease_acquired_at": "TEXT",
+        }
+        for name, declaration in additions.items():
+            if name not in columns:
+                connection.execute(
+                    f"ALTER TABLE candidate_clusters ADD COLUMN {name} {declaration}"
+                )
+        connection.execute(
+            """UPDATE candidate_clusters
+               SET state=CASE
+                   WHEN EXISTS(
+                       SELECT 1 FROM candidate_adjudications ca
+                       WHERE ca.cluster_id=candidate_clusters.id
+                   ) THEN 'adjudicated'
+                   WHEN state NOT IN ('pending', 'leased', 'adjudicated')
+                       THEN 'pending'
+                   ELSE state END"""
+        )
+        connection.execute(
+            """UPDATE candidate_clusters
+               SET lease_run_id=NULL, lease_acquired_at=NULL
+               WHERE state!='leased'"""
+        )
+        connection.execute(
+            """CREATE INDEX IF NOT EXISTS idx_candidate_clusters_state
+               ON candidate_clusters(state, id, ordinal)"""
+        )
+        connection.execute(
+            """CREATE INDEX IF NOT EXISTS idx_candidate_clusters_lease
+               ON candidate_clusters(lease_run_id, state, lease_acquired_at)"""
+        )
 
     @staticmethod
     def _candidate_adjudication_table_sql() -> str:
@@ -711,14 +771,14 @@ class V4Database:
         fallback_version = max(valid_versions)
         rows = connection.execute(
             """SELECT ca.id, ca.run_id, ca.cluster_id, ca.payload_json,
-                      ca.payload_hash, ca.knowledge_version, ca.created_at,
+                      ca.payload_hash, ca.knowledge_version, ca.active, ca.created_at,
                       ca.updated_at, ca.superseded_at, r.knowledge_version run_version
                FROM candidate_adjudications ca
                LEFT JOIN runs r ON r.id=ca.run_id
-               ORDER BY ca.run_id, ca.cluster_id, ca.updated_at DESC,
+               ORDER BY ca.cluster_id, ca.updated_at DESC,
                         ca.created_at DESC, ca.id DESC"""
         ).fetchall()
-        newest_by_cluster: set[tuple[str, str]] = set()
+        active_clusters: set[str] = set()
         for row in rows:
             raw_payload = row["payload_json"] or "{}"
             try:
@@ -756,19 +816,19 @@ class V4Database:
                 knowledge_version = row["run_version"]
             if knowledge_version not in valid_versions:
                 knowledge_version = fallback_version
-            cluster_key = (str(row["run_id"]), str(row["cluster_id"]))
-            if "active" in missing_columns:
-                active = int(cluster_key not in newest_by_cluster)
-            else:
-                active = int(row["active"])
-            newest_by_cluster.add(cluster_key)
+            cluster_key = str(row["cluster_id"])
+            requested_active = (
+                True if "active" in missing_columns else bool(row["active"])
+            )
+            active = int(requested_active and cluster_key not in active_clusters)
+            if active:
+                active_clusters.add(cluster_key)
             superseded_at = row["superseded_at"]
             if (
-                "superseded_at" in missing_columns
-                and not active
+                not active
                 and superseded_at is None
             ):
-                superseded_at = row["updated_at"]
+                superseded_at = row["updated_at"] or row["created_at"] or utc_now()
             connection.execute(
                 """UPDATE candidate_adjudications
                    SET payload_hash=?, knowledge_version=?, active=?, superseded_at=?
@@ -836,11 +896,11 @@ class V4Database:
         connection.execute("DROP INDEX IF EXISTS idx_candidate_adjudications_active")
         connection.execute(
             """CREATE INDEX idx_candidate_adjudications_cluster
-               ON candidate_adjudications(run_id, cluster_id, active, created_at)"""
+               ON candidate_adjudications(cluster_id, active, created_at)"""
         )
         connection.execute(
             """CREATE UNIQUE INDEX idx_candidate_adjudications_active
-               ON candidate_adjudications(run_id, cluster_id) WHERE active=1"""
+               ON candidate_adjudications(cluster_id) WHERE active=1"""
         )
         connection.execute(
             """CREATE INDEX IF NOT EXISTS idx_candidate_resolutions_cluster
@@ -1271,6 +1331,12 @@ class V4Database:
                     )
                     failed += 1
                     continue
+                current_candidate_ids = {
+                    str(candidate["id"]) for candidate in outcome.lexical_candidates
+                }
+                self._remove_stale_pending_candidates(
+                    connection, outcome.block.id, current_candidate_ids
+                )
                 for candidate in outcome.lexical_candidates:
                     risk_flags = candidate.get("risk_flags_json")
                     if not isinstance(risk_flags, str):
@@ -1345,6 +1411,66 @@ class V4Database:
         return {"indexed": indexed, "failed": failed, "candidates": lexical_count}
 
     @staticmethod
+    def _remove_stale_pending_candidates(
+        connection: sqlite3.Connection,
+        block_id: str,
+        current_candidate_ids: set[str],
+    ) -> None:
+        params: List[Any] = [block_id]
+        current_clause = ""
+        if current_candidate_ids:
+            placeholders = ",".join("?" for _ in current_candidate_ids)
+            current_clause = f" AND lc.id NOT IN ({placeholders})"
+            params.extend(sorted(current_candidate_ids))
+        rows = connection.execute(
+            """SELECT lc.id
+               FROM lexical_candidates lc
+               WHERE lc.block_id=? AND lc.resolution_status='pending'"""
+            + current_clause
+            + """
+                 AND NOT EXISTS(
+                     SELECT 1 FROM candidate_resolutions cr
+                     WHERE cr.candidate_id=lc.id
+                 )
+                 AND NOT EXISTS(
+                     SELECT 1
+                     FROM candidate_cluster_members cm
+                     JOIN candidate_clusters cc ON cc.id=cm.cluster_id
+                     WHERE cm.candidate_id=lc.id
+                       AND (
+                           cc.state!='pending'
+                           OR EXISTS(
+                               SELECT 1 FROM candidate_adjudications ca
+                               WHERE ca.cluster_id=cc.id
+                           )
+                       )
+                 )
+               ORDER BY lc.id""",
+            params,
+        ).fetchall()
+        stale_ids = [row["id"] for row in rows]
+        if not stale_ids:
+            return
+        placeholders = ",".join("?" for _ in stale_ids)
+        connection.execute(
+            f"""DELETE FROM candidate_clusters
+                WHERE state='pending'
+                  AND NOT EXISTS(
+                      SELECT 1 FROM candidate_adjudications ca
+                      WHERE ca.cluster_id=candidate_clusters.id
+                  )
+                  AND id IN (
+                      SELECT cluster_id FROM candidate_cluster_members
+                      WHERE candidate_id IN ({placeholders})
+                  )""",
+            stale_ids,
+        )
+        connection.execute(
+            f"DELETE FROM lexical_candidates WHERE id IN ({placeholders})",
+            stale_ids,
+        )
+
+    @staticmethod
     def _safe_string_tuple_json(value: Any) -> tuple[str, ...]:
         """Parse bounded string-list JSON without trusting malformed storage."""
         try:
@@ -1377,26 +1503,54 @@ class V4Database:
             risk_flags=cls._safe_string_tuple_json(row["risk_flags_json"]),
         )
 
-    def load_pending_lexical_candidates(self) -> List[Any]:
-        """Return every unresolved local candidate in stable source order."""
+    @staticmethod
+    def _pending_lexical_rows(
+        connection: sqlite3.Connection,
+    ) -> List[sqlite3.Row]:
+        return connection.execute(
+            """SELECT lc.* FROM lexical_candidates lc
+               JOIN blocks b ON b.id=lc.block_id
+               WHERE lc.resolution_status='pending'
+                 AND b.source_edition_id=(
+                     SELECT id FROM source_editions WHERE active=1
+                 )
+                 AND NOT EXISTS (
+                     SELECT 1
+                     FROM candidate_cluster_members cm
+                     JOIN candidate_adjudications ca
+                       ON ca.cluster_id=cm.cluster_id
+                     WHERE cm.candidate_id=lc.id AND ca.active=1
+                 )
+                 AND NOT EXISTS (
+                     SELECT 1
+                     FROM candidate_cluster_members cm
+                     JOIN candidate_clusters cc ON cc.id=cm.cluster_id
+                     WHERE cm.candidate_id=lc.id AND cc.state='leased'
+                 )
+               ORDER BY b.global_index, lc.start_offset, lc.end_offset, lc.id"""
+        ).fetchall()
+
+    @staticmethod
+    def _candidate_snapshot_token(rows: Sequence[sqlite3.Row]) -> str:
+        payload = [
+            [row["id"], row["updated_at"], row["resolution_status"]]
+            for row in rows
+        ]
+        encoded = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+        return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+    def load_pending_candidate_snapshot(self) -> tuple[str, List[Any]]:
+        """Read candidates and their CAS token from one SQLite snapshot."""
         with closing(self.connect()) as connection:
-            rows = connection.execute(
-                """SELECT lc.* FROM lexical_candidates lc
-                   JOIN blocks b ON b.id=lc.block_id
-                   WHERE lc.resolution_status='pending'
-                     AND b.source_edition_id=(
-                         SELECT id FROM source_editions WHERE active=1
-                     )
-                     AND NOT EXISTS (
-                         SELECT 1
-                         FROM candidate_cluster_members cm
-                         JOIN candidate_adjudications ca
-                           ON ca.cluster_id=cm.cluster_id
-                         WHERE cm.candidate_id=lc.id AND ca.active=1
-                     )
-                   ORDER BY b.global_index, lc.start_offset, lc.end_offset, lc.id"""
-            ).fetchall()
-        return [self._row_to_lexical_candidate(row) for row in rows]
+            rows = self._pending_lexical_rows(connection)
+        return (
+            self._candidate_snapshot_token(rows),
+            [self._row_to_lexical_candidate(row) for row in rows],
+        )
+
+    def load_pending_lexical_candidates(self) -> List[Any]:
+        """Return every unresolved, unclaimed local candidate."""
+        return self.load_pending_candidate_snapshot()[1]
 
     @staticmethod
     def _candidate_cluster_members(cluster: Any) -> List[Dict[str, Any]]:
@@ -1527,13 +1681,25 @@ class V4Database:
         return {"clusters": len(ordered), "members": member_count}
 
     def replace_pending_candidate_clusters(
-        self, run_id: str, clusters: Sequence[Any]
+        self,
+        run_id: str,
+        clusters: Sequence[Any],
+        *,
+        expected_snapshot_token: Optional[str] = None,
     ) -> Dict[str, int]:
         """Atomically rebuild undecided clusters while preserving all history."""
         with self.transaction() as connection:
+            if expected_snapshot_token is not None:
+                current_rows = self._pending_lexical_rows(connection)
+                current_token = self._candidate_snapshot_token(current_rows)
+                if current_token != expected_snapshot_token:
+                    raise StaleCandidateSnapshot(
+                        "pending candidate snapshot changed during clustering"
+                    )
             connection.execute(
                 """DELETE FROM candidate_clusters
-                   WHERE NOT EXISTS (
+                   WHERE state='pending'
+                     AND NOT EXISTS (
                        SELECT 1 FROM candidate_adjudications ca
                        WHERE ca.cluster_id=candidate_clusters.id
                    )"""
@@ -1577,11 +1743,10 @@ class V4Database:
     def load_pending_candidate_clusters(
         self, max_clusters: Optional[int] = None
     ) -> List[Any]:
-        """Rehydrate undecided clusters, excluding every active adjudication."""
-        from .candidate_clusters import CandidateCluster, CandidateContext
-
+        """Bulk-rehydrate never-adjudicated pending clusters."""
         query = """SELECT cc.* FROM candidate_clusters cc
-                   WHERE NOT EXISTS (
+                   WHERE cc.state='pending'
+                     AND NOT EXISTS (
                        SELECT 1 FROM candidate_adjudications ca
                        WHERE ca.cluster_id=cc.id
                    )
@@ -1602,78 +1767,232 @@ class V4Database:
         if max_clusters is not None:
             query += " LIMIT ?"
             params.append(max(0, int(max_clusters)))
-        clusters: List[Any] = []
         with closing(self.connect()) as connection:
             cluster_rows = connection.execute(query, params).fetchall()
-            for cluster_row in cluster_rows:
-                members = connection.execute(
-                    """SELECT cm.role, cm.ordinal, cm.context_json, lc.*
-                       FROM candidate_cluster_members cm
-                       JOIN lexical_candidates lc ON lc.id=cm.candidate_id
-                       WHERE cm.cluster_id=?
-                       ORDER BY cm.ordinal, lc.id""",
-                    (cluster_row["id"],),
-                ).fetchall()
-                alternatives = []
-                contexts = []
-                for member in members:
-                    candidate = self._row_to_lexical_candidate(member)
-                    role = member["role"]
-                    if (
-                        role in {"alternative", "both"}
-                        and member["resolution_status"] == "pending"
-                    ):
-                        alternatives.append(candidate)
-                    if role not in {"context", "both"}:
-                        continue
-                    try:
-                        context_data = json.loads(member["context_json"] or "{}")
-                    except (TypeError, ValueError):
-                        context_data = {}
-                    if not isinstance(context_data, dict):
-                        context_data = {}
+            return self._hydrate_candidate_clusters(connection, cluster_rows)
 
-                    def context_string(field: str, fallback: str) -> str:
-                        value = context_data.get(field, fallback)
-                        return value if isinstance(value, str) else fallback
+    def _hydrate_candidate_clusters(
+        self,
+        connection: sqlite3.Connection,
+        cluster_rows: Sequence[sqlite3.Row],
+    ) -> List[Any]:
+        from .candidate_clusters import CandidateCluster, CandidateContext
 
-                    contexts.append(
-                        CandidateContext(
-                            candidate_id=candidate.id,
-                            block_id=context_string("block_id", candidate.block_id),
-                            paragraph_id=context_string(
-                                "paragraph_id", candidate.paragraph_id
-                            ),
-                            original_text=context_string(
-                                "original_text", candidate.original_text
-                            ),
-                            left_context=context_string(
-                                "left_context", candidate.left_context
-                            ),
-                            right_context=context_string(
-                                "right_context", candidate.right_context
-                            ),
-                            risk_flags=self._safe_string_tuple_json(
-                                context_data.get("risk_flags", [])
-                            ),
-                        )
-                    )
-                if not alternatives:
+        if not cluster_rows:
+            return []
+        cluster_ids = [row["id"] for row in cluster_rows]
+        placeholders = ",".join("?" for _ in cluster_ids)
+        member_rows = connection.execute(
+            f"""SELECT cm.cluster_id, cm.role, cm.ordinal, cm.context_json, lc.*
+                FROM candidate_cluster_members cm
+                JOIN lexical_candidates lc ON lc.id=cm.candidate_id
+                WHERE cm.cluster_id IN ({placeholders})
+                ORDER BY cm.cluster_id, cm.ordinal, lc.id""",
+            cluster_ids,
+        ).fetchall()
+        members_by_cluster: Dict[str, List[sqlite3.Row]] = {}
+        for member in member_rows:
+            members_by_cluster.setdefault(member["cluster_id"], []).append(member)
+        clusters: List[Any] = []
+        for cluster_row in cluster_rows:
+            alternatives = []
+            contexts = []
+            for member in members_by_cluster.get(cluster_row["id"], []):
+                candidate = self._row_to_lexical_candidate(member)
+                role = member["role"]
+                if (
+                    role in {"alternative", "both"}
+                    and member["resolution_status"] == "pending"
+                ):
+                    alternatives.append(candidate)
+                if role not in {"context", "both"}:
                     continue
-                clusters.append(
-                    CandidateCluster(
-                        id=cluster_row["id"],
-                        alternatives=tuple(alternatives),
-                        contexts=tuple(contexts),
-                        risk_flags=self._safe_string_tuple_json(
-                            cluster_row["risk_flags_json"]
+                try:
+                    context_data = json.loads(member["context_json"] or "{}")
+                except (TypeError, ValueError):
+                    context_data = {}
+                if not isinstance(context_data, dict):
+                    context_data = {}
+
+                def context_string(field: str, fallback: str) -> str:
+                    value = context_data.get(field, fallback)
+                    return value if isinstance(value, str) else fallback
+
+                contexts.append(
+                    CandidateContext(
+                        candidate_id=candidate.id,
+                        block_id=context_string("block_id", candidate.block_id),
+                        paragraph_id=context_string(
+                            "paragraph_id", candidate.paragraph_id
                         ),
-                        affected_blocks=int(
-                            cluster_row["affected_block_count"] or 0
+                        original_text=context_string(
+                            "original_text", candidate.original_text
+                        ),
+                        left_context=context_string(
+                            "left_context", candidate.left_context
+                        ),
+                        right_context=context_string(
+                            "right_context", candidate.right_context
+                        ),
+                        risk_flags=self._safe_string_tuple_json(
+                            context_data.get("risk_flags", [])
                         ),
                     )
                 )
+            if not alternatives:
+                continue
+            clusters.append(
+                CandidateCluster(
+                    id=cluster_row["id"],
+                    alternatives=tuple(alternatives),
+                    contexts=tuple(contexts),
+                    risk_flags=self._safe_string_tuple_json(
+                        cluster_row["risk_flags_json"]
+                    ),
+                    affected_blocks=int(cluster_row["affected_block_count"] or 0),
+                )
+            )
         return clusters
+
+    def claim_pending_candidate_clusters(
+        self, run_id: str, limit: int = 12
+    ) -> List[Any]:
+        """Atomically lease at most twelve clusters to one adjudication run."""
+        bounded_limit = max(0, min(int(limit), 12))
+        if bounded_limit == 0:
+            return []
+        with self.transaction() as connection:
+            run = connection.execute(
+                "SELECT stage, status FROM runs WHERE id=?", (run_id,)
+            ).fetchone()
+            if run is None or run["stage"] != "adjudicate" or run["status"] != "running":
+                raise ValueError(f"run is not a running adjudication: {run_id}")
+            cluster_rows = connection.execute(
+                """SELECT cc.* FROM candidate_clusters cc
+                   WHERE cc.state='pending'
+                     AND NOT EXISTS(
+                         SELECT 1 FROM candidate_adjudications ca
+                         WHERE ca.cluster_id=cc.id
+                     )
+                     AND EXISTS(
+                         SELECT 1
+                         FROM candidate_cluster_members cm
+                         JOIN lexical_candidates lc ON lc.id=cm.candidate_id
+                         JOIN blocks b ON b.id=lc.block_id
+                         WHERE cm.cluster_id=cc.id
+                           AND cm.role IN ('alternative', 'both')
+                           AND lc.resolution_status='pending'
+                           AND b.source_edition_id=(
+                               SELECT id FROM source_editions WHERE active=1
+                           )
+                     )
+                   ORDER BY cc.id
+                   LIMIT ?""",
+                (bounded_limit,),
+            ).fetchall()
+            if not cluster_rows:
+                return []
+            cluster_ids = [row["id"] for row in cluster_rows]
+            placeholders = ",".join("?" for _ in cluster_ids)
+            now = utc_now()
+            cursor = connection.execute(
+                f"""UPDATE candidate_clusters
+                    SET state='leased', lease_run_id=?, lease_acquired_at=?,
+                        updated_at=?
+                    WHERE state='pending' AND id IN ({placeholders})""",
+                [run_id, now, now, *cluster_ids],
+            )
+            if cursor.rowcount != len(cluster_ids):
+                raise StaleCandidateSnapshot("candidate cluster lease race")
+            return self._hydrate_candidate_clusters(connection, cluster_rows)
+
+    def has_claimable_candidate_clusters(self) -> bool:
+        with closing(self.connect()) as connection:
+            return connection.execute(
+                """SELECT 1 FROM candidate_clusters cc
+                   WHERE cc.state='pending'
+                     AND NOT EXISTS(
+                         SELECT 1 FROM candidate_adjudications ca
+                         WHERE ca.cluster_id=cc.id
+                     )
+                     AND EXISTS(
+                         SELECT 1
+                         FROM candidate_cluster_members cm
+                         JOIN lexical_candidates lc ON lc.id=cm.candidate_id
+                         JOIN blocks b ON b.id=lc.block_id
+                         WHERE cm.cluster_id=cc.id
+                           AND cm.role IN ('alternative', 'both')
+                           AND lc.resolution_status='pending'
+                           AND b.source_edition_id=(
+                               SELECT id FROM source_editions WHERE active=1
+                           )
+                     )
+                   LIMIT 1"""
+            ).fetchone() is not None
+
+    def release_adjudication_leases(self, run_id: str) -> int:
+        with self.transaction() as connection:
+            cursor = connection.execute(
+                """UPDATE candidate_clusters
+                   SET state='pending', lease_run_id=NULL,
+                       lease_acquired_at=NULL, updated_at=?
+                   WHERE state='leased' AND lease_run_id=?
+                     AND NOT EXISTS(
+                         SELECT 1 FROM candidate_adjudications ca
+                         WHERE ca.cluster_id=candidate_clusters.id
+                     )""",
+                (utc_now(), run_id),
+            )
+            return int(cursor.rowcount)
+
+    def recover_stale_candidate_leases(self, max_age_seconds: int = 3600) -> int:
+        """Explicitly recover abandoned leases without touching active decisions."""
+        cutoff_seconds = max(0, int(max_age_seconds))
+        with self.transaction() as connection:
+            cursor = connection.execute(
+                """UPDATE candidate_clusters
+                   SET state='pending', lease_run_id=NULL,
+                       lease_acquired_at=NULL, updated_at=?
+                   WHERE state='leased'
+                     AND NOT EXISTS(
+                         SELECT 1 FROM candidate_adjudications ca
+                         WHERE ca.cluster_id=candidate_clusters.id
+                     )
+                     AND (
+                         NOT EXISTS(
+                             SELECT 1 FROM runs r
+                             WHERE r.id=candidate_clusters.lease_run_id
+                               AND r.status='running'
+                         )
+                         OR julianday(lease_acquired_at) <=
+                            julianday(?) - (? / 86400.0)
+                     )""",
+                (utc_now(), utc_now(), cutoff_seconds),
+            )
+            return int(cursor.rowcount)
+
+    def finalize_adjudication_run(
+        self, run_id: str, status: str, error: Optional[str] = None
+    ) -> None:
+        if status not in {"completed", "completed_with_errors", "failed"}:
+            raise ValueError(f"invalid adjudication run status: {status}")
+        with self.transaction() as connection:
+            connection.execute(
+                """UPDATE candidate_clusters
+                   SET state='pending', lease_run_id=NULL,
+                       lease_acquired_at=NULL, updated_at=?
+                   WHERE state='leased' AND lease_run_id=?
+                     AND NOT EXISTS(
+                         SELECT 1 FROM candidate_adjudications ca
+                         WHERE ca.cluster_id=candidate_clusters.id
+                     )""",
+                (utc_now(), run_id),
+            )
+            connection.execute(
+                """UPDATE runs SET status=?, finished_at=?, error=?
+                   WHERE id=? AND stage='adjudicate'""",
+                (status, utc_now(), error, run_id),
+            )
 
     def source_texts_for_candidate_clusters(
         self, clusters: Sequence[Any]
@@ -1832,7 +2151,12 @@ class V4Database:
         return True
 
     def commit_adjudications(
-        self, run_id: str, results: Sequence[Any]
+        self,
+        run_id: str,
+        results: Sequence[Any],
+        *,
+        require_lease: bool = False,
+        finalize_run_status: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Atomically persist every final adjudication and promote existing spans."""
         ordered = sorted(
@@ -1852,11 +2176,20 @@ class V4Database:
                 raise ValueError(f"unknown run: {run_id}")
             cluster_members: Dict[str, List[sqlite3.Row]] = {}
             for cluster_id in cluster_ids:
-                if connection.execute(
-                    "SELECT 1 FROM candidate_clusters WHERE id=?",
+                cluster_row = connection.execute(
+                    """SELECT state, lease_run_id FROM candidate_clusters
+                       WHERE id=?""",
                     (cluster_id,),
-                ).fetchone() is None:
+                ).fetchone()
+                if cluster_row is None:
                     raise ValueError(f"unknown candidate cluster: {cluster_id}")
+                if require_lease and (
+                    cluster_row["state"] != "leased"
+                    or cluster_row["lease_run_id"] != run_id
+                ):
+                    raise StaleAdjudicationCommit(
+                        f"cluster lease is not owned by {run_id}: {cluster_id}"
+                    )
                 rows = connection.execute(
                     """SELECT lc.*, cm.role AS member_role
                        FROM candidate_cluster_members cm
@@ -1962,11 +2295,18 @@ class V4Database:
                     payload_json.encode("utf-8")
                 ).hexdigest()
                 normalized["active"] = connection.execute(
-                    """SELECT id, payload_hash, knowledge_version
+                    """SELECT id, run_id, payload_hash, knowledge_version
                        FROM candidate_adjudications
-                       WHERE run_id=? AND cluster_id=? AND active=1""",
-                    (run_id, cluster_id),
+                       WHERE cluster_id=? AND active=1""",
+                    (cluster_id,),
                 ).fetchone()
+                if (
+                    normalized["active"] is not None
+                    and normalized["active"]["run_id"] != run_id
+                ):
+                    raise StaleAdjudicationCommit(
+                        f"cluster already has an active adjudication: {cluster_id}"
+                    )
                 normalized["state_matches"] = bool(
                     normalized["active"]
                     and self._active_adjudication_matches(
@@ -2002,6 +2342,12 @@ class V4Database:
                         (run_id,),
                     ).fetchall()
                 ]
+                self._complete_committed_clusters(
+                    connection,
+                    run_id,
+                    cluster_ids,
+                    finalize_run_status=finalize_run_status,
+                )
                 return {
                     "knowledge_version": version,
                     "adjudications": len(normalized_results),
@@ -2190,12 +2536,46 @@ class V4Database:
                                    AND rr.retired_version IS NULL)""",
                         (version, previous_concept_id),
                     )
+            self._complete_committed_clusters(
+                connection,
+                run_id,
+                cluster_ids,
+                finalize_run_status=finalize_run_status,
+            )
             return {
                 "knowledge_version": version,
                 "adjudications": len(changed_results),
                 "concept_ids": sorted(set(concept_ids)),
                 "changed": len(changed_results),
             }
+
+    @staticmethod
+    def _complete_committed_clusters(
+        connection: sqlite3.Connection,
+        run_id: str,
+        cluster_ids: Sequence[str],
+        *,
+        finalize_run_status: Optional[str],
+    ) -> None:
+        if cluster_ids:
+            placeholders = ",".join("?" for _ in cluster_ids)
+            connection.execute(
+                f"""UPDATE candidate_clusters
+                    SET state='adjudicated', lease_run_id=NULL,
+                        lease_acquired_at=NULL, updated_at=?
+                    WHERE id IN ({placeholders})""",
+                [utc_now(), *cluster_ids],
+            )
+        if finalize_run_status is not None:
+            if finalize_run_status not in {"completed", "completed_with_errors"}:
+                raise ValueError(
+                    f"invalid adjudication final status: {finalize_run_status}"
+                )
+            connection.execute(
+                """UPDATE runs SET status=?, finished_at=?, error=NULL
+                   WHERE id=? AND stage='adjudicate'""",
+                (finalize_run_status, utc_now(), run_id),
+            )
 
     @staticmethod
     def _scan_evidence_where(alias: str = "e") -> str:

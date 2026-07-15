@@ -447,35 +447,62 @@ class V4Adjudicator:
             "max_attempts": self.max_attempts,
         }
         store.start_run(run_id, "adjudicate", config)
+        adjudicated = failed = deferred = 0
+        concept_ids: set[str] = set()
+        knowledge_version = None
+        remaining = None if max_clusters is None else max(0, int(max_clusters))
         try:
-            clusters = store.load_pending_candidate_clusters(max_clusters)
-            if not clusters:
-                store.finish_run(run_id, "completed")
-                return {
-                    "run_id": run_id,
-                    "adjudicated": 0,
-                    "concepts": 0,
-                    "failed": 0,
-                    "deferred": 0,
-                    "knowledge_version": None,
-                }
-            source_texts = store.source_texts_for_candidate_clusters(clusters)
-            results = self.adjudicate(clusters, source_texts)
-            committed = store.commit_adjudications(run_id, results)
-            failed = sum(
-                result.reason == "model_protocol_failure" for result in results
-            )
-            deferred = sum(result.verdict == "defer" for result in results)
-            status = "completed_with_errors" if failed else "completed"
-            store.finish_run(run_id, status)
+            if remaining == 0:
+                store.finalize_adjudication_run(run_id, "completed")
+            while remaining is None or remaining > 0:
+                claim_limit = 12 if remaining is None else min(12, remaining)
+                clusters = store.claim_pending_candidate_clusters(
+                    run_id, claim_limit
+                )
+                if not clusters:
+                    status = "completed_with_errors" if failed else "completed"
+                    store.finalize_adjudication_run(run_id, status)
+                    break
+                source_texts = store.source_texts_for_candidate_clusters(clusters)
+                results = self.adjudicate(clusters, source_texts)
+                batch_failed = sum(
+                    result.reason == "model_protocol_failure" for result in results
+                )
+                batch_deferred = sum(
+                    result.verdict == "defer" for result in results
+                )
+                next_adjudicated = adjudicated + len(results)
+                next_failed = failed + batch_failed
+                next_deferred = deferred + batch_deferred
+                if remaining is not None:
+                    remaining -= len(results)
+                no_more = remaining == 0 or not store.has_claimable_candidate_clusters()
+                final_status = None
+                if no_more:
+                    final_status = (
+                        "completed_with_errors" if next_failed else "completed"
+                    )
+                committed = store.commit_adjudications(
+                    run_id,
+                    results,
+                    require_lease=True,
+                    finalize_run_status=final_status,
+                )
+                adjudicated = next_adjudicated
+                failed = next_failed
+                deferred = next_deferred
+                concept_ids.update(committed.get("concept_ids", []))
+                knowledge_version = committed.get("knowledge_version")
+                if no_more:
+                    break
             return {
                 "run_id": run_id,
-                "adjudicated": len(results),
-                "concepts": len(set(committed.get("concept_ids", []))),
+                "adjudicated": adjudicated,
+                "concepts": len(concept_ids),
                 "failed": failed,
                 "deferred": deferred,
-                "knowledge_version": committed.get("knowledge_version"),
+                "knowledge_version": knowledge_version,
             }
         except Exception as exc:
-            store.finish_run(run_id, "failed", str(exc))
+            store.finalize_adjudication_run(run_id, "failed", str(exc))
             raise

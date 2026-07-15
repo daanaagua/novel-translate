@@ -8,7 +8,7 @@ from typing import Dict, List, Optional
 from uuid import uuid4
 
 from .candidate_clusters import CandidateClusterBuilder
-from .database import V4Database
+from .database import StaleCandidateSnapshot, V4Database
 from .lexical_index import LexicalCandidateExtractor
 from .models import ScanOutcome, ScanResponse, V4Block, V4BlockStatus
 
@@ -256,11 +256,25 @@ class V4Scanner:
                     workers += 1
                 cursor += len(wave)
 
-            all_pending = self.database.load_pending_lexical_candidates()
-            clusters = CandidateClusterBuilder().build(all_pending)
-            cluster_count = self.database.replace_pending_candidate_clusters(
-                run_id, clusters
-            )["clusters"]
+            # One bounded Python materialization is intentionally done only once
+            # per successful scan pass. Candidates are compact dataclasses backed
+            # by SQLite; CAS retries occur only when another coordinator changes
+            # the pending set while this final clustering pass is running.
+            for snapshot_attempt in range(3):
+                snapshot_token, all_pending = (
+                    self.database.load_pending_candidate_snapshot()
+                )
+                clusters = CandidateClusterBuilder().build(all_pending)
+                try:
+                    cluster_count = self.database.replace_pending_candidate_clusters(
+                        run_id,
+                        clusters,
+                        expected_snapshot_token=snapshot_token,
+                    )["clusters"]
+                    break
+                except StaleCandidateSnapshot:
+                    if snapshot_attempt == 2:
+                        raise
             status = "completed" if not failed else "completed_with_errors"
             self.database.finish_run(run_id, status)
         except Exception as exc:
