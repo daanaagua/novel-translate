@@ -3297,6 +3297,50 @@ class V4Database:
         if set(resolutions) != {row["id"] for row in members}:
             return False
         selected = set(result["selected_ids"])
+        chain_rows_by_candidate: Dict[str, List[sqlite3.Row]] = {
+            candidate_id: [] for candidate_id in selected
+        }
+        for row in connection.execute(
+            """SELECT cr.candidate_id,
+                      e.block_id AS evidence_block_id,
+                      e.paragraph_id AS evidence_paragraph_id,
+                      e.kind AS evidence_kind,
+                      e.source_form AS evidence_source_form,
+                      e.evidence_quote,
+                      e.payload_json AS evidence_payload_json,
+                      e.confidence AS evidence_confidence,
+                      e.extractor AS evidence_extractor,
+                      e.run_id AS evidence_run_id,
+                      ca.run_id AS adjudication_run_id,
+                      m.id AS mention_id,
+                      m.block_id AS mention_block_id,
+                      m.paragraph_id AS mention_paragraph_id,
+                      m.source_form AS mention_source_form,
+                      m.normalized_form AS mention_normalized_form,
+                      m.discourse_function,
+                      m.concept_id AS mention_concept_id,
+                      cto.id AS observation_id,
+                      cto.mention_id AS observation_mention_id,
+                      cto.kind AS observation_kind,
+                      cto.confidence AS observation_confidence,
+                      cto.source AS observation_source,
+                      cto.concept_id AS observation_concept_id,
+                      cto.retired_version AS observation_retired_version
+               FROM candidate_resolutions cr
+               JOIN candidate_adjudications ca ON ca.id=cr.adjudication_id
+               LEFT JOIN evidence e ON e.id=cr.evidence_id
+               LEFT JOIN concept_type_observations cto
+                 ON cto.adjudication_id=cr.adjudication_id
+                    AND cto.lexeme_id=cr.lexeme_id
+                    AND cto.evidence_id=cr.evidence_id
+               LEFT JOIN mentions m
+                 ON m.evidence_id=cr.evidence_id AND m.lexeme_id=cr.lexeme_id
+               WHERE cr.adjudication_id=?""",
+            (adjudication_id,),
+        ).fetchall():
+            candidate_id = str(row["candidate_id"])
+            if candidate_id in chain_rows_by_candidate:
+                chain_rows_by_candidate[candidate_id].append(row)
         for member in members:
             candidate_id = member["id"]
             resolution = resolutions[candidate_id]
@@ -3315,16 +3359,37 @@ class V4Database:
                     or not member["selected"]
                 ):
                     return False
-                evidence = connection.execute(
-                    """SELECT 1 FROM evidence
-                       WHERE id=? AND block_id=? AND source_form=?
-                             AND extractor='candidate_adjudication'""",
-                    (
-                        resolution["evidence_id"],
-                        member["block_id"],
-                        member["original_text"],
-                    ),
-                ).fetchone()
+                chain_rows = chain_rows_by_candidate.get(str(candidate_id), [])
+                if len(chain_rows) != 1:
+                    return False
+                chain = chain_rows[0]
+                normalized_form = normalize_english_form(member["original_text"])
+                if (
+                    chain["evidence_block_id"] != member["block_id"]
+                    or chain["evidence_paragraph_id"] != member["paragraph_id"]
+                    or chain["evidence_kind"] != "candidate_adjudication"
+                    or chain["evidence_source_form"] != member["original_text"]
+                    or chain["evidence_quote"] != member["original_text"]
+                    or chain["evidence_payload_json"] != result["payload_json"]
+                    or chain["evidence_confidence"] != result["confidence"]
+                    or chain["evidence_extractor"] != "candidate_adjudication"
+                    or chain["evidence_run_id"] != chain["adjudication_run_id"]
+                    or chain["mention_id"] is None
+                    or chain["mention_block_id"] != member["block_id"]
+                    or chain["mention_paragraph_id"] != member["paragraph_id"]
+                    or chain["mention_source_form"] != member["original_text"]
+                    or chain["mention_normalized_form"] != normalized_form
+                    or chain["discourse_function"] != "referential"
+                    or chain["mention_concept_id"] is not None
+                    or chain["observation_id"] is None
+                    or chain["observation_mention_id"] != chain["mention_id"]
+                    or chain["observation_kind"] != result["entity_kind"]
+                    or chain["observation_confidence"] != result["confidence"]
+                    or chain["observation_source"] != "candidate_adjudication"
+                    or chain["observation_concept_id"] is not None
+                    or chain["observation_retired_version"] is not None
+                ):
+                    return False
                 occurrence = connection.execute(
                     """SELECT 1 FROM form_occurrences
                        WHERE lexeme_id=? AND block_id=? AND start_offset=?
@@ -3338,32 +3403,7 @@ class V4Database:
                         member["block_source_hash"],
                     ),
                 ).fetchone()
-                observation = connection.execute(
-                    """SELECT 1
-                       FROM concept_type_observations cto
-                       JOIN mentions m ON m.id=cto.mention_id
-                       WHERE cto.adjudication_id=? AND cto.lexeme_id=?
-                             AND cto.kind=? AND cto.confidence=?
-                             AND cto.source='candidate_adjudication'
-                             AND cto.evidence_id=? AND cto.concept_id IS NULL
-                             AND cto.retired_version IS NULL
-                             AND m.lexeme_id=cto.lexeme_id
-                             AND m.concept_id IS NULL
-                             AND m.evidence_id=cto.evidence_id
-                             AND m.block_id=? AND m.paragraph_id=?
-                             AND m.source_form=?""",
-                    (
-                        adjudication_id,
-                        resolution["lexeme_id"],
-                        result["entity_kind"],
-                        result["confidence"],
-                        resolution["evidence_id"],
-                        member["block_id"],
-                        member["paragraph_id"],
-                        member["original_text"],
-                    ),
-                ).fetchone()
-                if evidence is None or occurrence is None or observation is None:
+                if occurrence is None:
                     return False
             else:
                 expected = (
@@ -4010,12 +4050,7 @@ class V4Database:
                WHERE cto.source='candidate_adjudication'
                  AND COALESCE(c.locked, 0)=0
                  AND cto.id NOT IN (
-                     SELECT id FROM reset_protected_type_observations)
-                 AND (cto.adjudication_id IN (
-                          SELECT id FROM candidate_adjudications)
-                      OR cto.mention_id IN (SELECT id FROM reset_scan_mentions)
-                      OR cto.evidence_id IN (SELECT id FROM reset_scan_evidence)
-                      OR cto.concept_id IN (SELECT id FROM reset_scan_concepts))""",
+                     SELECT id FROM reset_protected_type_observations)""",
             """CREATE TEMP TABLE reset_scan_lexemes AS
                SELECT DISTINCT l.id FROM lexemes l
                WHERE (

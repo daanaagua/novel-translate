@@ -1205,6 +1205,144 @@ def test_identical_payload_supersedes_drifted_mention_evidence_chain(tmp_path):
     )
 
 
+def test_identical_payload_supersedes_drifted_evidence_metadata(tmp_path):
+    db, _, block, candidates = _seed_database(tmp_path)
+    db.persist_candidate_clusters("scan-run", [_cluster("cluster-1", candidates)])
+    result = AdjudicationResult(
+        "cluster-1", "promote", (candidates[0].id,), "person", 0.9
+    )
+    first = db.commit_adjudications("judge-run", [result])
+    with db.transaction() as connection:
+        active = connection.execute(
+            """SELECT ca.id AS adjudication_id, ca.payload_json, cr.evidence_id
+               FROM candidate_adjudications ca
+               JOIN candidate_resolutions cr ON cr.adjudication_id=ca.id
+               WHERE ca.active=1 AND cr.candidate_id=?""",
+            (candidates[0].id,),
+        ).fetchone()
+        expected_payload_json = active["payload_json"]
+        connection.execute(
+            """UPDATE evidence
+               SET paragraph_id='drifted', evidence_quote='wrong quote',
+                   payload_json='{}', confidence=0.1, run_id='scan-run'
+               WHERE id=?""",
+            (active["evidence_id"],),
+        )
+
+    repaired = db.commit_adjudications("judge-run", [result])
+
+    assert repaired["knowledge_version"] != first["knowledge_version"]
+    assert repaired["changed"] == 1
+    with closing(db.connect()) as connection:
+        adjudications = connection.execute(
+            """SELECT id, active, superseded_at
+               FROM candidate_adjudications ORDER BY knowledge_version"""
+        ).fetchall()
+        chain = connection.execute(
+            """SELECT e.block_id, e.paragraph_id, e.kind, e.source_form,
+                      e.evidence_quote, e.payload_json, e.confidence,
+                      e.extractor, e.run_id
+               FROM candidate_adjudications ca
+               JOIN candidate_resolutions cr ON cr.adjudication_id=ca.id
+               JOIN evidence e ON e.id=cr.evidence_id
+               WHERE ca.active=1 AND cr.candidate_id=?""",
+            (candidates[0].id,),
+        ).fetchone()
+    assert [row["active"] for row in adjudications] == [0, 1]
+    assert adjudications[0]["superseded_at"] is not None
+    assert tuple(chain) == (
+        block.id,
+        candidates[0].paragraph_id,
+        "candidate_adjudication",
+        candidates[0].original_text,
+        candidates[0].original_text,
+        expected_payload_json,
+        result.confidence,
+        "candidate_adjudication",
+        "judge-run",
+    )
+
+
+@pytest.mark.parametrize(
+    ("column", "drifted_value"),
+    (("normalized_form", "corrupt"), ("discourse_function", "vocative")),
+)
+def test_identical_payload_supersedes_drifted_mention_metadata(
+    tmp_path, column, drifted_value
+):
+    db, _, _, candidates = _seed_database(tmp_path)
+    db.persist_candidate_clusters("scan-run", [_cluster("cluster-1", candidates)])
+    result = AdjudicationResult(
+        "cluster-1", "promote", (candidates[0].id,), "person", 0.9
+    )
+    first = db.commit_adjudications("judge-run", [result])
+    with db.transaction() as connection:
+        active = connection.execute(
+            """SELECT ca.id AS adjudication_id, cto.mention_id
+               FROM candidate_adjudications ca
+               JOIN concept_type_observations cto
+                 ON cto.adjudication_id=ca.id
+               WHERE ca.active=1"""
+        ).fetchone()
+        connection.execute(
+            f"UPDATE mentions SET {column}=? WHERE id=?",
+            (drifted_value, active["mention_id"]),
+        )
+
+    repaired = db.commit_adjudications("judge-run", [result])
+
+    assert repaired["knowledge_version"] != first["knowledge_version"]
+    assert repaired["changed"] == 1
+    with closing(db.connect()) as connection:
+        adjudications = connection.execute(
+            """SELECT active, superseded_at FROM candidate_adjudications
+               ORDER BY knowledge_version"""
+        ).fetchall()
+        mention = connection.execute(
+            """SELECT m.normalized_form, m.discourse_function
+               FROM candidate_adjudications ca
+               JOIN concept_type_observations cto
+                 ON cto.adjudication_id=ca.id
+               JOIN mentions m ON m.id=cto.mention_id
+               WHERE ca.active=1"""
+        ).fetchone()
+    assert [row["active"] for row in adjudications] == [0, 1]
+    assert adjudications[0]["superseded_at"] is not None
+    assert tuple(mention) == ("drotte", "referential")
+
+
+def test_reset_removes_orphan_automatic_type_observation_and_lexeme(tmp_path):
+    db = V4Database(tmp_path / "orphan-automatic-observation")
+    lexeme_id = db.ensure_lexeme("OrphanTerm")
+    observation_id = db.record_type_observation(
+        lexeme_id,
+        "person",
+        confidence=0.4,
+        source="candidate_adjudication",
+    )
+
+    preview = db.preview_scan_reset()
+
+    assert preview["concept_type_observations"] == 1
+    assert preview["lexemes"] == 1
+    assert preview["source_forms"] == 1
+    deleted = db.reset_scan_derivatives(preview["token"])
+    assert deleted["concept_type_observations"] == 1
+    assert deleted["lexemes"] == 1
+    assert deleted["source_forms"] == 1
+    with closing(db.connect()) as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM concept_type_observations WHERE id=?",
+            (observation_id,),
+        ).fetchone()[0] == 0
+        assert connection.execute(
+            "SELECT COUNT(*) FROM lexemes WHERE id=?", (lexeme_id,)
+        ).fetchone()[0] == 0
+        assert connection.execute(
+            "SELECT COUNT(*) FROM source_forms WHERE lexeme_id=?", (lexeme_id,)
+        ).fetchone()[0] == 0
+
+
 def test_reset_token_guards_snapshot_and_preserves_sources_baseline_and_locks(tmp_path):
     db, edition, block, candidates = _seed_database(tmp_path)
     db.persist_candidate_clusters("scan-run", [_cluster("cluster-1", candidates)])
