@@ -796,6 +796,219 @@ class V4Database:
                 changed += cursor.rowcount
         return changed
 
+    def apply_coreference_fallback(
+        self,
+        lexeme_id: str,
+        mention_ids: Sequence[int],
+        *,
+        connection: sqlite3.Connection | None = None,
+    ) -> Dict[str, Any]:
+        """Choose and persist one conservative lexeme-level working target.
+
+        Existing lexeme/concept targets are evidence only.  Affected blocks vote
+        through their currently bound concepts, and no concept identity is
+        created or changed by this fallback.
+        """
+
+        if connection is not None:
+            self._require_active_transaction(connection)
+        if not isinstance(lexeme_id, str) or not lexeme_id.strip():
+            raise ValueError("fallback lexeme_id cannot be empty")
+        if isinstance(mention_ids, (str, bytes)):
+            raise ValueError("fallback mention_ids must be integer ids")
+        raw_ids = tuple(mention_ids)
+        if any(
+            not isinstance(value, int)
+            or isinstance(value, bool)
+            or value <= 0
+            for value in raw_ids
+        ):
+            raise ValueError("fallback mention_ids must be positive integers")
+        ordered_ids = tuple(sorted(set(raw_ids)))
+        if connection is None:
+            with self.transaction() as owned_connection:
+                return self.apply_coreference_fallback(
+                    lexeme_id,
+                    ordered_ids,
+                    connection=owned_connection,
+                )
+
+        lexeme = connection.execute(
+            """SELECT default_target, working_target, verified_target,
+                      status, locked, retired_version
+               FROM lexemes WHERE id=?""",
+            (lexeme_id,),
+        ).fetchone()
+        if lexeme is None or lexeme["retired_version"] is not None:
+            raise ValueError(f"fallback requires an active lexeme: {lexeme_id}")
+
+        candidates: Dict[str, Dict[str, Any]] = {}
+
+        def add_candidate(
+            target: Any,
+            *,
+            source: str,
+            locked: bool = False,
+            verified: bool = False,
+            block_id: str | None = None,
+        ) -> None:
+            value = str(target or "").strip()
+            if not value:
+                return
+            candidate = candidates.setdefault(
+                value,
+                {
+                    "target": value,
+                    "locked": False,
+                    "verified": False,
+                    "sources": set(),
+                    "existing_sources": set(),
+                    "blocks": set(),
+                },
+            )
+            candidate["locked"] = candidate["locked"] or bool(locked)
+            candidate["verified"] = candidate["verified"] or bool(verified)
+            candidate["sources"].add(source)
+            if block_id:
+                candidate["blocks"].add(block_id)
+            else:
+                candidate["existing_sources"].add(source)
+
+        lexeme_locked = bool(lexeme["locked"])
+        lexeme_verified = str(lexeme["status"]) == "verified"
+        for field in ("default_target", "working_target", "verified_target"):
+            add_candidate(
+                lexeme[field],
+                source=f"lexeme.{field}",
+                locked=lexeme_locked,
+                verified=(field == "verified_target" or lexeme_verified),
+            )
+
+        placeholders = ",".join("?" for _ in ordered_ids)
+        mention_clause = (
+            f"OR m.id IN ({placeholders})" if ordered_ids else ""
+        )
+        concept_parameters: tuple[Any, ...] = (
+            lexeme_id,
+            *ordered_ids,
+        )
+        concept_rows = connection.execute(
+            f"""SELECT DISTINCT c.id, c.default_target, c.working_target,
+                       c.verified_target, c.status, c.locked
+                FROM concepts c
+                LEFT JOIN concept_lexemes cl
+                  ON cl.concept_id=c.id AND cl.retired_version IS NULL
+                LEFT JOIN mentions m ON m.concept_id=c.id
+                WHERE c.retired_version IS NULL
+                  AND (cl.lexeme_id=? {mention_clause})
+                ORDER BY c.id""",
+            concept_parameters,
+        ).fetchall()
+        for row in concept_rows:
+            concept_locked = bool(row["locked"])
+            concept_verified = str(row["status"]) == "verified"
+            for field in ("default_target", "working_target", "verified_target"):
+                add_candidate(
+                    row[field],
+                    source=f"concept:{row['id']}.{field}",
+                    locked=concept_locked,
+                    verified=(field == "verified_target" or concept_verified),
+                )
+
+        if ordered_ids:
+            block_rows = connection.execute(
+                f"""SELECT DISTINCT m.block_id, c.id AS concept_id,
+                           c.default_target, c.working_target,
+                           c.verified_target, c.status, c.locked
+                    FROM mentions m
+                    JOIN concepts c ON c.id=m.concept_id
+                    WHERE m.id IN ({placeholders})
+                      AND c.retired_version IS NULL
+                    ORDER BY m.block_id, c.id""",
+                ordered_ids,
+            ).fetchall()
+            for row in block_rows:
+                target = (
+                    str(row["verified_target"] or "").strip()
+                    or str(row["working_target"] or "").strip()
+                    or str(row["default_target"] or "").strip()
+                )
+                add_candidate(
+                    target,
+                    source=f"block:{row['block_id']}:concept:{row['concept_id']}",
+                    locked=bool(row["locked"]),
+                    verified=(
+                        bool(row["verified_target"])
+                        or str(row["status"]) == "verified"
+                    ),
+                    block_id=str(row["block_id"]),
+                )
+
+        ranked: list[Dict[str, Any]] = []
+        for candidate in candidates.values():
+            support_count = len(candidate["existing_sources"])
+            block_votes = len(candidate["blocks"])
+            ranked.append(
+                {
+                    "target": candidate["target"],
+                    "locked": bool(candidate["locked"]),
+                    "verified": bool(candidate["verified"]),
+                    "consistent": support_count >= 2,
+                    "support_count": support_count,
+                    "block_votes": block_votes,
+                    "sources": sorted(candidate["sources"]),
+                }
+            )
+        ranked.sort(
+            key=lambda item: (
+                -int(item["locked"]),
+                -int(item["verified"]),
+                -int(item["consistent"]),
+                -int(item["block_votes"]),
+                item["target"],
+            )
+        )
+        selected = str(ranked[0]["target"]) if ranked else ""
+        if not ranked:
+            reason = "no_candidate"
+        elif ranked[0]["locked"]:
+            reason = "locked"
+        elif ranked[0]["verified"]:
+            reason = "verified"
+        elif ranked[0]["consistent"]:
+            reason = "existing_consistent"
+        elif ranked[0]["block_votes"]:
+            reason = "affected_block_majority"
+        else:
+            reason = "unicode_order"
+
+        changed = False
+        if (
+            selected
+            and not lexeme_locked
+            and not lexeme_verified
+            and not str(lexeme["verified_target"] or "").strip()
+            and (
+                str(lexeme["default_target"] or "").strip() != selected
+                or str(lexeme["working_target"] or "").strip() != selected
+            )
+        ):
+            cursor = connection.execute(
+                """UPDATE lexemes
+                   SET default_target=?, working_target=?
+                   WHERE id=? AND retired_version IS NULL AND locked=0
+                     AND status!='verified' AND verified_target=''""",
+                (selected, selected, lexeme_id),
+            )
+            changed = bool(cursor.rowcount)
+        return {
+            "source": "fallback",
+            "selected": selected,
+            "reason": reason,
+            "changed": changed,
+            "candidates": ranked,
+        }
+
     def record_type_observation(
         self,
         lexeme_id: str,

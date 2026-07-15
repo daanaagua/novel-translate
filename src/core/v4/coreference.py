@@ -12,7 +12,8 @@ import hashlib
 import json
 import re
 import sqlite3
-from typing import Any, Iterable, Mapping, Sequence
+import time
+from typing import Any, Callable, Iterable, Mapping, Sequence
 
 from pydantic import BaseModel, ValidationError
 
@@ -426,8 +427,28 @@ _TITLE_DIRECTORY_BLOCK_KINDS = {
 class CoreferenceCoordinator:
     """Freeze same-lexeme cases and coordinate their local protocol."""
 
-    def __init__(self, database: V4Database):
+    def __init__(
+        self,
+        database: V4Database,
+        *,
+        llm_factory_a: Callable[[], Any] | None = None,
+        llm_factory_b: Callable[[], Any] | None = None,
+        max_attempts: int = 2,
+    ):
+        if (
+            not isinstance(max_attempts, int)
+            or isinstance(max_attempts, bool)
+            or max_attempts < 1
+        ):
+            raise ValueError("max_attempts must be an integer greater than zero")
+        if llm_factory_a is not None and not callable(llm_factory_a):
+            raise ValueError("llm_factory_a must be callable")
+        if llm_factory_b is not None and not callable(llm_factory_b):
+            raise ValueError("llm_factory_b must be callable")
         self.database = database
+        self.llm_factory_a = llm_factory_a
+        self.llm_factory_b = llm_factory_b
+        self.max_attempts = max_attempts
 
     def freeze_cases(self, max_cases: int | None = None) -> tuple[CoreferenceCase, ...]:
         if max_cases is not None:
@@ -1307,7 +1328,7 @@ class CoreferenceCoordinator:
                       anchor_members_json
                FROM coreference_decisions
                WHERE lexeme_id=? AND retired_version IS NULL
-                     AND relation='same'
+                     AND relation='same' AND decision_source!='dual_model'
                ORDER BY id""",
             (case.lexeme_id,),
         ).fetchall():
@@ -1751,6 +1772,556 @@ class CoreferenceCoordinator:
                 "active coreference payload collides with protected decision"
             )
         return (relation, rule)
+
+    @staticmethod
+    def _raw_response_text(raw_response: Any) -> str:
+        if isinstance(raw_response, bytes):
+            return raw_response.decode("utf-8", errors="replace")
+        if isinstance(raw_response, str):
+            return raw_response
+        if isinstance(raw_response, BaseModel):
+            return raw_response.model_dump_json()
+        if isinstance(raw_response, Mapping):
+            return json.dumps(raw_response, ensure_ascii=False, sort_keys=True)
+        return str(raw_response)
+
+    @staticmethod
+    def _cached_reason(votes_json: Any) -> str:
+        try:
+            votes = json.loads(str(votes_json or "[]"))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return "model_agreement"
+        if not isinstance(votes, list):
+            return "model_agreement"
+        for vote in votes:
+            if (
+                isinstance(vote, Mapping)
+                and vote.get("source") == "dual_model"
+                and isinstance(vote.get("reason"), str)
+                and str(vote["reason"]).strip()
+            ):
+                return str(vote["reason"])
+        return "model_agreement"
+
+    def _cached_dual_decision(
+        self,
+        case: CoreferenceCase,
+        decision_payload_hash: str,
+        *,
+        connection: sqlite3.Connection | None = None,
+    ) -> tuple[str, str] | None:
+        query = """SELECT relation, votes_json FROM coreference_decisions
+                   WHERE payload_hash=? AND lexeme_id=?
+                     AND decision_source='dual_model'
+                     AND retired_version IS NULL"""
+        if connection is None:
+            with closing(self.database.connect()) as owned_connection:
+                row = owned_connection.execute(
+                    query, (decision_payload_hash, case.lexeme_id)
+                ).fetchone()
+        else:
+            row = connection.execute(
+                query, (decision_payload_hash, case.lexeme_id)
+            ).fetchone()
+        if row is None:
+            return None
+        return str(row["relation"]), self._cached_reason(row["votes_json"])
+
+    def _has_matching_dual_same(self, case: CoreferenceCase) -> bool:
+        mention_ids = {mention.mention_id for mention in case.mentions}
+        evidence_ids = {mention.evidence_id for mention in case.mentions}
+        with closing(self.database.connect()) as connection:
+            rows = connection.execute(
+                """SELECT anchor_members_json, evidence_ids_json
+                   FROM coreference_decisions
+                   WHERE lexeme_id=? AND decision_source='dual_model'
+                     AND relation='same' AND retired_version IS NULL""",
+                (case.lexeme_id,),
+            ).fetchall()
+        return any(
+            _anchor_member_ids(row["anchor_members_json"]) == mention_ids
+            and _anchor_member_ids(row["evidence_ids_json"]) == evidence_ids
+            for row in rows
+        )
+
+    def _model_clients(self) -> tuple[Any, Any, tuple[str, str]]:
+        if self.llm_factory_a is None or self.llm_factory_b is None:
+            raise RuntimeError(
+                "dual-model coreference requires llm_factory_a and llm_factory_b"
+            )
+        client_a = self.llm_factory_a()
+        client_b = self.llm_factory_b()
+        if client_a is client_b:
+            raise ValueError("coreference sides require independent clients")
+        try:
+            raw_names = (
+                client_a.get_model("coreference"),
+                client_b.get_model("coreference"),
+            )
+        except Exception as exc:
+            raise ValueError("coreference model names are unavailable") from exc
+        names = _validated_model_names(raw_names)
+        return client_a, client_b, names
+
+    def _call_model_side(
+        self,
+        *,
+        side: str,
+        client: Any,
+        model: str,
+        case: CoreferenceCase,
+        frozen_payload: bytes,
+        frozen_payload_hash: str,
+        decision_payload_hash: str,
+    ) -> tuple[dict[str, Any] | None, list[dict[str, Any]]]:
+        messages = [
+            {
+                "role": "system",
+                "content": (
+                    "Return only the strict coreference JSON response for the "
+                    "supplied frozen case. Use every supplied short mention id."
+                ),
+            },
+            {
+                "role": "user",
+                "content": frozen_payload.decode("utf-8"),
+            },
+        ]
+        attempts: list[dict[str, Any]] = []
+        accepted_vote: dict[str, Any] | None = None
+        for attempt in range(1, self.max_attempts + 1):
+            started = time.perf_counter()
+            raw_response: Any = ""
+            raw_text = ""
+            parsed: dict[str, Any] | None = None
+            error: str | None = None
+            try:
+                raw_response = client.chat(
+                    messages=[dict(message) for message in messages],
+                    purpose="coreference",
+                    temperature=0.0,
+                    json_mode=True,
+                    stream=False,
+                )
+                raw_text = self._raw_response_text(raw_response)
+                response = self.validate_response(raw_response, [case])
+                vote = response.votes[0]
+                parsed = vote.model_dump(mode="json")
+                accepted_vote = parsed
+            except Exception as exc:
+                raw_text = self._raw_response_text(raw_response)
+                error = f"{type(exc).__name__}: {exc}"
+            attempts.append(
+                {
+                    "side": side,
+                    "model": model,
+                    "attempt": attempt,
+                    "request": {
+                        "messages": [dict(message) for message in messages],
+                        "json_mode": True,
+                        "side": side,
+                        "model": model,
+                        "payload_hash": frozen_payload_hash,
+                        "decision_payload_hash": decision_payload_hash,
+                        "protocol_version": COREFERENCE_PROTOCOL_VERSION,
+                    },
+                    "raw_response": raw_text,
+                    "parsed": parsed,
+                    "accepted": accepted_vote is not None,
+                    "elapsed_ms": int((time.perf_counter() - started) * 1000),
+                    "error": error,
+                }
+            )
+            if accepted_vote is not None:
+                break
+        return accepted_vote, attempts
+
+    @staticmethod
+    def _combined_model_relation(
+        vote_a: Mapping[str, Any] | None,
+        vote_b: Mapping[str, Any] | None,
+    ) -> tuple[str, str]:
+        if vote_a is None or vote_b is None:
+            return "uncertain", "model_protocol_failure"
+        relations = (str(vote_a["relation"]), str(vote_b["relation"]))
+        if "uncertain" in relations:
+            return "uncertain", "model_uncertain"
+        if relations[0] != relations[1]:
+            return "uncertain", "model_conflict"
+        return relations[0], "model_agreement"
+
+    def _related_active_concepts(
+        self,
+        case: CoreferenceCase,
+        connection: sqlite3.Connection,
+    ) -> set[str]:
+        mention_ids = tuple(mention.mention_id for mention in case.mentions)
+        placeholders = ",".join("?" for _ in mention_ids)
+        found = {
+            str(row["id"])
+            for row in connection.execute(
+                f"""SELECT DISTINCT c.id
+                    FROM concepts c
+                    LEFT JOIN mentions m ON m.concept_id=c.id
+                    WHERE c.retired_version IS NULL
+                      AND (m.id IN ({placeholders})
+                           OR c.anchor_mention_id IN ({placeholders}))
+                    ORDER BY c.id""",
+                (*mention_ids, *mention_ids),
+            ).fetchall()
+        }
+        payload_ids = {
+            anchor_id
+            for mention in case.mentions
+            for anchor_id in mention.concept_anchor_ids
+        }
+        if payload_ids:
+            anchor_placeholders = ",".join("?" for _ in payload_ids)
+            found.update(
+                str(row["id"])
+                for row in connection.execute(
+                    f"""SELECT id FROM concepts
+                        WHERE id IN ({anchor_placeholders})
+                          AND retired_version IS NULL
+                        ORDER BY id""",
+                    tuple(sorted(payload_ids)),
+                ).fetchall()
+            )
+        return found
+
+    def _safe_model_same_binding(
+        self,
+        case: CoreferenceCase,
+        connection: sqlite3.Connection,
+    ) -> str | None:
+        related = self._related_active_concepts(case, connection)
+        if len(related) > 1:
+            return None
+        mention_ids = tuple(mention.mention_id for mention in case.mentions)
+        try:
+            with self.database._method_savepoint(connection, "dual_model_same"):
+                target = next(iter(related), None)
+                if target is None:
+                    target = self.database.ensure_concept_for_anchor(
+                        case.lexeme_id,
+                        self._stable_anchor_mention_id(case),
+                        connection=connection,
+                    )
+                placeholders = ",".join("?" for _ in mention_ids)
+                expected_changes = sum(
+                    row["concept_id"] != target
+                    for row in connection.execute(
+                        f"""SELECT concept_id FROM mentions
+                            WHERE id IN ({placeholders}) ORDER BY id""",
+                        mention_ids,
+                    ).fetchall()
+                )
+                changed = self.database.bind_mentions(
+                    target, mention_ids, connection=connection
+                )
+                if changed != expected_changes:
+                    raise _ProtectedBindingConflict(
+                        "dual-model same cannot safely bind every mention"
+                    )
+                return target
+        except (_ProtectedBindingConflict, ValueError):
+            return None
+
+    @staticmethod
+    def _model_vote_payload(
+        side: str,
+        model: str,
+        vote: Mapping[str, Any] | None,
+        attempts: Sequence[Mapping[str, Any]],
+    ) -> dict[str, Any]:
+        if vote is None:
+            return {
+                "source": "model",
+                "side": side,
+                "model": model,
+                "relation": "uncertain",
+                "reason": "model_protocol_failure",
+                "attempts": len(attempts),
+            }
+        return {
+            "source": "model",
+            "side": side,
+            "model": model,
+            "relation": str(vote["relation"]),
+            "mention_ids": list(vote["mention_ids"]),
+            "confidence": float(vote["confidence"]),
+            "rationale": str(vote["rationale"]),
+            "attempts": len(attempts),
+        }
+
+    def resolve_dual_model(
+        self,
+        case: CoreferenceCase,
+    ) -> tuple[str, str]:
+        """Resolve one case after deterministic rules, never creating a queue item."""
+
+        preflight = self._deterministic_relation(case)
+        if (
+            preflight == ("same", "same_anchor_or_duplicate_subset")
+            and self._has_matching_dual_same(case)
+        ):
+            _, _, model_names = self._model_clients()
+            cached = self._cached_dual_decision(
+                case, cache_key(case, model_names)
+            )
+            if cached is not None:
+                return cached
+        deterministic = self.resolve_deterministic(case)
+        if deterministic[0] is not None:
+            return deterministic[0], str(deterministic[1])
+        return self._resolve_dual_models_only(case)
+
+    def _resolve_dual_models_only(
+        self,
+        case: CoreferenceCase,
+    ) -> tuple[str, str]:
+        client_a, client_b, model_names = self._model_clients()
+        decision_payload_hash = cache_key(case, model_names)
+        cached = self._cached_dual_decision(case, decision_payload_hash)
+        if cached is not None:
+            return cached
+
+        frozen_payload_a, frozen_payload_b = self.model_payloads(
+            case, model_names
+        )
+        if frozen_payload_a != frozen_payload_b:
+            raise RuntimeError("dual-model payload bytes must be identical")
+        frozen_payload_hash = hashlib.sha256(frozen_payload_a).hexdigest()
+        vote_a, attempts_a = self._call_model_side(
+            side="A",
+            client=client_a,
+            model=model_names[0],
+            case=case,
+            frozen_payload=frozen_payload_a,
+            frozen_payload_hash=frozen_payload_hash,
+            decision_payload_hash=decision_payload_hash,
+        )
+        vote_b, attempts_b = self._call_model_side(
+            side="B",
+            client=client_b,
+            model=model_names[1],
+            case=case,
+            frozen_payload=frozen_payload_b,
+            frozen_payload_hash=frozen_payload_hash,
+            decision_payload_hash=decision_payload_hash,
+        )
+        for side, vote, attempts in (
+            ("A", vote_a, attempts_a),
+            ("B", vote_b, attempts_b),
+        ):
+            if vote is None and attempts:
+                attempts[-1]["parsed"] = {
+                    "side": side,
+                    "relation": "uncertain",
+                    "reason": "model_protocol_failure",
+                    "attempts": len(attempts),
+                }
+        relation, reason = self._combined_model_relation(vote_a, vote_b)
+        model_votes = [
+            self._model_vote_payload(
+                "A", model_names[0], vote_a, attempts_a
+            ),
+            self._model_vote_payload(
+                "B", model_names[1], vote_b, attempts_b
+            ),
+        ]
+        model_votes.append(
+            {
+                "source": "dual_model",
+                "relation": relation,
+                "reason": reason,
+                "models": list(model_names),
+                "protocol_version": COREFERENCE_PROTOCOL_VERSION,
+                "frozen_payload_hash": frozen_payload_hash,
+            }
+        )
+
+        mention_ids = tuple(mention.mention_id for mention in case.mentions)
+        evidence_ids = tuple(mention.evidence_id for mention in case.mentions)
+        with self.database.transaction() as connection:
+            with self.database._method_savepoint(
+                connection, "dual_model_resolution"
+            ):
+                # Revalidate every persisted identity immediately before writes.
+                evaluation = self._deterministic_evaluation(case, connection)
+                if evaluation["relation"] is not None:
+                    return self._resolve_deterministic_in_transaction(
+                        case, connection
+                    )
+                raced = self._cached_dual_decision(
+                    case,
+                    decision_payload_hash,
+                    connection=connection,
+                )
+                if raced is not None:
+                    return raced
+
+                target_concept_id = None
+                if relation == "same":
+                    target_concept_id = self._safe_model_same_binding(
+                        case, connection
+                    )
+
+                fallback = None
+                if relation == "uncertain":
+                    fallback = self.database.apply_coreference_fallback(
+                        case.lexeme_id,
+                        mention_ids,
+                        connection=connection,
+                    )
+                    model_votes.append(fallback)
+
+                decision_id = stable_id(
+                    "coref", decision_payload_hash, length=24
+                )
+                collision = connection.execute(
+                    "SELECT payload_hash FROM coreference_decisions WHERE id=?",
+                    (decision_id,),
+                ).fetchone()
+                if (
+                    collision is not None
+                    and str(collision["payload_hash"]) != decision_payload_hash
+                ):
+                    raise RuntimeError(
+                        f"coreference decision id collision: {decision_id}"
+                    )
+                version = int(
+                    connection.execute(
+                        "SELECT MAX(id) FROM knowledge_versions"
+                    ).fetchone()[0]
+                )
+                confidences = [
+                    float(vote["confidence"])
+                    for vote in (vote_a, vote_b)
+                    if vote is not None
+                ]
+                confidence = (
+                    min(confidences)
+                    if relation != "uncertain" and len(confidences) == 2
+                    else 0.0
+                )
+                connection.execute(
+                    """INSERT INTO coreference_decisions(
+                           id, lexeme_id, left_anchor_type, left_anchor_id,
+                           right_anchor_type, right_anchor_id, relation,
+                           decision_source, confidence, locked, votes_json,
+                           evidence_ids_json, anchor_members_json, payload_hash,
+                           created_version, created_at)
+                       VALUES(?, ?, ?, ?, 'mention_set', ?, ?, 'dual_model', ?,
+                              0, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        decision_id,
+                        case.lexeme_id,
+                        (
+                            "concept"
+                            if target_concept_id is not None
+                            else "mention_set"
+                        ),
+                        target_concept_id or case.mention_set_id,
+                        case.mention_set_id,
+                        relation,
+                        confidence,
+                        json.dumps(
+                            model_votes, ensure_ascii=False, sort_keys=True
+                        ),
+                        json.dumps(sorted(evidence_ids)),
+                        json.dumps(sorted(mention_ids)),
+                        decision_payload_hash,
+                        version,
+                        utc_now(),
+                    ),
+                )
+                for attempt in (*attempts_a, *attempts_b):
+                    self.database.record_audit_call(
+                        run_id=None,
+                        block_id=None,
+                        purpose="dual_model_coreference",
+                        model=str(attempt["model"]),
+                        knowledge_version=case.knowledge_version,
+                        request=dict(attempt["request"]),
+                        raw_response=str(attempt["raw_response"]),
+                        parsed=(
+                            dict(attempt["parsed"])
+                            if attempt["parsed"] is not None
+                            else None
+                        ),
+                        accepted=bool(attempt["accepted"]),
+                        attempts=int(attempt["attempt"]),
+                        elapsed_ms=int(attempt["elapsed_ms"]),
+                        error=(
+                            str(attempt["error"])
+                            if attempt["error"] is not None
+                            else None
+                        ),
+                        connection=connection,
+                    )
+                if fallback is not None:
+                    fallback_audit = dict(fallback)
+                    fallback_audit["decision_reason"] = reason
+                    self.database.record_audit_call(
+                        run_id=None,
+                        block_id=None,
+                        purpose="coreference_fallback",
+                        model="none",
+                        knowledge_version=case.knowledge_version,
+                        request={
+                            "actor_type": "fallback",
+                            "case_id": case.case_id,
+                            "lexeme_id": case.lexeme_id,
+                            "payload_hash": frozen_payload_hash,
+                            "decision_payload_hash": decision_payload_hash,
+                        },
+                        raw_response="",
+                        parsed=fallback_audit,
+                        accepted=True,
+                        attempts=1,
+                        elapsed_ms=0,
+                        error=None,
+                        connection=connection,
+                        archive_payload=False,
+                    )
+        return relation, reason
+
+    def run(self, max_cases: int | None = None) -> dict[str, int]:
+        """Resolve frozen cases without producing blocking human work."""
+
+        cases = self.freeze_cases(max_cases=max_cases)
+        summary = {
+            "cases": len(cases),
+            "deterministic_merges": 0,
+            "model_merges": 0,
+            "different": 0,
+            "non_entity": 0,
+            "uncertain": 0,
+            "protocol_failures": 0,
+            "fallbacks": 0,
+        }
+        for case in cases:
+            relation, rule = self.resolve_dual_model(case)
+            model_result = rule in {
+                "model_agreement",
+                "model_conflict",
+                "model_uncertain",
+                "model_protocol_failure",
+            }
+            if relation == "same":
+                key = "model_merges" if model_result else "deterministic_merges"
+                summary[key] += 1
+            elif relation == "different":
+                summary["different"] += 1
+            elif relation == "non_entity":
+                summary["non_entity"] += 1
+            elif relation == "uncertain":
+                summary["uncertain"] += 1
+                summary["fallbacks"] += 1
+                if rule == "model_protocol_failure":
+                    summary["protocol_failures"] += 1
+        return summary
 
     @staticmethod
     def payload_bytes(case: CoreferenceCase) -> bytes:
