@@ -66,9 +66,36 @@ def test_coordination_span_supports_general_coordinators():
     assert "coordination" in coordinated.risk_flags
 
 
+def test_capitalized_function_word_stops_phrase_expansion():
+    block = make_block("Drotte I waited. He left.")
+
+    candidates = LexicalCandidateExtractor([block], max_candidates=80).extract(block)
+
+    assert "Drotte I" not in {candidate.original_text for candidate in candidates}
+
+
 def test_extract_respects_max_candidates_for_overlapping_spans():
     block = make_block("Drotte and Roche waited beside the Corpse Door.")
 
     candidates = LexicalCandidateExtractor([block], max_candidates=3).extract(block)
 
     assert len(candidates) == 3
+
+
+def test_competition_marking_only_receives_capped_candidate_set():
+    names = [
+        f"Name{chr(ord('A') + index // 26)}{chr(ord('A') + index % 26)}"
+        for index in range(120)
+    ]
+    block = make_block(" ".join(f"{name}." for name in names))
+    marked_lengths = []
+
+    class RecordingExtractor(LexicalCandidateExtractor):
+        def _mark_candidate_risks(self, candidates):
+            marked_lengths.append(len(candidates))
+            return super()._mark_candidate_risks(candidates)
+
+    candidates = RecordingExtractor([block], max_candidates=80).extract(block)
+
+    assert len(candidates) == 80
+    assert marked_lengths == [80]

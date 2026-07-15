@@ -19,6 +19,23 @@ WORD_RE = re.compile(
 SENTENCE_END_RE = re.compile(r"[.!?]+")
 COORDINATORS = {"and", "or", "nor"}
 CONNECTORS = COORDINATORS | {"of", "for", "the", "to", "de", "del", "la", "van", "von"}
+GRAMMATICAL_FUNCTION_WORDS = {
+    "a", "an", "the", "this", "that", "these", "those", "all", "any", "both",
+    "each", "either", "every", "few", "many", "much", "neither", "no", "some",
+    "i", "me", "my", "mine", "myself", "we", "us", "our", "ours", "ourselves",
+    "you", "your", "yours", "yourself", "yourselves", "he", "him", "his", "himself",
+    "she", "her", "hers", "herself", "it", "its", "itself", "they", "them", "their",
+    "theirs", "themselves", "who", "whom", "whose", "what", "which",
+    "about", "above", "after", "against", "along", "among", "around", "as", "at",
+    "before", "below", "beside", "between", "by", "during", "for", "from", "in",
+    "into", "of", "off", "on", "out", "over", "since", "through", "to", "under",
+    "until", "up", "upon", "with", "without",
+    "am", "are", "is", "was", "were", "be", "being", "been", "do", "does", "did",
+    "done", "have", "has", "had", "can", "could", "may", "might", "must", "shall",
+    "should", "will", "would",
+    "and", "or", "but", "nor", "yet", "so", "if", "then", "else", "although",
+    "because", "though", "while", "when", "where", "whether", "unless",
+}
 NUMBER_WORDS = {
     "one", "two", "three", "four", "five", "six", "seven", "eight", "nine", "ten",
     "hundred", "thousand", "million", "first", "second", "third",
@@ -246,6 +263,35 @@ class LexicalCandidateExtractor:
             score=score,
         )
 
+    @staticmethod
+    def _mark_candidate_risks(
+        candidates: Sequence[LexicalCandidate],
+    ) -> List[LexicalCandidate]:
+        flagged: List[LexicalCandidate] = []
+        for candidate in candidates:
+            flags = set(candidate.risk_flags)
+            words = lexical_key(candidate.original_text).split()
+            if any(word in COORDINATORS for word in words[1:-1]):
+                flags.add("coordination")
+            if any(
+                other.paragraph_id == candidate.paragraph_id
+                and other.id != candidate.id
+                and (
+                    (
+                        other.start_offset <= candidate.start_offset
+                        and candidate.end_offset <= other.end_offset
+                    )
+                    or (
+                        candidate.start_offset <= other.start_offset
+                        and other.end_offset <= candidate.end_offset
+                    )
+                )
+                for other in candidates
+            ):
+                flags.add("span_competition")
+            flagged.append(replace(candidate, risk_flags=tuple(sorted(flags))))
+        return flagged
+
     def extract(self, block: V4Block) -> List[LexicalCandidate]:
         by_span: Dict[tuple[str, int, int, str], LexicalCandidate] = {}
 
@@ -307,7 +353,10 @@ class LexicalCandidateExtractor:
                             break
                         next_text = tokens[last].group(0)
                         next_key = lexical_key(next_text)
-                        if next_text[0].isupper():
+                        if (
+                            next_text[0].isupper()
+                            and next_key not in GRAMMATICAL_FUNCTION_WORDS
+                        ):
                             content_count += 1
                             last += 1
                             continue
@@ -356,33 +405,8 @@ class LexicalCandidateExtractor:
                     if candidate:
                         retain(candidate)
 
-        candidates = list(by_span.values())
-        flagged: List[LexicalCandidate] = []
-        for candidate in candidates:
-            flags = set(candidate.risk_flags)
-            words = lexical_key(candidate.original_text).split()
-            if any(word in COORDINATORS for word in words[1:-1]):
-                flags.add("coordination")
-            if any(
-                other.paragraph_id == candidate.paragraph_id
-                and other.id != candidate.id
-                and (
-                    (
-                        other.start_offset <= candidate.start_offset
-                        and candidate.end_offset <= other.end_offset
-                    )
-                    or (
-                        candidate.start_offset <= other.start_offset
-                        and other.end_offset <= candidate.end_offset
-                    )
-                )
-                for other in candidates
-            ):
-                flags.add("span_competition")
-            flagged.append(replace(candidate, risk_flags=tuple(sorted(flags))))
-
         ordered = sorted(
-            flagged,
+            by_span.values(),
             key=lambda item: (-item.score, item.start_offset, -len(item.original_text)),
         )
-        return ordered[: self.max_candidates]
+        return self._mark_candidate_risks(ordered[: self.max_candidates])
