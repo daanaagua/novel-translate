@@ -86,6 +86,15 @@ class KnowledgeSnapshotError(RuntimeError):
         super().__init__(f"invalid rendering rule {rule_id}: {detail}")
 
 
+class ConceptAnchorConflictError(RuntimeError, ValueError):
+    """An immutable mention anchor prevents safe concept creation."""
+
+
+MAX_COREFERENCE_FALLBACK_CANDIDATES = 16
+MAX_COREFERENCE_FALLBACK_SOURCES = 8
+MAX_COREFERENCE_FALLBACK_TEXT_CHARS = 120
+
+
 class V4Database:
     """All writes happen through this object on the coordinator thread."""
 
@@ -435,13 +444,13 @@ class V4Database:
             ).fetchall()
         ]
         if competing_owners:
-            raise RuntimeError(
+            raise ConceptAnchorConflictError(
                 f"concept anchor collision for mention {anchor_mention_id}: "
                 f"{', '.join(competing_owners)}"
             )
         if existing is not None:
             if existing["retired_version"] is not None:
-                raise ValueError(
+                raise ConceptAnchorConflictError(
                     f"stable anchor concept is retired and cannot be revived: "
                     f"{concept_id}"
                 )
@@ -449,7 +458,7 @@ class V4Database:
                 str(existing["primary_lexeme_id"] or "") != lexeme_id
                 or existing["anchor_mention_id"] != anchor_mention_id
             ):
-                raise RuntimeError(
+                raise ConceptAnchorConflictError(
                     f"stable concept id collision violates immutable anchor: "
                     f"{concept_id}"
                 )
@@ -463,13 +472,13 @@ class V4Database:
                         expected_lexeme_id=lexeme_id,
                     )
                 if bound_canonical != concept_id:
-                    raise RuntimeError(
+                    raise ConceptAnchorConflictError(
                         "anchor mention binding disagrees with its immutable "
                         f"concept owner: {anchor_mention_id}"
                     )
         else:
             if mention["concept_id"] is not None:
-                raise RuntimeError(
+                raise ConceptAnchorConflictError(
                     f"anchor mention already belongs to a different concept: "
                     f"{mention['concept_id']}"
                 )
@@ -482,7 +491,7 @@ class V4Database:
             (concept_id, lexeme_id),
         ).fetchone()
         if conflicting_primary is not None:
-            raise RuntimeError(
+            raise ConceptAnchorConflictError(
                 f"stable concept primary lexeme collision: {concept_id}"
             )
         active_link = connection.execute(
@@ -498,7 +507,7 @@ class V4Database:
             (concept_id, lexeme_id),
         ).fetchone()
         if existing is not None and active_link is None and retired_link is not None:
-            raise ValueError(
+            raise ConceptAnchorConflictError(
                 f"retired concept/lexeme ownership cannot be revived: {concept_id}"
             )
 
@@ -842,6 +851,33 @@ class V4Database:
         if lexeme is None or lexeme["retired_version"] is not None:
             raise ValueError(f"fallback requires an active lexeme: {lexeme_id}")
 
+        placeholders = ",".join("?" for _ in ordered_ids)
+        if ordered_ids:
+            active_mentions = connection.execute(
+                f"""SELECT m.id, m.lexeme_id
+                    FROM mentions m
+                    JOIN blocks b ON b.id=m.block_id
+                    JOIN source_editions se
+                      ON se.id=b.source_edition_id AND se.active=1
+                    JOIN lexemes l
+                      ON l.id=m.lexeme_id AND l.retired_version IS NULL
+                    WHERE m.id IN ({placeholders})
+                    ORDER BY m.id""",
+                ordered_ids,
+            ).fetchall()
+            active_by_id = {
+                int(row["id"]): str(row["lexeme_id"])
+                for row in active_mentions
+            }
+            if set(active_by_id) != set(ordered_ids):
+                raise ValueError(
+                    "fallback mentions must exist in the active source edition"
+                )
+            if any(value != lexeme_id for value in active_by_id.values()):
+                raise ValueError(
+                    "fallback mentions must belong to the requested lexeme"
+                )
+
         candidates: Dict[str, Dict[str, Any]] = {}
 
         def add_candidate(
@@ -884,7 +920,6 @@ class V4Database:
                 verified=(field == "verified_target"),
             )
 
-        placeholders = ",".join("?" for _ in ordered_ids)
         mention_clause = (
             f"OR m.id IN ({placeholders})" if ordered_ids else ""
         )
@@ -964,7 +999,8 @@ class V4Database:
                 item["target"],
             )
         )
-        selected = str(ranked[0]["target"]) if ranked else ""
+        selected_candidate = ranked[0] if ranked else None
+        selected = str(selected_candidate["target"]) if selected_candidate else ""
         if not ranked:
             reason = "no_candidate"
         elif ranked[0]["locked"]:
@@ -997,12 +1033,88 @@ class V4Database:
                 (selected, selected, lexeme_id),
             )
             changed = bool(cursor.rowcount)
+        digest = hashlib.sha256()
+        for candidate in ranked:
+            digest.update(
+                json.dumps(
+                    candidate,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode("utf-8")
+            )
+            digest.update(b"\n")
+
+        def bounded_text(value: Any) -> str:
+            text = str(value)
+            if len(text) <= MAX_COREFERENCE_FALLBACK_TEXT_CHARS:
+                return text
+            return text[: MAX_COREFERENCE_FALLBACK_TEXT_CHARS - 1] + "…"
+
+        bounded_candidates: list[Dict[str, Any]] = []
+        truncated = len(ranked) > MAX_COREFERENCE_FALLBACK_CANDIDATES
+        for candidate in ranked[:MAX_COREFERENCE_FALLBACK_CANDIDATES]:
+            all_sources = list(candidate["sources"])
+            bounded_sources = [
+                bounded_text(source)
+                for source in all_sources[:MAX_COREFERENCE_FALLBACK_SOURCES]
+            ]
+            target = bounded_text(candidate["target"])
+            target_truncated = target != candidate["target"]
+            source_text_truncated = any(
+                source != bounded
+                for source, bounded in zip(all_sources, bounded_sources)
+            )
+            truncated = (
+                truncated
+                or len(all_sources) > MAX_COREFERENCE_FALLBACK_SOURCES
+                or target_truncated
+                or source_text_truncated
+            )
+            bounded_candidates.append(
+                {
+                    "target": target,
+                    "target_sha256": hashlib.sha256(
+                        str(candidate["target"]).encode("utf-8")
+                    ).hexdigest(),
+                    "locked": bool(candidate["locked"]),
+                    "verified": bool(candidate["verified"]),
+                    "consistent": bool(candidate["consistent"]),
+                    "support_count": int(candidate["support_count"]),
+                    "block_votes": int(candidate["block_votes"]),
+                    "sources": bounded_sources,
+                    "total_sources": len(all_sources),
+                    "omitted_sources": max(
+                        0, len(all_sources) - MAX_COREFERENCE_FALLBACK_SOURCES
+                    ),
+                }
+            )
+
         return {
             "source": "fallback",
-            "selected": selected,
+            "selected": bounded_text(selected),
+            "selected_sha256": hashlib.sha256(
+                selected.encode("utf-8")
+            ).hexdigest(),
             "reason": reason,
             "changed": changed,
-            "candidates": ranked,
+            "candidates": bounded_candidates,
+            "total_candidates": len(ranked),
+            "omitted_candidates": max(
+                0, len(ranked) - MAX_COREFERENCE_FALLBACK_CANDIDATES
+            ),
+            "selected_block_votes": (
+                int(selected_candidate["block_votes"])
+                if selected_candidate is not None
+                else 0
+            ),
+            "selected_support_count": (
+                int(selected_candidate["support_count"])
+                if selected_candidate is not None
+                else 0
+            ),
+            "payload_hash": digest.hexdigest(),
+            "truncated": truncated,
         }
 
     def record_type_observation(

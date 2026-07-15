@@ -3607,6 +3607,114 @@ def test_dual_model_fallback_block_majority_precedes_unicode_order(tmp_path):
     assert result["reason"] == "affected_block_majority"
 
 
+def test_dual_model_fallback_rejects_cross_lexeme_mentions_atomically(tmp_path):
+    database, lexeme_id, mention_ids, _, _ = _coreference_case(tmp_path)
+    john_lexeme_id = database.ensure_lexeme("John")
+    john_mention_id, _ = _insert_coreference_mention(
+        database,
+        john_lexeme_id,
+        paragraph_id="P099",
+        evidence_quote="John",
+        source_form="John",
+    )
+    with database.transaction() as connection:
+        connection.execute(
+            """UPDATE lexemes SET default_target='保留', working_target='保留'
+               WHERE id=?""",
+            (lexeme_id,),
+        )
+    with closing(database.connect()) as connection:
+        audits_before = connection.execute(
+            "SELECT COUNT(*) FROM audit_calls"
+        ).fetchone()[0]
+
+    with pytest.raises(ValueError, match="lexeme|mention"):
+        database.apply_coreference_fallback(
+            lexeme_id,
+            [mention_ids[0], john_mention_id, mention_ids[0]],
+        )
+
+    with closing(database.connect()) as connection:
+        target = connection.execute(
+            """SELECT default_target, working_target FROM lexemes
+               WHERE id=?""",
+            (lexeme_id,),
+        ).fetchone()
+        audits_after = connection.execute(
+            "SELECT COUNT(*) FROM audit_calls"
+        ).fetchone()[0]
+    assert tuple(target) == ("保留", "保留")
+    assert audits_after == audits_before
+
+
+def test_dual_model_fallback_keeps_large_candidate_evidence_bounded(tmp_path):
+    database, lexeme_id, _, _, _ = _coreference_case(tmp_path)
+    with database.transaction() as connection:
+        version = connection.execute(
+            "SELECT MAX(id) FROM knowledge_versions"
+        ).fetchone()[0]
+        for index in range(2_000):
+            concept_id = f"concept-scale-{index:04d}"
+            target = "WINNER" if index < 40 else f"候选-{index:04d}"
+            connection.execute(
+                """INSERT INTO concepts(
+                       id, kind, canonical_source, default_target,
+                       primary_lexeme_id, created_version, created_at)
+                   VALUES(?, 'person', ?, ?, ?, ?,
+                          '2000-01-01T00:00:00+00:00')""",
+                (concept_id, concept_id, target, lexeme_id, version),
+            )
+            connection.execute(
+                """INSERT INTO concept_lexemes(
+                       concept_id, lexeme_id, role, confidence, status,
+                       created_version, created_at)
+                   VALUES(?, ?, 'primary', 1.0, 'provisional', ?,
+                          '2000-01-01T00:00:00+00:00')""",
+                (concept_id, lexeme_id, version),
+            )
+    case = CoreferenceCoordinator(database).freeze_cases()[0]
+    coordinator, _, _ = _dual_model_coordinator(
+        database,
+        case,
+        [_dual_model_response(case, "uncertain")],
+        [_dual_model_response(case, "uncertain")],
+    )
+
+    assert coordinator.resolve_dual_model(case)[0] == "uncertain"
+
+    with closing(database.connect()) as connection:
+        target = connection.execute(
+            "SELECT working_target FROM lexemes WHERE id=?", (lexeme_id,)
+        ).fetchone()[0]
+        decision = connection.execute(
+            """SELECT votes_json, LENGTH(CAST(votes_json AS BLOB)) AS bytes
+               FROM coreference_decisions"""
+        ).fetchone()
+        fallback_audit = connection.execute(
+            """SELECT parsed_json, LENGTH(CAST(parsed_json AS BLOB)) AS bytes
+               FROM audit_calls WHERE purpose='coreference_fallback'"""
+        ).fetchone()
+        blocking = connection.execute(
+            "SELECT COUNT(*) FROM human_queue WHERE severity='blocking'"
+        ).fetchone()[0]
+    votes = json.loads(decision["votes_json"])
+    fallback = next(vote for vote in votes if vote.get("source") == "fallback")
+    compact_audit = json.loads(fallback_audit["parsed_json"])
+    assert target == fallback["selected"] == "WINNER"
+    assert fallback["reason"] == "existing_consistent"
+    assert fallback["total_candidates"] == 1_961
+    assert fallback["omitted_candidates"] > 0
+    assert len(fallback["candidates"]) <= 32
+    assert max(len(item["sources"]) for item in fallback["candidates"]) <= 16
+    assert fallback["payload_hash"]
+    assert fallback["selected_block_votes"] == 0
+    assert decision["bytes"] <= 64 * 1024
+    assert fallback_audit["bytes"] <= 8 * 1024
+    assert "candidates" not in compact_audit
+    assert compact_audit["payload_hash"] == fallback["payload_hash"]
+    assert blocking == 0
+
+
 def test_dual_model_run_summary_is_exact_and_honors_max_cases(tmp_path):
     database, _, _, _, case = _coreference_case(tmp_path)
     coordinator, clients_a, clients_b = _dual_model_coordinator(
@@ -3722,6 +3830,121 @@ def test_dual_model_run_cached_same_reports_zero_changes(tmp_path):
 
     assert summary["model_merges"] == 0
     assert cached_a[0].calls == cached_b[0].calls == []
+
+
+def test_dual_model_run_cached_uncertain_does_not_repeat_fallback(tmp_path):
+    database, lexeme_id, _, _, case = _coreference_case(tmp_path)
+    _insert_test_concept(database, lexeme_id, "concept-fallback-cached")
+    with database.transaction() as connection:
+        connection.execute(
+            """UPDATE concepts SET default_target='候选译名'
+               WHERE id='concept-fallback-cached'"""
+        )
+    case = CoreferenceCoordinator(database).freeze_cases()[0]
+    first, _, _ = _dual_model_coordinator(
+        database,
+        case,
+        [_dual_model_response(case, "uncertain")],
+        [_dual_model_response(case, "uncertain")],
+    )
+    first_summary = first.run(max_cases=1)
+    cached_a = []
+    cached_b = []
+    cached = CoreferenceCoordinator(
+        database,
+        llm_factory_a=_dual_model_factory(
+            "model-a", [AssertionError("must not call A")], cached_a
+        ),
+        llm_factory_b=_dual_model_factory(
+            "model-b", [AssertionError("must not call B")], cached_b
+        ),
+    )
+
+    cached_summary = cached.run(max_cases=1)
+
+    assert first_summary["uncertain"] == first_summary["fallbacks"] == 1
+    assert cached_summary["uncertain"] == 1
+    assert cached_summary["fallbacks"] == 0
+    assert cached_a[0].calls == cached_b[0].calls == []
+
+
+def test_dual_model_run_deterministic_merges_count_only_fresh_changes(tmp_path):
+    database, _, _, evidence_ids, _ = _coreference_case(tmp_path)
+    _set_evidence_payload(
+        database,
+        evidence_ids,
+        {"evidence_hash": "deterministic-run-effect"},
+    )
+    first = CoreferenceCoordinator(database)
+
+    first_summary = first.run(max_cases=1)
+    replay_summary = CoreferenceCoordinator(database).run(max_cases=1)
+
+    assert first_summary["deterministic_merges"] == 1
+    assert replay_summary["deterministic_merges"] == 0
+
+
+def test_dual_model_retired_anchor_collision_is_nonblocking_same(tmp_path):
+    database, lexeme_id, mention_ids, _, _ = _coreference_case(tmp_path)
+    _insert_test_concept(
+        database,
+        lexeme_id,
+        "concept-retired-anchor-owner",
+        anchor_mention_id=mention_ids[0],
+        retired=True,
+    )
+    case = CoreferenceCoordinator(database).freeze_cases()[0]
+    coordinator, _, _ = _dual_model_coordinator(
+        database,
+        case,
+        [_dual_model_response(case, "same")],
+        [_dual_model_response(case, "same")],
+    )
+
+    summary = coordinator.run(max_cases=1)
+
+    assert summary["model_merges"] == 0
+    with closing(database.connect()) as connection:
+        decision = connection.execute(
+            """SELECT relation, votes_json FROM coreference_decisions
+               WHERE decision_source='dual_model'"""
+        ).fetchone()
+        assert connection.execute(
+            """SELECT COUNT(*) FROM audit_calls
+               WHERE purpose='dual_model_coreference'"""
+        ).fetchone()[0] == 2
+        assert connection.execute(
+            "SELECT COUNT(*) FROM mentions WHERE concept_id IS NOT NULL"
+        ).fetchone()[0] == 0
+    resolution = next(
+        vote
+        for vote in json.loads(decision["votes_json"])
+        if vote.get("source") == "dual_model"
+    )
+    assert decision["relation"] == "same"
+    assert resolution["effect"]["bindings_changed"] == 0
+
+
+def test_dual_model_unknown_anchor_runtime_error_rolls_back(tmp_path, monkeypatch):
+    database, _, _, _, case = _coreference_case(tmp_path)
+    coordinator, _, _ = _dual_model_coordinator(
+        database,
+        case,
+        [_dual_model_response(case, "same")],
+        [_dual_model_response(case, "same")],
+    )
+
+    def fail_unknown(*_args, **_kwargs):
+        raise RuntimeError("unknown anchor implementation failure")
+
+    monkeypatch.setattr(database, "ensure_concept_for_anchor", fail_unknown)
+    with pytest.raises(RuntimeError, match="unknown anchor implementation"):
+        coordinator.resolve_dual_model(case)
+    with closing(database.connect()) as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM coreference_decisions"
+        ).fetchone()[0] == 0
+        assert connection.execute("SELECT COUNT(*) FROM audit_calls").fetchone()[0] == 0
 
 
 def test_dual_model_persistence_failure_rolls_back_decision_binding_and_audits(
