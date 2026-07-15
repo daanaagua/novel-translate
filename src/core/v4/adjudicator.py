@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass, replace
-from typing import Any, Dict, Mapping, Sequence
+from typing import Any, Dict, Mapping, Optional, Sequence
+from uuid import uuid4
 
 from .candidate_clusters import CandidateCluster, CandidateClusterBatch
 from .lexical_index import COORDINATORS, LexicalCandidate, lexical_key
@@ -55,10 +56,12 @@ class V4Adjudicator:
         llm: Any,
         max_attempts: int = 2,
         max_tokens: int = 8192,
+        database: Optional[Any] = None,
     ):
         self.llm = llm
         self.max_attempts = max(1, int(max_attempts))
         self.max_tokens = max(1, int(max_tokens))
+        self.database = database
 
     @staticmethod
     def _clean_json(raw: str) -> str:
@@ -426,3 +429,44 @@ class V4Adjudicator:
                 self._adjudicate_one_batch(clusters[start : start + 12], source_texts)
             )
         return tuple(results)
+
+    def run(
+        self,
+        database: Optional[Any] = None,
+        *,
+        max_clusters: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        """Adjudicate persisted pending clusters as an independent stage."""
+        store = database or self.database
+        if store is None:
+            raise ValueError("V4Adjudicator.run requires a database")
+        run_id = f"adjudicate_{uuid4().hex}"
+        config = {
+            "max_clusters": max_clusters,
+            "batch_size": 12,
+            "max_attempts": self.max_attempts,
+        }
+        store.start_run(run_id, "adjudicate", config)
+        try:
+            clusters = store.load_pending_candidate_clusters(max_clusters)
+            if not clusters:
+                store.finish_run(run_id, "completed")
+                return {
+                    "run_id": run_id,
+                    "adjudicated": 0,
+                    "concepts": 0,
+                    "knowledge_version": None,
+                }
+            source_texts = store.source_texts_for_candidate_clusters(clusters)
+            results = self.adjudicate(clusters, source_texts)
+            committed = store.commit_adjudications(run_id, results)
+            store.finish_run(run_id, "completed")
+            return {
+                "run_id": run_id,
+                "adjudicated": len(results),
+                "concepts": len(set(committed.get("concept_ids", []))),
+                "knowledge_version": committed.get("knowledge_version"),
+            }
+        except Exception as exc:
+            store.finish_run(run_id, "failed", str(exc))
+            raise

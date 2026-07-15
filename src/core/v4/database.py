@@ -1242,6 +1242,154 @@ class V4Database:
                 )
             return version
 
+    def commit_candidate_index_batch(
+        self, run_id: str, outcomes: Sequence[ScanOutcome]
+    ) -> Dict[str, int]:
+        """Atomically persist deterministic candidates and block scan states.
+
+        This deliberately creates neither a knowledge version nor model audit rows:
+        candidate indexing is local evidence collection, not a knowledge decision.
+        """
+        ordered = sorted(outcomes, key=lambda item: item.block.global_index)
+        indexed = failed = lexical_count = 0
+        with self.transaction() as connection:
+            if connection.execute(
+                "SELECT 1 FROM runs WHERE id=?", (run_id,)
+            ).fetchone() is None:
+                raise ValueError(f"unknown run: {run_id}")
+            for outcome in ordered:
+                if outcome.error is not None or outcome.response is None:
+                    connection.execute(
+                        "UPDATE blocks SET status=?, last_error=?, updated_at=? WHERE id=?",
+                        (
+                            V4BlockStatus.FAILED_RETRYABLE.value,
+                            outcome.error or "candidate indexing failed",
+                            utc_now(),
+                            outcome.block.id,
+                        ),
+                    )
+                    failed += 1
+                    continue
+                for candidate in outcome.lexical_candidates:
+                    risk_flags = candidate.get("risk_flags_json")
+                    if not isinstance(risk_flags, str):
+                        risk_flags = json.dumps(
+                            candidate.get("risk_flags", []),
+                            ensure_ascii=False,
+                            sort_keys=True,
+                        )
+                    now = utc_now()
+                    connection.execute(
+                        """INSERT INTO lexical_candidates(
+                               id, block_id, paragraph_id, start_offset, end_offset,
+                               original_text, normalized_text, left_context, right_context,
+                               extraction_reason, book_frequency, risk_flags_json,
+                               model_status, resolution_status, selected, run_id,
+                               created_at, updated_at
+                           ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending',
+                                    'pending', 0, ?, ?, ?)
+                           ON CONFLICT(id) DO UPDATE SET
+                               paragraph_id=excluded.paragraph_id,
+                               start_offset=excluded.start_offset,
+                               end_offset=excluded.end_offset,
+                               original_text=excluded.original_text,
+                               normalized_text=excluded.normalized_text,
+                               left_context=excluded.left_context,
+                               right_context=excluded.right_context,
+                               extraction_reason=excluded.extraction_reason,
+                               book_frequency=excluded.book_frequency,
+                               risk_flags_json=excluded.risk_flags_json,
+                               model_status=CASE
+                                   WHEN lexical_candidates.resolution_status='pending'
+                                   THEN 'pending' ELSE lexical_candidates.model_status END,
+                               selected=CASE
+                                   WHEN lexical_candidates.resolution_status='pending'
+                                   THEN 0 ELSE lexical_candidates.selected END,
+                               run_id=CASE
+                                   WHEN lexical_candidates.resolution_status='pending'
+                                   THEN excluded.run_id ELSE lexical_candidates.run_id END,
+                               updated_at=excluded.updated_at""",
+                        (
+                            candidate["id"],
+                            outcome.block.id,
+                            candidate["paragraph_id"],
+                            int(candidate["start_offset"]),
+                            int(candidate["end_offset"]),
+                            candidate["original_text"],
+                            candidate["normalized_text"],
+                            candidate.get("left_context", ""),
+                            candidate.get("right_context", ""),
+                            candidate["extraction_reason"],
+                            int(candidate.get("book_frequency", 1)),
+                            risk_flags,
+                            run_id,
+                            now,
+                            now,
+                        ),
+                    )
+                    lexical_count += 1
+                is_front_matter = bool(
+                    outcome.request_payload.get("front_matter", False)
+                )
+                status = (
+                    V4BlockStatus.READY.value
+                    if is_front_matter
+                    else V4BlockStatus.SCANNED.value
+                )
+                connection.execute(
+                    "UPDATE blocks SET status=?, last_error=NULL, updated_at=? WHERE id=?",
+                    (status, utc_now(), outcome.block.id),
+                )
+                indexed += 1
+        return {"indexed": indexed, "failed": failed, "candidates": lexical_count}
+
+    @staticmethod
+    def _safe_string_tuple_json(value: Any) -> tuple[str, ...]:
+        """Parse bounded string-list JSON without trusting malformed storage."""
+        try:
+            parsed = json.loads(value) if isinstance(value, str) else value
+        except (TypeError, ValueError):
+            return ()
+        if not isinstance(parsed, list) or any(
+            not isinstance(item, str) for item in parsed
+        ):
+            return ()
+        return tuple(sorted(set(parsed)))
+
+    @classmethod
+    def _row_to_lexical_candidate(cls, row: sqlite3.Row) -> Any:
+        from .lexical_index import LexicalCandidate
+
+        return LexicalCandidate(
+            id=row["id"],
+            block_id=row["block_id"],
+            paragraph_id=row["paragraph_id"],
+            start_offset=int(row["start_offset"]),
+            end_offset=int(row["end_offset"]),
+            original_text=row["original_text"],
+            normalized_text=row["normalized_text"],
+            left_context=row["left_context"] or "",
+            right_context=row["right_context"] or "",
+            extraction_reason=row["extraction_reason"],
+            book_frequency=int(row["book_frequency"] or 1),
+            score=0,
+            risk_flags=cls._safe_string_tuple_json(row["risk_flags_json"]),
+        )
+
+    def load_pending_lexical_candidates(self) -> List[Any]:
+        """Return every unresolved local candidate in stable source order."""
+        with closing(self.connect()) as connection:
+            rows = connection.execute(
+                """SELECT lc.* FROM lexical_candidates lc
+                   JOIN blocks b ON b.id=lc.block_id
+                   WHERE lc.resolution_status='pending'
+                     AND b.source_edition_id=(
+                         SELECT id FROM source_editions WHERE active=1
+                     )
+                   ORDER BY b.global_index, lc.start_offset, lc.end_offset, lc.id"""
+            ).fetchall()
+        return [self._row_to_lexical_candidate(row) for row in rows]
+
     @staticmethod
     def _candidate_cluster_members(cluster: Any) -> List[Dict[str, Any]]:
         members: Dict[str, Dict[str, Any]] = {}
@@ -1274,35 +1422,45 @@ class V4Database:
         self, run_id: str, clusters: Sequence[Any]
     ) -> Dict[str, int]:
         """Persist bounded cluster decisions without removing source occurrences."""
+        with self.transaction() as connection:
+            return self._persist_candidate_clusters(connection, run_id, clusters)
+
+    def _persist_candidate_clusters(
+        self,
+        connection: sqlite3.Connection,
+        run_id: str,
+        clusters: Sequence[Any],
+    ) -> Dict[str, int]:
         ordered = sorted(clusters, key=lambda cluster: cluster.id)
         if len({cluster.id for cluster in ordered}) != len(ordered):
             raise ValueError("duplicate candidate cluster id")
         member_count = 0
-        with self.transaction() as connection:
-            if connection.execute("SELECT 1 FROM runs WHERE id=?", (run_id,)).fetchone() is None:
-                raise ValueError(f"unknown run: {run_id}")
-            for ordinal, cluster in enumerate(ordered):
-                members = self._candidate_cluster_members(cluster)
-                if not members:
-                    raise ValueError(f"candidate cluster has no members: {cluster.id}")
-                candidate_ids = [member["candidate_id"] for member in members]
-                placeholders = ",".join("?" for _ in candidate_ids)
-                existing_ids = {
-                    row[0]
-                    for row in connection.execute(
-                        f"SELECT id FROM lexical_candidates WHERE id IN ({placeholders})",
-                        candidate_ids,
-                    ).fetchall()
-                }
-                missing = sorted(set(candidate_ids) - existing_ids)
-                if missing:
-                    raise ValueError(
-                        f"unknown lexical candidate(s) in cluster {cluster.id}: {', '.join(missing)}"
-                    )
-                block_ids = sorted({member["block_id"] for member in members})
-                now = utc_now()
-                connection.execute(
-                    """INSERT INTO candidate_clusters(
+        if connection.execute(
+            "SELECT 1 FROM runs WHERE id=?", (run_id,)
+        ).fetchone() is None:
+            raise ValueError(f"unknown run: {run_id}")
+        for ordinal, cluster in enumerate(ordered):
+            members = self._candidate_cluster_members(cluster)
+            if not members:
+                raise ValueError(f"candidate cluster has no members: {cluster.id}")
+            candidate_ids = [member["candidate_id"] for member in members]
+            placeholders = ",".join("?" for _ in candidate_ids)
+            existing_ids = {
+                row[0]
+                for row in connection.execute(
+                    f"SELECT id FROM lexical_candidates WHERE id IN ({placeholders})",
+                    candidate_ids,
+                ).fetchall()
+            }
+            missing = sorted(set(candidate_ids) - existing_ids)
+            if missing:
+                raise ValueError(
+                    f"unknown lexical candidate(s) in cluster {cluster.id}: {', '.join(missing)}"
+                )
+            block_ids = sorted({member["block_id"] for member in members})
+            now = utc_now()
+            connection.execute(
+                """INSERT INTO candidate_clusters(
                            run_id, id, risk_flags_json, affected_blocks_json,
                            affected_block_count, ordinal, created_at, updated_at
                        ) VALUES(?, ?, ?, ?, ?, ?, ?, ?)
@@ -1313,48 +1471,195 @@ class V4Database:
                            affected_block_count=excluded.affected_block_count,
                            ordinal=excluded.ordinal,
                            updated_at=excluded.updated_at""",
-                    (
-                        run_id,
-                        cluster.id,
-                        json.dumps(
-                            sorted(set(cluster.risk_flags)),
-                            ensure_ascii=False,
-                            separators=(",", ":"),
-                        ),
-                        json.dumps(block_ids, ensure_ascii=False, separators=(",", ":")),
-                        int(cluster.affected_blocks),
-                        ordinal,
-                        now,
-                        now,
+                (
+                    run_id,
+                    cluster.id,
+                    json.dumps(
+                        sorted(set(cluster.risk_flags)),
+                        ensure_ascii=False,
+                        separators=(",", ":"),
                     ),
-                )
+                    json.dumps(
+                        block_ids,
+                        ensure_ascii=False,
+                        separators=(",", ":"),
+                    ),
+                    int(cluster.affected_blocks),
+                    ordinal,
+                    now,
+                    now,
+                ),
+            )
+            connection.execute(
+                "DELETE FROM candidate_cluster_members WHERE cluster_id=?",
+                (cluster.id,),
+            )
+            for member_ordinal, member in enumerate(members):
                 connection.execute(
-                    "DELETE FROM candidate_cluster_members WHERE cluster_id=?",
-                    (cluster.id,),
-                )
-                for member_ordinal, member in enumerate(members):
-                    connection.execute(
-                        """INSERT INTO candidate_cluster_members(
+                    """INSERT INTO candidate_cluster_members(
                                run_id, cluster_id, candidate_id, role, ordinal,
                                context_json, created_at
                            ) VALUES(?, ?, ?, ?, ?, ?, ?)""",
-                        (
-                            run_id,
-                            cluster.id,
-                            member["candidate_id"],
-                            member["role"],
-                            member_ordinal,
-                            json.dumps(
-                                member["context"],
-                                ensure_ascii=False,
-                                sort_keys=True,
-                                separators=(",", ":"),
+                    (
+                        run_id,
+                        cluster.id,
+                        member["candidate_id"],
+                        member["role"],
+                        member_ordinal,
+                        json.dumps(
+                            member["context"],
+                            ensure_ascii=False,
+                            sort_keys=True,
+                            separators=(",", ":"),
+                        ),
+                        now,
+                    ),
+                )
+            member_count += len(members)
+        return {"clusters": len(ordered), "members": member_count}
+
+    def replace_pending_candidate_clusters(
+        self, run_id: str, clusters: Sequence[Any]
+    ) -> Dict[str, int]:
+        """Atomically rebuild undecided clusters while preserving all history."""
+        with self.transaction() as connection:
+            connection.execute(
+                """DELETE FROM candidate_clusters
+                   WHERE NOT EXISTS (
+                       SELECT 1 FROM candidate_adjudications ca
+                       WHERE ca.cluster_id=candidate_clusters.id
+                   )"""
+            )
+            historical_ids = {
+                row[0]
+                for row in connection.execute(
+                    "SELECT DISTINCT cluster_id FROM candidate_adjudications"
+                ).fetchall()
+            }
+            safe_clusters = [
+                cluster for cluster in clusters if cluster.id not in historical_ids
+            ]
+            return self._persist_candidate_clusters(connection, run_id, safe_clusters)
+
+    def load_pending_candidate_clusters(
+        self, max_clusters: Optional[int] = None
+    ) -> List[Any]:
+        """Rehydrate undecided clusters, excluding every active adjudication."""
+        from .candidate_clusters import CandidateCluster, CandidateContext
+
+        query = """SELECT cc.* FROM candidate_clusters cc
+                   WHERE NOT EXISTS (
+                       SELECT 1 FROM candidate_adjudications ca
+                       WHERE ca.cluster_id=cc.id AND ca.active=1
+                   )
+                     AND EXISTS (
+                       SELECT 1
+                       FROM candidate_cluster_members cm
+                       JOIN lexical_candidates lc ON lc.id=cm.candidate_id
+                       JOIN blocks b ON b.id=lc.block_id
+                       WHERE cm.cluster_id=cc.id
+                         AND cm.role IN ('alternative', 'both')
+                         AND lc.resolution_status='pending'
+                         AND b.source_edition_id=(
+                             SELECT id FROM source_editions WHERE active=1
+                         )
+                   )
+                   ORDER BY cc.id"""
+        params: List[Any] = []
+        if max_clusters is not None:
+            query += " LIMIT ?"
+            params.append(max(0, int(max_clusters)))
+        clusters: List[Any] = []
+        with closing(self.connect()) as connection:
+            cluster_rows = connection.execute(query, params).fetchall()
+            for cluster_row in cluster_rows:
+                members = connection.execute(
+                    """SELECT cm.role, cm.ordinal, cm.context_json, lc.*
+                       FROM candidate_cluster_members cm
+                       JOIN lexical_candidates lc ON lc.id=cm.candidate_id
+                       WHERE cm.cluster_id=?
+                       ORDER BY cm.ordinal, lc.id""",
+                    (cluster_row["id"],),
+                ).fetchall()
+                alternatives = []
+                contexts = []
+                for member in members:
+                    candidate = self._row_to_lexical_candidate(member)
+                    role = member["role"]
+                    if role in {"alternative", "both"}:
+                        alternatives.append(candidate)
+                    if role not in {"context", "both"}:
+                        continue
+                    try:
+                        context_data = json.loads(member["context_json"] or "{}")
+                    except (TypeError, ValueError):
+                        context_data = {}
+                    if not isinstance(context_data, dict):
+                        context_data = {}
+
+                    def context_string(field: str, fallback: str) -> str:
+                        value = context_data.get(field, fallback)
+                        return value if isinstance(value, str) else fallback
+
+                    contexts.append(
+                        CandidateContext(
+                            candidate_id=candidate.id,
+                            block_id=context_string("block_id", candidate.block_id),
+                            paragraph_id=context_string(
+                                "paragraph_id", candidate.paragraph_id
                             ),
-                            now,
+                            original_text=context_string(
+                                "original_text", candidate.original_text
+                            ),
+                            left_context=context_string(
+                                "left_context", candidate.left_context
+                            ),
+                            right_context=context_string(
+                                "right_context", candidate.right_context
+                            ),
+                            risk_flags=self._safe_string_tuple_json(
+                                context_data.get("risk_flags", [])
+                            ),
+                        )
+                    )
+                if not alternatives:
+                    continue
+                clusters.append(
+                    CandidateCluster(
+                        id=cluster_row["id"],
+                        alternatives=tuple(alternatives),
+                        contexts=tuple(contexts),
+                        risk_flags=self._safe_string_tuple_json(
+                            cluster_row["risk_flags_json"]
+                        ),
+                        affected_blocks=int(
+                            cluster_row["affected_block_count"] or 0
                         ),
                     )
-                member_count += len(members)
-        return {"clusters": len(ordered), "members": member_count}
+                )
+        return clusters
+
+    def source_texts_for_candidate_clusters(
+        self, clusters: Sequence[Any]
+    ) -> Dict[str, str]:
+        block_ids = sorted(
+            {
+                candidate.block_id
+                for cluster in clusters
+                for candidate in cluster.alternatives
+            }
+        )
+        if not block_ids:
+            return {}
+        placeholders = ",".join("?" for _ in block_ids)
+        with closing(self.connect()) as connection:
+            return {
+                row["id"]: row["source_text"]
+                for row in connection.execute(
+                    f"SELECT id, source_text FROM blocks WHERE id IN ({placeholders})",
+                    block_ids,
+                ).fetchall()
+            }
 
     @staticmethod
     def _adjudication_value(result: Any, field: str, default: Any = None) -> Any:
