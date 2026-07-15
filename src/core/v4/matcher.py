@@ -32,6 +32,8 @@ def _is_grapheme_extend(value: str) -> bool:
 
 def _hangul_jamo_class(value: str) -> str:
     codepoint = ord(value)
+    if 0xAC00 <= codepoint <= 0xD7A3:
+        return "LV" if (codepoint - 0xAC00) % 28 == 0 else "LVT"
     if 0x1100 <= codepoint <= 0x115F or 0xA960 <= codepoint <= 0xA97C:
         return "L"
     if 0x1160 <= codepoint <= 0x11A7 or 0xD7B0 <= codepoint <= 0xD7C6:
@@ -58,9 +60,18 @@ def _grapheme_clusters(text: str) -> Iterator[tuple[int, int]]:
                 previous_hangul = _hangul_jamo_class(text[index - 1])
                 continue
             if (
-                (previous_hangul == "L" and current_hangul in {"L", "V"})
-                or (previous_hangul == "V" and current_hangul in {"V", "T"})
-                or (previous_hangul == "T" and current_hangul == "T")
+                (
+                    previous_hangul == "L"
+                    and current_hangul in {"L", "V", "LV", "LVT"}
+                )
+                or (
+                    previous_hangul in {"LV", "V"}
+                    and current_hangul in {"V", "T"}
+                )
+                or (
+                    previous_hangul in {"LVT", "T"}
+                    and current_hangul == "T"
+                )
             ):
                 previous_hangul = current_hangul
                 index += 1
@@ -252,6 +263,26 @@ class FrozenRenderIndex(Sequence[Mapping[str, Any]]):
     _cache_lock = RLock()
     _cache: Dict[str, "FrozenRenderIndex"] = {}
     _max_entries = 8
+    _indexable_condition_fields = (
+        "mention_id",
+        "block_id",
+        "paragraph_id",
+        "paragraph",
+        "paragraph_index",
+        "discourse_function",
+        "start_offset",
+        "end_offset",
+        "occurrence_offset",
+        "speaker",
+        "speaker_id",
+        "thread",
+        "thread_id",
+        "concept_id",
+        "lexeme_id",
+        "source_form",
+        "matched_form",
+        "occurrence",
+    )
 
     def __init__(
         self,
@@ -265,8 +296,10 @@ class FrozenRenderIndex(Sequence[Mapping[str, Any]]):
         self._by_id = by_id
         self._matcher = matcher
         self._rule_buckets: Dict[
-            tuple[str, str], Dict[tuple[str, str, str], tuple[Mapping[str, Any], ...]]
+            tuple[str, str],
+            Dict[tuple[tuple[str, str], ...], tuple[Mapping[str, Any], ...]],
         ] = {}
+        self._rule_keysets: Dict[tuple[str, str], tuple[tuple[str, ...], ...]] = {}
         self._generic_rules: Dict[
             tuple[str, str], tuple[Mapping[str, Any], ...]
         ] = {}
@@ -294,23 +327,29 @@ class FrozenRenderIndex(Sequence[Mapping[str, Any]]):
         return None
 
     @classmethod
-    def _condition_bucket_keys(
+    def _condition_bucket_entries(
         cls, condition: Mapping[str, Any]
-    ) -> tuple[tuple[str, str, str], ...]:
-        preferred = ("mention_id", "speaker_id", "thread_id", "block_id")
-        ordered_keys = list(preferred) + sorted(
-            key for key in condition if key not in preferred
-        )
-        condition_keys = [key for key in ordered_keys if key in condition]
-        for key in condition_keys:
+    ) -> tuple[tuple[tuple[str, str], ...], ...]:
+        if any(key not in cls._indexable_condition_fields for key in condition):
+            return ()
+        ordered_keys = [
+            key for key in cls._indexable_condition_fields if key in condition
+        ]
+        combinations: list[tuple[tuple[str, str], ...]] = [()]
+        for key in ordered_keys:
             expected = condition[key]
             values = expected if isinstance(expected, list) else [expected]
             encoded = [cls._scalar_bucket_value(value) for value in values]
-            if encoded and all(value is not None for value in encoded):
-                return tuple(("value", str(key), str(value)) for value in encoded)
-        if condition_keys:
-            return (("present", str(condition_keys[0]), ""),)
-        return ()
+            if not encoded or any(value is None for value in encoded):
+                return ()
+            combinations = [
+                current + ((key, str(value)),)
+                for current in combinations
+                for value in encoded
+            ]
+            if len(combinations) > 256:
+                return ()
+        return tuple(combinations)
 
     @staticmethod
     def _rule_layer(rule: Mapping[str, Any], subject_type: str) -> int:
@@ -367,25 +406,47 @@ class FrozenRenderIndex(Sequence[Mapping[str, Any]]):
                         concept.get("rules", []) or []
                     )
         for subject_key, rules in subjects.items():
-            buckets: Dict[tuple[str, str, str], list[Mapping[str, Any]]] = {}
-            generic: list[Mapping[str, Any]] = []
+            buckets: Dict[
+                tuple[tuple[str, str], ...], list[Mapping[str, Any]]
+            ] = {}
+            unconditional: list[Mapping[str, Any]] = []
+            complex_generic: list[Mapping[str, Any]] = []
+            keysets: set[tuple[str, ...]] = set()
             for rule in rules:
                 condition = rule.get("condition") or {}
-                keys = (
-                    self._condition_bucket_keys(condition)
-                    if isinstance(condition, Mapping) and condition
-                    else ()
-                )
-                if not keys:
-                    generic.append(rule)
+                if not condition:
+                    unconditional.append(rule)
                     continue
-                for key in keys:
-                    buckets.setdefault(key, []).append(rule)
+                if not isinstance(condition, Mapping):
+                    continue
+                if any(
+                    key not in self._indexable_condition_fields
+                    for key in condition
+                ):
+                    continue
+                entries = self._condition_bucket_entries(condition)
+                if not entries:
+                    complex_generic.append(rule)
+                    continue
+                for entry in entries:
+                    keysets.add(tuple(key for key, _value in entry))
+                    buckets.setdefault(entry, []).append(rule)
             self._rule_buckets[subject_key] = {
                 key: tuple(value) for key, value in buckets.items()
             }
-            self._generic_rules[subject_key] = self._best_unconditional_rules(
-                generic, subject_key[0]
+            self._rule_keysets[subject_key] = tuple(sorted(keysets))
+            ranked_complex = sorted(
+                complex_generic,
+                key=lambda rule: (
+                    self._rule_layer(rule, subject_key[0]),
+                    -int(rule.get("priority") or 0),
+                    -int(bool(rule.get("locked"))),
+                    str(rule.get("id") or ""),
+                ),
+            )[:16]
+            self._generic_rules[subject_key] = (
+                self._best_unconditional_rules(unconditional, subject_key[0])
+                + tuple(ranked_complex)
             )
 
     def _rules_for_context(
@@ -405,15 +466,20 @@ class FrozenRenderIndex(Sequence[Mapping[str, Any]]):
         )
         seen = {id(rule) for rule in selected}
         buckets = self._rule_buckets.get(subject_key, {})
-        for key, value in context.items():
-            for rule in buckets.get(("present", str(key), ""), ()):
-                if id(rule) not in seen:
-                    seen.add(id(rule))
-                    selected.append(rule)
-            encoded = self._scalar_bucket_value(value)
-            if encoded is None:
+        for keyset in self._rule_keysets.get(subject_key, ()):
+            entry: list[tuple[str, str]] = []
+            for key in keyset:
+                if key not in context:
+                    entry = []
+                    break
+                encoded = self._scalar_bucket_value(context[key])
+                if encoded is None:
+                    entry = []
+                    break
+                entry.append((key, encoded))
+            if not entry:
                 continue
-            for rule in buckets.get(("value", str(key), encoded), ()):
+            for rule in buckets.get(tuple(entry), ()):
                 if id(rule) not in seen:
                     seen.add(id(rule))
                     selected.append(rule)

@@ -342,9 +342,14 @@ class V4TranslationPipeline:
             }
             manager.render_warnings = (
                 [
-                    "translation glossary was deterministically truncated: "
-                    f"{len(omitted_items)} of {len(items)} entries omitted "
-                    f"({omitted_digest[:16]})"
+                    {
+                        "kind": "render_constraints_truncated",
+                        "total": len(items),
+                        "kept": len(selected_items),
+                        "omitted": len(omitted_items),
+                        "digest": omitted_digest,
+                        "reason": "bounded_translation_glossary",
+                    }
                 ]
                 if omitted_items
                 else []
@@ -474,12 +479,18 @@ class V4TranslationPipeline:
         previous_translation = ""
         local_summary = ""
         for block in island.blocks:
+            render_constraint_warnings: List[Dict[str, Any]] = []
             if isinstance(concept_snapshot, FrozenRenderIndex):
                 engine.glossary = self._glossary_for(
                     [block],
                     concept_snapshot=concept_snapshot,
                     rendering_contexts_by_block=rendering_contexts_by_block,
                 )
+                render_constraint_warnings = [
+                    dict(value)
+                    for value in getattr(engine.glossary, "render_warnings", [])
+                    if isinstance(value, Mapping)
+                ]
             frozen_block_concept_ids = [
                 str(concept["id"])
                 for concept in self.database.concepts_for_text(
@@ -634,6 +645,30 @@ class V4TranslationPipeline:
                     "final_translation": result.final_translation or "",
                     "warnings": list(result.quality_warnings),
                 }
+            quality_warnings: List[Any] = []
+            warning_keys: set[str] = set()
+            for warning in list(result.quality_warnings) + render_constraint_warnings:
+                key = json.dumps(
+                    warning,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ) if isinstance(warning, Mapping) else str(warning)
+                if key in warning_keys:
+                    continue
+                warning_keys.add(key)
+                quality_warnings.append(warning)
+            audit_with_warnings = (
+                polish_audits[-1]
+                if polish_audits
+                else draft_audits[-1] if draft_audits else None
+            )
+            if audit_with_warnings is not None and quality_warnings:
+                parsed_with_warnings = dict(
+                    audit_with_warnings.get("parsed") or {}
+                )
+                parsed_with_warnings["quality_warnings"] = quality_warnings
+                audit_with_warnings["parsed"] = parsed_with_warnings
             outcome = TranslationOutcome(
                 block=block,
                 knowledge_version=knowledge_version,
@@ -643,7 +678,7 @@ class V4TranslationPipeline:
                 analysis=result.analysis or "",
                 semantic_obligations=result.semantic_obligations or "",
                 memory_summary=result.memory_summary or "",
-                warnings=list(result.quality_warnings),
+                warnings=quality_warnings,
                 term_proposals=term_proposals,
                 relation_proposals=relation_proposals,
                 matched_concept_ids=list(packet.matched_concept_ids),
@@ -653,6 +688,7 @@ class V4TranslationPipeline:
                 elapsed_ms=int((time.perf_counter() - started) * 1000),
                 error=result.error_message,
             )
+            outcome.quality_warnings = quality_warnings
             outcomes.append(outcome)
             if status == V4BlockStatus.FAILED_RETRYABLE.value:
                 break

@@ -667,6 +667,12 @@ def test_nfkc_grapheme_matching_preserves_original_cluster_spans():
     assert matcher.iter_matches("A\u030A") == (("ring", "A\u030A", 0, 2),)
     assert matcher.iter_matches("\ufb03") == (("ligature", "\ufb03", 0, 1),)
 
+    hangul = AhoConceptMatcher({"각": ["full"], "가": ["partial"]})
+    assert hangul.iter_matches("가\u11A8") == (("full", "가\u11A8", 0, 2),)
+    assert hangul.iter_matches("\u1100\u1161\u11A8") == (
+        ("full", "\u1100\u1161\u11A8", 0, 3),
+    )
+
 
 def test_matcher_cache_builds_once_for_one_signature():
     ConceptMatcherCache.clear()
@@ -691,7 +697,10 @@ def test_compiled_rule_buckets_avoid_scanning_all_contextual_rules(monkeypatch):
         {
             "id": f"speaker-{index}",
             "subject_type": "lexeme",
-            "condition": {"speaker_id": f"speaker-{index}"},
+            "condition": {
+                "speaker_id": "shared-speaker",
+                "thread_id": f"thread-{index}",
+            },
             "target": f"TARGET-{index}",
             "priority": index,
             "status": "verified",
@@ -714,7 +723,9 @@ def test_compiled_rule_buckets_avoid_scanning_all_contextual_rules(monkeypatch):
         staticmethod(counted),
     )
 
-    matched = index.matched_renderings("Archon", speaker_id="speaker-321")[0]
+    matched = index.matched_renderings(
+        "Archon", speaker_id="shared-speaker", thread_id="thread-321"
+    )[0]
 
     assert matched.rendered_target == "TARGET-321"
     assert checks["count"] < 20
@@ -722,7 +733,9 @@ def test_compiled_rule_buckets_avoid_scanning_all_contextual_rules(monkeypatch):
     checks["count"] = 0
     source = " ".join("Archon" for _ in range(1000))
     started = time.perf_counter()
-    repeated = index.matched_renderings(source, speaker_id="speaker-321")
+    repeated = index.matched_renderings(
+        source, speaker_id="shared-speaker", thread_id="thread-321"
+    )
     elapsed = time.perf_counter() - started
 
     assert len(repeated) == 1000

@@ -380,11 +380,11 @@ class ParallelV4Tests(unittest.TestCase):
         self.assertEqual(len(calls[0]), 5)
 
     def test_glossary_items_and_visible_characters_are_hard_bounded(self):
-        source = " ".join(f"Name{index}" for index in range(200))
+        source = " ".join(f"Name{index}" for index in range(500))
         block = self.add_blocks([source], status="ready")[0]
         version = self.database.current_knowledge_version()
         with self.database.transaction() as connection:
-            for index in range(200):
+            for index in range(500):
                 lexeme_id = f"lex-limit-{index:03d}"
                 form = f"Name{index}"
                 connection.execute(
@@ -419,6 +419,66 @@ class ParallelV4Tests(unittest.TestCase):
         self.assertLessEqual(len(rendered), 1024)
         self.assertGreater(manager.render_limit_metadata["omitted"], 0)
         self.assertTrue(manager.render_warnings)
+
+        captured = []
+        original_commit = self.database.commit_translation_batch
+
+        def capture_commit(run_id, outcomes, **kwargs):
+            captured.extend(outcomes)
+            return original_commit(run_id, outcomes, **kwargs)
+
+        self.database.commit_translation_batch = capture_commit
+        production = V4TranslationPipeline(
+            self.database,
+            lambda: FakeTranslationLLM(),
+            config=V4PipelineConfig(
+                max_context_chars=50000,
+                island_size=1,
+                initial_workers=1,
+                max_workers=1,
+                enable_polish=False,
+                enable_semantic_mapper=False,
+            ),
+        )
+        result = production.run()
+
+        self.assertEqual(result["status"], "completed")
+        warning = captured[0].quality_warnings[0]
+        self.assertEqual(warning["kind"], "render_constraints_truncated")
+        self.assertEqual(warning["total"], 500)
+        self.assertEqual(warning["kept"], 128)
+        self.assertEqual(warning["omitted"], 372)
+        with closing(self.database.connect()) as connection:
+            stored = json.loads(
+                connection.execute(
+                    """SELECT warnings_json FROM translation_versions
+                       WHERE block_id=? AND active=1""",
+                    (block.id,),
+                ).fetchone()[0]
+            )
+            audit_ids = [
+                int(row[0])
+                for row in connection.execute(
+                    """SELECT id FROM audit_calls
+                       WHERE block_id=? AND accepted=1""",
+                    (block.id,),
+                ).fetchall()
+            ]
+            blocking = connection.execute(
+                """SELECT COUNT(*) FROM human_queue
+                   WHERE block_id=? AND severity='blocking'
+                     AND kind='render_constraints_truncated'""",
+                (block.id,),
+            ).fetchone()[0]
+        self.assertIn(warning, stored)
+        audit_payloads = [
+            self.database.read_audit_payload(audit_id).get("parsed") or {}
+            for audit_id in audit_ids
+        ]
+        self.assertTrue(
+            any(warning in payload.get("quality_warnings", []) for payload in audit_payloads)
+        )
+        self.assertEqual(blocking, 0)
 
     def test_local_scan_indexes_candidates_and_legacy_reconcile_is_conservative(self):
         blocks = self.add_blocks(["Archon spoke.", "archon waited.", "Archons gathered."])
