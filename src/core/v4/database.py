@@ -30,7 +30,7 @@ from .models import (
     V4BlockStatus,
     WorkingTargetRule,
 )
-from .matcher import ConceptMatcherCache, FrozenConceptIndex
+from .matcher import FrozenRenderIndex
 from .schema_v8 import (
     SCHEMA_VERSION,
     SchemaUpgradeRequired,
@@ -6995,13 +6995,15 @@ class V4Database:
         return (paragraphs[0] if paragraphs else source_text)[:1200]
 
     def working_target_candidates(self) -> List[Dict[str, Any]]:
-        """Return active, targetless concepts that cannot safely remain unnamed."""
+        """Return active targetless lexemes that need one book-wide rendering."""
 
         with closing(self.connect()) as connection:
             rows = connection.execute(
-                """SELECT c.id, c.kind, c.canonical_source, c.description,
-                          c.default_target, c.working_target, c.verified_target,
-                          c.status, c.locked,
+                """SELECT l.id lexeme_id, l.canonical_form, l.default_target,
+                          l.working_target, l.verified_target, l.status, l.locked,
+                          c.id concept_id, c.kind, c.description,
+                          c.verified_target concept_verified_target,
+                          c.locked concept_locked,
                           COUNT(m.id) mention_count,
                           COUNT(DISTINCT m.block_id) mentioned_blocks,
                           COALESCE((
@@ -7010,38 +7012,56 @@ class V4Database:
                               JOIN candidate_adjudications ca
                                 ON ca.id=cr.adjudication_id AND ca.active=1
                               JOIN candidate_clusters cc ON cc.id=cr.cluster_id
-                              WHERE cr.concept_id=c.id
+                              WHERE cr.lexeme_id=l.id
                           ), 0) cluster_blocks
-                   FROM concepts c
-                   LEFT JOIN mentions m ON m.concept_id=c.id
-                   WHERE c.retired_version IS NULL
-                   GROUP BY c.id
-                   ORDER BY lower(c.canonical_source), c.id"""
+                   FROM lexemes l
+                   LEFT JOIN mentions m ON m.lexeme_id=l.id
+                   LEFT JOIN concepts c ON c.id=(
+                       SELECT c2.id FROM concepts c2
+                       WHERE c2.retired_version IS NULL
+                         AND c2.primary_lexeme_id=l.id
+                       ORDER BY c2.locked DESC,
+                                CASE WHEN c2.status='verified' THEN 1 ELSE 0 END DESC,
+                                c2.id LIMIT 1
+                   )
+                   WHERE l.retired_version IS NULL
+                   GROUP BY l.id
+                   ORDER BY lower(l.normalized_form), l.id"""
             ).fetchall()
             candidates: List[Dict[str, Any]] = []
             for row in rows:
                 working = str(row["working_target"] or "").strip()
                 verified = str(row["verified_target"] or "").strip()
-                effective = verified or working
-                if verified or bool(row["locked"]):
+                effective = verified or working or str(
+                    row["default_target"] or ""
+                ).strip()
+                if (
+                    verified
+                    or bool(row["locked"])
+                    or str(row["concept_verified_target"] or "").strip()
+                    or bool(row["concept_locked"])
+                ):
                     continue
                 affected_blocks = max(
                     int(row["mentioned_blocks"] or 0),
                     int(row["cluster_blocks"] or 0),
                 )
                 repeated = int(row["mention_count"] or 0) >= 2 or affected_blocks >= 2
-                identity_kind = str(row["kind"] or "concept") in {
-                    "person", "place", "organization", "group", "unit"
-                }
                 high_impact = affected_blocks >= 3
-                required = (identity_kind and repeated) or high_impact
+                required = repeated or high_impact
                 if effective or not required:
                     continue
+                lexeme_id = str(row["lexeme_id"])
+                concept_id = str(row["concept_id"] or "")
                 candidates.append(
                     {
-                        "concept_id": str(row["id"]),
-                        "source": str(row["canonical_source"]),
-                        "kind": str(row["kind"]),
+                        "subject_type": "lexeme",
+                        "subject_id": lexeme_id,
+                        "lexeme_id": lexeme_id,
+                        # Kept for old model/audit/queue readers.
+                        "concept_id": concept_id,
+                        "source": str(row["canonical_form"]),
+                        "kind": str(row["kind"] or "concept"),
                         "description": str(row["description"] or ""),
                         "contexts": [],
                         "context_block_ids": [],
@@ -7052,30 +7072,30 @@ class V4Database:
             if not candidates:
                 return []
 
-            concept_ids = [item["concept_id"] for item in candidates]
-            placeholders = ",".join("?" for _ in concept_ids)
+            lexeme_ids = [item["lexeme_id"] for item in candidates]
+            placeholders = ",".join("?" for _ in lexeme_ids)
             context_rows = connection.execute(
                 f"""WITH ranked AS (
-                           SELECT m.concept_id, b.id block_id, b.source_text,
+                           SELECT m.lexeme_id, b.id block_id, b.source_text,
                                   b.global_index,
                                   ROW_NUMBER() OVER (
-                                      PARTITION BY m.concept_id
+                                      PARTITION BY m.lexeme_id
                                       ORDER BY b.global_index, b.id
                                   ) occurrence_rank
                            FROM mentions m JOIN blocks b ON b.id=m.block_id
-                           WHERE m.concept_id IN ({placeholders})
-                           GROUP BY m.concept_id, b.id
+                           WHERE m.lexeme_id IN ({placeholders})
+                           GROUP BY m.lexeme_id, b.id
                        )
-                       SELECT concept_id, block_id, source_text, global_index
+                       SELECT lexeme_id, block_id, source_text, global_index
                        FROM ranked WHERE occurrence_rank<=3
-                       ORDER BY concept_id, global_index, block_id""",
-                concept_ids,
+                       ORDER BY lexeme_id, global_index, block_id""",
+                lexeme_ids,
             ).fetchall()
             candidates_by_id = {
-                item["concept_id"]: item for item in candidates
+                item["lexeme_id"]: item for item in candidates
             }
             for row in context_rows:
-                candidate = candidates_by_id[str(row["concept_id"])]
+                candidate = candidates_by_id[str(row["lexeme_id"])]
                 candidate["context_block_ids"].append(str(row["block_id"]))
                 candidate["contexts"].append(
                     self._representative_paragraph(
@@ -7163,30 +7183,65 @@ class V4Database:
             return candidates
 
     def enqueue_working_target_review(
-        self, concept_ids: Sequence[str], error: str
+        self, subject_ids: Sequence[str], error: str
     ) -> int:
         queued = 0
         with self.transaction() as connection:
-            for concept_id in dict.fromkeys(str(value) for value in concept_ids):
+            for requested_id in dict.fromkeys(str(value) for value in subject_ids):
+                concept = connection.execute(
+                    """SELECT id, canonical_source, kind, primary_lexeme_id
+                       FROM concepts
+                       WHERE id=? AND retired_version IS NULL""",
+                    (requested_id,),
+                ).fetchone()
+                lexeme = connection.execute(
+                    """SELECT id, canonical_form FROM lexemes
+                       WHERE id=? AND retired_version IS NULL""",
+                    (requested_id,),
+                ).fetchone()
+                if lexeme is not None:
+                    representative = connection.execute(
+                        """SELECT id, canonical_source, kind, primary_lexeme_id
+                           FROM concepts
+                           WHERE primary_lexeme_id=? AND retired_version IS NULL
+                           ORDER BY locked DESC,
+                                    CASE WHEN status='verified' THEN 1 ELSE 0 END DESC,
+                                    id LIMIT 1""",
+                        (requested_id,),
+                    ).fetchone()
+                    concept = representative
+                    subject_type = "lexeme"
+                    subject_id = requested_id
+                    source = str(lexeme["canonical_form"])
+                elif concept is not None:
+                    subject_type = "concept"
+                    subject_id = requested_id
+                    source = str(concept["canonical_source"])
+                else:
+                    continue
+                concept_id = str(concept["id"] or "") if concept is not None else ""
                 exists = connection.execute(
                     """SELECT 1 FROM human_queue
                        WHERE kind='working_target_required' AND status='open'
-                         AND json_extract(payload_json, '$.concept_id')=?""",
-                    (concept_id,),
+                         AND (
+                             json_extract(payload_json, '$.subject_id')=?
+                             OR (?!='' AND json_extract(payload_json, '$.concept_id')=?)
+                         )""",
+                    (subject_id, concept_id, concept_id),
                 ).fetchone()
                 if exists:
                     continue
-                concept = connection.execute(
-                    """SELECT canonical_source, kind FROM concepts
-                       WHERE id=? AND retired_version IS NULL""",
-                    (concept_id,),
-                ).fetchone()
-                if concept is None:
-                    continue
                 payload = {
+                    "subject_type": subject_type,
+                    "subject_id": subject_id,
                     "concept_id": concept_id,
-                    "source": concept["canonical_source"],
-                    "kind": concept["kind"],
+                    "lexeme_id": (
+                        subject_id
+                        if subject_type == "lexeme"
+                        else str(concept["primary_lexeme_id"] or "")
+                    ),
+                    "source": source,
+                    "kind": str(concept["kind"] or "concept") if concept else "concept",
                     "error": error[:1000],
                 }
                 connection.execute(
@@ -7217,32 +7272,38 @@ class V4Database:
     def _invalidate_working_target_dependents(
         self,
         connection: sqlite3.Connection,
-        concept_ids: Sequence[str],
+        subjects: Sequence[Dict[str, str]],
     ) -> int:
         import re
 
         affected_blocks: set[str] = set()
-        for concept_id in concept_ids:
+        for subject in subjects:
+            subject_type = str(subject["subject_type"])
+            subject_id = str(subject["subject_id"])
             affected_blocks.update(
                 str(row["block_id"])
                 for row in connection.execute(
                     """SELECT DISTINCT tv.block_id
                        FROM dependencies d
                        JOIN translation_versions tv ON tv.id=d.translation_id
-                       WHERE d.dependency_type='concept' AND d.dependency_id=?""",
-                    (concept_id,),
+                       WHERE d.dependency_type=? AND d.dependency_id=?""",
+                    (subject_type, subject_id),
                 ).fetchall()
             )
-            forms = [
-                str(row["form"])
-                for row in connection.execute(
+            if subject_type == "lexeme":
+                form_rows = connection.execute(
+                    """SELECT DISTINCT form FROM source_forms
+                       WHERE lexeme_id=?""",
+                    (subject_id,),
+                ).fetchall()
+            else:
+                form_rows = connection.execute(
                     """SELECT DISTINCT sf.form FROM source_forms sf
                        JOIN concept_lexemes cl ON cl.lexeme_id=sf.lexeme_id
                        WHERE cl.concept_id=? AND cl.retired_version IS NULL""",
-                    (concept_id,),
+                    (subject_id,),
                 ).fetchall()
-                if str(row["form"] or "").strip()
-            ]
+            forms = [str(row["form"]) for row in form_rows if str(row["form"] or "").strip()]
             if not forms:
                 continue
             patterns = [
@@ -7278,7 +7339,7 @@ class V4Database:
     def apply_working_target_decisions(
         self, decisions: Sequence[Dict[str, Any]]
     ) -> Dict[str, Any]:
-        """Atomically install provisional translations without touching human locks."""
+        """Install working renderings on lexemes unless a reliable concept is explicit."""
 
         validated: List[Dict[str, Any]] = []
         for decision in decisions:
@@ -7292,59 +7353,168 @@ class V4Database:
             ]
             validated.append(item)
         ordered = sorted(
-            validated, key=lambda item: str(item.get("concept_id") or "")
+            validated,
+            key=lambda item: (
+                str(item.get("subject_type") or "lexeme"),
+                str(
+                    item.get("subject_id")
+                    or item.get("lexeme_id")
+                    or item.get("concept_id")
+                    or ""
+                ),
+            ),
         )
         with self.transaction() as connection:
             changed: List[Dict[str, Any]] = []
-            processed_ids: List[str] = []
+            processed: List[Dict[str, str]] = []
+            queue_ids: set[str] = set()
             resolved = 0
             for decision in ordered:
-                concept_id = str(decision.get("concept_id") or "")
                 target = str(decision.get("target") or "").strip()
                 rules = list(decision.get("rules") or [])
-                if not concept_id or not target:
-                    raise ValueError("working target decisions require concept_id and target")
-                concept = connection.execute(
-                    """SELECT id, working_target, verified_target, locked
-                       FROM concepts WHERE id=? AND retired_version IS NULL""",
-                    (concept_id,),
-                ).fetchone()
-                if concept is None:
-                    raise KeyError(f"active concept not found: {concept_id}")
-                if bool(concept["locked"]) or str(concept["verified_target"] or "").strip():
+                if not target:
+                    raise ValueError("working target decisions require a non-empty target")
+                requested_type = str(decision.get("subject_type") or "lexeme")
+                if requested_type not in {"lexeme", "concept"}:
+                    raise ValueError(
+                        "working target subject_type must be lexeme or concept"
+                    )
+                legacy_concept_id = str(decision.get("concept_id") or "").strip()
+                if legacy_concept_id:
+                    queue_ids.add(legacy_concept_id)
+                if requested_type == "concept":
+                    raw_id = str(
+                        decision.get("subject_id") or legacy_concept_id or ""
+                    ).strip()
+                    if not raw_id:
+                        raise ValueError("concept working target requires subject_id")
+                    subject_id = self.resolve_concept_id(
+                        raw_id, connection=connection
+                    )
+                    subject_type = "concept"
+                    row = connection.execute(
+                        """SELECT id, working_target, verified_target, locked
+                           FROM concepts
+                           WHERE id=? AND retired_version IS NULL""",
+                        (subject_id,),
+                    ).fetchone()
+                    reliable_different = connection.execute(
+                        """SELECT 1
+                           FROM concepts c
+                           WHERE c.id=? AND (
+                               EXISTS(
+                                   SELECT 1 FROM coreference_decisions cd
+                                   WHERE cd.retired_version IS NULL
+                                     AND cd.lexeme_id=c.primary_lexeme_id
+                                     AND cd.relation='different'
+                                     AND (cd.locked=1 OR cd.decision_source='human')
+                                     AND (
+                                         (cd.left_anchor_type='concept'
+                                          AND cd.left_anchor_id=c.id)
+                                         OR
+                                         (cd.right_anchor_type='concept'
+                                          AND cd.right_anchor_id=c.id)
+                                     )
+                               )
+                               OR EXISTS(
+                                   SELECT 1 FROM concept_type_observations cto
+                                   WHERE cto.concept_id=c.id
+                                     AND cto.retired_version IS NULL
+                                     AND cto.source IN ('human','verified')
+                               )
+                           )""",
+                        (subject_id,),
+                    ).fetchone()
+                    if reliable_different is None:
+                        raise ValueError(
+                            "concept override requires reliable different concept evidence"
+                        )
+                    queue_ids.add(subject_id)
+                else:
+                    raw_lexeme_id = str(
+                        decision.get("subject_id")
+                        or decision.get("lexeme_id")
+                        or ""
+                    ).strip()
+                    if not raw_lexeme_id and legacy_concept_id:
+                        canonical = self.resolve_concept_id(
+                            legacy_concept_id, connection=connection
+                        )
+                        concept = connection.execute(
+                            """SELECT primary_lexeme_id, verified_target, locked
+                               FROM concepts
+                               WHERE id=? AND retired_version IS NULL""",
+                            (canonical,),
+                        ).fetchone()
+                        if concept is None or not str(concept["primary_lexeme_id"] or ""):
+                            raise KeyError(f"active concept has no primary lexeme: {canonical}")
+                        if bool(concept["locked"]) or str(
+                            concept["verified_target"] or ""
+                        ).strip():
+                            continue
+                        raw_lexeme_id = str(concept["primary_lexeme_id"])
+                        queue_ids.add(canonical)
+                    if not raw_lexeme_id:
+                        raise ValueError("lexeme working target requires subject_id")
+                    subject_type = "lexeme"
+                    subject_id = raw_lexeme_id
+                    row = connection.execute(
+                        """SELECT id, working_target, verified_target, locked
+                           FROM lexemes
+                           WHERE id=? AND retired_version IS NULL""",
+                        (subject_id,),
+                    ).fetchone()
+                    queue_ids.add(subject_id)
+                if row is None:
+                    raise KeyError(f"active {subject_type} not found: {subject_id}")
+                if bool(row["locked"]) or str(row["verified_target"] or "").strip():
                     continue
                 resolved += 1
-                processed_ids.append(concept_id)
+                subject_ref = {
+                    "subject_type": subject_type,
+                    "subject_id": subject_id,
+                }
+                processed.append(subject_ref)
+                subject_column = f"{subject_type}_id"
                 existing_rules = [
                     {
                         "condition": json.loads(row["condition_json"]),
                         "target": row["target"],
                     }
                     for row in connection.execute(
-                        """SELECT condition_json, target FROM rendering_rules
-                           WHERE concept_id=? AND retired_version IS NULL
+                        f"""SELECT condition_json, target FROM rendering_rules
+                           WHERE {subject_column}=? AND retired_version IS NULL
                              AND locked=0 AND status='provisional'""",
-                        (concept_id,),
+                        (subject_id,),
                     ).fetchall()
                 ]
                 if (
-                    str(concept["working_target"] or "") == target
+                    str(row["working_target"] or "") == target
                     and self._normalized_working_rules(existing_rules)
                     == self._normalized_working_rules(rules)
                 ):
                     continue
                 changed.append(
-                    {"concept_id": concept_id, "target": target, "rules": rules}
+                    {
+                        **subject_ref,
+                        "legacy_concept_id": legacy_concept_id,
+                        "target": target,
+                        "rules": rules,
+                    }
                 )
 
             resolved_at = utc_now()
-            for concept_id in processed_ids:
+            for queue_id in sorted(queue_ids):
                 connection.execute(
                     """UPDATE human_queue
                        SET status='resolved', resolved_at=?
                        WHERE kind='working_target_required' AND status='open'
-                         AND json_extract(payload_json, '$.concept_id')=?""",
-                    (resolved_at, concept_id),
+                         AND (
+                             json_extract(payload_json, '$.concept_id')=?
+                             OR json_extract(payload_json, '$.subject_id')=?
+                             OR json_extract(payload_json, '$.lexeme_id')=?
+                         )""",
+                    (resolved_at, queue_id, queue_id, queue_id),
                 )
 
             if not changed:
@@ -7353,22 +7523,41 @@ class V4Database:
                     "changed": 0,
                     "knowledge_version": None,
                     "affected_blocks": 0,
+                    "subjects": processed,
                 }
             version = self.create_knowledge_version(
                 "resolve provisional working translations", connection
             )
             for decision in changed:
-                concept_id = decision["concept_id"]
+                subject_type = decision["subject_type"]
+                subject_id = decision["subject_id"]
+                table = "lexemes" if subject_type == "lexeme" else "concepts"
+                subject_column = f"{subject_type}_id"
                 connection.execute(
-                    """UPDATE concepts
+                    f"""UPDATE {table}
                        SET working_target=?, default_target=?
                        WHERE id=? AND locked=0 AND verified_target=''""",
-                    (decision["target"], decision["target"], concept_id),
+                    (decision["target"], decision["target"], subject_id),
                 )
+                if subject_type == "lexeme" and decision["legacy_concept_id"]:
+                    # Compatibility mirror only. Rendering treats it as a concept
+                    # override solely when independent reliable concept evidence exists.
+                    connection.execute(
+                        """UPDATE concepts
+                           SET working_target=?, default_target=?
+                           WHERE id=? AND primary_lexeme_id=? AND locked=0
+                             AND verified_target=''""",
+                        (
+                            decision["target"],
+                            decision["target"],
+                            decision["legacy_concept_id"],
+                            subject_id,
+                        ),
+                    )
                 connection.execute(
-                    """UPDATE rendering_rules SET retired_version=?
-                       WHERE concept_id=? AND retired_version IS NULL AND locked=0""",
-                    (version, concept_id),
+                    f"""UPDATE rendering_rules SET retired_version=?
+                       WHERE {subject_column}=? AND retired_version IS NULL AND locked=0""",
+                    (version, subject_id),
                 )
                 for ordinal, rule in enumerate(decision["rules"]):
                     condition = rule.get("condition") or {}
@@ -7380,17 +7569,17 @@ class V4Database:
                     )
                     rule_id = stable_id(
                         "rule",
-                        f"working:{concept_id}:{version}:{ordinal}:{condition_json}:{target}",
+                        f"working:{subject_type}:{subject_id}:{version}:{ordinal}:{condition_json}:{target}",
                         length=24,
                     )
                     connection.execute(
-                        """INSERT INTO rendering_rules(
-                               id, concept_id, condition_json, target, priority,
+                        f"""INSERT INTO rendering_rules(
+                               id, {subject_column}, condition_json, target, priority,
                                status, scope, locked, created_version, created_at
                            ) VALUES(?, ?, ?, ?, ?, 'provisional', 'book', 0, ?, ?)""",
                         (
                             rule_id,
-                            concept_id,
+                            subject_id,
                             condition_json,
                             target,
                             50 - ordinal,
@@ -7399,13 +7588,35 @@ class V4Database:
                         ),
                     )
             affected = self._invalidate_working_target_dependents(
-                connection, [item["concept_id"] for item in changed]
+                connection,
+                [
+                    {
+                        "subject_type": item["subject_type"],
+                        "subject_id": item["subject_id"],
+                    }
+                    for item in changed
+                ]
+                + [
+                    {
+                        "subject_type": "concept",
+                        "subject_id": item["legacy_concept_id"],
+                    }
+                    for item in changed
+                    if item["legacy_concept_id"]
+                ],
             )
             return {
                 "resolved": resolved,
                 "changed": len(changed),
                 "knowledge_version": version,
                 "affected_blocks": affected,
+                "subjects": [
+                    {
+                        "subject_type": item["subject_type"],
+                        "subject_id": item["subject_id"],
+                    }
+                    for item in changed
+                ],
             }
 
     def _concept_snapshot_from_connection(
@@ -7505,6 +7716,355 @@ class V4Database:
             )
         return list(concepts.values())
 
+    def _render_snapshot_from_connection(
+        self, connection: sqlite3.Connection
+    ) -> List[Dict[str, Any]]:
+        """Build the bounded lexeme-rooted rendering state with bulk SQL only."""
+
+        rows = connection.execute(
+            """SELECT l.id, l.language, l.normalized_form, l.canonical_form,
+                      l.default_target, l.working_target, l.verified_target,
+                      l.status, l.locked, l.created_version, l.created_at,
+                      sf.form, sf.normalized_form source_normalized_form
+               FROM lexemes l
+               LEFT JOIN source_forms sf ON sf.lexeme_id=l.id
+               WHERE l.retired_version IS NULL
+               ORDER BY lower(l.normalized_form), l.id,
+                        lower(COALESCE(sf.form, l.canonical_form)),
+                        COALESCE(sf.form, l.canonical_form), sf.id"""
+        ).fetchall()
+        lexemes: Dict[str, Dict[str, Any]] = {}
+        for row in rows:
+            lexeme_id = str(row["id"])
+            item = lexemes.setdefault(
+                lexeme_id,
+                {
+                    "id": lexeme_id,
+                    "lexeme_id": lexeme_id,
+                    "language": str(row["language"]),
+                    "normalized_form": str(row["normalized_form"]),
+                    "source": str(row["canonical_form"]),
+                    "forms": [],
+                    "default_target": str(row["default_target"] or "").strip(),
+                    "working_target": str(row["working_target"] or "").strip(),
+                    "verified_target": str(row["verified_target"] or "").strip(),
+                    "status": str(row["status"]),
+                    "locked": bool(row["locked"]),
+                    "created_version": int(row["created_version"]),
+                    "created_at": str(row["created_at"]),
+                    "lexeme_rules": [],
+                    # Stable flattened compatibility view; ownership remains explicit.
+                    "rules": [],
+                    "concepts": [],
+                },
+            )
+            form = str(row["form"] or row["canonical_form"] or "").strip()
+            if form and form not in item["forms"]:
+                item["forms"].append(form)
+        if not lexemes:
+            return []
+
+        concept_rows = connection.execute(
+            """SELECT c.id, c.kind, c.canonical_source, c.default_target,
+                      c.working_target, c.verified_target, c.description,
+                      c.status, c.locked, c.created_version, c.created_at,
+                      c.primary_lexeme_id, cl.lexeme_id, cl.role,
+                      cl.confidence, cl.status binding_status,
+                      kv.reason created_reason,
+                      CASE WHEN c.locked=1 OR c.status='verified'
+                                  OR c.verified_target!=''
+                                  OR EXISTS(
+                                      SELECT 1 FROM coreference_decisions cd
+                                      WHERE cd.retired_version IS NULL
+                                        AND cd.lexeme_id=cl.lexeme_id
+                                        AND cd.relation='different'
+                                        AND (cd.locked=1 OR cd.decision_source='human')
+                                        AND (
+                                            (cd.left_anchor_type='concept'
+                                             AND cd.left_anchor_id=c.id)
+                                            OR
+                                            (cd.right_anchor_type='concept'
+                                             AND cd.right_anchor_id=c.id)
+                                        )
+                                  )
+                                  OR EXISTS(
+                                      SELECT 1 FROM concept_type_observations cto
+                                      WHERE cto.retired_version IS NULL
+                                        AND cto.concept_id=c.id
+                                        AND cto.source IN ('human','verified')
+                                  )
+                           THEN 1 ELSE 0 END concept_reliable,
+                      CASE WHEN EXISTS(
+                                      SELECT 1 FROM coreference_decisions cd
+                                      WHERE cd.retired_version IS NULL
+                                        AND cd.lexeme_id=cl.lexeme_id
+                                        AND cd.relation='different'
+                                        AND (cd.locked=1 OR cd.decision_source='human')
+                                        AND (
+                                            (cd.left_anchor_type='concept'
+                                             AND cd.left_anchor_id=c.id)
+                                            OR
+                                            (cd.right_anchor_type='concept'
+                                             AND cd.right_anchor_id=c.id)
+                                        )
+                                  )
+                                  OR EXISTS(
+                                      SELECT 1 FROM concept_type_observations cto
+                                      WHERE cto.retired_version IS NULL
+                                        AND cto.concept_id=c.id
+                                        AND cto.source IN ('human','verified')
+                                  )
+                           THEN 1 ELSE 0 END different_evidence
+                      ,CASE WHEN EXISTS(
+                           SELECT 1 FROM verification_tasks vt
+                           WHERE vt.subject_type='concept' AND vt.subject_id=c.id
+                             AND vt.status IN ('open','needs_human')
+                       ) THEN 1 ELSE 0 END verification_pending
+               FROM concept_lexemes cl
+               JOIN concepts c ON c.id=cl.concept_id
+               JOIN knowledge_versions kv ON kv.id=c.created_version
+               JOIN lexemes l ON l.id=cl.lexeme_id
+               WHERE cl.retired_version IS NULL
+                 AND c.retired_version IS NULL
+                 AND l.retired_version IS NULL
+               ORDER BY cl.lexeme_id, c.id, cl.role, cl.created_version"""
+        ).fetchall()
+        concepts_by_id: Dict[str, List[Dict[str, Any]]] = {}
+        for row in concept_rows:
+            lexeme_id = str(row["lexeme_id"])
+            if lexeme_id not in lexemes:
+                continue
+            concept_reliable = bool(row["concept_reliable"])
+            binding_reliable = (
+                str(row["role"]) != "uncertain"
+                and float(row["confidence"] or 0.0) >= 0.8
+                and (
+                    str(row["binding_status"]) == "verified"
+                    or concept_reliable
+                )
+            )
+            concept = {
+                "id": str(row["id"]),
+                "kind": str(row["kind"]),
+                "source": str(row["canonical_source"]),
+                "default_target": str(row["default_target"] or "").strip(),
+                "working_target": str(row["working_target"] or "").strip(),
+                "verified_target": str(row["verified_target"] or "").strip(),
+                "description": str(row["description"] or ""),
+                "status": str(row["status"]),
+                "locked": bool(row["locked"]),
+                "created_version": int(row["created_version"]),
+                "created_at": str(row["created_at"]),
+                "primary_lexeme_id": str(row["primary_lexeme_id"] or ""),
+                "binding_lexeme_id": lexeme_id,
+                "binding_role": str(row["role"]),
+                "binding_status": str(row["binding_status"]),
+                "binding_confidence": float(row["confidence"]),
+                "binding_reliable": binding_reliable,
+                "concept_reliable": concept_reliable,
+                "different_evidence": bool(row["different_evidence"]),
+                "verification_pending": (
+                    bool(row["verification_pending"]) and not bool(row["locked"])
+                ),
+                "_created_reason": str(row["created_reason"] or ""),
+                "redirect_source_ids": [],
+                "rules": [],
+            }
+            lexemes[lexeme_id]["concepts"].append(concept)
+            concepts_by_id.setdefault(str(row["id"]), []).append(concept)
+
+        redirect_rows = connection.execute(
+            """SELECT retired_concept_id, canonical_concept_id
+               FROM concept_redirects
+               ORDER BY retired_concept_id"""
+        ).fetchall()
+        redirects = {
+            str(row["retired_concept_id"]): str(row["canonical_concept_id"])
+            for row in redirect_rows
+        }
+        for source_id in sorted(redirects):
+            current = source_id
+            visited: set[str] = set()
+            for _ in range(MAX_CONCEPT_REDIRECT_DEPTH + 1):
+                if current in visited:
+                    break
+                visited.add(current)
+                target = redirects.get(current)
+                if target is None:
+                    concepts = concepts_by_id.get(current, [])
+                    if source_id != current:
+                        for concept in concepts:
+                            concept["redirect_source_ids"].append(source_id)
+                    break
+                current = target
+
+        rule_rows = connection.execute(
+            """SELECT rr.id, rr.lexeme_id, rr.concept_id, rr.condition_json,
+                      rr.target, rr.priority, rr.status, rr.scope, rr.locked,
+                      rr.created_version, rr.created_at
+               FROM rendering_rules rr
+               LEFT JOIN lexemes l ON l.id=rr.lexeme_id
+               LEFT JOIN concepts c ON c.id=rr.concept_id
+               WHERE rr.retired_version IS NULL
+                 AND (
+                     (rr.lexeme_id IS NOT NULL AND l.retired_version IS NULL)
+                     OR
+                     (rr.concept_id IS NOT NULL AND c.retired_version IS NULL)
+                 )
+               ORDER BY rr.priority DESC, rr.locked DESC, rr.status DESC,
+                        rr.created_version DESC, rr.id"""
+        ).fetchall()
+        for row in rule_rows:
+            rule_id = str(row["id"])
+            try:
+                condition = json.loads(str(row["condition_json"] or "{}"))
+            except (json.JSONDecodeError, TypeError) as exc:
+                raise KnowledgeSnapshotError(rule_id, str(exc)) from exc
+            if not isinstance(condition, dict):
+                raise KnowledgeSnapshotError(
+                    rule_id, "condition_json must decode to an object"
+                )
+            rule = {
+                "id": rule_id,
+                "condition": condition,
+                "target": str(row["target"] or "").strip(),
+                "priority": int(row["priority"]),
+                "status": str(row["status"]),
+                "scope": str(row["scope"]),
+                "locked": bool(row["locked"]),
+                "created_version": int(row["created_version"]),
+                "created_at": str(row["created_at"]),
+            }
+            if row["lexeme_id"] is not None:
+                rule["subject_type"] = "lexeme"
+                rule["subject_id"] = str(row["lexeme_id"])
+                lexeme = lexemes.get(str(row["lexeme_id"]))
+                if lexeme is not None:
+                    lexeme["lexeme_rules"].append(rule)
+                    lexeme["rules"].append(rule)
+            else:
+                rule["subject_type"] = "concept"
+                rule["subject_id"] = str(row["concept_id"])
+                concepts = concepts_by_id.get(str(row["concept_id"]), [])
+                for concept in concepts:
+                    concept["rules"].append(rule)
+                    owner = lexemes.get(str(concept["binding_lexeme_id"]))
+                    if owner is not None:
+                        owner["rules"].append(rule)
+
+        for lexeme in lexemes.values():
+            lexeme["forms"].sort(key=lambda value: (value.casefold(), value))
+            lexeme["concepts"].sort(key=lambda item: str(item["id"]))
+            for concept in lexeme["concepts"]:
+                concept["redirect_source_ids"].sort()
+            primary = next(
+                (
+                    concept
+                    for concept in lexeme["concepts"]
+                    if concept["primary_lexeme_id"] == lexeme["lexeme_id"]
+                    and concept["binding_role"] == "primary"
+                ),
+                None,
+            )
+            if primary is not None:
+                # ``id`` is the legacy concept-facing identity; lexeme ownership
+                # remains explicit and authoritative in ``lexeme_id``.
+                lexeme["id"] = primary["id"]
+        filtered: List[Dict[str, Any]] = []
+        for lexeme in lexemes.values():
+            concepts = list(lexeme["concepts"])
+            created_reasons = [
+                str(concept.pop("_created_reason", "")) for concept in concepts
+            ]
+            proposal_only = bool(concepts) and all(
+                reason.startswith("translation proposals ")
+                and concept["status"] == "provisional"
+                and not concept["locked"]
+                and not concept["working_target"]
+                and not concept["verified_target"]
+                for reason, concept in zip(created_reasons, concepts)
+            )
+            if (
+                proposal_only
+                and not lexeme["working_target"]
+                and not lexeme["verified_target"]
+                and not lexeme["locked"]
+            ):
+                continue
+            filtered.append(lexeme)
+        return filtered
+
+    def render_snapshot(self) -> List[Dict[str, Any]]:
+        """Return stable, JSON-friendly active rendering knowledge."""
+
+        connection = self.connect()
+        try:
+            connection.execute("BEGIN")
+            return self._render_snapshot_from_connection(connection)
+        finally:
+            connection.rollback()
+            connection.close()
+
+    def rendering_contexts_for_block(self, block_id: str) -> List[Dict[str, Any]]:
+        """Return persisted occurrence evidence used by rendering conditions."""
+
+        with closing(self.connect()) as connection:
+            rows = connection.execute(
+                """SELECT m.id mention_id, m.lexeme_id, m.concept_id,
+                          m.paragraph_id, m.source_form, m.discourse_function,
+                          e.confidence, e.payload_json,
+                          fo.start_offset, fo.end_offset
+                   FROM mentions m
+                   JOIN evidence e ON e.id=m.evidence_id
+                   LEFT JOIN form_occurrences fo
+                     ON fo.block_id=m.block_id
+                    AND fo.lexeme_id=m.lexeme_id
+                    AND fo.source_form=m.source_form
+                   WHERE m.block_id=?
+                   ORDER BY m.id, fo.start_offset, fo.end_offset""",
+                (block_id,),
+            ).fetchall()
+        contexts: List[Dict[str, Any]] = []
+        seen: set[str] = set()
+        for row in rows:
+            try:
+                payload = json.loads(str(row["payload_json"] or "{}"))
+            except (json.JSONDecodeError, TypeError):
+                payload = {}
+            if not isinstance(payload, dict):
+                payload = {}
+            concept_id = str(row["concept_id"] or "")
+            confidence = float(row["confidence"] or 0.0)
+            context: Dict[str, Any] = {
+                "block_id": str(block_id),
+                "lexeme_id": str(row["lexeme_id"]),
+                "source_form": str(row["source_form"]),
+                "paragraph_id": str(row["paragraph_id"]),
+                "paragraph": str(row["paragraph_id"]),
+                "discourse_function": str(row["discourse_function"]),
+                "mention": {
+                    "id": int(row["mention_id"]),
+                    "concept_id": concept_id,
+                    "confidence": confidence,
+                    "reliable": bool(concept_id) and confidence >= 0.8,
+                },
+            }
+            if concept_id:
+                context["concept_id"] = concept_id
+            if row["start_offset"] is not None:
+                context["start_offset"] = int(row["start_offset"])
+                context["end_offset"] = int(row["end_offset"])
+            for key in ("speaker", "speaker_id", "thread", "thread_id"):
+                if payload.get(key) not in (None, ""):
+                    context[key] = payload[key]
+            signature = json.dumps(
+                context, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+            )
+            if signature not in seen:
+                seen.add(signature)
+                contexts.append(context)
+        return contexts
+
     def concept_snapshot(self) -> List[Dict[str, Any]]:
         """Materialize active rendering state from one SQLite read snapshot."""
 
@@ -7518,8 +8078,8 @@ class V4Database:
 
     def freeze_translation_knowledge(
         self,
-    ) -> tuple[int, FrozenConceptIndex, str]:
-        """Atomically freeze the version, concept rendering state, and signature."""
+    ) -> tuple[int, FrozenRenderIndex, str]:
+        """Atomically freeze version and lexeme/concept rendering state."""
 
         connection = self.connect()
         try:
@@ -7529,8 +8089,10 @@ class V4Database:
                     "SELECT MAX(id) FROM knowledge_versions"
                 ).fetchone()[0]
             )
-            snapshot = self._concept_snapshot_from_connection(connection)
-            frozen = FrozenConceptIndex.compile(
+            # Preserve the historical read hook and its single-transaction view.
+            self._concept_snapshot_from_connection(connection)
+            snapshot = self._render_snapshot_from_connection(connection)
+            frozen = FrozenRenderIndex.compile(
                 snapshot, self.target_snapshot_signature
             )
             return version, frozen, frozen.signature
@@ -7540,61 +8102,10 @@ class V4Database:
 
     @staticmethod
     def target_snapshot_signature(snapshot: Sequence[Dict[str, Any]]) -> str:
-        payload: List[Dict[str, Any]] = []
-        for concept in sorted(snapshot, key=lambda item: str(item.get("id") or "")):
-            rules = []
-            for rule in concept.get("rules", []):
-                rules.append(
-                    {
-                        "id": str(rule.get("id") or ""),
-                        "condition": deepcopy(rule.get("condition") or {}),
-                        "target": str(rule.get("target") or "").strip(),
-                        "priority": int(rule.get("priority") or 0),
-                        "status": str(rule.get("status") or ""),
-                        "locked": bool(rule.get("locked")),
-                    }
-                )
-            rules.sort(
-                key=lambda item: (
-                    item["id"],
-                    -item["priority"],
-                    json.dumps(
-                        item["condition"],
-                        ensure_ascii=False,
-                        sort_keys=True,
-                        separators=(",", ":"),
-                    ),
-                    item["target"],
-                )
-            )
-            payload.append(
-                {
-                    "id": str(concept.get("id") or ""),
-                    "source": str(concept.get("source") or ""),
-                    "forms": sorted(
-                        {
-                            str(form)
-                            for form in concept.get("forms", [])
-                            if str(form)
-                        },
-                        key=lambda value: (value.casefold(), value),
-                    ),
-                    "kind": str(concept.get("kind") or ""),
-                    "description": str(concept.get("description") or ""),
-                    "status": str(concept.get("status") or ""),
-                    "locked": bool(concept.get("locked")),
-                    "working_target": str(concept.get("working_target") or ""),
-                    "verified_target": str(concept.get("verified_target") or ""),
-                    "default_target": str(concept.get("default_target") or ""),
-                    "target_strength": str(
-                        concept.get("target_strength") or "unset"
-                    ),
-                    "verification_pending": bool(
-                        concept.get("verification_pending")
-                    ),
-                    "rules": rules,
-                }
-            )
+        payload = sorted(
+            (deepcopy(dict(item)) for item in snapshot),
+            key=lambda item: str(item.get("lexeme_id") or item.get("id") or ""),
+        )
         raw = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
         return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
@@ -7603,21 +8114,17 @@ class V4Database:
         text: str,
         concept_snapshot: Optional[Sequence[Dict[str, Any]]] = None,
     ) -> List[Dict[str, Any]]:
-        if isinstance(concept_snapshot, FrozenConceptIndex):
+        if isinstance(concept_snapshot, FrozenRenderIndex):
             return concept_snapshot.matched_concepts(text)
         snapshot = (
             list(concept_snapshot)
             if concept_snapshot is not None
-            else self.concept_snapshot()
+            else self.render_snapshot()
         )
         signature = self.target_snapshot_signature(snapshot)
-        matcher = ConceptMatcherCache.get(signature, snapshot)
-        by_id = {str(concept.get("id") or ""): concept for concept in snapshot}
-        return [
-            deepcopy(by_id[concept_id])
-            for concept_id in matcher.match(text)
-            if concept_id in by_id
-        ]
+        return FrozenRenderIndex.compile(
+            snapshot, lambda _snapshot: signature
+        ).matched_concepts(text)
 
     def finish_translation_run_atomically(
         self,
@@ -7630,7 +8137,9 @@ class V4Database:
         """Finalize a translation run against knowledge read in the same write txn."""
 
         with self.transaction() as connection:
-            snapshot = self._concept_snapshot_from_connection(connection)
+            # Preserve the historical validation/read hook before rendering.
+            self._concept_snapshot_from_connection(connection)
+            snapshot = self._render_snapshot_from_connection(connection)
             current_signature = self.target_snapshot_signature(snapshot)
             stale = force_revalidate or current_signature != expected_signature
             persisted_status = (

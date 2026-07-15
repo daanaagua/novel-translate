@@ -14,7 +14,7 @@ from src.core.v4.context import ContextBuilder, ContextOverflow
 from src.core.v4.database import V4Database
 from src.core.v4.exporter import ParallelV4BookExporter
 from src.core.v4.migration import V4Migrator
-from src.core.v4.models import ScanOutcome, ScanResponse
+from src.core.v4.models import ScanOutcome, ScanResponse, TranslationOutcome, V4BlockStatus
 from src.core.v4.pipeline import V4PipelineConfig, V4TranslationPipeline
 from src.core.v4.scanner import ScanProtocolError, V4Scanner
 from src.core.v4.semantic_mapper import SemanticMapper
@@ -191,6 +191,81 @@ class ParallelV4Tests(unittest.TestCase):
             )
         self.database.upsert_blocks(self.edition, rows)
         return self.database.list_blocks()
+
+    def test_pipeline_glossary_uses_frozen_rendered_target_for_each_block_context(self):
+        self.add_blocks(
+            ["Archon, hear me.", "The Archon sat in the tavern."], status="ready"
+        )
+        concept_id = self.database.import_legacy_concept(
+            "Archon", "", "title", "office"
+        )
+        self.database.apply_working_target_decisions(
+            [{"concept_id": concept_id, "target": "执政官", "rules": []}]
+        )
+        version = self.database.current_knowledge_version()
+        with self.database.transaction() as connection:
+            lexeme_id = connection.execute(
+                "SELECT primary_lexeme_id FROM concepts WHERE id=?", (concept_id,)
+            ).fetchone()[0]
+            evidence_id = connection.execute(
+                """INSERT INTO evidence(
+                       block_id, paragraph_id, kind, source_form, evidence_quote,
+                       payload_json, confidence, extractor, run_id, created_at)
+                   VALUES('ch01_000', 'P000', 'test', 'Archon', 'Archon', ?,
+                          1.0, 'test', NULL, 'now')""",
+                (json.dumps({"speaker_id": "severian", "thread_id": "court"}),),
+            ).lastrowid
+            connection.execute(
+                """INSERT INTO mentions(
+                       block_id, paragraph_id, source_form, normalized_form,
+                       discourse_function, lexeme_id, concept_id, evidence_id)
+                   VALUES('ch01_000', 'P000', 'Archon', 'archon', 'vocative',
+                          ?, ?, ?)""",
+                (lexeme_id, concept_id, evidence_id),
+            )
+            connection.execute(
+                """INSERT INTO form_occurrences(
+                       lexeme_id, block_id, start_offset, end_offset,
+                       source_form, source_hash, created_at)
+                   VALUES(?, 'ch01_000', 0, 6, 'Archon', 'hash-0', 'now')""",
+                (lexeme_id,),
+            )
+            connection.execute(
+                """INSERT INTO rendering_rules(
+                       id, lexeme_id, condition_json, target, priority, status,
+                       scope, locked, created_version, created_at)
+                   VALUES('archon-block-vocative', ?, ?, '阁下', 100, 'verified',
+                          'book', 1, ?, 'now')""",
+                (
+                    lexeme_id,
+                    json.dumps(
+                        {
+                            "block_id": "ch01_000",
+                            "discourse_function": "vocative",
+                            "speaker_id": "severian",
+                            "thread_id": "court",
+                            "start_offset": 0,
+                            "end_offset": 6,
+                        },
+                        separators=(",", ":"),
+                    ),
+                    version,
+                ),
+            )
+        _, frozen, _ = self.database.freeze_translation_knowledge()
+        blocks = self.database.list_blocks()
+        pipeline = V4TranslationPipeline(self.database, lambda: None)
+
+        vocative = pipeline._glossary_for(
+            [blocks[0]], concept_snapshot=frozen
+        ).glossary.items
+        tavern = pipeline._glossary_for(
+            [blocks[1]], concept_snapshot=frozen
+        ).glossary.items
+
+        self.assertEqual([item.default_target for item in vocative], ["阁下"])
+        self.assertEqual([item.default_target for item in tavern], ["执政官"])
+        self.assertEqual(vocative[0].rules, [])
 
     def test_local_scan_indexes_candidates_and_legacy_reconcile_is_conservative(self):
         blocks = self.add_blocks(["Archon spoke.", "archon waited.", "Archons gathered."])

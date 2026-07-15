@@ -1,4 +1,5 @@
 import json
+import hashlib
 from contextlib import closing
 
 import pytest
@@ -9,6 +10,7 @@ from src.core.v4.matcher import (
     ConceptMatcherCache,
     FrozenConceptIndex,
 )
+from src.core.v4 import matcher as matcher_module
 from src.core.v4.models import TranslationOutcome, V4BlockStatus
 
 
@@ -37,6 +39,379 @@ def _db(tmp_path, texts):
         ],
     )
     return db
+
+
+def _render_signature(snapshot):
+    raw = json.dumps(
+        snapshot, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    )
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def _render_snapshot(
+    *,
+    concept_verified="大执政官",
+    lexeme_verified="督政官",
+    concept_working="首席",
+    lexeme_working="执政官",
+):
+    return [
+        {
+            "id": "lex-archon",
+            "lexeme_id": "lex-archon",
+            "source": "Archon",
+            "forms": ["Archon", "ARCHON"],
+            "default_target": "旧执政官",
+            "working_target": lexeme_working,
+            "verified_target": lexeme_verified,
+            "status": "verified" if lexeme_verified else "provisional",
+            "locked": False,
+            "created_version": 1,
+            "rules": [],
+            "concepts": [
+                {
+                    "id": "concept-archon",
+                    "kind": "title",
+                    "source": "Archon",
+                    "default_target": "",
+                    "working_target": concept_working,
+                    "verified_target": concept_verified,
+                    "status": "verified",
+                    "locked": False,
+                    "created_version": 2,
+                    "binding_role": "primary",
+                    "binding_status": "verified",
+                    "binding_confidence": 1.0,
+                    "binding_reliable": True,
+                    "redirect_source_ids": [],
+                    "rules": [
+                        {
+                            "id": "locked-vocative",
+                            "condition": {
+                                "block_id": "b-vocative",
+                                "speaker": "Severian",
+                                "thread_id": "court",
+                                "start_offset": 0,
+                                "end_offset": 6,
+                            },
+                            "target": "阁下",
+                            "priority": 100,
+                            "status": "verified",
+                            "locked": True,
+                            "created_version": 3,
+                        },
+                        {
+                            "id": "empty-locked-rule",
+                            "condition": {"block_id": "b-vocative"},
+                            "target": "",
+                            "priority": 999,
+                            "status": "verified",
+                            "locked": True,
+                            "created_version": 4,
+                        },
+                    ],
+                }
+            ],
+        }
+    ]
+
+
+def _compile_render(snapshot):
+    return matcher_module.FrozenRenderIndex.compile(snapshot, _render_signature)
+
+
+def test_frozen_render_index_applies_six_layers_and_locked_conditions_exactly():
+    vocative = _compile_render(_render_snapshot())
+    matched = vocative.matched_renderings(
+        "Archon entered.",
+        block_id="b-vocative",
+        speaker="Severian",
+        thread_id="court",
+    )[0]
+    assert matched.rendered_target == "阁下"
+    assert matched.applied_rule_ids == ("locked-vocative",)
+
+    ordinary = vocative.matched_renderings(
+        "Archon entered.",
+        block_id="b-tavern",
+        speaker="Innkeeper",
+        thread_id="tavern",
+    )[0]
+    assert ordinary.rendered_target == "大执政官"
+    assert ordinary.applied_rule_ids == ()
+
+    verified_lexeme = _compile_render(_render_snapshot(concept_verified=""))
+    assert verified_lexeme.matched_renderings("Archon")[0].rendered_target == "督政官"
+
+    working_concept = _compile_render(
+        _render_snapshot(concept_verified="", lexeme_verified="")
+    )
+    assert working_concept.matched_renderings("Archon")[0].rendered_target == "首席"
+
+    working_lexeme = _compile_render(
+        _render_snapshot(
+            concept_verified="", lexeme_verified="", concept_working=""
+        )
+    )
+    assert working_lexeme.matched_renderings("Archon")[0].rendered_target == "执政官"
+
+    unconstrained = _compile_render(
+        _render_snapshot(
+            concept_verified="",
+            lexeme_verified="",
+            concept_working="",
+            lexeme_working="",
+        )
+    )
+    unconstrained_match = unconstrained.matched_renderings("Archon")[0]
+    assert unconstrained_match.rendered_target == "旧执政官"
+
+    no_target = _render_snapshot(
+        concept_verified="",
+        lexeme_verified="",
+        concept_working="",
+        lexeme_working="",
+    )
+    no_target[0]["default_target"] = ""
+    assert _compile_render(no_target).matched_renderings("Archon")[0].rendered_target == ""
+
+
+def test_render_matches_preserve_offsets_identity_uncertain_fallback_and_fingerprint():
+    snapshot = _render_snapshot(concept_verified="", lexeme_verified="")
+    index = _compile_render(snapshot)
+    matches = index.matched_renderings("ARCHON met Archon.")
+
+    assert len(matches) == 2
+    assert isinstance(matches[0], matcher_module.MatchedRendering)
+    assert (
+        matches[0].lexeme_id,
+        matches[0].concept_id,
+        matches[0].matched_form,
+        matches[0].start_offset,
+        matches[0].end_offset,
+        matches[0].rendered_target,
+    ) == ("lex-archon", "concept-archon", "ARCHON", 0, 6, "首席")
+    assert matches[0].dependency_fingerprint == matches[1].dependency_fingerprint
+
+    snapshot[0]["concepts"][0]["binding_role"] = "uncertain"
+    snapshot[0]["concepts"][0]["binding_reliable"] = False
+    uncertain = _compile_render(snapshot).matched_renderings(
+        "Archon", mention={"concept_id": "concept-archon", "status": "uncertain"}
+    )[0]
+    assert uncertain.concept_id is None
+    assert uncertain.rendered_target == "执政官"
+
+    changed = _render_snapshot(concept_verified="", lexeme_verified="")
+    changed[0]["working_target"] = "执政者"
+    changed_match = _compile_render(changed).matched_renderings("Archon")[0]
+    assert changed_match.dependency_fingerprint == matches[0].dependency_fingerprint
+
+    changed[0]["concepts"][0]["working_target"] = "大人"
+    concept_changed = _compile_render(changed).matched_renderings("Archon")[0]
+    assert concept_changed.dependency_fingerprint != matches[0].dependency_fingerprint
+
+
+def test_frozen_concept_index_remains_a_sequence_and_matched_concepts_compatibility():
+    snapshot = _render_snapshot(concept_verified="", lexeme_verified="")
+    index = FrozenConceptIndex.compile(snapshot, _render_signature)
+
+    assert isinstance(index, matcher_module.FrozenRenderIndex)
+    assert len(index) == 1
+    assert index[0]["lexeme_id"] == "lex-archon"
+    concepts = index.matched_concepts("The Archon spoke.")
+    assert concepts[0]["id"] == "concept-archon"
+    assert concepts[0]["default_target"] == "首席"
+
+
+def test_database_render_snapshot_is_canonical_bounded_and_redirect_aware(tmp_path):
+    db = _db(tmp_path, ["Archon spoke."])
+    retired_id = db.import_legacy_concept("Archon", "", "title", "office")
+    version = db.current_knowledge_version()
+    canonical_id = "concept-archon-office"
+    with db.transaction() as connection:
+        lexeme_id = connection.execute(
+            "SELECT primary_lexeme_id FROM concepts WHERE id=?", (retired_id,)
+        ).fetchone()[0]
+        connection.execute(
+            """UPDATE lexemes SET working_target='执政官'
+                 WHERE id=?""",
+            (lexeme_id,),
+        )
+        connection.execute(
+            """INSERT INTO concepts(
+                   id, kind, canonical_source, default_target, working_target,
+                   verified_target, description, status, scope, locked,
+                   primary_lexeme_id, created_version, created_at)
+               VALUES(?, 'title', 'Archon', '大执政官', '', '大执政官', 'office',
+                      'verified', 'book', 0, ?, ?, 'now')""",
+            (canonical_id, lexeme_id, version),
+        )
+        connection.execute(
+            """INSERT INTO concept_lexemes(
+                   concept_id, lexeme_id, role, confidence, status,
+                   created_version, created_at)
+               VALUES(?, ?, 'primary', 1.0, 'verified', ?, 'now')""",
+            (canonical_id, lexeme_id, version),
+        )
+        connection.execute(
+            "UPDATE concepts SET status='retired', retired_version=? WHERE id=?",
+            (version, retired_id),
+        )
+        connection.execute(
+            """INSERT INTO concept_redirects(
+                   retired_concept_id, canonical_concept_id, reason,
+                   knowledge_version, created_at)
+               VALUES(?, ?, 'same lexeme', ?, 'now')""",
+            (retired_id, canonical_id, version),
+        )
+        connection.execute(
+            """INSERT INTO rendering_rules(
+                   id, concept_id, condition_json, target, priority, status,
+                   scope, locked, created_version, created_at)
+               VALUES('archon-vocative', ?, ?, '阁下', 100, 'verified',
+                      'book', 1, ?, 'now')""",
+            (
+                canonical_id,
+                json.dumps(
+                    {"block_id": "block_0", "speaker": "Severian"},
+                    separators=(",", ":"),
+                ),
+                version,
+            ),
+        )
+        connection.execute(
+            """INSERT INTO lexemes(
+                   id, language, normalized_form, canonical_form, default_target,
+                   working_target, status, locked, created_version,
+                   retired_version, created_at)
+               VALUES('retired-lexeme', 'en', 'ghost', 'Ghost', '幽灵', '幽灵',
+                      'provisional', 0, ?, ?, 'now')""",
+            (version, version),
+        )
+        connection.execute(
+            """INSERT INTO source_forms(
+                   lexeme_id, form, normalized_form, grammar_json)
+               VALUES('retired-lexeme', 'Ghost', 'ghost', '{}')"""
+        )
+
+    first = db.render_snapshot()
+    second = db.render_snapshot()
+    assert first == second
+    assert db.target_snapshot_signature(first) == db.target_snapshot_signature(second)
+    encoded = json.dumps(first, ensure_ascii=False, sort_keys=True)
+    assert "source_text" not in encoded
+    assert "retired-lexeme" not in encoded
+    assert len(first) == 1
+    assert [item["id"] for item in first[0]["concepts"]] == [canonical_id]
+    assert first[0]["concepts"][0]["redirect_source_ids"] == [retired_id]
+
+    index = matcher_module.FrozenRenderIndex.compile(
+        first, db.target_snapshot_signature
+    )
+    ordinary = index.matched_renderings(
+        "Archon spoke.", block_id="block_0", speaker="Innkeeper"
+    )[0]
+    vocative = index.matched_renderings(
+        "Archon spoke.",
+        block_id="block_0",
+        speaker="Severian",
+        concept_id=retired_id,
+    )[0]
+    assert ordinary.rendered_target == "大执政官"
+    assert vocative.concept_id == canonical_id
+    assert vocative.rendered_target == "阁下"
+    assert vocative.applied_rule_ids == ("archon-vocative",)
+
+
+def test_concept_rules_are_attached_to_every_active_lexeme_binding(tmp_path):
+    db = _db(tmp_path, ["Archon met the Magistrate."])
+    concept_id = db.import_legacy_concept("Archon", "", "title", "office")
+    version = db.current_knowledge_version()
+    with db.transaction() as connection:
+        primary = connection.execute(
+            "SELECT primary_lexeme_id FROM concepts WHERE id=?", (concept_id,)
+        ).fetchone()[0]
+        connection.execute(
+            """UPDATE concepts SET status='verified', verified_target='CON'
+                 WHERE id=?""",
+            (concept_id,),
+        )
+        connection.execute(
+            """UPDATE concept_lexemes SET status='verified', confidence=1.0
+                 WHERE concept_id=? AND lexeme_id=?""",
+            (concept_id, primary),
+        )
+        connection.execute(
+            """INSERT INTO lexemes(
+                   id, language, normalized_form, canonical_form,
+                   created_version, created_at)
+               VALUES('lex-magistrate', 'en', 'magistrate', 'Magistrate', ?, 'now')""",
+            (version,),
+        )
+        connection.execute(
+            """INSERT INTO source_forms(
+                   lexeme_id, form, normalized_form, grammar_json)
+               VALUES('lex-magistrate', 'Magistrate', 'magistrate', '{}')"""
+        )
+        connection.execute(
+            """INSERT INTO concept_lexemes(
+                   concept_id, lexeme_id, role, confidence, status,
+                   created_version, created_at)
+               VALUES(?, 'lex-magistrate', 'alias', 1.0, 'verified', ?, 'now')""",
+            (concept_id, version),
+        )
+        connection.execute(
+            """INSERT INTO rendering_rules(
+                   id, concept_id, condition_json, target, priority, status,
+                   scope, locked, created_version, created_at)
+               VALUES('shared-rule', ?, '{}', 'RULE', 100, 'verified',
+                      'book', 1, ?, 'now')""",
+            (concept_id, version),
+        )
+
+    _, frozen, _ = db.freeze_translation_knowledge()
+    assert [item.rendered_target for item in frozen.matched_renderings(
+        "Archon met the Magistrate."
+    )] == ["RULE", "RULE"]
+
+
+def test_render_snapshot_and_compile_use_constant_query_count(tmp_path):
+    db = _db(tmp_path, ["Name1999 spoke."])
+    version = db.current_knowledge_version()
+    with db.transaction() as connection:
+        for index in range(200):
+            source = f"Name{index}"
+            lexeme_id = f"lex-{index:04d}"
+            connection.execute(
+                """INSERT INTO lexemes(
+                       id, language, normalized_form, canonical_form,
+                       working_target, created_version, created_at)
+                   VALUES(?, 'en', lower(?), ?, ?, ?, 'now')""",
+                (lexeme_id, source, source, f"译名{index}", version),
+            )
+            connection.execute(
+                """INSERT INTO source_forms(
+                       lexeme_id, form, normalized_form, grammar_json)
+                   VALUES(?, ?, lower(?), '{}')""",
+                (lexeme_id, source, source),
+            )
+
+    statements = []
+    original_connect = db.connect
+
+    def traced_connect():
+        connection = original_connect()
+        connection.set_trace_callback(statements.append)
+        return connection
+
+    db.connect = traced_connect
+    snapshot = db.render_snapshot()
+    index = matcher_module.FrozenRenderIndex.compile(
+        snapshot, db.target_snapshot_signature
+    )
+    assert index.matched_renderings("Name199 and Name1")
+    selects = [sql for sql in statements if sql.lstrip().upper().startswith("SELECT")]
+    assert len(selects) <= 6
 
 
 def test_aho_matcher_preserves_word_boundaries_case_and_nfkc():

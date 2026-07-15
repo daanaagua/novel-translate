@@ -162,6 +162,159 @@ def _response(*decisions):
     return json.dumps({"decisions": list(decisions)}, ensure_ascii=False)
 
 
+def test_working_targets_default_to_lexeme_subject_and_keep_concept_override_empty(
+    tmp_path,
+):
+    database = _database(tmp_path, ["Archon spoke.", "The Archon waited."])
+    concept_id = _seed_concept(database, "Archon", kind="title")
+
+    candidates = database.working_target_candidates()
+    assert len(candidates) == 1
+    candidate = candidates[0]
+    assert candidate["subject_type"] == "lexeme"
+    assert candidate["subject_id"] == candidate["lexeme_id"]
+    assert candidate["concept_id"] == concept_id
+
+    applied = database.apply_working_target_decisions(
+        [
+            {
+                "concept_id": concept_id,
+                "target": "执政官",
+                "rules": [
+                    {
+                        "condition": {"discourse_function": "vocative"},
+                        "target": "阁下",
+                    }
+                ],
+            }
+        ]
+    )
+    assert applied["subjects"] == [
+        {"subject_type": "lexeme", "subject_id": candidate["lexeme_id"]}
+    ]
+    with closing(database.connect()) as connection:
+        lexeme = connection.execute(
+            """SELECT working_target, verified_target, locked FROM lexemes
+                 WHERE id=?""",
+            (candidate["lexeme_id"],),
+        ).fetchone()
+        concept = connection.execute(
+            """SELECT working_target, verified_target, status FROM concepts WHERE id=?""",
+            (concept_id,),
+        ).fetchone()
+        rules = connection.execute(
+            """SELECT lexeme_id, concept_id, target FROM rendering_rules
+                 WHERE retired_version IS NULL AND target='阁下'"""
+        ).fetchall()
+    assert tuple(lexeme) == ("执政官", "", 0)
+    # The legacy concept column remains a read-compatible mirror, but the
+    # provisional concept is not a reliable override in the render snapshot.
+    assert tuple(concept) == ("执政官", "", "legacy_provisional")
+    rendered = database.freeze_translation_knowledge()[1].matched_renderings(
+        "Archon", mention={"concept_id": concept_id, "status": "uncertain"}
+    )[0]
+    assert rendered.concept_id is None
+    assert rendered.rendered_target == "执政官"
+    assert [tuple(row) for row in rules] == [
+        (candidate["lexeme_id"], None, "阁下")
+    ]
+
+    repeated = database.apply_working_target_decisions(
+        [{"concept_id": concept_id, "target": "执政官", "rules": [
+            {"condition": {"discourse_function": "vocative"}, "target": "阁下"}
+        ]}]
+    )
+    assert repeated["changed"] == 0
+
+
+def test_explicit_concept_override_requires_reliable_different_evidence(tmp_path):
+    database = _database(tmp_path, ["Archon spoke.", "The Archon waited."])
+    concept_id = _seed_concept(database, "Archon", kind="title")
+
+    with pytest.raises(ValueError, match="reliable different concept evidence"):
+        database.apply_working_target_decisions(
+            [
+                {
+                    "subject_type": "concept",
+                    "subject_id": concept_id,
+                    "target": "首席执政官",
+                    "rules": [],
+                }
+            ]
+        )
+
+    version = database.current_knowledge_version()
+    with database.transaction() as connection:
+        lexeme_id = connection.execute(
+            "SELECT primary_lexeme_id FROM concepts WHERE id=?", (concept_id,)
+        ).fetchone()[0]
+        connection.execute(
+            """INSERT INTO coreference_decisions(
+                   id, lexeme_id, left_anchor_type, left_anchor_id,
+                   right_anchor_type, right_anchor_id, relation,
+                   decision_source, confidence, locked, votes_json,
+                   evidence_ids_json, anchor_members_json, payload_hash,
+                   created_version, created_at)
+               VALUES('different-archon', ?, 'concept', ?, 'mention_set', 'other',
+                      'different', 'human', 1.0, 1, '[]', '[]', '[]',
+                      'different-archon-hash', ?, 'now')""",
+            (lexeme_id, concept_id, version),
+        )
+
+    applied = database.apply_working_target_decisions(
+        [
+            {
+                "subject_type": "concept",
+                "subject_id": concept_id,
+                "target": "首席执政官",
+                "rules": [],
+            }
+        ]
+    )
+    assert applied["subjects"] == [
+        {"subject_type": "concept", "subject_id": concept_id}
+    ]
+    with closing(database.connect()) as connection:
+        assert connection.execute(
+            "SELECT working_target FROM concepts WHERE id=?", (concept_id,)
+        ).fetchone()[0] == "首席执政官"
+
+
+def test_target_resolver_preserves_legacy_wire_alias_but_emits_lexeme_subject(tmp_path):
+    database = _database(tmp_path, ["Severian waited.", "Severian returned."])
+    concept_id = _seed_concept(database, "Severian")
+    candidate = database.working_target_candidates()[0]
+    resolver = TargetResolver(
+        database,
+        FakeTargetLLM(
+            [
+                _response(
+                    {
+                        "concept_id": "Q01",
+                        "working_target": "塞万里安",
+                        "rules": [],
+                        "confidence": 0.99,
+                    }
+                )
+            ]
+        ),
+    )
+
+    decisions, error = resolver._call_batch([candidate])
+    assert error == ""
+    assert decisions == [
+        {
+            "subject_type": "lexeme",
+            "subject_id": candidate["lexeme_id"],
+            "lexeme_id": candidate["lexeme_id"],
+            "concept_id": concept_id,
+            "target": "塞万里安",
+            "rules": [],
+            "confidence": 0.99,
+        }
+    ]
+
+
 def test_working_target_models_are_strict_and_bounded():
     rule = WorkingTargetRule(condition={"discourse_function": "vocative"}, target="阁下")
     decision = WorkingTargetDecision(
@@ -1074,3 +1227,21 @@ def test_invalid_snapshot_fails_safely_and_enqueues_one_blocking_review(
     assert len(invalid) == 1
     assert invalid[0]["severity"] == "blocking"
     assert json.loads(invalid[0]["payload_json"])["rule_id"] == "broken-rule"
+
+
+def test_conceptless_lexemes_enqueue_distinct_working_target_reviews(tmp_path):
+    database = _database(tmp_path, ["Alpha met Beta."])
+    version = database.current_knowledge_version()
+    with database.transaction() as connection:
+        for lexeme_id, source in (("lex-alpha", "Alpha"), ("lex-beta", "Beta")):
+            connection.execute(
+                """INSERT INTO lexemes(
+                       id, language, normalized_form, canonical_form,
+                       created_version, created_at)
+                   VALUES(?, 'en', lower(?), ?, ?, 'now')""",
+                (lexeme_id, source, source, version),
+            )
+
+    assert database.enqueue_working_target_review(
+        ["lex-alpha", "lex-beta"], "model failed"
+    ) == 2

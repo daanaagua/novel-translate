@@ -22,6 +22,7 @@ from ..schemas import (
 from ..translator import TranslationConfig, TranslationEngine
 from .context import ContextBuilder, ContextOverflow
 from .database import KnowledgeSnapshotError, V4Database
+from .matcher import FrozenRenderIndex
 from .models import Island, TranslationOutcome, V4Block, V4BlockStatus
 from .semantic_mapper import SemanticMapper, SemanticMapperConfig
 
@@ -164,6 +165,73 @@ class V4TranslationPipeline:
         blocks: Sequence[V4Block],
         concept_snapshot: Optional[Sequence[Dict[str, Any]]] = None,
     ) -> GlossaryManager:
+        if isinstance(concept_snapshot, FrozenRenderIndex):
+            items: List[GlossaryItem] = []
+            seen: set[tuple[str, str]] = set()
+            for block in blocks:
+                context_loader = getattr(
+                    self.database, "rendering_contexts_for_block", None
+                )
+                occurrence_contexts = (
+                    context_loader(block.id) if context_loader is not None else []
+                )
+                for matched in concept_snapshot.matched_renderings(
+                    block.source_text,
+                    block_id=block.id,
+                    occurrence_contexts=occurrence_contexts,
+                ):
+                    target = str(matched.rendered_target or "").strip()
+                    if not target:
+                        continue
+                    key = (matched.lexeme_id, target)
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    lexeme = concept_snapshot.get_lexeme(matched.lexeme_id) or {}
+                    concept = next(
+                        (
+                            value
+                            for value in lexeme.get("concepts", []) or []
+                            if str(value.get("id") or "") == matched.concept_id
+                        ),
+                        None,
+                    )
+                    if concept is None:
+                        concept = next(iter(lexeme.get("concepts", []) or []), {})
+                    winning_rules = {
+                        str(rule.get("id") or ""): rule
+                        for rule in list(lexeme.get("rules", []) or [])
+                        + list(concept.get("rules", []) or [])
+                    }
+                    rule_verified = any(
+                        bool(winning_rules.get(rule_id, {}).get("locked"))
+                        or str(winning_rules.get(rule_id, {}).get("status") or "")
+                        == "verified"
+                        for rule_id in matched.applied_rule_ids
+                    )
+                    verified = rule_verified or target in {
+                        str(lexeme.get("verified_target") or "").strip(),
+                        str(concept.get("verified_target") or "").strip(),
+                    }
+                    status = TermStatus.VERIFIED if verified else TermStatus.WORKING
+                    items.append(
+                        GlossaryItem(
+                            id=str(matched.concept_id or matched.lexeme_id),
+                            src=str(matched.matched_form or lexeme.get("source") or ""),
+                            default_target=target,
+                            category=self._category(
+                                str(concept.get("kind") or "concept")
+                            ),
+                            status=status,
+                            description=str(concept.get("description") or "") or None,
+                            rules=[],
+                        )
+                    )
+            manager = GlossaryManager(str(self.database.root / "readonly_glossary"))
+            manager.glossary = Glossary(items=items)
+            manager._build_patterns()
+            return manager
+
         source = "\n".join(block.source_text for block in blocks)
         concepts = self.database.concepts_for_text(
             source, concept_snapshot=concept_snapshot
@@ -270,6 +338,10 @@ class V4TranslationPipeline:
         previous_translation = ""
         local_summary = ""
         for block in island.blocks:
+            if isinstance(concept_snapshot, FrozenRenderIndex):
+                engine.glossary = self._glossary_for(
+                    [block], concept_snapshot=concept_snapshot
+                )
             frozen_block_concept_ids = [
                 str(concept["id"])
                 for concept in self.database.concepts_for_text(
@@ -571,7 +643,7 @@ class V4TranslationPipeline:
                     workers += 1
                 cursor += len(wave)
                 current_signature = self.database.target_snapshot_signature(
-                    self.database.concept_snapshot()
+                    self.database.render_snapshot()
                 )
                 if current_signature != target_signature:
                     knowledge_stale = True

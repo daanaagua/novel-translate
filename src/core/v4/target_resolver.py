@@ -81,17 +81,31 @@ class TargetResolver:
     @staticmethod
     def _aliased_batch(
         concepts: Sequence[Dict[str, Any]],
-    ) -> tuple[Dict[str, str], Dict[str, Any]]:
+    ) -> tuple[Dict[str, Dict[str, str]], Dict[str, Any]]:
         if not concepts or len(concepts) > 24:
             raise ValueError("a target-resolution batch must contain 1..24 concepts")
-        alias_map: Dict[str, str] = {}
+        alias_map: Dict[str, Dict[str, str]] = {}
         public = []
         for index, concept in enumerate(concepts, start=1):
             alias = f"Q{index:02d}"
-            alias_map[alias] = str(concept["concept_id"])
+            subject_type = str(concept.get("subject_type") or "lexeme")
+            legacy = "subject_type" not in concept and "lexeme_id" not in concept
+            subject_id = str(
+                concept.get("subject_id")
+                or concept.get("lexeme_id")
+                or concept.get("concept_id")
+            )
+            alias_map[alias] = {
+                "subject_type": subject_type,
+                "subject_id": subject_id,
+                "lexeme_id": str(concept.get("lexeme_id") or ""),
+                "concept_id": str(concept.get("concept_id") or ""),
+                "legacy": "1" if legacy else "0",
+            }
             public.append(
                 {
                     "concept_id": alias,
+                    "subject_type": subject_type,
                     "source": concept["source"],
                     "kind": concept["kind"],
                     "description": concept.get("description") or "",
@@ -106,7 +120,7 @@ class TargetResolver:
     @staticmethod
     def _resolve_response(
         parsed: WorkingTargetResponse,
-        alias_map: Dict[str, str],
+        alias_map: Dict[str, Dict[str, str]],
     ) -> List[Dict[str, Any]]:
         decisions: Dict[str, Any] = {}
         for decision in parsed.decisions:
@@ -119,12 +133,25 @@ class TargetResolver:
         if set(decisions) != set(alias_map):
             raise TargetResolutionProtocolError("missing working-target alias")
         return [
-            {
-                "concept_id": alias_map[alias],
-                "target": decisions[alias].working_target,
-                "rules": [rule.model_dump() for rule in decisions[alias].rules],
-                "confidence": decisions[alias].confidence,
-            }
+            (
+                {
+                    "concept_id": alias_map[alias]["concept_id"],
+                    "target": decisions[alias].working_target,
+                    "rules": [rule.model_dump() for rule in decisions[alias].rules],
+                    "confidence": decisions[alias].confidence,
+                }
+                if alias_map[alias]["legacy"] == "1"
+                else {
+                    **{
+                        key: value
+                        for key, value in alias_map[alias].items()
+                        if key != "legacy"
+                    },
+                    "target": decisions[alias].working_target,
+                    "rules": [rule.model_dump() for rule in decisions[alias].rules],
+                    "confidence": decisions[alias].confidence,
+                }
+            )
             for alias in sorted(alias_map)
         ]
 
@@ -251,6 +278,7 @@ class TargetResolver:
                 "max_concepts": max_concepts,
                 "batch_size": 24,
                 "max_attempts": self.max_attempts,
+                "subject_type": "lexeme",
             },
         )
         knowledge_version = int(self.database.current_knowledge_version())
@@ -267,7 +295,7 @@ class TargetResolver:
                 )
                 if decisions is None:
                     self.database.enqueue_working_target_review(
-                        [item["concept_id"] for item in batch], error
+                        [item["subject_id"] for item in batch], error
                     )
                     queued += len(batch)
                     continue
@@ -290,5 +318,6 @@ class TargetResolver:
             "changed": changed,
             "knowledge_version": last_version,
             "affected_blocks": affected_blocks,
+            "subject_type": "lexeme",
             "prepared_blocks": preparation,
         }
