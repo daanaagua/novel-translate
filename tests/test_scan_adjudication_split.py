@@ -791,3 +791,112 @@ def test_unchanged_lease_snapshot_commits_normally(tmp_path):
     )
 
     assert result["changed"] == 1
+
+
+def test_context_risk_refresh_creates_new_generation_and_stales_old_lease(tmp_path):
+    db = make_database(tmp_path, ["Severian waited."])
+    V4Scanner(db, ExplodingLLM()).scan_project()
+    db.start_run("judge-waited", "adjudicate", {})
+    old_cluster = db.claim_pending_candidate_clusters("judge-waited", 1)[0]
+    old_decision = AdjudicationResult(
+        cluster_id=old_cluster.id,
+        verdict="promote",
+        selected_candidate_ids=(old_cluster.alternatives[0].id,),
+        entity_kind="person",
+        confidence=0.99,
+    )
+    candidate_id = old_cluster.alternatives[0].id
+    block_id = old_cluster.alternatives[0].block_id
+
+    with db.transaction() as connection:
+        connection.execute(
+            """UPDATE blocks
+               SET source_text='Severian rested.', source_hash='hash-rested',
+                   status='pending'
+               WHERE id=?""",
+            (block_id,),
+        )
+    V4Scanner(db, ExplodingLLM()).scan_project()
+    with db.transaction() as connection:
+        connection.execute(
+            """UPDATE lexical_candidates
+               SET risk_flags_json='["new-risk"]', updated_at=updated_at || '-risk'
+               WHERE id=?""",
+            (candidate_id,),
+        )
+    V4Scanner(db, ExplodingLLM()).scan_project()
+
+    with pytest.raises(database_module.StaleAdjudicationLease, match="snapshot"):
+        db.commit_adjudications(
+            "judge-waited", [old_decision], require_lease=True
+        )
+    db.finalize_adjudication_run("judge-waited", "failed", "stale snapshot")
+
+    with closing(db.connect()) as connection:
+        states = dict(connection.execute("SELECT id, state FROM candidate_clusters"))
+    assert states[old_cluster.id] == "stale"
+    refreshed_ids = [
+        cluster_id for cluster_id, state in states.items() if state == "pending"
+    ]
+    assert len(refreshed_ids) == 1
+    assert refreshed_ids[0] != old_cluster.id
+
+    V4Scanner(db, ExplodingLLM()).scan_project()
+    with closing(db.connect()) as connection:
+        maintained_pending_ids = [
+            row[0]
+            for row in connection.execute(
+                """SELECT id FROM candidate_clusters
+                   WHERE state='pending' ORDER BY id"""
+            )
+        ]
+    assert maintained_pending_ids == refreshed_ids
+
+    db.start_run("judge-rested", "adjudicate", {})
+    refreshed = db.claim_pending_candidate_clusters("judge-rested", 12)
+    assert len(refreshed) == 1
+    assert refreshed[0].id == refreshed_ids[0]
+    assert all("waited" not in context.text.casefold() for context in refreshed[0].contexts)
+    assert any("rested" in context.text.casefold() for context in refreshed[0].contexts)
+    assert "new-risk" in {
+        flag for item in refreshed[0].alternatives for flag in item.risk_flags
+    }
+    refreshed_decision = AdjudicationResult(
+        cluster_id=refreshed[0].id,
+        verdict="promote",
+        selected_candidate_ids=(refreshed[0].alternatives[0].id,),
+        entity_kind="person",
+        confidence=0.99,
+    )
+    assert db.commit_adjudications(
+        "judge-rested", [refreshed_decision], require_lease=True
+    )["changed"] == 1
+
+
+def test_unchanged_concurrent_rescan_reuses_leased_generation(tmp_path):
+    db = make_database(tmp_path, ["Severian waited."])
+    V4Scanner(db, ExplodingLLM()).scan_project()
+    db.start_run("judge-stable-scan", "adjudicate", {})
+    cluster = db.claim_pending_candidate_clusters("judge-stable-scan", 1)[0]
+    decision = AdjudicationResult(
+        cluster_id=cluster.id,
+        verdict="promote",
+        selected_candidate_ids=(cluster.alternatives[0].id,),
+        entity_kind="person",
+        confidence=0.99,
+    )
+    with db.transaction() as connection:
+        connection.execute("UPDATE blocks SET status='pending'")
+
+    V4Scanner(db, ExplodingLLM()).scan_project()
+
+    with closing(db.connect()) as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM candidate_clusters"
+        ).fetchone()[0] == 1
+        assert connection.execute(
+            "SELECT COUNT(*) FROM candidate_clusters WHERE state='pending'"
+        ).fetchone()[0] == 0
+    assert db.commit_adjudications(
+        "judge-stable-scan", [decision], require_lease=True
+    )["changed"] == 1

@@ -1435,10 +1435,20 @@ class V4Database:
                                selected=CASE
                                    WHEN lexical_candidates.resolution_status='pending'
                                    THEN 0 ELSE lexical_candidates.selected END,
-                               run_id=CASE
-                                   WHEN lexical_candidates.resolution_status='pending'
-                                   THEN excluded.run_id ELSE lexical_candidates.run_id END,
-                               updated_at=excluded.updated_at""",
+                                run_id=CASE
+                                    WHEN lexical_candidates.resolution_status='pending'
+                                    THEN excluded.run_id ELSE lexical_candidates.run_id END,
+                                updated_at=CASE
+                                    WHEN lexical_candidates.paragraph_id=excluded.paragraph_id
+                                     AND lexical_candidates.start_offset=excluded.start_offset
+                                     AND lexical_candidates.end_offset=excluded.end_offset
+                                     AND lexical_candidates.original_text=excluded.original_text
+                                     AND lexical_candidates.normalized_text=excluded.normalized_text
+                                     AND lexical_candidates.left_context=excluded.left_context
+                                     AND lexical_candidates.right_context=excluded.right_context
+                                     AND lexical_candidates.risk_flags_json=excluded.risk_flags_json
+                                    THEN lexical_candidates.updated_at
+                                    ELSE excluded.updated_at END""",
                         (
                             candidate["id"],
                             outcome.block.id,
@@ -1584,13 +1594,11 @@ class V4Database:
                        ON ca.cluster_id=cm.cluster_id
                      WHERE cm.candidate_id=lc.id AND ca.active=1
                  )
-                 AND NOT EXISTS (
-                     SELECT 1
-                     FROM candidate_cluster_members cm
-                     JOIN candidate_clusters cc ON cc.id=cm.cluster_id
-                     WHERE cm.candidate_id=lc.id
-                       AND cc.state IN ('leased', 'stale')
-                 )
+                 AND substr(
+                       b.source_text,
+                       lc.start_offset + 1,
+                       lc.end_offset - lc.start_offset
+                     )=lc.original_text
                ORDER BY b.global_index, lc.start_offset, lc.end_offset, lc.id"""
         ).fetchall()
 
@@ -1774,6 +1782,37 @@ class V4Database:
                        ORDER BY cm.candidate_id"""
                 ).fetchall()
             ]
+            refreshed_clusters = []
+            for cluster in clusters:
+                proposed = cluster
+                seen_ids = set()
+                while True:
+                    collision = connection.execute(
+                        """SELECT state, lease_snapshot_hash
+                           FROM candidate_clusters
+                           WHERE id=? AND state IN ('leased', 'stale')""",
+                        (proposed.id,),
+                    ).fetchone()
+                    if collision is None:
+                        refreshed_clusters.append(proposed)
+                        break
+                    incoming_hash = self._incoming_candidate_cluster_snapshot(
+                        connection, proposed
+                    )
+                    if (
+                        collision["state"] == "leased"
+                        and collision["lease_snapshot_hash"] == incoming_hash
+                    ):
+                        break
+                    if proposed.id in seen_ids:
+                        raise ValueError("candidate cluster refresh generation cycle")
+                    seen_ids.add(proposed.id)
+                    refreshed_id = stable_id(
+                        "cluster",
+                        f"refreshed:{proposed.id}:{incoming_hash}",
+                        length=20,
+                    )
+                    proposed = replace(proposed, id=refreshed_id)
             connection.execute(
                 """DELETE FROM candidate_clusters
                    WHERE state IN ('pending', 'stale')
@@ -1790,7 +1829,7 @@ class V4Database:
             ).fetchall():
                 latest_history.setdefault(row["cluster_id"], row["id"])
             safe_clusters = []
-            for cluster in clusters:
+            for cluster in refreshed_clusters:
                 reopened_id = cluster.id
                 member_ids = sorted(
                     member["candidate_id"]
@@ -1952,6 +1991,108 @@ class V4Database:
         return clusters
 
     @staticmethod
+    def _candidate_cluster_snapshot_digest(
+        cluster_id: str,
+        risk_flags_json: str,
+        affected_blocks_json: str,
+        affected_block_count: int,
+        members: Sequence[Dict[str, Any]],
+    ) -> str:
+        payload = {
+            "cluster_id": cluster_id,
+            "risk_flags_json": risk_flags_json,
+            "affected_blocks_json": affected_blocks_json,
+            "affected_block_count": int(affected_block_count),
+            "members": list(members),
+        }
+        encoded = json.dumps(
+            payload,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+    @staticmethod
+    def _candidate_lexical_snapshot(member: sqlite3.Row) -> Dict[str, Any]:
+        return {
+            "id": member["lexical_id"],
+            "block_id": member["block_id"],
+            "paragraph_id": member["paragraph_id"],
+            "start_offset": int(member["start_offset"]),
+            "end_offset": int(member["end_offset"]),
+            "original_text": member["original_text"],
+            "normalized_text": member["normalized_text"],
+            "left_context": member["left_context"],
+            "right_context": member["right_context"],
+            "risk_flags_json": member["lexical_risk_flags_json"],
+            "updated_at": member["lexical_updated_at"],
+            "source_hash": member["source_hash"],
+            "source_edition_id": int(member["source_edition_id"]),
+        }
+
+    def _incoming_candidate_cluster_snapshot(
+        self, connection: sqlite3.Connection, cluster: Any
+    ) -> str:
+        members = self._candidate_cluster_members(cluster)
+        candidate_ids = [member["candidate_id"] for member in members]
+        if not candidate_ids:
+            raise ValueError(f"candidate cluster has no members: {cluster.id}")
+        placeholders = ",".join("?" for _ in candidate_ids)
+        lexical_by_id = {
+            row["lexical_id"]: row
+            for row in connection.execute(
+                f"""SELECT lc.id AS lexical_id, lc.block_id, lc.paragraph_id,
+                           lc.start_offset, lc.end_offset, lc.original_text,
+                           lc.normalized_text, lc.left_context, lc.right_context,
+                           lc.risk_flags_json AS lexical_risk_flags_json,
+                           lc.updated_at AS lexical_updated_at,
+                           b.source_hash, b.source_edition_id
+                    FROM lexical_candidates lc
+                    JOIN blocks b ON b.id=lc.block_id
+                    WHERE lc.id IN ({placeholders})""",
+                candidate_ids,
+            ).fetchall()
+        }
+        payload_members: List[Dict[str, Any]] = []
+        for ordinal, member in enumerate(members):
+            item: Dict[str, Any] = {
+                "candidate_id": member["candidate_id"],
+                "role": member["role"],
+                "ordinal": ordinal,
+                "context_json": json.dumps(
+                    member["context"],
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ),
+            }
+            if member["role"] in {"alternative", "both"}:
+                lexical = lexical_by_id.get(member["candidate_id"])
+                if lexical is None:
+                    raise ValueError(
+                        f"unknown lexical candidate: {member['candidate_id']}"
+                    )
+                item["lexical"] = self._candidate_lexical_snapshot(lexical)
+            payload_members.append(item)
+        affected_blocks = sorted({member["block_id"] for member in members})
+        return self._candidate_cluster_snapshot_digest(
+            cluster.id,
+            json.dumps(
+                sorted(set(cluster.risk_flags)),
+                ensure_ascii=False,
+                separators=(",", ":"),
+            ),
+            json.dumps(
+                affected_blocks,
+                ensure_ascii=False,
+                separators=(",", ":"),
+            ),
+            int(cluster.affected_blocks),
+            payload_members,
+        )
+
+    @staticmethod
     def _candidate_cluster_lease_snapshot(
         connection: sqlite3.Connection, cluster_id: str
     ) -> tuple[str, bool]:
@@ -2008,36 +2149,18 @@ class V4Database:
                             source_slices_current = source_slices_current and (
                                 leased_original == original_text
                             )
-                item["lexical"] = {
-                    "id": member["lexical_id"],
-                    "block_id": member["block_id"],
-                    "paragraph_id": member["paragraph_id"],
-                    "start_offset": start,
-                    "end_offset": end,
-                    "original_text": original_text,
-                    "normalized_text": member["normalized_text"],
-                    "left_context": member["left_context"],
-                    "right_context": member["right_context"],
-                    "risk_flags_json": member["lexical_risk_flags_json"],
-                    "updated_at": member["lexical_updated_at"],
-                    "source_hash": member["source_hash"],
-                    "source_edition_id": int(member["source_edition_id"]),
-                }
+                item["lexical"] = V4Database._candidate_lexical_snapshot(member)
             payload_members.append(item)
-        payload = {
-            "cluster_id": cluster["id"],
-            "risk_flags_json": cluster["risk_flags_json"],
-            "affected_blocks_json": cluster["affected_blocks_json"],
-            "affected_block_count": int(cluster["affected_block_count"]),
-            "members": payload_members,
-        }
-        encoded = json.dumps(
-            payload,
-            ensure_ascii=False,
-            sort_keys=True,
-            separators=(",", ":"),
+        return (
+            V4Database._candidate_cluster_snapshot_digest(
+                cluster["id"],
+                cluster["risk_flags_json"],
+                cluster["affected_blocks_json"],
+                int(cluster["affected_block_count"]),
+                payload_members,
+            ),
+            source_slices_current,
         )
-        return hashlib.sha256(encoded.encode("utf-8")).hexdigest(), source_slices_current
 
     @staticmethod
     def _leased_cluster_has_pending_replacement(
@@ -2071,15 +2194,27 @@ class V4Database:
         now = utc_now()
         released = 0
         for cluster_id in cluster_ids:
-            _snapshot_hash, source_current = self._candidate_cluster_lease_snapshot(
+            lease = connection.execute(
+                """SELECT lease_snapshot_hash FROM candidate_clusters
+                   WHERE id=? AND state='leased'""",
+                (cluster_id,),
+            ).fetchone()
+            if lease is None:
+                continue
+            current_hash, source_current = self._candidate_cluster_lease_snapshot(
                 connection, cluster_id
             )
             replacement_exists = self._leased_cluster_has_pending_replacement(
                 connection, cluster_id
             )
-            next_state = (
-                "pending" if source_current and not replacement_exists else "stale"
-            )
+            next_state = "pending"
+            if (
+                not lease["lease_snapshot_hash"]
+                or lease["lease_snapshot_hash"] != current_hash
+                or not source_current
+                or replacement_exists
+            ):
+                next_state = "stale"
             cursor = connection.execute(
                 """UPDATE candidate_clusters
                    SET state=?, lease_run_id=NULL, lease_acquired_at=NULL,
