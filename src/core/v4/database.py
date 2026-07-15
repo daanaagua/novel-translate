@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import sqlite3
+import unicodedata
 from contextlib import closing, contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
@@ -13,7 +14,7 @@ from typing import Any, Dict, Iterable, Iterator, List, Optional, Sequence
 from .models import ScanOutcome, TranslationOutcome, V4Block, V4BlockStatus
 
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 
 
 def utc_now() -> str:
@@ -26,7 +27,16 @@ def stable_id(prefix: str, value: str, length: int = 16) -> str:
 
 
 def normalize_english_form(value: str) -> str:
-    normalized = " ".join(value.strip().casefold().split())
+    normalized = unicodedata.normalize("NFKC", value).translate(
+        str.maketrans(
+            {
+                "’": "'", "‘": "'", "`": "'", "´": "'",
+                "“": '"', "”": '"', "«": '"', "»": '"',
+                "–": "-", "—": "-", "−": "-", "\u00a0": " ",
+            }
+        )
+    )
+    normalized = " ".join(normalized.strip().casefold().split())
     if normalized.endswith("'s") or normalized.endswith("’s"):
         normalized = normalized[:-2]
     elif normalized.endswith("'") or normalized.endswith("’"):
@@ -156,6 +166,30 @@ class V4Database:
                     created_at TEXT NOT NULL
                 );
                 CREATE INDEX IF NOT EXISTS idx_evidence_block ON evidence(block_id);
+
+                CREATE TABLE IF NOT EXISTS lexical_candidates (
+                    id TEXT PRIMARY KEY,
+                    block_id TEXT NOT NULL REFERENCES blocks(id),
+                    paragraph_id TEXT NOT NULL,
+                    start_offset INTEGER NOT NULL,
+                    end_offset INTEGER NOT NULL,
+                    original_text TEXT NOT NULL,
+                    normalized_text TEXT NOT NULL,
+                    left_context TEXT NOT NULL DEFAULT '',
+                    right_context TEXT NOT NULL DEFAULT '',
+                    extraction_reason TEXT NOT NULL,
+                    book_frequency INTEGER NOT NULL DEFAULT 1,
+                    model_status TEXT NOT NULL DEFAULT 'pending',
+                    selected INTEGER NOT NULL DEFAULT 0,
+                    run_id TEXT REFERENCES runs(id),
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    UNIQUE(block_id, start_offset, end_offset, normalized_text)
+                );
+                CREATE INDEX IF NOT EXISTS idx_lexical_candidates_block
+                    ON lexical_candidates(block_id, selected, model_status);
+                CREATE INDEX IF NOT EXISTS idx_lexical_candidates_normalized
+                    ON lexical_candidates(normalized_text);
 
                 CREATE TABLE IF NOT EXISTS concepts (
                     id TEXT PRIMARY KEY,
@@ -562,7 +596,7 @@ class V4Database:
             block_index=row["block_index"], global_index=row["global_index"],
             block_type=row["block_type"], source_text=row["source_text"],
             source_hash=row["source_hash"], token_count=row["token_count"],
-            status=row["status"],
+            status=row["status"], legacy_id=row["legacy_id"],
         )
 
     def list_blocks(self, statuses: Optional[Sequence[str]] = None) -> List[V4Block]:
@@ -671,18 +705,55 @@ class V4Database:
                 else int(connection.execute("SELECT MAX(id) FROM knowledge_versions").fetchone()[0])
             )
             for outcome in ordered:
+                for candidate in outcome.lexical_candidates:
+                    connection.execute(
+                        """INSERT INTO lexical_candidates(
+                               id, block_id, paragraph_id, start_offset, end_offset,
+                               original_text, normalized_text, left_context, right_context,
+                               extraction_reason, book_frequency, model_status, selected,
+                               run_id, created_at, updated_at
+                           ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                           ON CONFLICT(id) DO UPDATE SET
+                               paragraph_id=excluded.paragraph_id,
+                               start_offset=excluded.start_offset,
+                               end_offset=excluded.end_offset,
+                               original_text=excluded.original_text,
+                               normalized_text=excluded.normalized_text,
+                               left_context=excluded.left_context,
+                               right_context=excluded.right_context,
+                               extraction_reason=excluded.extraction_reason,
+                               book_frequency=excluded.book_frequency,
+                               model_status=excluded.model_status,
+                               selected=excluded.selected,
+                               run_id=excluded.run_id,
+                               updated_at=excluded.updated_at""",
+                        (
+                            candidate["id"], outcome.block.id, candidate["paragraph_id"],
+                            int(candidate["start_offset"]), int(candidate["end_offset"]),
+                            candidate["original_text"], candidate["normalized_text"],
+                            candidate.get("left_context", ""),
+                            candidate.get("right_context", ""),
+                            candidate["extraction_reason"],
+                            int(candidate.get("book_frequency", 1)),
+                            candidate.get("model_status", "pending"),
+                            int(bool(candidate.get("selected"))),
+                            run_id, utc_now(), utc_now(),
+                        ),
+                    )
                 parsed = outcome.response.model_dump(mode="json") if outcome.response else None
-                calls = outcome.audit_calls or [
-                    {
-                        "request": outcome.request_payload,
-                        "raw_response": outcome.raw_response,
-                        "parsed": parsed,
-                        "accepted": outcome.response is not None,
-                        "attempts": outcome.attempts,
-                        "elapsed_ms": outcome.elapsed_ms,
-                        "error": outcome.error,
-                    }
-                ]
+                calls = outcome.audit_calls
+                if not calls and outcome.attempts:
+                    calls = [
+                        {
+                            "request": outcome.request_payload,
+                            "raw_response": outcome.raw_response,
+                            "parsed": parsed,
+                            "accepted": outcome.response is not None,
+                            "attempts": outcome.attempts,
+                            "elapsed_ms": outcome.elapsed_ms,
+                            "error": outcome.error,
+                        }
+                    ]
                 for call in calls:
                     audit_request, audit_raw, audit_parsed = self._audit_fields(
                         audit_mode,
@@ -709,7 +780,7 @@ class V4Database:
                         """INSERT INTO evidence(
                                block_id, paragraph_id, kind, source_form, evidence_quote,
                                payload_json, confidence, extractor, run_id, created_at
-                           ) VALUES(?, ?, 'mention', ?, ?, ?, ?, 'scan_v4', ?, ?)""",
+                           ) VALUES(?, ?, 'mention', ?, ?, ?, ?, 'scan_v4_2', ?, ?)""",
                         (
                             outcome.block.id, mention.paragraph_id, mention.source_form,
                             mention.evidence_quote, json.dumps(payload, ensure_ascii=False),
@@ -724,7 +795,9 @@ class V4Database:
                            ) VALUES(?, ?, ?, ?, ?, ?)""",
                         (
                             outcome.block.id, mention.paragraph_id, mention.source_form,
-                            normalize_english_form(mention.source_form),
+                            normalize_english_form(
+                                mention.canonical_form or mention.source_form
+                            ),
                             mention.discourse_function, evidence_id,
                         ),
                     )
@@ -828,8 +901,9 @@ class V4Database:
                            status, scope, locked, created_version, created_at
                        ) VALUES(?, ?, ?, ?, ?, 'provisional', 'book', 0, ?, ?)""",
                     (
-                        concept_id, payload.get("category", "concept"), row["source_form"],
-                        payload.get("suggested_target", ""), payload.get("description", ""),
+                        concept_id, payload.get("category", "concept"),
+                        payload.get("canonical_form") or row["source_form"],
+                        "", payload.get("description", ""),
                         version, utc_now(),
                     ),
                 )
@@ -837,26 +911,16 @@ class V4Database:
                     """INSERT OR IGNORE INTO source_forms(
                            concept_id, form, normalized_form, grammar_json
                        ) VALUES(?, ?, ?, '{}')""",
-                    (concept_id, row["source_form"], row["normalized_form"]),
+                    (
+                        concept_id,
+                        row["source_form"],
+                        normalize_english_form(row["source_form"]),
+                    ),
                 )
                 connection.execute(
                     "UPDATE mentions SET concept_id=? WHERE id=?",
                     (concept_id, row["mention_id"]),
                 )
-                target = payload.get("suggested_target", "").strip()
-                if target:
-                    condition = {"discourse_function": row["discourse_function"]}
-                    rule_id = stable_id(
-                        "rule",
-                        f"{concept_id}:{json.dumps(condition, sort_keys=True)}:{target}",
-                    )
-                    connection.execute(
-                        """INSERT OR IGNORE INTO rendering_rules(
-                               id, concept_id, condition_json, target, priority, status,
-                               scope, locked, created_version, created_at
-                           ) VALUES(?, ?, ?, ?, 0, 'provisional', 'book', 0, ?, ?)""",
-                        (rule_id, concept_id, json.dumps(condition), target, version, utc_now()),
-                    )
             connection.execute(
                 "UPDATE blocks SET status=?, updated_at=? WHERE status=?",
                 (V4BlockStatus.READY.value, utc_now(), V4BlockStatus.SCANNED.value),
@@ -875,12 +939,22 @@ class V4Database:
                    GROUP BY c.id"""
             ).fetchall()
             for concept in concept_rows:
+                target_votes = connection.execute(
+                    """SELECT json_extract(e.payload_json, '$.suggested_target') target,
+                              COUNT(DISTINCT m.block_id) block_count
+                       FROM mentions m JOIN evidence e ON e.id=m.evidence_id
+                       WHERE m.concept_id=?
+                         AND COALESCE(json_extract(e.payload_json, '$.suggested_target'), '')!=''
+                       GROUP BY target ORDER BY block_count DESC, target""",
+                    (concept["id"],),
+                ).fetchall()
+                current_target = str(concept["default_target"] or "")
                 high_impact = (
                     int(concept["affected_blocks"]) >= 3
                     or int(concept["target_count"]) > 1
                     or bool(concept["locked"])
                 )
-                if not high_impact or not concept["default_target"]:
+                if not high_impact or not target_votes:
                     continue
                 evidence_rows = connection.execute(
                     """SELECT e.evidence_quote, e.payload_json, b.legacy_id
@@ -892,7 +966,14 @@ class V4Database:
                 ).fetchall()
                 payload = {
                     "source": concept["canonical_source"],
-                    "target": concept["default_target"],
+                    "target": current_target,
+                    "target_candidates": [
+                        {
+                            "target": row["target"],
+                            "block_count": int(row["block_count"]),
+                        }
+                        for row in target_votes
+                    ],
                     "affected_blocks": int(concept["affected_blocks"]),
                     "target_conflict": int(concept["target_count"]) > 1,
                     "evidence": [dict(row) for row in evidence_rows],

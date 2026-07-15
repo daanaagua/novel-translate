@@ -142,34 +142,55 @@ class ParallelV4Tests(unittest.TestCase):
 
     def test_scan_is_strict_and_reconcile_is_conservative(self):
         blocks = self.add_blocks(["Archon spoke.", "archon waited.", "Archons gathered."])
+        fake = FakeScanLLM([])
+        scanner = V4Scanner(self.database, fake, max_attempts=1)
+        candidate = next(
+            item for item in scanner.extractor.extract(blocks[0])
+            if item.normalized_text == "Archon"
+        )
+        candidates = scanner.extractor.extract(blocks[0])
+        model_id = f"C{candidates.index(candidate):03d}"
         valid = json.dumps(
             {
                 "mentions": [
                     {
-                        "paragraph_id": "P000",
-                        "source_form": "Archon",
+                        "candidate_id": model_id,
                         "category": "title",
                         "suggested_target": "执政官",
                         "description": "职衔",
                         "discourse_function": "referential",
-                        "evidence_quote": "Archon",
+                        "canonical_candidate_id": None,
                         "confidence": 0.9,
                     }
-                ],
-                "ambiguities": [],
+                ]
             }
         )
-        scanner = V4Scanner(self.database, FakeScanLLM([valid]), max_attempts=1)
+        fake.responses = iter([valid])
         outcome = scanner.scan_block(blocks[0])
         self.assertIsNotNone(outcome.response)
+        self.assertEqual(outcome.response.mentions[0].evidence_quote, "Archon")
+        self.assertTrue(outcome.response.mentions[0].candidate_id)
 
         invalid_scanner = V4Scanner(
             self.database,
-            FakeScanLLM([valid.replace('"Archon"', '"Missing"')]),
+            FakeScanLLM(
+                [valid.replace(model_id, "C999")]
+            ),
             max_attempts=1,
         )
         invalid = invalid_scanner.scan_block(blocks[0])
         self.assertIsNone(invalid.response)
+
+        self.database.start_run("candidate-test", "scan", {})
+        self.database.commit_scan_batch("candidate-test", [outcome], "fake")
+        self.database.finish_run("candidate-test", "completed")
+        with closing(self.database.connect()) as connection:
+            stored = connection.execute(
+                "SELECT original_text, selected FROM lexical_candidates WHERE id=?",
+                (candidate.id,),
+            ).fetchone()
+        self.assertEqual(stored["original_text"], "Archon")
+        self.assertEqual(stored["selected"], 1)
 
         responses = []
         for form in ["Archon", "archon", "Archons"]:
@@ -201,10 +222,21 @@ class ParallelV4Tests(unittest.TestCase):
         self.database.reconcile_exact_forms()
         with closing(self.database.connect()) as connection:
             concepts = connection.execute(
-                "SELECT normalized_form, concept_id FROM mentions ORDER BY id"
+                "SELECT source_form, concept_id FROM mentions ORDER BY id"
             ).fetchall()
-        self.assertEqual(concepts[0]["concept_id"], concepts[1]["concept_id"])
-        self.assertNotEqual(concepts[0]["concept_id"], concepts[2]["concept_id"])
+            targets = {
+                row["canonical_source"]: row["default_target"]
+                for row in connection.execute(
+                    "SELECT canonical_source, default_target FROM concepts"
+                )
+            }
+        by_form = {}
+        for row in concepts:
+            by_form.setdefault(row["source_form"], row["concept_id"])
+        self.assertEqual(by_form["Archon"], by_form["archon"])
+        self.assertNotEqual(by_form["Archon"], by_form["Archons"])
+        self.assertEqual(targets["Archon"], "")
+        self.assertEqual(targets["Archons"], "")
 
     def test_scan_repairs_only_uniquely_mislocated_evidence(self):
         response = ScanResponse.model_validate(
@@ -241,6 +273,65 @@ class ParallelV4Tests(unittest.TestCase):
         self.assertEqual(ambiguous.mentions[0].paragraph_id, "P000")
         with self.assertRaises(ScanProtocolError):
             V4Scanner._validate_evidence(ambiguous, duplicate_paragraphs)
+
+    def test_candidate_scan_maps_normalized_input_back_to_exact_curly_punctuation(self):
+        block = self.add_blocks(["The Witches’ Keep leaned behind the Old Yard."])[0]
+        fake = FakeScanLLM([])
+        scanner = V4Scanner(self.database, fake, max_attempts=1)
+        candidate = next(
+            item for item in scanner.extractor.extract(block)
+            if item.normalized_text == "Witches Keep"
+        )
+        candidates = scanner.extractor.extract(block)
+        model_id = f"C{candidates.index(candidate):03d}"
+        model_payload = candidate.model_payload()
+        self.assertNotIn("’", model_payload["candidate"])
+        self.assertNotIn("’", model_payload["context"])
+        fake.responses = iter(
+            [
+                json.dumps(
+                    {
+                        "mentions": [
+                            {
+                                "candidate_id": model_id,
+                                "category": "place",
+                                "suggested_target": "女巫塔",
+                                "description": "建筑名",
+                                "discourse_function": "referential",
+                                "canonical_candidate_id": None,
+                                "confidence": 0.95,
+                            }
+                        ]
+                    },
+                    ensure_ascii=False,
+                )
+            ]
+        )
+        outcome = scanner.scan_block(block)
+        self.assertIsNotNone(outcome.response)
+        self.assertEqual(outcome.response.mentions[0].source_form, "Witches’ Keep")
+        self.assertEqual(outcome.response.mentions[0].evidence_quote, "Witches’ Keep")
+        self.assertEqual(outcome.response.ambiguities, [])
+
+    def test_candidate_scan_canonicalizes_safe_title_and_inflection_forms(self):
+        self.assertEqual(
+            V4Scanner._deterministic_canonical_form(
+                "Master Malrubius", "Master Malrubius", "person"
+            ),
+            "Malrubius",
+        )
+        self.assertEqual(
+            V4Scanner._deterministic_canonical_form(
+                "exultants", "exultants", "group"
+            ),
+            "exultant",
+        )
+        self.assertEqual(
+            V4Scanner._deterministic_canonical_form(
+                "Erebus’s", "Erebus", "place"
+            ),
+            "Erebus",
+        )
 
     def test_context_only_injects_matched_terms_and_overflow_is_terminal_for_worker(self):
         blocks = self.add_blocks(["The Archon spoke.", "Nothing happened."], status="ready")
