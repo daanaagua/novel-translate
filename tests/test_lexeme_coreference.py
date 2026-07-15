@@ -175,6 +175,46 @@ def test_type_observations_coexist_without_creating_or_splitting_concepts(tmp_pa
     assert concept_count == 0
 
 
+def test_retired_type_observation_does_not_satisfy_idempotent_replay(tmp_path):
+    database = _db(tmp_path)
+    lexeme_id = database.ensure_lexeme("Briah")
+    first_id = database.record_type_observation(
+        lexeme_id,
+        "place",
+        confidence=0.8,
+        source="scanner",
+    )
+    with database.transaction() as connection:
+        retired_version = database.create_knowledge_version(
+            "retire type observation",
+            connection,
+        )
+        connection.execute(
+            """UPDATE concept_type_observations SET retired_version=?
+               WHERE id=?""",
+            (retired_version, first_id),
+        )
+
+    replay_id = database.record_type_observation(
+        lexeme_id,
+        "place",
+        confidence=0.8,
+        source="scanner",
+    )
+
+    assert replay_id != first_id
+    with closing(database.connect()) as connection:
+        observations = connection.execute(
+            """SELECT id, retired_version FROM concept_type_observations
+               WHERE lexeme_id=? ORDER BY id""",
+            (lexeme_id,),
+        ).fetchall()
+    assert [tuple(row) for row in observations] == [
+        (first_id, retired_version),
+        (replay_id, None),
+    ]
+
+
 @pytest.mark.parametrize(
     ("kind", "confidence", "source"),
     [
@@ -286,6 +326,89 @@ def test_identical_occurrence_replay_is_idempotent(tmp_path):
     assert [tuple(row) for row in rows] == [
         (lexeme_id, "block-1", 0, 5, "Briah", "hash-1")
     ]
+
+
+def test_occurrence_batch_failure_is_atomic_inside_caught_outer_transaction(tmp_path):
+    database = _db(tmp_path)
+    lexeme_id = database.ensure_lexeme("Briah")
+    valid = _occurrence(
+        lexeme_id=lexeme_id,
+        block_id="block-1",
+        start_offset=0,
+        end_offset=5,
+        source_form="Briah",
+        source_hash="hash-1",
+    )
+    missing_lexeme = _occurrence(
+        lexeme_id="lexeme_missing",
+        block_id="block-1",
+        start_offset=10,
+        end_offset=15,
+        source_form="BRIAH",
+        source_hash="hash-1",
+    )
+
+    with database.transaction() as connection:
+        preserved_before = database.ensure_lexeme(
+            "Preserved Before",
+            connection=connection,
+        )
+        with pytest.raises(KeyError):
+            database.record_form_occurrences(
+                [valid, missing_lexeme],
+                connection=connection,
+            )
+        preserved_after = database.ensure_lexeme(
+            "Preserved After",
+            connection=connection,
+        )
+
+    with closing(database.connect()) as connection:
+        count = connection.execute("SELECT COUNT(*) FROM form_occurrences").fetchone()[0]
+        preserved_ids = {
+            str(row[0])
+            for row in connection.execute(
+                "SELECT id FROM lexemes WHERE id IN (?, ?)",
+                (preserved_before, preserved_after),
+            )
+        }
+    assert count == 0
+    assert preserved_ids == {preserved_before, preserved_after}
+
+
+@pytest.mark.parametrize("invalid_lexeme_id", [None, ""])
+def test_occurrence_batch_rejects_empty_lexeme_without_partial_writes(
+    tmp_path, invalid_lexeme_id
+):
+    database = _db(tmp_path)
+    lexeme_id = database.ensure_lexeme("Briah")
+    valid = _occurrence(
+        lexeme_id=lexeme_id,
+        block_id="block-1",
+        start_offset=0,
+        end_offset=5,
+        source_form="Briah",
+        source_hash="hash-1",
+    )
+    invalid = _occurrence(
+        lexeme_id=invalid_lexeme_id,
+        block_id="block-1",
+        start_offset=10,
+        end_offset=15,
+        source_form="BRIAH",
+        source_hash="hash-1",
+    )
+
+    with database.transaction() as connection:
+        with pytest.raises(ValueError):
+            database.record_form_occurrences(
+                [valid, invalid],
+                connection=connection,
+            )
+
+    with closing(database.connect()) as connection:
+        count = connection.execute("SELECT COUNT(*) FROM form_occurrences").fetchone()[0]
+    assert count == 0
 
 
 def test_persistence_apis_join_the_callers_transaction(tmp_path):

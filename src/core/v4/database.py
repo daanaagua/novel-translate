@@ -7,6 +7,7 @@ import json
 import re
 import sqlite3
 import unicodedata
+import uuid
 from copy import deepcopy
 from contextlib import closing, contextmanager
 from dataclasses import replace
@@ -132,6 +133,28 @@ class V4Database:
                 with self._audit_transactions_lock:
                     self._audit_transactions.pop(id(connection), None)
             connection.close()
+
+    @staticmethod
+    @contextmanager
+    def _method_savepoint(
+        connection: sqlite3.Connection,
+        prefix: str,
+    ) -> Iterator[None]:
+        name = f"{prefix}_{uuid.uuid4().hex}"
+        connection.execute(f"SAVEPOINT {name}")
+        try:
+            yield
+            connection.execute(f"RELEASE SAVEPOINT {name}")
+        except BaseException:
+            try:
+                connection.execute(f"ROLLBACK TO SAVEPOINT {name}")
+            except sqlite3.Error:
+                pass
+            try:
+                connection.execute(f"RELEASE SAVEPOINT {name}")
+            except sqlite3.Error:
+                pass
+            raise
 
     def _audit_transaction_for(
         self, connection: sqlite3.Connection
@@ -322,6 +345,7 @@ class V4Database:
                WHERE lexeme_id=? AND kind=? AND confidence=? AND source=?
                      AND mention_id IS ? AND concept_id IS ?
                      AND evidence_id IS ? AND adjudication_id IS ?
+                     AND retired_version IS NULL
                ORDER BY id LIMIT 1""",
             (
                 lexeme_id,
@@ -379,7 +403,20 @@ class V4Database:
             return 0
 
         blocks: dict[str, Any] = {}
+        active_lexemes: set[str] = set()
         for occurrence in rows:
+            lexeme_id = occurrence.lexeme_id
+            if not isinstance(lexeme_id, str) or not lexeme_id.strip():
+                raise ValueError("form occurrence lexeme_id cannot be empty")
+            if lexeme_id not in active_lexemes:
+                active_lexeme = connection.execute(
+                    """SELECT 1 FROM lexemes
+                       WHERE id=? AND retired_version IS NULL""",
+                    (lexeme_id,),
+                ).fetchone()
+                if active_lexeme is None:
+                    raise KeyError(f"active lexeme does not exist: {lexeme_id}")
+                active_lexemes.add(lexeme_id)
             block = blocks.get(occurrence.block_id)
             if block is None:
                 block = connection.execute(
@@ -420,25 +457,29 @@ class V4Database:
                     f"source form does not match block slice: {occurrence.block_id}"
                 )
 
-        inserted = 0
-        now = utc_now()
-        for occurrence in rows:
-            cursor = connection.execute(
-                """INSERT OR IGNORE INTO form_occurrences(
-                       lexeme_id, block_id, start_offset, end_offset,
-                       source_form, source_hash, created_at)
-                   VALUES(?, ?, ?, ?, ?, ?, ?)""",
-                (
-                    occurrence.lexeme_id,
-                    occurrence.block_id,
-                    occurrence.start_offset,
-                    occurrence.end_offset,
-                    occurrence.source_form,
-                    occurrence.source_hash,
-                    now,
-                ),
-            )
-            inserted += cursor.rowcount
+        with self._method_savepoint(connection, "form_occurrences"):
+            inserted = 0
+            now = utc_now()
+            for occurrence in rows:
+                cursor = connection.execute(
+                    """INSERT INTO form_occurrences(
+                           lexeme_id, block_id, start_offset, end_offset,
+                           source_form, source_hash, created_at)
+                       VALUES(?, ?, ?, ?, ?, ?, ?)
+                       ON CONFLICT(
+                           lexeme_id, block_id, start_offset, end_offset
+                       ) DO NOTHING""",
+                    (
+                        occurrence.lexeme_id,
+                        occurrence.block_id,
+                        occurrence.start_offset,
+                        occurrence.end_offset,
+                        occurrence.source_form,
+                        occurrence.source_hash,
+                        now,
+                    ),
+                )
+                inserted += cursor.rowcount
         return inserted
 
     def _ensure_schema8_lexeme(
