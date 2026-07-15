@@ -304,6 +304,7 @@ def _run_scan_v4(project, args):
         initial_workers=getattr(args, "initial_workers", 2),
         max_workers=getattr(args, "max_workers", 4),
         max_blocks=getattr(args, "max_blocks", None),
+        block_ids=getattr(args, "block", None),
     )
 
 
@@ -781,6 +782,9 @@ def main(argv=None):
     p_scan_v4.add_argument("--max-attempts", type=_positive_int, default=3)
     p_scan_v4.add_argument("--max-blocks", type=_non_negative_int)
     p_scan_v4.add_argument(
+        "--block", action="append", help="仅扫描指定文本块，可重复提供ID或旧版ID"
+    )
+    p_scan_v4.add_argument(
         "--audit-mode", choices=["full", "response", "minimal"]
     )
     p_scan_v4.set_defaults(func=cmd_scan_v4)
@@ -812,6 +816,9 @@ def main(argv=None):
     )
     p_prepare_v4.add_argument("book_id", help="项目ID")
     p_prepare_v4.add_argument("--max-blocks", type=_non_negative_int)
+    p_prepare_v4.add_argument(
+        "--block", action="append", help="仅准备指定文本块，可重复提供ID或旧版ID"
+    )
     p_prepare_v4.add_argument("--max-clusters", type=_non_negative_int)
     p_prepare_v4.add_argument("--max-attempts", type=_positive_int, default=2)
     p_prepare_v4.add_argument(

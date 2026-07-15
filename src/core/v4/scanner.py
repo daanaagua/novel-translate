@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Sequence
 from uuid import uuid4
 
 from .candidate_clusters import CandidateClusterBuilder
@@ -216,10 +216,21 @@ class V4Scanner:
         initial_workers: int = 2,
         max_workers: int = 4,
         max_blocks: Optional[int] = None,
+        block_ids: Optional[Sequence[str]] = None,
     ) -> Dict[str, int | str]:
-        blocks = self.database.list_blocks(
-            [V4BlockStatus.PENDING.value, V4BlockStatus.FAILED_RETRYABLE.value]
-        )
+        if block_ids is None:
+            blocks = self.database.list_blocks(
+                [V4BlockStatus.PENDING.value, V4BlockStatus.FAILED_RETRYABLE.value]
+            )
+        else:
+            blocks = []
+            seen_block_ids = set()
+            for identifier in block_ids:
+                block = self.database.get_block_by_identifier(str(identifier))
+                if block.id in seen_block_ids:
+                    continue
+                seen_block_ids.add(block.id)
+                blocks.append(block)
         if max_blocks is not None:
             blocks = blocks[:max_blocks]
         run_id = f"scan_{uuid4().hex}"
@@ -227,6 +238,7 @@ class V4Scanner:
             "initial_workers": initial_workers,
             "max_workers": max_workers,
             "max_blocks": max_blocks,
+            "block_ids": [block.id for block in blocks] if block_ids is not None else None,
             "schema_version": SCAN_SCHEMA_VERSION,
             "mode": "local_candidate_index",
         }
@@ -286,6 +298,7 @@ class V4Scanner:
         except Exception as exc:
             self.database.finish_run(run_id, "failed", str(exc))
             raise
+        successful_block_ids = set(indexed_block_ids)
         return {
             "run_id": run_id,
             "indexed": indexed,
@@ -293,5 +306,7 @@ class V4Scanner:
             "completed": indexed,
             "failed": failed,
             "final_workers": workers,
-            "block_ids": sorted(set(indexed_block_ids)),
+            "block_ids": [
+                block.id for block in blocks if block.id in successful_block_ids
+            ],
         }

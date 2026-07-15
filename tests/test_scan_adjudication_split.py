@@ -177,6 +177,127 @@ def test_scan_project_is_local_indexes_candidates_and_frontmatter_atomically(dat
         assert connection.execute("SELECT COUNT(*) FROM concepts").fetchone()[0] == 0
 
 
+def test_explicit_scan_indexes_translated_blocks_without_mutating_their_state(tmp_path):
+    db = V4Database(tmp_path / "book")
+    edition = db.ensure_source_edition("raw", "normalized", "test", "source.txt")
+    protected_statuses = {
+        2: "completed",
+        3: "needs_revalidate",
+        4: "completed_with_warnings",
+    }
+    rows = []
+    for index in range(8):
+        front_matter = index < 2
+        rows.append(
+            {
+                "id": f"block-{index}",
+                "legacy_id": f"v00_pre_{index:03d}" if front_matter else f"v01_ch01_{index:03d}",
+                "chapter_id": "pre" if front_matter else "ch01",
+                "chapter_title": "Preamble" if front_matter else "I",
+                "chapter_index": 0 if front_matter else 1,
+                "block_index": index,
+                "global_index": index,
+                "block_type": "frontmatter" if front_matter else "prose",
+                "source_text": (
+                    f"PUBLISHER PAGE {index}"
+                    if front_matter
+                    else f"Severian met Person{index}."
+                ),
+                "source_hash": f"hash-{index}",
+                "token_count": 3,
+                "status": protected_statuses.get(index, "pending"),
+            }
+        )
+    db.upsert_blocks(edition, rows)
+    with db.transaction() as connection:
+        for index, status in protected_statuses.items():
+            connection.execute(
+                """INSERT INTO translation_versions(
+                       block_id, pipeline, knowledge_version, status,
+                       draft_translation, final_translation, active, created_at
+                   ) VALUES(?, 'parallel_v4', 1, ?, ?, ?, 1, 'before')""",
+                (f"block-{index}", status, f"draft-{index}", f"final-{index}"),
+            )
+
+    llm = ExplodingLLM()
+    explicit_identifiers = [
+        "block-0",
+        "v00_pre_001",
+        "block-2",
+        "v01_ch01_003",
+        "block-4",
+        "block-5",
+        "block-6",
+        "block-7",
+        "block-2",  # repeated CLI selectors must not duplicate work
+    ]
+    result = V4Scanner(db, llm).scan_project(
+        block_ids=explicit_identifiers,
+        max_blocks=8,
+    )
+
+    assert result["indexed"] == 8
+    assert result["block_ids"] == [f"block-{index}" for index in range(8)]
+    assert llm.calls == 0
+    with closing(db.connect()) as connection:
+        statuses = dict(
+            connection.execute("SELECT id, status FROM blocks ORDER BY global_index")
+        )
+        candidate_blocks = {
+            row[0]
+            for row in connection.execute(
+                "SELECT DISTINCT block_id FROM lexical_candidates ORDER BY block_id"
+            )
+        }
+        translations = connection.execute(
+            """SELECT block_id, status, draft_translation, final_translation, active,
+                      created_at
+               FROM translation_versions ORDER BY block_id"""
+        ).fetchall()
+    assert statuses["block-0"] == "ready"
+    assert statuses["block-1"] == "ready"
+    assert statuses["block-2"] == "completed"
+    assert statuses["block-3"] == "needs_revalidate"
+    assert statuses["block-4"] == "completed_with_warnings"
+    assert all(statuses[f"block-{index}"] == "scanned" for index in range(5, 8))
+    assert not candidate_blocks.intersection({"block-0", "block-1"})
+    assert {f"block-{index}" for index in range(2, 8)} <= candidate_blocks
+    assert [tuple(row) for row in translations] == [
+        (f"block-{index}", status, f"draft-{index}", f"final-{index}", 1, "before")
+        for index, status in protected_statuses.items()
+    ]
+
+
+def test_default_scan_limit_still_selects_only_pending_or_retryable_blocks(tmp_path):
+    db = make_database(tmp_path, ["Completed Name.", "Pending Name."])
+    db.set_block_status("block-0", "completed")
+
+    result = V4Scanner(db, ExplodingLLM()).scan_project(max_blocks=1)
+
+    assert result["block_ids"] == ["block-1"]
+    assert db.get_block_by_identifier("block-0").status == "completed"
+    assert db.get_block_by_identifier("block-1").status == "scanned"
+
+
+def test_candidate_commit_failure_does_not_overwrite_protected_block_state(tmp_path):
+    db = make_database(tmp_path, ["Protected Name.", "Retryable Name."])
+    protected, pending = db.list_blocks()
+    db.set_block_status(protected.id, "completed")
+    db.start_run("explicit-failure", "scan", {})
+
+    result = db.commit_candidate_index_batch(
+        "explicit-failure",
+        [
+            ScanOutcome(block=protected, response=None, error="protected failure"),
+            ScanOutcome(block=pending, response=None, error="pending failure"),
+        ],
+    )
+
+    assert result["failed"] == 2
+    assert db.get_block_by_identifier(protected.id).status == "completed"
+    assert db.get_block_by_identifier(pending.id).status == "failed_retryable"
+
+
 def test_pending_cluster_loader_roundtrips_roles_contexts_and_offsets(database):
     scanner = V4Scanner(database, ExplodingLLM())
     scanner.scan_project(max_blocks=3)

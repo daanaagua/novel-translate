@@ -792,14 +792,37 @@ class ParallelV4CliTests(unittest.TestCase):
             patch.object(cli_main, "LLMManager", side_effect=AssertionError("local scan must not create an LLM")),
         ):
             exit_code, output = self.invoke(
-                "scan-v4", "book", "--max-blocks", "3", "--max-attempts", "7"
+                "scan-v4", "book", "--max-blocks", "3", "--max-attempts", "7",
+                "--block", "block-2", "--block", "v01_ch01_003",
             )
 
         self.assertEqual(exit_code, 0)
         migrator.assert_called_once_with(self.project)
         self.assertEqual(calls[0], (self.root, {"max_attempts": 7}))
         self.assertEqual(calls[1]["max_blocks"], 3)
+        self.assertEqual(calls[1]["block_ids"], ["block-2", "v01_ch01_003"])
         self.assertEqual(json.loads(output)["indexed"], 3)
+
+    def test_prepare_v4_unknown_explicit_block_fails_before_constructing_an_llm(self):
+        import main as cli_main
+
+        with (
+            patch.object(cli_main, "V4Migrator"),
+            patch.object(
+                cli_main,
+                "LLMManager",
+                side_effect=AssertionError("unknown block must stop before model stages"),
+            ) as llm_manager,
+        ):
+            exit_code, output = self.invoke(
+                "prepare-v4", "book", "--block", "does-not-exist"
+            )
+
+        self.assertNotEqual(exit_code, 0)
+        llm_manager.assert_not_called()
+        result = json.loads(output)
+        self.assertEqual(result["failed_stage"], "scan")
+        self.assertIn("does-not-exist", result["stages"]["scan"]["error"])
 
     def test_prepare_cli_makes_scanned_prose_eligible_for_translation_pipeline(self):
         database = V4Database(self.root)

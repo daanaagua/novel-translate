@@ -1625,10 +1625,23 @@ class V4Database:
             for outcome in ordered:
                 if outcome.error is not None or outcome.response is None:
                     connection.execute(
-                        "UPDATE blocks SET status=?, last_error=?, updated_at=? WHERE id=?",
+                        """UPDATE blocks
+                           SET status=CASE
+                                   WHEN status IN (?, ?) THEN ? ELSE status END,
+                               last_error=CASE
+                                   WHEN status IN (?, ?) THEN ? ELSE last_error END,
+                               updated_at=CASE
+                                   WHEN status IN (?, ?) THEN ? ELSE updated_at END
+                           WHERE id=?""",
                         (
+                            V4BlockStatus.PENDING.value,
+                            V4BlockStatus.FAILED_RETRYABLE.value,
+                            V4BlockStatus.FAILED_RETRYABLE.value,
+                            V4BlockStatus.PENDING.value,
                             V4BlockStatus.FAILED_RETRYABLE.value,
                             outcome.error or "candidate indexing failed",
+                            V4BlockStatus.PENDING.value,
+                            V4BlockStatus.FAILED_RETRYABLE.value,
                             utc_now(),
                             outcome.block.id,
                         ),
@@ -1774,8 +1787,25 @@ class V4Database:
                     else V4BlockStatus.SCANNED.value
                 )
                 connection.execute(
-                    "UPDATE blocks SET status=?, last_error=NULL, updated_at=? WHERE id=?",
-                    (status, utc_now(), outcome.block.id),
+                    """UPDATE blocks
+                       SET status=CASE
+                               WHEN status IN (?, ?) THEN ? ELSE status END,
+                           last_error=CASE
+                               WHEN status IN (?, ?) THEN NULL ELSE last_error END,
+                           updated_at=CASE
+                               WHEN status IN (?, ?) THEN ? ELSE updated_at END
+                       WHERE id=?""",
+                    (
+                        V4BlockStatus.PENDING.value,
+                        V4BlockStatus.FAILED_RETRYABLE.value,
+                        status,
+                        V4BlockStatus.PENDING.value,
+                        V4BlockStatus.FAILED_RETRYABLE.value,
+                        V4BlockStatus.PENDING.value,
+                        V4BlockStatus.FAILED_RETRYABLE.value,
+                        utc_now(),
+                        outcome.block.id,
+                    ),
                 )
                 indexed += 1
         return {"indexed": indexed, "failed": failed, "candidates": lexical_count}
