@@ -314,15 +314,30 @@ def _preparation_audit_mode(args, config):
     ).get("audit_mode", "full")
 
 
+def _adjudication_worker_limits(args):
+    initial_workers = int(getattr(args, "initial_workers", 2))
+    max_workers = int(getattr(args, "max_workers", 4))
+    if initial_workers > max_workers:
+        raise ValueError("initial_workers cannot exceed max_workers")
+    return initial_workers, max_workers
+
+
 def _run_adjudicate_v4(project, args):
+    initial_workers, max_workers = _adjudication_worker_limits(args)
     config = config_loader.load_config()
     database = V4Database(project.root_dir)
+    llm_config = config["llm"]
     return V4Adjudicator(
-        LLMManager(config["llm"]),
+        LLMManager(llm_config),
+        llm_factory=lambda: LLMManager(llm_config),
         database=database,
         max_attempts=args.max_attempts,
         audit_mode=_preparation_audit_mode(args, config),
-    ).run(max_clusters=getattr(args, "max_clusters", None))
+    ).run(
+        max_clusters=getattr(args, "max_clusters", None),
+        initial_workers=initial_workers,
+        max_workers=max_workers,
+    )
 
 
 def _run_resolve_targets_v4(project, args):
@@ -358,6 +373,11 @@ def cmd_scan_v4(args):
 
 
 def cmd_adjudicate_v4(args):
+    try:
+        _adjudication_worker_limits(args)
+    except ValueError as exc:
+        _print_stage_error("arguments", exc)
+        return 1
     project = _load_project_or_error(args.book_id)
     if not project:
         return 1
@@ -386,6 +406,11 @@ def cmd_resolve_targets_v4(args):
 
 
 def cmd_prepare_v4(args):
+    try:
+        _adjudication_worker_limits(args)
+    except ValueError as exc:
+        _print_stage_error("arguments", exc)
+        return 1
     project = _load_project_or_error(args.book_id)
     if not project:
         return 1
@@ -793,6 +818,8 @@ def main(argv=None):
         "adjudicate-v4", help="对本地候选簇执行严格双重裁决"
     )
     p_adjudicate_v4.add_argument("book_id", help="项目ID")
+    p_adjudicate_v4.add_argument("--initial-workers", type=_positive_int, default=2)
+    p_adjudicate_v4.add_argument("--max-workers", type=_positive_int, default=4)
     p_adjudicate_v4.add_argument("--max-clusters", type=_non_negative_int)
     p_adjudicate_v4.add_argument("--max-attempts", type=_positive_int, default=2)
     p_adjudicate_v4.add_argument(
@@ -815,6 +842,8 @@ def main(argv=None):
         "prepare-v4", help="依次执行本地索引、候选裁决和工作译名解析"
     )
     p_prepare_v4.add_argument("book_id", help="项目ID")
+    p_prepare_v4.add_argument("--initial-workers", type=_positive_int, default=2)
+    p_prepare_v4.add_argument("--max-workers", type=_positive_int, default=4)
     p_prepare_v4.add_argument("--max-blocks", type=_non_negative_int)
     p_prepare_v4.add_argument(
         "--block", action="append", help="仅准备指定文本块，可重复提供ID或旧版ID"

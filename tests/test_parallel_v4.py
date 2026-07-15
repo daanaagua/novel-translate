@@ -900,6 +900,8 @@ class ParallelV4CliTests(unittest.TestCase):
                         args.max_clusters,
                         args.max_attempts,
                         args.audit_mode,
+                        args.initial_workers,
+                        args.max_workers,
                     )
                 )
                 return result
@@ -923,12 +925,16 @@ class ParallelV4CliTests(unittest.TestCase):
                 "2",
                 "--audit-mode",
                 "full",
+                "--initial-workers",
+                "3",
+                "--max-workers",
+                "4",
             )
 
         self.assertEqual(exit_code, 0)
         migrator.assert_called_once_with(self.project)
         self.assertEqual([item[0] for item in calls], ["scan", "adjudicate", "resolve"])
-        self.assertTrue(all(item[2:] == (8, 13, 2, "full") for item in calls))
+        self.assertTrue(all(item[2:] == (8, 13, 2, "full", 3, 4) for item in calls))
         self.assertEqual(json.loads(output)["status"], "completed")
 
     def test_prepare_v4_stops_after_first_failed_stage(self):
@@ -967,8 +973,10 @@ class ParallelV4CliTests(unittest.TestCase):
             def __init__(self, llm, **kwargs):
                 constructed.append(("adjudicate", kwargs))
 
-            def run(self, *, max_clusters=None):
-                constructed.append(("adjudicate-run", max_clusters))
+            def run(self, *, max_clusters=None, initial_workers=1, max_workers=1):
+                constructed.append(
+                    ("adjudicate-run", max_clusters, initial_workers, max_workers)
+                )
                 return {"adjudicated": 4, "failed": 0, "deferred": 1}
 
         class FakeResolver:
@@ -995,6 +1003,10 @@ class ParallelV4CliTests(unittest.TestCase):
                 "5",
                 "--audit-mode",
                 "response",
+                "--initial-workers",
+                "3",
+                "--max-workers",
+                "4",
             )
             resolve_code, _ = self.invoke(
                 "resolve-targets-v4",
@@ -1009,15 +1021,44 @@ class ParallelV4CliTests(unittest.TestCase):
 
         self.assertEqual((adjudicate_code, resolve_code), (0, 0))
         self.assertIn(
-            ("adjudicate", {"database": ANY, "max_attempts": 5, "audit_mode": "response"}),
+            (
+                "adjudicate",
+                {
+                    "database": ANY,
+                    "max_attempts": 5,
+                    "audit_mode": "response",
+                    "llm_factory": ANY,
+                },
+            ),
             constructed,
         )
-        self.assertIn(("adjudicate-run", 4), constructed)
+        self.assertIn(("adjudicate-run", 4, 3, 4), constructed)
         self.assertIn(
             ("resolve", {"max_attempts": 6, "audit_mode": "minimal"}),
             constructed,
         )
         self.assertIn(("resolve-run", 3), constructed)
+
+    def test_adjudication_cli_rejects_inverted_worker_limits_before_model(self):
+        import main as cli_main
+
+        with (
+            patch.object(cli_main.project_manager, "load_project") as load_project,
+            patch.object(cli_main, "LLMManager") as llm_manager,
+        ):
+            exit_code, output = self.invoke(
+                "adjudicate-v4",
+                "book",
+                "--initial-workers",
+                "4",
+                "--max-workers",
+                "2",
+            )
+
+        self.assertEqual(exit_code, 1)
+        load_project.assert_not_called()
+        llm_manager.assert_not_called()
+        self.assertIn("initial_workers", json.loads(output)["error"])
 
     def test_preparation_cli_rejects_unsafe_negative_limits_before_loading_project(self):
         import main as cli_main
