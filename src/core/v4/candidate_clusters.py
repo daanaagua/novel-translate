@@ -1,0 +1,339 @@
+"""Deterministic adjudication clusters for overlapping lexical candidates."""
+
+from __future__ import annotations
+
+import hashlib
+from dataclasses import dataclass
+from typing import Dict, Mapping, Sequence
+
+from .lexical_index import LexicalCandidate, lexical_key
+
+
+@dataclass(frozen=True)
+class CandidateContext:
+    """A reversible source occurrence retained as evidence for a cluster."""
+
+    candidate_id: str
+    block_id: str
+    paragraph_id: str
+    original_text: str
+    left_context: str
+    right_context: str
+    risk_flags: tuple[str, ...]
+
+    @property
+    def text(self) -> str:
+        return " ".join(
+            part for part in (self.left_context, self.original_text, self.right_context) if part
+        )
+
+
+@dataclass(frozen=True)
+class CandidateCluster:
+    """A stable local adjudication unit and its bounded model-facing evidence."""
+
+    id: str
+    alternatives: tuple[LexicalCandidate, ...]
+    contexts: tuple[CandidateContext, ...]
+    risk_flags: tuple[str, ...]
+    affected_blocks: int
+
+    @property
+    def texts(self) -> tuple[str, ...]:
+        return tuple(alternative.original_text for alternative in self.alternatives)
+
+
+@dataclass(frozen=True)
+class CandidateClusterBatch:
+    """At most twelve clusters with aliases scoped only to this batch."""
+
+    clusters: tuple[CandidateCluster, ...]
+    alias_map: Mapping[str, str]
+
+    def candidate_id_for_alias(self, alias: str) -> str:
+        return self.alias_map[alias]
+
+    def alias_for_candidate(self, candidate_id: str) -> str:
+        for alias, mapped_candidate_id in self.alias_map.items():
+            if mapped_candidate_id == candidate_id:
+                return alias
+        raise KeyError(candidate_id)
+
+
+class _UnionFind:
+    def __init__(self, size: int):
+        self.parent = list(range(size))
+
+    def find(self, item: int) -> int:
+        while self.parent[item] != item:
+            self.parent[item] = self.parent[self.parent[item]]
+            item = self.parent[item]
+        return item
+
+    def union(self, left: int, right: int) -> None:
+        left_root = self.find(left)
+        right_root = self.find(right)
+        if left_root == right_root:
+            return
+        if left_root < right_root:
+            self.parent[right_root] = left_root
+        else:
+            self.parent[left_root] = right_root
+
+
+class CandidateClusterBuilder:
+    """Group overlapping spans without fuzzy cross-block entity conflation."""
+
+    def __init__(self, max_contexts: int = 3, max_alternatives: int = 4):
+        self.max_contexts = max(1, min(int(max_contexts), 3))
+        self.max_alternatives = max(1, min(int(max_alternatives), 4))
+
+    @staticmethod
+    def _location_key(candidate: LexicalCandidate) -> tuple[object, ...]:
+        return (
+            candidate.block_id,
+            candidate.paragraph_id,
+            candidate.start_offset,
+            candidate.end_offset,
+            candidate.id,
+        )
+
+    @staticmethod
+    def _span_signature(candidate: LexicalCandidate) -> str:
+        return lexical_key(candidate.normalized_text or candidate.original_text)
+
+    @classmethod
+    def _candidate_key(cls, candidate: LexicalCandidate) -> tuple[object, ...]:
+        return cls._location_key(candidate) + (
+            cls._span_signature(candidate),
+            candidate.original_text,
+            candidate.risk_flags,
+        )
+
+    @staticmethod
+    def _overlaps(left: LexicalCandidate, right: LexicalCandidate) -> bool:
+        return (
+            left.start_offset < right.end_offset
+            and right.start_offset < left.end_offset
+        )
+
+    @classmethod
+    def _cluster_id(cls, members: Sequence[LexicalCandidate]) -> str:
+        identity = "\n".join(sorted(candidate.id for candidate in members))
+        digest = hashlib.sha256(identity.encode("utf-8")).hexdigest()[:20]
+        return f"cluster_{digest}"
+
+    @classmethod
+    def _representatives(
+        cls, members: Sequence[LexicalCandidate]
+    ) -> tuple[LexicalCandidate, ...]:
+        by_signature: Dict[str, LexicalCandidate] = {}
+        for candidate in members:
+            signature = cls._span_signature(candidate)
+            previous = by_signature.get(signature)
+            choice_key = (
+                -len(set(candidate.risk_flags) - {"span_competition"}),
+                -candidate.score,
+                cls._location_key(candidate),
+            )
+            if previous is None:
+                by_signature[signature] = candidate
+                continue
+            previous_key = (
+                -len(set(previous.risk_flags) - {"span_competition"}),
+                -previous.score,
+                cls._location_key(previous),
+            )
+            if choice_key < previous_key:
+                by_signature[signature] = candidate
+        return tuple(by_signature.values())
+
+    def _select_alternatives(
+        self, members: Sequence[LexicalCandidate]
+    ) -> tuple[LexicalCandidate, ...]:
+        representatives = self._representatives(members)
+        selected: list[LexicalCandidate] = []
+
+        def add(candidate: LexicalCandidate) -> None:
+            if candidate not in selected and len(selected) < self.max_alternatives:
+                selected.append(candidate)
+
+        structural = sorted(
+            (
+                candidate
+                for candidate in representatives
+                if set(candidate.risk_flags) - {"span_competition"}
+            ),
+            key=lambda candidate: (
+                -len(set(candidate.risk_flags) - {"span_competition"}),
+                -(candidate.end_offset - candidate.start_offset),
+                self._span_signature(candidate),
+                self._location_key(candidate),
+            ),
+        )
+        structural_slots = max(1, self.max_alternatives // 2)
+        for candidate in structural[:structural_slots]:
+            add(candidate)
+
+        longest = min(
+            representatives,
+            key=lambda candidate: (
+                -(candidate.end_offset - candidate.start_offset),
+                -len(self._span_signature(candidate).split()),
+                self._location_key(candidate),
+            ),
+        )
+        add(longest)
+
+        atoms = sorted(
+            (
+                candidate
+                for candidate in representatives
+                if len(self._span_signature(candidate).split()) == 1
+            ),
+            key=self._location_key,
+        )
+        for candidate in atoms:
+            add(candidate)
+
+        remaining = sorted(
+            representatives,
+            key=lambda candidate: (
+                -len(candidate.risk_flags),
+                -(candidate.end_offset - candidate.start_offset),
+                -candidate.score,
+                self._span_signature(candidate),
+                self._location_key(candidate),
+            ),
+        )
+        for candidate in remaining:
+            add(candidate)
+
+        return tuple(selected)
+
+    @staticmethod
+    def _as_context(candidate: LexicalCandidate) -> CandidateContext:
+        return CandidateContext(
+            candidate_id=candidate.id,
+            block_id=candidate.block_id,
+            paragraph_id=candidate.paragraph_id,
+            original_text=candidate.original_text,
+            left_context=candidate.left_context,
+            right_context=candidate.right_context,
+            risk_flags=candidate.risk_flags,
+        )
+
+    def _select_contexts(
+        self, members: Sequence[LexicalCandidate]
+    ) -> tuple[CandidateContext, ...]:
+        ordered = sorted(members, key=self._location_key)
+        selected: list[LexicalCandidate] = []
+
+        def add(candidate: LexicalCandidate) -> None:
+            if candidate not in selected and len(selected) < self.max_contexts:
+                selected.append(candidate)
+
+        add(ordered[0])
+        add(
+            min(
+                members,
+                key=lambda candidate: (-candidate.book_frequency, self._location_key(candidate)),
+            )
+        )
+
+        seen_risks = {candidate.risk_flags for candidate in selected}
+        for candidate in sorted(
+            members,
+            key=lambda item: (
+                -len(item.risk_flags),
+                item.risk_flags,
+                self._location_key(item),
+            ),
+        ):
+            if candidate.risk_flags not in seen_risks:
+                add(candidate)
+                seen_risks.add(candidate.risk_flags)
+
+        for candidate in ordered:
+            add(candidate)
+
+        return tuple(self._as_context(candidate) for candidate in selected)
+
+    def build(
+        self, candidates: Sequence[LexicalCandidate]
+    ) -> tuple[CandidateCluster, ...]:
+        by_id: Dict[str, LexicalCandidate] = {}
+        for candidate in sorted(candidates, key=self._candidate_key):
+            by_id.setdefault(candidate.id, candidate)
+        ordered = tuple(sorted(by_id.values(), key=self._candidate_key))
+        if not ordered:
+            return ()
+
+        union_find = _UnionFind(len(ordered))
+        by_paragraph: Dict[tuple[str, str], list[int]] = {}
+        by_signature: Dict[str, list[int]] = {}
+        for index, candidate in enumerate(ordered):
+            by_paragraph.setdefault((candidate.block_id, candidate.paragraph_id), []).append(index)
+            by_signature.setdefault(self._span_signature(candidate), []).append(index)
+
+        for indexes in by_paragraph.values():
+            for offset, left_index in enumerate(indexes):
+                left = ordered[left_index]
+                for right_index in indexes[offset + 1 :]:
+                    right = ordered[right_index]
+                    if right.start_offset >= left.end_offset:
+                        break
+                    if self._overlaps(left, right):
+                        union_find.union(left_index, right_index)
+
+        for indexes in by_signature.values():
+            if len({ordered[index].block_id for index in indexes}) < 2:
+                continue
+            first_index = indexes[0]
+            for index in indexes[1:]:
+                union_find.union(first_index, index)
+
+        members_by_root: Dict[int, list[LexicalCandidate]] = {}
+        for index, candidate in enumerate(ordered):
+            members_by_root.setdefault(union_find.find(index), []).append(candidate)
+
+        clusters = []
+        for members in members_by_root.values():
+            members.sort(key=self._candidate_key)
+            clusters.append(
+                CandidateCluster(
+                    id=self._cluster_id(members),
+                    alternatives=self._select_alternatives(members),
+                    contexts=self._select_contexts(members),
+                    risk_flags=tuple(
+                        sorted({flag for candidate in members for flag in candidate.risk_flags})
+                    ),
+                    affected_blocks=len({candidate.block_id for candidate in members}),
+                )
+            )
+        return tuple(sorted(clusters, key=lambda cluster: cluster.id))
+
+    def batch(
+        self,
+        clusters: Sequence[CandidateCluster],
+        batch_size: int = 12,
+    ) -> tuple[CandidateClusterBatch, ...]:
+        size = max(1, min(int(batch_size), 12))
+        ordered = tuple(sorted(clusters, key=lambda cluster: cluster.id))
+        batches = []
+        for start in range(0, len(ordered), size):
+            batch_clusters = ordered[start : start + size]
+            alias_map: Dict[str, str] = {}
+            for cluster_index, cluster in enumerate(batch_clusters, start=1):
+                for alternative_index, alternative in enumerate(cluster.alternatives):
+                    alias = f"K{cluster_index:02d}{chr(ord('A') + alternative_index)}"
+                    alias_map[alias] = alternative.id
+            batches.append(CandidateClusterBatch(batch_clusters, alias_map))
+        return tuple(batches)
+
+    def build_batches(
+        self,
+        candidates: Sequence[LexicalCandidate],
+        batch_size: int = 12,
+    ) -> tuple[CandidateClusterBatch, ...]:
+        return self.batch(self.build(candidates), batch_size=batch_size)
