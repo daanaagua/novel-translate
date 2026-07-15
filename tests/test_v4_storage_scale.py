@@ -2,6 +2,8 @@ import hashlib
 import json
 import sqlite3
 from contextlib import closing
+from concurrent.futures import ThreadPoolExecutor
+from threading import Barrier
 
 import pytest
 
@@ -1258,6 +1260,26 @@ def test_accepted_audit_round_trips_from_independent_zstd_frames(tmp_path):
     assert archive.read(second) == second_payload
 
 
+def test_independent_archive_instances_append_unique_readable_frames(tmp_path):
+    root = tmp_path / "audit"
+    archives = [AuditArchive(root) for _ in range(24)]
+    barrier = Barrier(len(archives))
+
+    def append_one(index):
+        barrier.wait()
+        return archives[index].append(
+            "shared-run", {"index": index}, stage="concurrent"
+        )
+
+    with ThreadPoolExecutor(max_workers=len(archives)) as executor:
+        locators = list(executor.map(append_one, range(len(archives))))
+
+    assert len({item.offset for item in locators}) == len(locators)
+    assert sorted(item.offset for item in locators)[0] == 0
+    for locator in locators:
+        assert AuditArchive(root).read(locator)["index"] in range(len(archives))
+
+
 def test_database_externalizes_only_successful_automatic_audits(tmp_path):
     db, _, block, _ = _seed_database(tmp_path)
     accepted_id = db.record_audit_call(
@@ -1412,6 +1434,41 @@ def test_human_model_is_kept_inline_even_with_ordinary_purpose(tmp_path):
         "note": "ordinary purpose, human model"
     }
     assert row["raw_response"] == "editor response"
+
+
+@pytest.mark.parametrize(
+    ("model", "request_payload"),
+    [
+        ("human reviewer", {}),
+        ("automatic", {"provider": "human/editor"}),
+        ("automatic", {"call_type": "manual review"}),
+    ],
+)
+def test_structured_human_markers_with_common_separators_stay_inline(
+    tmp_path, model, request_payload
+):
+    db, _, block, _ = _seed_database(tmp_path)
+    audit_id = db.record_audit_call(
+        "scan-run",
+        block.id,
+        "translate",
+        model,
+        db.current_knowledge_version(),
+        request_payload,
+        "editor response",
+        {"choice": "B"},
+        True,
+        1,
+        0,
+        None,
+    )
+
+    with closing(db.connect()) as connection:
+        row = connection.execute(
+            "SELECT * FROM audit_calls WHERE id=?", (audit_id,)
+        ).fetchone()
+    assert row["archive_relative_path"] is None
+    assert json.loads(row["request_json"]) == request_payload
 
 
 def test_existing_schema7_audit_table_gains_archive_locator_columns(tmp_path):
@@ -1593,4 +1650,84 @@ def test_storage_budget_rolls_back_legacy_translation(tmp_path, monkeypatch):
             """SELECT COUNT(*) FROM translation_versions
                WHERE block_id=? AND pipeline='serial_v3'""",
             (block.id,),
+        ).fetchone()[0] == 0
+
+
+def test_budget_failure_rolls_back_new_audit_frame(tmp_path, monkeypatch):
+    db, _, block, _ = _seed_database(tmp_path)
+    db.start_run("audit-budget", "translate", {})
+    before = sum(
+        path.stat().st_size
+        for path in db.audit_archive.root.glob("*.jsonl.zst")
+    )
+    monkeypatch.setattr(StorageBudget, "FIXED_ALLOWANCE_BYTES", 0)
+
+    with pytest.raises(StorageBudgetExceeded):
+        db.record_audit_call(
+            "audit-budget",
+            block.id,
+            "translate",
+            "fake",
+            db.current_knowledge_version(),
+            {"messages": [{"content": "must roll back"}]},
+            "must roll back",
+            {"translation": "回滚"},
+            True,
+            1,
+            1,
+            None,
+        )
+
+    after = sum(
+        path.stat().st_size
+        for path in db.audit_archive.root.glob("*.jsonl.zst")
+    )
+    assert after == before
+    with closing(db.connect()) as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM audit_calls WHERE run_id='audit-budget'"
+        ).fetchone()[0] == 0
+
+
+def test_sql_commit_failure_truncates_only_uncommitted_audit_frame(tmp_path):
+    db, _, block, _ = _seed_database(tmp_path)
+    db.start_run("audit-commit-fail", "translate", {})
+    baseline_payload = {"baseline": True}
+    baseline = db.audit_archive.append(
+        "audit-commit-fail", baseline_payload, stage="translate"
+    )
+    archive_path = db.audit_archive.root / baseline.relative_path
+    before = archive_path.stat().st_size
+
+    with pytest.raises(sqlite3.IntegrityError):
+        with db.transaction() as connection:
+            connection.execute("PRAGMA defer_foreign_keys=ON")
+            db.record_audit_call(
+                "audit-commit-fail",
+                block.id,
+                "translate",
+                "fake",
+                db.current_knowledge_version(),
+                {"messages": [{"content": "uncommitted"}]},
+                "uncommitted",
+                {"translation": "不应保留"},
+                True,
+                1,
+                1,
+                None,
+                connection=connection,
+            )
+            connection.execute(
+                """INSERT INTO dependencies(
+                       translation_id, dependency_type, dependency_id,
+                       knowledge_version
+                   ) VALUES(999999, 'concept', 'missing', ?)""",
+                (db.current_knowledge_version(),),
+            )
+
+    assert archive_path.stat().st_size == before
+    assert db.audit_archive.read(baseline) == baseline_payload
+    with closing(db.connect()) as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM audit_calls WHERE run_id='audit-commit-fail'"
         ).fetchone()[0] == 0

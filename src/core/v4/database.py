@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import sqlite3
 import unicodedata
 from copy import deepcopy
@@ -11,9 +12,15 @@ from contextlib import closing, contextmanager
 from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
+from threading import RLock
 from typing import Any, Dict, Iterable, Iterator, List, Optional, Sequence
 
-from .audit_archive import AuditArchive, AuditLocator, StorageBudget
+from .audit_archive import (
+    AuditArchive,
+    AuditArchiveTransaction,
+    AuditLocator,
+    StorageBudget,
+)
 from .models import (
     ScanOutcome,
     TranslationOutcome,
@@ -84,6 +91,8 @@ class V4Database:
         self.root.mkdir(parents=True, exist_ok=True)
         self.path = self.root / "book.db"
         self.audit_archive = AuditArchive(self.root / "audit")
+        self._audit_transactions: Dict[int, AuditArchiveTransaction] = {}
+        self._audit_transactions_lock = RLock()
         self.initialize()
 
     def connect(self) -> sqlite3.Connection:
@@ -97,16 +106,39 @@ class V4Database:
     @contextmanager
     def transaction(self) -> Iterator[sqlite3.Connection]:
         connection = self.connect()
+        audit_transaction = self.audit_archive.begin()
+        registered = False
         try:
             connection.execute("BEGIN IMMEDIATE")
+            with self._audit_transactions_lock:
+                self._audit_transactions[id(connection)] = audit_transaction
+            registered = True
             yield connection
             self._check_storage_budget(connection)
             connection.commit()
+            audit_transaction.commit()
         except Exception:
-            connection.rollback()
+            try:
+                connection.rollback()
+            finally:
+                audit_transaction.rollback()
             raise
         finally:
+            if registered:
+                with self._audit_transactions_lock:
+                    self._audit_transactions.pop(id(connection), None)
             connection.close()
+
+    def _audit_transaction_for(
+        self, connection: sqlite3.Connection
+    ) -> AuditArchiveTransaction:
+        with self._audit_transactions_lock:
+            transaction = self._audit_transactions.get(id(connection))
+        if transaction is None:
+            raise RuntimeError(
+                "accepted audit persistence requires a managed database transaction"
+            )
+        return transaction
 
     @staticmethod
     def _source_bytes(connection: sqlite3.Connection) -> int:
@@ -1246,7 +1278,7 @@ class V4Database:
             json.dumps(parsed, ensure_ascii=False) if parsed is not None else None
         )
         if archive_eligible:
-            locator = self.audit_archive.append(
+            locator = self._audit_transaction_for(connection).append(
                 run_id,
                 {
                     "request": request,
@@ -1324,11 +1356,7 @@ class V4Database:
         ]
         for value in values:
             normalized = str(value or "").strip().casefold()
-            tokens = {
-                token
-                for token in normalized.replace("-", "_").split("_")
-                if token
-            }
+            tokens = set(re.findall(r"[a-z0-9]+", normalized))
             if {"human", "manual"} & tokens:
                 return True
         return False
