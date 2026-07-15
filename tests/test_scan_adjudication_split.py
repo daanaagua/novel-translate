@@ -3,6 +3,7 @@ from contextlib import closing
 
 import pytest
 
+from src.core.v4 import database as database_module
 from src.core.v4.adjudicator import AdjudicationResult, V4Adjudicator
 from src.core.v4.candidate_clusters import CandidateCluster
 from src.core.v4.database import (
@@ -676,3 +677,117 @@ def test_finish_run_failure_hook_cannot_leave_committed_run_running(
             "SELECT status FROM runs WHERE id=?", (result["run_id"],)
         ).fetchone()
     assert run["status"] == "completed"
+
+
+def test_stale_lease_cannot_commit_after_source_candidate_is_replaced(tmp_path):
+    db = make_database(tmp_path, ["Severian waited."])
+    V4Scanner(db, ExplodingLLM()).scan_project()
+    db.start_run("judge-old-source", "adjudicate", {})
+    old_cluster = db.claim_pending_candidate_clusters("judge-old-source", 1)[0]
+    old_decision = AdjudicationResult(
+        cluster_id=old_cluster.id,
+        verdict="promote",
+        selected_candidate_ids=(old_cluster.alternatives[0].id,),
+        entity_kind="person",
+        confidence=0.99,
+    )
+
+    block_id = old_cluster.alternatives[0].block_id
+    with db.transaction() as connection:
+        connection.execute(
+            """UPDATE blocks
+               SET source_text='Valerian waited.', source_hash='hash-valerian',
+                   status='pending'
+               WHERE id=?""",
+            (block_id,),
+        )
+    V4Scanner(db, ExplodingLLM()).scan_project()
+
+    with pytest.raises(database_module.StaleAdjudicationLease, match="snapshot"):
+        db.commit_adjudications(
+            "judge-old-source", [old_decision], require_lease=True
+        )
+    with closing(db.connect()) as connection:
+        assert connection.execute("SELECT COUNT(*) FROM concepts").fetchone()[0] == 0
+        assert connection.execute("SELECT COUNT(*) FROM mentions").fetchone()[0] == 0
+        assert connection.execute(
+            "SELECT COUNT(*) FROM candidate_adjudications WHERE active=1"
+        ).fetchone()[0] == 0
+
+    db.finalize_adjudication_run("judge-old-source", "failed", "stale snapshot")
+    with closing(db.connect()) as connection:
+        assert connection.execute(
+            "SELECT state FROM candidate_clusters WHERE id=?", (old_cluster.id,)
+        ).fetchone()[0] == "stale"
+        assert connection.execute(
+            "SELECT COUNT(*) FROM candidate_clusters WHERE state='pending'"
+        ).fetchone()[0] == 1
+
+    db.start_run("judge-current-source", "adjudicate", {})
+    current = db.claim_pending_candidate_clusters("judge-current-source", 12)
+    assert len(current) == 1
+    assert {item.original_text for item in current[0].alternatives} == {"Valerian"}
+    assert current[0].id != old_cluster.id
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    ["member_context", "candidate_risk", "source_hash"],
+)
+def test_lease_snapshot_covers_model_facing_context_and_source_metadata(
+    tmp_path, mutation
+):
+    db = make_database(tmp_path, ["Severian waited."])
+    V4Scanner(db, ExplodingLLM()).scan_project()
+    run_id = f"judge-{mutation}"
+    db.start_run(run_id, "adjudicate", {})
+    cluster = db.claim_pending_candidate_clusters(run_id, 1)[0]
+    decision = AdjudicationResult(
+        cluster_id=cluster.id,
+        verdict="promote",
+        selected_candidate_ids=(cluster.alternatives[0].id,),
+        entity_kind="person",
+        confidence=0.99,
+    )
+    with db.transaction() as connection:
+        if mutation == "member_context":
+            connection.execute(
+                """UPDATE candidate_cluster_members
+                   SET context_json='{"left_context":"changed"}'
+                   WHERE cluster_id=?""",
+                (cluster.id,),
+            )
+        elif mutation == "candidate_risk":
+            connection.execute(
+                """UPDATE lexical_candidates SET risk_flags_json='["changed"]'
+                   WHERE id=?""",
+                (cluster.alternatives[0].id,),
+            )
+        else:
+            connection.execute(
+                "UPDATE blocks SET source_hash='changed-source-hash' WHERE id=?",
+                (cluster.alternatives[0].block_id,),
+            )
+
+    with pytest.raises(database_module.StaleAdjudicationLease, match="snapshot"):
+        db.commit_adjudications(run_id, [decision], require_lease=True)
+
+
+def test_unchanged_lease_snapshot_commits_normally(tmp_path):
+    db = make_database(tmp_path, ["Severian waited."])
+    V4Scanner(db, ExplodingLLM()).scan_project()
+    db.start_run("judge-unchanged", "adjudicate", {})
+    cluster = db.claim_pending_candidate_clusters("judge-unchanged", 1)[0]
+    decision = AdjudicationResult(
+        cluster_id=cluster.id,
+        verdict="promote",
+        selected_candidate_ids=(cluster.alternatives[0].id,),
+        entity_kind="person",
+        confidence=0.99,
+    )
+
+    result = db.commit_adjudications(
+        "judge-unchanged", [decision], require_lease=True
+    )
+
+    assert result["changed"] == 1
