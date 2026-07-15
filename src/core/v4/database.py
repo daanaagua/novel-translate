@@ -1361,6 +1361,31 @@ class V4Database:
                 return True
         return False
 
+    @classmethod
+    def _audit_row_is_human(cls, row: sqlite3.Row) -> bool:
+        """Classify persisted audits with the same policy used at write time."""
+
+        try:
+            request = json.loads(row["request_json"] or "{}")
+            parsed = (
+                json.loads(row["parsed_json"])
+                if row["parsed_json"] is not None
+                else None
+            )
+        except (TypeError, ValueError, json.JSONDecodeError):
+            # A destructive reset must preserve an audit it cannot classify.
+            return True
+        if not isinstance(request, dict) or (
+            parsed is not None and not isinstance(parsed, dict)
+        ):
+            return True
+        return cls._is_human_audit(
+            str(row["purpose"] or ""),
+            str(row["model"] or ""),
+            request,
+            parsed,
+        )
+
     @staticmethod
     def _audit_fields(
         mode: str,
@@ -3339,23 +3364,53 @@ class V4Database:
             """CREATE TEMP TABLE reset_scan_verification_votes AS
                SELECT id FROM verification_votes
                WHERE task_id IN (SELECT id FROM reset_scan_verification_tasks)""",
+        )
+        for statement in statements:
+            connection.execute(statement)
+        connection.execute(
+            "CREATE TEMP TABLE reset_scan_audit_calls(id INTEGER PRIMARY KEY)"
+        )
+        rows = connection.execute(
+            """SELECT id, purpose, model, request_json, parsed_json
+               FROM audit_calls
+               WHERE run_id IN (SELECT id FROM reset_scan_audit_runs)
+               ORDER BY id"""
+        ).fetchall()
+        connection.executemany(
+            "INSERT INTO reset_scan_audit_calls(id) VALUES(?)",
+            [
+                (int(row["id"]),)
+                for row in rows
+                if not self._audit_row_is_human(row)
+            ],
+        )
+        connection.execute(
             """CREATE TEMP TABLE reset_scan_runs AS
                SELECT r.id FROM runs r
                WHERE r.id IN (SELECT id FROM reset_scan_audit_runs)
+                 AND NOT EXISTS(
+                     SELECT 1 FROM audit_calls a
+                     WHERE a.run_id=r.id
+                       AND a.id NOT IN (SELECT id FROM reset_scan_audit_calls))
                  AND NOT EXISTS(
                      SELECT 1 FROM evidence e
                      WHERE e.run_id=r.id
                        AND e.id NOT IN (SELECT id FROM reset_scan_evidence))
                  AND NOT EXISTS(
-                     SELECT 1 FROM translation_versions t WHERE t.run_id=r.id)""",
+                     SELECT 1 FROM translation_versions t WHERE t.run_id=r.id)"""
         )
-        for statement in statements:
-            connection.execute(statement)
 
     @staticmethod
     def _scan_reset_queries() -> Dict[str, str]:
         return {
-            "audit_calls": "SELECT id,run_id,purpose,accepted,created_at FROM audit_calls WHERE run_id IN (SELECT id FROM reset_scan_audit_runs) ORDER BY id",
+            "audit_calls": """SELECT id,run_id,purpose,model,request_json,
+                                      raw_response,parsed_json,accepted,attempts,
+                                      elapsed_ms,error,archive_relative_path,
+                                      archive_offset,archive_compressed_length,
+                                      archive_sha256,created_at
+                               FROM audit_calls
+                               WHERE id IN (SELECT id FROM reset_scan_audit_calls)
+                               ORDER BY id""",
             "runs": "SELECT id,stage,status,started_at,finished_at FROM runs WHERE id IN (SELECT id FROM reset_scan_runs) ORDER BY id",
             "blocks_reset": "SELECT id,status,last_error,updated_at FROM blocks WHERE id IN (SELECT id FROM reset_scan_blocks) ORDER BY id",
             "lexical_candidates": "SELECT id,updated_at,resolution_status,selected FROM lexical_candidates ORDER BY id",
@@ -3446,7 +3501,7 @@ class V4Database:
                 )
             deleted: Dict[str, int] = {}
             connection.execute(
-                "DELETE FROM audit_calls WHERE run_id IN (SELECT id FROM reset_scan_audit_runs)"
+                "DELETE FROM audit_calls WHERE id IN (SELECT id FROM reset_scan_audit_calls)"
             )
             deletion_statements = (
                 ("verification_votes", "DELETE FROM verification_votes WHERE id IN (SELECT id FROM reset_scan_verification_votes)"),

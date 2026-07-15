@@ -951,15 +951,74 @@ class ParallelV4CliTests(unittest.TestCase):
             )
             database.finish_run(run_id, "completed_with_errors")
 
+        human_id = database.record_audit_call(
+            run_id="scan-run",
+            block_id=None,
+            purpose="scan_review",
+            model="human-reviewer",
+            knowledge_version=database.current_knowledge_version(),
+            request={"actor_type": "human", "note": "人工复核"},
+            raw_response="人工全文",
+            parsed={"actor_type": "human", "decision": "保留"},
+            accepted=True,
+            attempts=1,
+            elapsed_ms=1,
+            error=None,
+        )
+        locator = database.audit_archive.append(
+            "scan-run",
+            {
+                "request": {"actor_type": "human"},
+                "raw_response": "人工全文",
+                "parsed": {"decision": "保留"},
+            },
+            stage="manual_review",
+        )
+        with database.transaction() as connection:
+            connection.execute(
+                """UPDATE audit_calls
+                   SET archive_relative_path=?, archive_offset=?,
+                       archive_compressed_length=?, archive_sha256=?
+                   WHERE id=?""",
+                (
+                    locator.relative_path,
+                    locator.offset,
+                    locator.compressed_length,
+                    locator.sha256,
+                    human_id,
+                ),
+            )
+
         preview = database.preview_scan_reset()
         self.assertEqual(preview["audit_calls"], 3)
-        self.assertEqual(preview["runs"], 3)
+        self.assertEqual(preview["runs"], 2)
+        with database.transaction() as connection:
+            connection.execute(
+                "UPDATE audit_calls SET raw_response='人工全文更新' WHERE id=?",
+                (human_id,),
+            )
         database.reset_scan_derivatives(preview["token"])
         with closing(database.connect()) as connection:
             remaining = connection.execute(
-                "SELECT r.stage, a.purpose FROM runs r JOIN audit_calls a ON a.run_id=r.id"
+                """SELECT r.stage, a.purpose, a.raw_response,
+                          a.archive_relative_path, a.archive_sha256
+                   FROM runs r JOIN audit_calls a ON a.run_id=r.id
+                   ORDER BY r.stage, a.id"""
             ).fetchall()
-        self.assertEqual([tuple(row) for row in remaining], [("translate", "translate")])
+        self.assertEqual(
+            [tuple(row) for row in remaining],
+            [
+                (
+                    "scan",
+                    "scan_review",
+                    "人工全文更新",
+                    locator.relative_path,
+                    locator.sha256,
+                ),
+                ("translate", "translate", "failure", None, None),
+            ],
+        )
+        self.assertEqual(database.read_audit_payload(human_id)["raw_response"], "人工全文")
 
 
 if __name__ == "__main__":
