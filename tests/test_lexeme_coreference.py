@@ -1,9 +1,12 @@
 from contextlib import closing
-from dataclasses import FrozenInstanceError
+from dataclasses import FrozenInstanceError, replace
+import json
 
 import pytest
 
 from src.core.v4 import models as v4_models
+from src.core.v4 import coreference as coreference_module
+from src.core.v4.coreference import CoreferenceCoordinator, CoreferenceProtocolError
 from src.core.v4.database import V4Database, normalize_english_form, stable_id
 
 
@@ -511,3 +514,299 @@ def test_persistence_apis_join_the_callers_transaction(tmp_path):
             == 0
         )
         assert connection.execute("SELECT COUNT(*) FROM form_occurrences").fetchone()[0] == 0
+
+
+def _insert_coreference_mention(
+    database,
+    lexeme_id,
+    *,
+    paragraph_id,
+    evidence_quote,
+    kind=None,
+):
+    with database.transaction() as connection:
+        cursor = connection.execute(
+            """INSERT INTO evidence(
+                   block_id, paragraph_id, kind, source_form, evidence_quote,
+                   payload_json, confidence, extractor, created_at)
+               VALUES('block-1', ?, 'scan', 'Briah', ?, '{}', 0.9,
+                      'test', '2000-01-01T00:00:00+00:00')""",
+            (paragraph_id, evidence_quote),
+        )
+        evidence_id = int(cursor.lastrowid)
+        cursor = connection.execute(
+            """INSERT INTO mentions(
+                   block_id, paragraph_id, source_form, normalized_form,
+                   discourse_function, lexeme_id, evidence_id)
+               VALUES('block-1', ?, 'Briah', 'briah', 'referential', ?, ?)""",
+            (paragraph_id, lexeme_id, evidence_id),
+        )
+        mention_id = int(cursor.lastrowid)
+        if kind is not None:
+            database.record_type_observation(
+                lexeme_id,
+                kind,
+                confidence=0.9,
+                source="test",
+                mention_id=mention_id,
+                evidence_id=evidence_id,
+                connection=connection,
+            )
+    return mention_id, evidence_id
+
+
+def _coreference_case(tmp_path, *, count=2, long_context=False):
+    database = _db(tmp_path, source_text="Briah.\n\nBriah again.")
+    lexeme_id = database.ensure_lexeme("Briah")
+    mention_ids = []
+    evidence_ids = []
+    for index in range(count):
+        quote = (
+            (f"context-{index}-" + ("x" * 2_000))
+            if long_context
+            else f"Briah context {index}"
+        )
+        mention_id, evidence_id = _insert_coreference_mention(
+            database,
+            lexeme_id,
+            paragraph_id=f"P{index + 1:03d}",
+            evidence_quote=quote,
+            kind="person" if index % 2 == 0 else "place",
+        )
+        mention_ids.append(mention_id)
+        evidence_ids.append(evidence_id)
+    cases = CoreferenceCoordinator(database).freeze_cases()
+    assert len(cases) == 1
+    return database, lexeme_id, tuple(mention_ids), tuple(evidence_ids), cases[0]
+
+
+@pytest.mark.parametrize(
+    "relation", ["same", "different", "uncertain", "non_entity"]
+)
+def test_coreference_protocol_accepts_only_the_four_relations(tmp_path, relation):
+    database, _, _, _, case = _coreference_case(tmp_path)
+    coordinator = CoreferenceCoordinator(database)
+    aliases = [mention.request_id for mention in case.mentions]
+
+    response = coordinator.parse_response(
+        {
+            "votes": [
+                {
+                    "case_id": case.case_id,
+                    "relation": relation,
+                    "mention_ids": aliases,
+                    "confidence": 0.8,
+                    "rationale": "bounded rationale",
+                }
+            ]
+        },
+        [case],
+    )
+
+    assert response.votes[0].relation == relation
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        lambda vote: vote.update(case_id="R999"),
+        lambda vote: vote.pop("mention_ids"),
+        lambda vote: vote.update(mention_ids=[]),
+        lambda vote: vote.update(mention_ids=["M999"]),
+        lambda vote: vote.update(mention_ids=["M001", "M001"]),
+        lambda vote: vote.update(unexpected=True),
+        lambda vote: vote.update(relation="maybe"),
+    ],
+)
+def test_coreference_protocol_rejects_unknown_omitted_or_extra_values(
+    tmp_path, mutate
+):
+    database, _, _, _, case = _coreference_case(tmp_path)
+    coordinator = CoreferenceCoordinator(database)
+    vote = {
+        "case_id": case.case_id,
+        "relation": "same",
+        "mention_ids": [mention.request_id for mention in case.mentions],
+        "confidence": 0.8,
+        "rationale": "bounded rationale",
+    }
+    mutate(vote)
+
+    with pytest.raises(CoreferenceProtocolError):
+        coordinator.parse_response({"votes": [vote]}, [case])
+
+
+def test_coreference_protocol_revalidates_an_existing_response_instance(tmp_path):
+    database, _, _, _, case = _coreference_case(tmp_path)
+    coordinator = CoreferenceCoordinator(database)
+    response = v4_models.CoreferenceResponse.model_validate(
+        {
+            "votes": [
+                {
+                    "case_id": case.case_id,
+                    "relation": "same",
+                    "mention_ids": [
+                        mention.request_id for mention in case.mentions
+                    ],
+                    "confidence": 0.8,
+                    "rationale": "bounded rationale",
+                }
+            ]
+        }
+    )
+    response.votes[0].relation = "maybe"
+
+    with pytest.raises(CoreferenceProtocolError):
+        coordinator.parse_response(response, [case])
+
+
+def test_frozen_coreference_payload_is_identical_for_both_models_and_runtime_free(
+    tmp_path,
+):
+    database, _, _, _, case = _coreference_case(tmp_path)
+    coordinator = CoreferenceCoordinator(database)
+
+    left = coordinator.payload_bytes(case)
+    right = coordinator.payload_bytes(case)
+    payload = json.loads(left)
+
+    assert left == right
+    assert coordinator.model_payloads(case, ["model-b", "model-a"]) == (left, left)
+    assert "run_id" not in left.decode("utf-8")
+    assert "created_at" not in left.decode("utf-8")
+    assert "timestamp" not in left.decode("utf-8")
+    assert payload["protocol_version"] == coreference_module.COREFERENCE_PROTOCOL_VERSION
+
+
+def test_coreference_high_frequency_selection_is_bounded_and_stable(tmp_path):
+    database, _, real_ids, _, first_case = _coreference_case(tmp_path, count=12)
+    coordinator = CoreferenceCoordinator(database)
+
+    second_case = coordinator.freeze_cases()[0]
+    selected_ids = [mention.mention_id for mention in first_case.mentions]
+
+    assert first_case == second_case
+    assert len(selected_ids) == 8
+    assert real_ids[0] in selected_ids
+    assert real_ids[-1] in selected_ids
+    assert len(set(selected_ids)) == len(selected_ids)
+    payload = json.loads(coordinator.payload_bytes(first_case))["case"]
+    assert {
+        item["mention_id"]
+        for item in payload["type_observations"]
+        if item["mention_id"] is not None
+    } <= set(selected_ids)
+
+
+def test_frozen_payload_keeps_real_ids_hashes_types_anchors_and_bounded_context(
+    tmp_path,
+):
+    database, lexeme_id, mention_ids, evidence_ids, case = _coreference_case(
+        tmp_path, long_context=True
+    )
+    coordinator = CoreferenceCoordinator(database)
+    payload = json.loads(coordinator.payload_bytes(case))["case"]
+
+    assert payload["knowledge_version"] == database.current_knowledge_version()
+    assert payload["lexeme"]["id"] == lexeme_id
+    assert payload["mention_set_id"] == stable_id(
+        "mention-set", ":".join(sorted(str(value) for value in mention_ids))
+    )
+    assert [item["mention_id"] for item in payload["mentions"]] == list(mention_ids)
+    assert [item["evidence_id"] for item in payload["mentions"]] == list(evidence_ids)
+    assert all(item["block_id"] == "block-1" for item in payload["mentions"])
+    assert all(item["source_hash"] == "hash-1" for item in payload["mentions"])
+    assert all(item["request_id"].startswith("M") for item in payload["mentions"])
+    assert {item["kind"] for item in payload["type_observations"]} == {
+        "person",
+        "place",
+    }
+    assert sum(len(item["context"]) for item in payload["mentions"]) <= 3_200
+    assert all(len(item["context"]) <= 400 for item in payload["mentions"])
+
+
+def test_coreference_payload_carries_each_existing_concept_anchor_once(tmp_path):
+    database, lexeme_id, mention_ids, _, _ = _coreference_case(tmp_path)
+    with database.transaction() as connection:
+        version = connection.execute(
+            "SELECT MAX(id) FROM knowledge_versions"
+        ).fetchone()[0]
+        connection.execute(
+            """INSERT INTO concepts(
+                   id, kind, canonical_source, primary_lexeme_id,
+                   anchor_mention_id, created_version, created_at)
+               VALUES('concept-briah', 'person', 'Briah', ?, ?, ?,
+                      '2000-01-01T00:00:00+00:00')""",
+            (lexeme_id, mention_ids[0], version),
+        )
+        connection.execute(
+            """INSERT INTO concept_lexemes(
+                   concept_id, lexeme_id, role, confidence, status,
+                   created_version, created_at)
+               VALUES('concept-briah', ?, 'primary', 1.0, 'provisional', ?,
+                      '2000-01-01T00:00:00+00:00')""",
+            (lexeme_id, version),
+        )
+        connection.execute(
+            "UPDATE mentions SET concept_id='concept-briah' WHERE id=?",
+            (mention_ids[0],),
+        )
+
+    case = CoreferenceCoordinator(database).freeze_cases()[0]
+    payload = json.loads(CoreferenceCoordinator.payload_bytes(case))["case"]
+
+    assert [item["concept_id"] for item in payload["concept_anchors"]] == [
+        "concept-briah"
+    ]
+    assert payload["concept_anchors"][0]["role"] == "primary"
+    assert payload["mentions"][0]["concept_anchor_ids"] == ["concept-briah"]
+
+
+def test_coreference_payload_does_not_emit_dangling_retired_anchor_ids(tmp_path):
+    database, lexeme_id, mention_ids, _, _ = _coreference_case(tmp_path)
+    with database.transaction() as connection:
+        created_version = connection.execute(
+            "SELECT MAX(id) FROM knowledge_versions"
+        ).fetchone()[0]
+        connection.execute(
+            """INSERT INTO concepts(
+                   id, kind, canonical_source, primary_lexeme_id,
+                   anchor_mention_id, created_version, created_at)
+               VALUES('retired-briah', 'person', 'Briah', ?, ?, ?,
+                      '2000-01-01T00:00:00+00:00')""",
+            (lexeme_id, mention_ids[0], created_version),
+        )
+        connection.execute(
+            "UPDATE mentions SET concept_id='retired-briah' WHERE id=?",
+            (mention_ids[0],),
+        )
+        retired_version = database.create_knowledge_version(
+            "retire test concept", connection
+        )
+        connection.execute(
+            "UPDATE concepts SET retired_version=? WHERE id='retired-briah'",
+            (retired_version,),
+        )
+
+    case = CoreferenceCoordinator(database).freeze_cases()[0]
+    payload = json.loads(CoreferenceCoordinator.payload_bytes(case))["case"]
+
+    assert payload["concept_anchors"] == []
+    assert payload["mentions"][0]["concept_anchor_ids"] == []
+
+
+def test_coreference_cache_key_uses_payload_models_and_protocol_not_model_order(
+    tmp_path, monkeypatch
+):
+    database, _, _, _, case = _coreference_case(tmp_path)
+    coordinator = CoreferenceCoordinator(database)
+
+    original = coordinator.cache_key(case, ["model-b", "model-a"])
+    assert original == coordinator.cache_key(case, ["model-a", "model-b"])
+    assert original != coordinator.cache_key(case, ["model-a", "model-c"])
+
+    changed_case = replace(case, knowledge_version=case.knowledge_version + 1)
+    assert original != coordinator.cache_key(changed_case, ["model-a", "model-b"])
+
+    monkeypatch.setattr(coreference_module, "COREFERENCE_PROTOCOL_VERSION", "test-v2")
+    assert original != coordinator.cache_key(case, ["model-a", "model-b"])

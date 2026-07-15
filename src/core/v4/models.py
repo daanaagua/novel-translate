@@ -165,6 +165,18 @@ class WorkingTargetResponse(StrictModel):
     decisions: List[WorkingTargetDecision] = Field(default_factory=list, max_length=24)
 
 
+class CoreferenceVote(StrictModel):
+    case_id: str = Field(pattern=r"^R\d{3}$")
+    relation: Literal["same", "different", "uncertain", "non_entity"]
+    mention_ids: list[str] = Field(min_length=1, max_length=8)
+    confidence: float = Field(ge=0.0, le=1.0)
+    rationale: str = Field(max_length=300)
+
+
+class CoreferenceResponse(StrictModel):
+    votes: list[CoreferenceVote] = Field(min_length=1, max_length=999)
+
+
 class VerificationResponse(StrictModel):
     verdict: str = Field(pattern=r"^(support|reject|uncertain)$")
     rationale: str = Field(min_length=1, max_length=1200)
@@ -210,6 +222,70 @@ class TypeObservation:
     concept_id: str | None = None
     evidence_id: int | None = None
     adjudication_id: str | None = None
+
+
+@dataclass(frozen=True)
+class CoreferenceTypeObservation:
+    observation_id: int
+    kind: str
+    confidence: float
+    source: str
+    mention_id: int | None = None
+    concept_id: str | None = None
+    evidence_id: int | None = None
+    adjudication_id: str | None = None
+
+
+@dataclass(frozen=True)
+class CoreferenceConceptAnchor:
+    concept_id: str
+    kind: str
+    canonical_source: str
+    status: str
+    role: str
+    anchor_mention_id: int | None = None
+    evidence_id: int | None = None
+
+
+@dataclass(frozen=True)
+class CoreferenceMention:
+    mention_id: int
+    request_id: str
+    evidence_id: int
+    block_id: str
+    paragraph_id: str
+    block_kind: str
+    source_hash: str
+    source_edition_hash: str
+    source_form: str
+    discourse_function: str
+    context: str
+    context_source: str
+    type_observations: tuple[CoreferenceTypeObservation, ...] = ()
+    concept_anchor_ids: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class CoreferenceCase:
+    case_id: str
+    mention_set_id: str
+    knowledge_version: int
+    lexeme_id: str
+    language: str
+    normalized_form: str
+    canonical_form: str
+    mentions: tuple[CoreferenceMention, ...]
+    type_observations: tuple[CoreferenceTypeObservation, ...] = ()
+    concept_anchors: tuple[CoreferenceConceptAnchor, ...] = ()
+
+    @property
+    def lexeme(self) -> LexemeRef:
+        return LexemeRef(
+            id=self.lexeme_id,
+            language=self.language,
+            normalized_form=self.normalized_form,
+            canonical_form=self.canonical_form,
+        )
 
 
 @dataclass(frozen=True)
