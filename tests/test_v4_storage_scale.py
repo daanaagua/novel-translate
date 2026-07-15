@@ -6,6 +6,11 @@ from contextlib import closing
 import pytest
 
 from src.core.v4.adjudicator import AdjudicationResult
+from src.core.v4.audit_archive import (
+    AuditArchive,
+    StorageBudget,
+    StorageBudgetExceeded,
+)
 from src.core.v4.candidate_clusters import CandidateCluster, CandidateContext
 from src.core.v4.database import SCHEMA_VERSION, V4Database
 from src.core.v4.lexical_index import LexicalCandidate
@@ -1236,3 +1241,159 @@ def test_moderate_candidate_storage_scale_keeps_integrity(tmp_path):
         assert connection.execute("SELECT COUNT(*) FROM candidate_cluster_members").fetchone()[0] == 240
         assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
         assert connection.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+
+
+def test_accepted_audit_round_trips_from_independent_zstd_frames(tmp_path):
+    archive = AuditArchive(tmp_path / "audit")
+    first_payload = {"request": {"x": 1}, "response": "ok"}
+    second_payload = {"request": {"x": 2}, "response": "also ok"}
+
+    first = archive.append("run_1", first_payload, stage="translate")
+    second = archive.append("run_1", second_payload, stage="translate")
+
+    assert first.relative_path == second.relative_path
+    assert second.offset == first.offset + first.compressed_length
+    assert len(first.sha256) == 64
+    assert archive.read(first) == first_payload
+    assert archive.read(second) == second_payload
+
+
+def test_database_externalizes_only_successful_automatic_audits(tmp_path):
+    db, _, block, _ = _seed_database(tmp_path)
+    accepted_id = db.record_audit_call(
+        "scan-run",
+        block.id,
+        "translate",
+        "fake",
+        db.current_knowledge_version(),
+        {"messages": [{"content": "large request"}]},
+        "large response",
+        {"translation": "译文"},
+        True,
+        1,
+        12,
+        None,
+    )
+    failed_id = db.record_audit_call(
+        "scan-run",
+        block.id,
+        "translate",
+        "fake",
+        db.current_knowledge_version(),
+        {"messages": [{"content": "failed request"}]},
+        "failed response",
+        None,
+        False,
+        2,
+        24,
+        "protocol failure",
+    )
+    manual_id = db.record_audit_call(
+        "scan-run",
+        block.id,
+        "manual_review",
+        "human",
+        db.current_knowledge_version(),
+        {"note": "keep in SQL"},
+        "accepted by editor",
+        {"choice": "A"},
+        True,
+        1,
+        0,
+        None,
+    )
+
+    with closing(db.connect()) as connection:
+        accepted = connection.execute(
+            "SELECT * FROM audit_calls WHERE id=?", (accepted_id,)
+        ).fetchone()
+        failed = connection.execute(
+            "SELECT * FROM audit_calls WHERE id=?", (failed_id,)
+        ).fetchone()
+        manual = connection.execute(
+            "SELECT * FROM audit_calls WHERE id=?", (manual_id,)
+        ).fetchone()
+
+    assert accepted["request_json"] == "{}"
+    assert accepted["raw_response"] == ""
+    assert accepted["parsed_json"] is None
+    assert accepted["archive_relative_path"].endswith("translate_scan-run.jsonl.zst")
+    assert accepted["archive_offset"] >= 0
+    assert accepted["archive_compressed_length"] > 0
+    assert len(accepted["archive_sha256"]) == 64
+    assert db.read_audit_payload(accepted_id) == {
+        "request": {"messages": [{"content": "large request"}]},
+        "raw_response": "large response",
+        "parsed": {"translation": "译文"},
+    }
+
+    assert failed["archive_relative_path"] is None
+    assert json.loads(failed["request_json"])["messages"][0]["content"] == "failed request"
+    assert failed["raw_response"] == "failed response"
+    assert manual["archive_relative_path"] is None
+    assert json.loads(manual["request_json"]) == {"note": "keep in SQL"}
+    assert manual["raw_response"] == "accepted by editor"
+
+
+def test_existing_schema7_audit_table_gains_archive_locator_columns(tmp_path):
+    root = tmp_path / "legacy-audit"
+    path = root / "artifacts" / "parallel_v4" / "book.db"
+    path.parent.mkdir(parents=True)
+    with closing(sqlite3.connect(path)) as connection:
+        connection.executescript(
+            """
+            CREATE TABLE schema_meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);
+            INSERT INTO schema_meta VALUES('schema_version', '7');
+            CREATE TABLE audit_calls (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                run_id TEXT,
+                block_id TEXT,
+                purpose TEXT NOT NULL,
+                model TEXT NOT NULL,
+                knowledge_version INTEGER,
+                request_json TEXT NOT NULL,
+                raw_response TEXT NOT NULL,
+                parsed_json TEXT,
+                accepted INTEGER NOT NULL DEFAULT 0,
+                attempts INTEGER NOT NULL DEFAULT 1,
+                elapsed_ms INTEGER NOT NULL DEFAULT 0,
+                error TEXT,
+                created_at TEXT NOT NULL
+            );
+            """
+        )
+
+    V4Database(root)
+
+    with closing(sqlite3.connect(path)) as connection:
+        columns = {
+            row[1] for row in connection.execute("PRAGMA table_info(audit_calls)")
+        }
+    assert {
+        "archive_relative_path",
+        "archive_offset",
+        "archive_compressed_length",
+        "archive_sha256",
+    } <= columns
+
+
+def test_storage_budget_formula_and_batch_rollback(tmp_path, monkeypatch):
+    budget = StorageBudget(source_bytes=1_000_000)
+    assert budget.active_limit == 40_000_000 + 64 * 1024**2
+    with pytest.raises(StorageBudgetExceeded):
+        budget.check(budget.active_limit + 1)
+
+    db, _, _, candidates = _seed_database(tmp_path)
+    monkeypatch.setattr(StorageBudget, "FIXED_ALLOWANCE_BYTES", 0)
+    item = _cluster("cluster-over-budget", candidates)
+
+    with pytest.raises(StorageBudgetExceeded):
+        db.persist_candidate_clusters("scan-run", [item])
+
+    with closing(db.connect()) as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM candidate_clusters WHERE id='cluster-over-budget'"
+        ).fetchone()[0] == 0
+        assert connection.execute(
+            "SELECT COUNT(*) FROM candidate_cluster_members WHERE cluster_id='cluster-over-budget'"
+        ).fetchone()[0] == 0
