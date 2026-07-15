@@ -769,6 +769,103 @@ def test_retired_automatic_concept_is_reactivated_when_promoted_again(tmp_path):
     assert active_resolution["retired_version"] is None
 
 
+def test_active_human_lock_wins_over_retired_automatic_identity(tmp_path):
+    db, _, _, candidates = _seed_database(tmp_path)
+    db.persist_candidate_clusters("scan-run", [_cluster("cluster-1", candidates)])
+    promote = AdjudicationResult(
+        "cluster-1", "promote", (candidates[0].id,), "person", 0.9
+    )
+    reject = AdjudicationResult(
+        "cluster-1", "reject", (), "person", 0.8, "not_an_entity"
+    )
+    automatic_id = db.commit_adjudications("judge-run", [promote])["concept_ids"][0]
+    db.commit_adjudications("judge-run", [reject])
+    human = db.lock_concept_translation(
+        candidates[0].original_text,
+        "人工译名",
+        kind="title",
+        description="人工说明",
+    )
+
+    promoted = db.commit_adjudications("judge-run", [promote])
+    with closing(db.connect()) as connection:
+        active_concept_id = connection.execute(
+            """SELECT cr.concept_id FROM candidate_resolutions cr
+               JOIN candidate_adjudications ca ON ca.id=cr.adjudication_id
+               WHERE ca.active=1 AND cr.candidate_id=?""",
+            (candidates[0].id,),
+        ).fetchone()[0]
+        automatic = connection.execute(
+            """SELECT status, locked, retired_version FROM concepts WHERE id=?""",
+            (automatic_id,),
+        ).fetchone()
+        human_row = connection.execute(
+            """SELECT kind, default_target, working_target, verified_target,
+                      description, status, locked, retired_version
+               FROM concepts WHERE id=?""",
+            (human["concept_id"],),
+        ).fetchone()
+
+    assert promoted["concept_ids"] == [human["concept_id"]]
+    assert active_concept_id == human["concept_id"]
+    assert tuple(automatic) == ("retired", 0, 3)
+    assert tuple(human_row) == (
+        "title",
+        "人工译名",
+        "人工译名",
+        "人工译名",
+        "人工说明",
+        "verified",
+        1,
+        None,
+    )
+
+
+def test_locked_automatic_base_id_is_reused_without_collision(tmp_path):
+    db, _, _, candidates = _seed_database(tmp_path)
+    db.persist_candidate_clusters("scan-run", [_cluster("cluster-1", candidates)])
+    promote = AdjudicationResult(
+        "cluster-1", "promote", (candidates[0].id,), "person", 0.9
+    )
+    automatic_id = db.commit_adjudications("judge-run", [promote])["concept_ids"][0]
+    with db.transaction() as connection:
+        connection.execute(
+            """UPDATE concepts SET locked=1, status='verified',
+                      default_target='人工译名', working_target='人工译名',
+                      verified_target='人工译名'
+               WHERE id=?""",
+            (automatic_id,),
+        )
+        connection.execute(
+            """UPDATE lexical_candidates SET resolution_status='rejected',
+                      model_status='rejected', selected=0 WHERE id=?""",
+            (candidates[0].id,),
+        )
+
+    repaired = db.commit_adjudications("judge-run", [promote])
+    with closing(db.connect()) as connection:
+        concept_ids = connection.execute(
+            "SELECT id FROM concepts ORDER BY id"
+        ).fetchall()
+        locked_row = connection.execute(
+            """SELECT default_target, working_target, verified_target,
+                      status, locked, retired_version
+               FROM concepts WHERE id=?""",
+            (automatic_id,),
+        ).fetchone()
+
+    assert repaired["concept_ids"] == [automatic_id]
+    assert [row[0] for row in concept_ids] == [automatic_id]
+    assert tuple(locked_row) == (
+        "人工译名",
+        "人工译名",
+        "人工译名",
+        "verified",
+        1,
+        None,
+    )
+
+
 @pytest.mark.parametrize(
     ("verdict", "selected_indexes", "reason", "overlap"),
     [

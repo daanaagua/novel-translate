@@ -1388,6 +1388,12 @@ class V4Database:
         knowledge_version: int,
         created_at: str,
     ) -> str:
+        active = self._active_concept_for_form(
+            connection, normalized_form, entity_kind
+        )
+        if active is not None and bool(active["locked"]):
+            return str(active["id"])
+
         base_identity = f"{entity_kind}:{normalized_form}"
         base_concept_id = stable_id("concept", base_identity)
         base = connection.execute(
@@ -1395,12 +1401,8 @@ class V4Database:
                WHERE id=?""",
             (base_concept_id,),
         ).fetchone()
-        if base is None:
-            active = self._active_concept_for_form(
-                connection, normalized_form, entity_kind
-            )
-            if active is not None:
-                return str(active["id"])
+        if base is None and active is not None:
+            return str(active["id"])
 
         for collision_index in range(100):
             identity = base_identity
