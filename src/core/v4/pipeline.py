@@ -159,11 +159,21 @@ class V4TranslationPipeline:
         except ValueError:
             return TermCategory.CONCEPT
 
-    def _glossary_for(self, blocks: Sequence[V4Block]) -> GlossaryManager:
+    def _glossary_for(
+        self,
+        blocks: Sequence[V4Block],
+        concept_snapshot: Optional[Sequence[Dict[str, Any]]] = None,
+    ) -> GlossaryManager:
         source = "\n".join(block.source_text for block in blocks)
-        concepts = self.database.concepts_for_text(source)
+        concepts = self.database.concepts_for_text(
+            source, concept_snapshot=concept_snapshot
+        )
         items: List[GlossaryItem] = []
         for concept in concepts:
+            src = str(concept.get("source") or "").strip()
+            target = str(concept.get("default_target") or "").strip()
+            if not src or not target:
+                continue
             rules = [
                 GlossaryRule(
                     condition=json.dumps(rule.get("condition") or {}, ensure_ascii=False),
@@ -172,15 +182,14 @@ class V4TranslationPipeline:
                 for rule in concept.get("rules", [])
                 if rule.get("target")
             ]
-            verified = bool(concept.get("locked")) or concept.get("status") in {
-                "verified",
-                "human_locked",
-            }
+            verified = concept.get("target_strength") == "verified" or bool(
+                concept.get("locked")
+            )
             items.append(
                 GlossaryItem(
                     id=concept["id"],
-                    src=concept["source"],
-                    default_target=concept.get("default_target") or "",
+                    src=src,
+                    default_target=target,
                     category=self._category(concept.get("kind") or "concept"),
                     status=TermStatus.VERIFIED if verified else TermStatus.PENDING,
                     description=concept.get("description") or None,
@@ -223,7 +232,12 @@ class V4TranslationPipeline:
             persist_discoveries=False,
         )
 
-    def _translate_island(self, island: Island, knowledge_version: int) -> List[TranslationOutcome]:
+    def _translate_island(
+        self,
+        island: Island,
+        knowledge_version: int,
+        concept_snapshot: Optional[Sequence[Dict[str, Any]]] = None,
+    ) -> List[TranslationOutcome]:
         audited_llm = AuditedLLM(self.llm_factory())
         semantic_mapper = SemanticMapper(
             audited_llm,
@@ -236,7 +250,9 @@ class V4TranslationPipeline:
         proposals: List[tuple[str, Dict[str, Any]]] = []
         engine = TranslationEngine(
             llm_manager=audited_llm,
-            glossary_manager=self._glossary_for(island.blocks),
+            glossary_manager=self._glossary_for(
+                island.blocks, concept_snapshot=concept_snapshot
+            ),
             knowledge_base=None,
             prompts=self.prompts,
             config=self._translation_config(),
@@ -254,6 +270,7 @@ class V4TranslationPipeline:
                     previous_translation=previous_translation,
                     local_summary=local_summary,
                     knowledge_version=knowledge_version,
+                    concept_snapshot=concept_snapshot,
                 )
             except ContextOverflow as exc:
                 outcomes.append(
@@ -452,19 +469,29 @@ class V4TranslationPipeline:
         islands = self._make_islands(candidates, self.config.island_size)
         run_id = f"translate_{uuid4().hex}"
         run_config = dict(self.config.__dict__)
+        knowledge_version = self.database.current_knowledge_version()
+        concept_snapshot = self.database.concept_snapshot()
+        target_signature = self.database.target_snapshot_signature(concept_snapshot)
+        run_config["frozen_knowledge_version"] = knowledge_version
+        run_config["target_snapshot_signature"] = target_signature
         self.database.start_run(run_id, "translate", run_config)
         workers = min(self.config.initial_workers, self.config.max_workers)
         completed = warnings = failed = manual = 0
         paused = False
+        knowledge_stale = False
         try:
             cursor = 0
             while cursor < len(islands):
                 wave = islands[cursor : cursor + workers]
-                knowledge_version = self.database.current_knowledge_version()
                 wave_outcomes: List[TranslationOutcome] = []
                 with ThreadPoolExecutor(max_workers=workers) as executor:
                     futures = {
-                        executor.submit(self._translate_island, island, knowledge_version): island
+                        executor.submit(
+                            self._translate_island,
+                            island,
+                            knowledge_version,
+                            concept_snapshot,
+                        ): island
                         for island in wave
                     }
                     for future in as_completed(futures):
@@ -502,10 +529,17 @@ class V4TranslationPipeline:
                 elif workers < self.config.max_workers:
                     workers += 1
                 cursor += len(wave)
+                current_signature = self.database.target_snapshot_signature(
+                    self.database.concept_snapshot()
+                )
+                if current_signature != target_signature:
+                    self.database.invalidate_translation_run(run_id)
+                    knowledge_stale = True
+                    break
                 if self.config.decision_mode == "interactive" and proposal_version is not None:
                     paused = True
                     break
-            status = "paused_for_review" if paused else (
+            status = "stale_knowledge" if knowledge_stale else "paused_for_review" if paused else (
                 "completed_with_errors" if failed or manual else "completed"
             )
             self.database.finish_run(run_id, status)
@@ -514,11 +548,17 @@ class V4TranslationPipeline:
             raise
         return {
             "run_id": run_id,
-            "status": "paused_for_review" if paused else "completed",
+            "status": (
+                "stale_knowledge"
+                if knowledge_stale
+                else "paused_for_review" if paused else "completed"
+            ),
             "completed": completed,
             "completed_with_warnings": warnings,
             "failed_retryable": failed,
             "incomplete_requires_human": manual,
             "remaining_islands": max(0, len(islands) - cursor),
             "final_workers": workers,
+            "knowledge_stale": knowledge_stale,
+            "frozen_knowledge_version": knowledge_version,
         }

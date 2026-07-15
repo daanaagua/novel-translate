@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from typing import List, Optional
+from typing import Any, Dict, List, Optional, Sequence
 
 from .database import V4Database
 from .models import ContextPacket, V4Block
@@ -30,22 +30,27 @@ class ContextBuilder:
             return "（当前块没有命中的已知概念）"
         rendered = []
         for concept in concepts:
+            effective_target = str(concept.get("default_target") or "").strip()
+            strength = concept.get("target_strength") or "unset"
+            if effective_target:
+                strength_label = "已核验" if strength == "verified" else "工作译名"
+                target_line = f"{effective_target}（{strength_label}）"
+            else:
+                target_line = "（未定）"
             lines = [
                 f"- {concept['source']}",
-                "  核心译名: "
-                + (
-                    "（高影响项待核验，不提供候选译法）"
-                    if concept.get("verification_pending")
-                    else concept["default_target"] or "（未定）"
-                ),
+                f"  核心译名: {target_line}",
                 f"  concept_id: {concept['id']}",
             ]
             if concept.get("description"):
                 lines.append(f"  概念含义: {concept['description']}")
             for rule in concept.get("rules", []):
                 condition = rule.get("condition") or {}
+                target = str(rule.get("target") or "").strip()
+                if not target:
+                    continue
                 lines.append(
-                    f"  语境规则: {json.dumps(condition, ensure_ascii=False)} → {rule['target']}"
+                    f"  语境规则: {json.dumps(condition, ensure_ascii=False)} → {target}"
                 )
             rendered.append("\n".join(lines))
         return "\n".join(rendered)
@@ -70,9 +75,12 @@ class ContextBuilder:
         previous_translation: str = "",
         local_summary: str = "",
         knowledge_version: Optional[int] = None,
+        concept_snapshot: Optional[Sequence[Dict[str, Any]]] = None,
     ) -> ContextPacket:
         version = knowledge_version or self.database.current_knowledge_version()
-        concepts = self.database.concepts_for_text(block.source_text)
+        concepts = self.database.concepts_for_text(
+            block.source_text, concept_snapshot=concept_snapshot
+        )
         claims = self.database.claims_for_block(block)
         prior_evidence = self.database.prior_concept_source_evidence(block, concepts)
         parts = [

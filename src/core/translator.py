@@ -578,6 +578,30 @@ class TranslationEngine:
             except Exception as e:
                 print(f"[Warn] Term processing failed for {term}: {e}")
 
+    @staticmethod
+    def _promptable_glossary_terms(terms: List[Any]) -> List[Any]:
+        return [
+            term
+            for term in terms
+            if str(getattr(term, "src", "") or "").strip()
+            and str(getattr(term, "default_target", "") or "").strip()
+        ]
+
+    @staticmethod
+    def _render_glossary_term(term: Any) -> str:
+        src = str(term.src).strip()
+        target = str(term.default_target).strip()
+        lines = [f"- {src} -> {target}"]
+        if getattr(term, "description", None):
+            lines.append(f"  说明: {term.description}")
+        for rule in getattr(term, "rules", []) or []:
+            condition = str(getattr(rule, "condition", "") or "").strip()
+            rule_target = str(getattr(rule, "target", "") or "").strip()
+            if not condition or not rule_target:
+                continue
+            lines.append(f"  - 若 {condition}: 译为 「{rule_target}」")
+        return "\n".join(lines)
+
     def _draft_translate(
         self,
         source_text: str,
@@ -598,16 +622,19 @@ class TranslationEngine:
             source_text,
             status_filter=[TermStatus.PENDING],
         )
+        verified_terms = self._promptable_glossary_terms(verified_terms)
+        pending_terms = self._promptable_glossary_terms(pending_terms)
         glossary_terms = verified_terms + pending_terms
         glossary_parts = []
         if verified_terms:
             glossary_parts.append(
-                "【硬性术语】\n" + "\n".join(term.to_prompt_text() for term in verified_terms)
+                "【硬性术语】\n"
+                + "\n".join(self._render_glossary_term(term) for term in verified_terms)
             )
         if pending_terms:
             glossary_parts.append(
                 "【待审核建议：仅用于保持暂时一致，不得压过本段语境】\n"
-                + "\n".join(term.to_prompt_text() for term in pending_terms)
+                + "\n".join(self._render_glossary_term(term) for term in pending_terms)
             )
         glossary_rules = "\n\n".join(glossary_parts) or "（无特殊术语）"
         
@@ -687,14 +714,18 @@ class TranslationEngine:
             source_text,
             status_filter=[TermStatus.PENDING],
         )
+        verified_terms = self._promptable_glossary_terms(verified_terms)
+        pending_terms = self._promptable_glossary_terms(pending_terms)
         glossary_parts = []
         if verified_terms:
             glossary_parts.append(
-                "【硬性术语】\n" + "\n".join(term.to_prompt_text() for term in verified_terms)
+                "【硬性术语】\n"
+                + "\n".join(self._render_glossary_term(term) for term in verified_terms)
             )
         if pending_terms:
             glossary_parts.append(
-                "【待审核建议】\n" + "\n".join(term.to_prompt_text() for term in pending_terms)
+                "【待审核建议】\n"
+                + "\n".join(self._render_glossary_term(term) for term in pending_terms)
             )
         glossary_rules = "\n\n".join(glossary_parts) or "（无特殊术语）"
         system_prompt = system_template.format(

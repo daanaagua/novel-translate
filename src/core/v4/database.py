@@ -3650,64 +3650,480 @@ class V4Database:
                 ),
             )
 
-    def concepts_for_text(self, text: str) -> List[Dict[str, Any]]:
+    @staticmethod
+    def _representative_paragraph(source_text: str, source_form: str) -> str:
         import re
+
+        paragraphs = [
+            part.strip()
+            for part in re.split(r"\n\s*\n", source_text or "")
+            if part.strip()
+        ]
+        for paragraph in paragraphs:
+            if re.search(rf"(?<!\w){re.escape(source_form)}(?!\w)", paragraph, re.I):
+                return paragraph[:1200]
+        return (paragraphs[0] if paragraphs else source_text)[:1200]
+
+    def working_target_candidates(self) -> List[Dict[str, Any]]:
+        """Return active, targetless concepts that cannot safely remain unnamed."""
 
         with closing(self.connect()) as connection:
             rows = connection.execute(
-                """SELECT c.id, c.kind, c.canonical_source, c.default_target, c.description,
+                """SELECT c.id, c.kind, c.canonical_source, c.description,
+                          c.default_target, c.working_target, c.verified_target,
+                          c.status, c.locked,
+                          COUNT(m.id) mention_count,
+                          COUNT(DISTINCT m.block_id) mentioned_blocks,
+                          COALESCE((
+                              SELECT MAX(cc.affected_block_count)
+                              FROM candidate_resolutions cr
+                              JOIN candidate_adjudications ca
+                                ON ca.id=cr.adjudication_id AND ca.active=1
+                              JOIN candidate_clusters cc ON cc.id=cr.cluster_id
+                              WHERE cr.concept_id=c.id
+                          ), 0) cluster_blocks,
+                          EXISTS(
+                              SELECT 1 FROM verification_tasks vt
+                              WHERE vt.subject_type='concept' AND vt.subject_id=c.id
+                                AND vt.status IN ('open','needs_human')
+                          ) verification_pending
+                   FROM concepts c
+                   LEFT JOIN mentions m ON m.concept_id=c.id
+                   WHERE c.retired_version IS NULL
+                   GROUP BY c.id
+                   ORDER BY lower(c.canonical_source), c.id"""
+            ).fetchall()
+            candidates: List[Dict[str, Any]] = []
+            for row in rows:
+                working = str(row["working_target"] or "").strip()
+                verified = str(row["verified_target"] or "").strip()
+                effective = verified or working
+                if verified or bool(row["locked"]):
+                    continue
+                affected_blocks = max(
+                    int(row["mentioned_blocks"] or 0),
+                    int(row["cluster_blocks"] or 0),
+                )
+                repeated = int(row["mention_count"] or 0) >= 2 or affected_blocks >= 2
+                identity_kind = str(row["kind"] or "concept") in {
+                    "person", "place", "organization", "group", "unit"
+                }
+                high_impact = (
+                    affected_blocks >= 3 or bool(row["verification_pending"])
+                )
+                required = (identity_kind and repeated) or high_impact
+                if effective or not required:
+                    continue
+                context_rows = connection.execute(
+                    """SELECT DISTINCT b.id, b.source_text, b.global_index
+                       FROM mentions m JOIN blocks b ON b.id=m.block_id
+                       WHERE m.concept_id=?
+                       ORDER BY b.global_index, b.id LIMIT 3""",
+                    (row["id"],),
+                ).fetchall()
+                contexts = [
+                    self._representative_paragraph(
+                        str(item["source_text"]), str(row["canonical_source"])
+                    )
+                    for item in context_rows
+                ]
+                candidates.append(
+                    {
+                        "concept_id": str(row["id"]),
+                        "source": str(row["canonical_source"]),
+                        "kind": str(row["kind"]),
+                        "description": str(row["description"] or ""),
+                        "contexts": contexts[:3],
+                        "context_block_ids": [str(item["id"]) for item in context_rows[:3]],
+                        "affected_blocks": affected_blocks,
+                        "high_impact": high_impact,
+                    }
+                )
+
+        for candidate in candidates:
+            baselines: List[str] = []
+            for block_id in candidate.pop("context_block_ids"):
+                reference = self.comparison_reference_for_block(block_id)
+                if reference and str(reference.get("text") or "").strip():
+                    text = str(reference["text"]).strip()
+                    if text not in baselines:
+                        baselines.append(text[:1600])
+                if len(baselines) >= 2:
+                    break
+            candidate["baseline_translations"] = baselines
+        return candidates
+
+    def enqueue_working_target_review(
+        self, concept_ids: Sequence[str], error: str
+    ) -> int:
+        queued = 0
+        with self.transaction() as connection:
+            for concept_id in dict.fromkeys(str(value) for value in concept_ids):
+                exists = connection.execute(
+                    """SELECT 1 FROM human_queue
+                       WHERE kind='working_target_required' AND status='open'
+                         AND json_extract(payload_json, '$.concept_id')=?""",
+                    (concept_id,),
+                ).fetchone()
+                if exists:
+                    continue
+                concept = connection.execute(
+                    """SELECT canonical_source, kind FROM concepts
+                       WHERE id=? AND retired_version IS NULL""",
+                    (concept_id,),
+                ).fetchone()
+                if concept is None:
+                    continue
+                payload = {
+                    "concept_id": concept_id,
+                    "source": concept["canonical_source"],
+                    "kind": concept["kind"],
+                    "error": error[:1000],
+                }
+                connection.execute(
+                    """INSERT INTO human_queue(
+                           block_id, kind, severity, payload_json, created_at
+                       ) VALUES(NULL, 'working_target_required', 'blocking', ?, ?)""",
+                    (json.dumps(payload, ensure_ascii=False, sort_keys=True), utc_now()),
+                )
+                queued += 1
+        return queued
+
+    @staticmethod
+    def _normalized_working_rules(rules: Sequence[Dict[str, Any]]) -> tuple[str, ...]:
+        normalized = []
+        for rule in rules:
+            condition = rule.get("condition") or {}
+            target = str(rule.get("target") or "").strip()
+            normalized.append(
+                json.dumps(
+                    {"condition": condition, "target": target},
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
+            )
+        return tuple(sorted(normalized))
+
+    def _invalidate_working_target_dependents(
+        self,
+        connection: sqlite3.Connection,
+        concept_ids: Sequence[str],
+    ) -> int:
+        import re
+
+        affected_blocks: set[str] = set()
+        for concept_id in concept_ids:
+            affected_blocks.update(
+                str(row["block_id"])
+                for row in connection.execute(
+                    """SELECT DISTINCT tv.block_id
+                       FROM dependencies d
+                       JOIN translation_versions tv ON tv.id=d.translation_id
+                       WHERE d.dependency_type='concept' AND d.dependency_id=?""",
+                    (concept_id,),
+                ).fetchall()
+            )
+            forms = [
+                str(row["form"])
+                for row in connection.execute(
+                    "SELECT form FROM source_forms WHERE concept_id=?",
+                    (concept_id,),
+                ).fetchall()
+                if str(row["form"] or "").strip()
+            ]
+            if not forms:
+                continue
+            patterns = [
+                re.compile(rf"(?<!\w){re.escape(form)}(?!\w)", re.I)
+                for form in forms
+            ]
+            for block in connection.execute(
+                """SELECT id, source_text, status FROM blocks
+                   WHERE source_edition_id=(
+                       SELECT id FROM source_editions WHERE active=1
+                   )"""
+            ).fetchall():
+                if block["status"] not in {
+                    V4BlockStatus.READY.value,
+                    V4BlockStatus.TRANSLATING.value,
+                }:
+                    continue
+                if any(pattern.search(str(block["source_text"])) for pattern in patterns):
+                    affected_blocks.add(str(block["id"]))
+
+        for block_id in sorted(affected_blocks):
+            connection.execute(
+                """UPDATE translation_versions SET status=?
+                   WHERE block_id=? AND pipeline='parallel_v4' AND active=1""",
+                (V4BlockStatus.NEEDS_REVALIDATE.value, block_id),
+            )
+            connection.execute(
+                "UPDATE blocks SET status=?, updated_at=? WHERE id=?",
+                (V4BlockStatus.NEEDS_REVALIDATE.value, utc_now(), block_id),
+            )
+        return len(affected_blocks)
+
+    def apply_working_target_decisions(
+        self, decisions: Sequence[Dict[str, Any]]
+    ) -> Dict[str, Any]:
+        """Atomically install provisional translations without touching human locks."""
+
+        ordered = sorted(decisions, key=lambda item: str(item.get("concept_id") or ""))
+        with self.transaction() as connection:
+            changed: List[Dict[str, Any]] = []
+            resolved = 0
+            for decision in ordered:
+                concept_id = str(decision.get("concept_id") or "")
+                target = str(decision.get("target") or "").strip()
+                rules = list(decision.get("rules") or [])
+                if not concept_id or not target:
+                    raise ValueError("working target decisions require concept_id and target")
+                concept = connection.execute(
+                    """SELECT id, working_target, verified_target, locked
+                       FROM concepts WHERE id=? AND retired_version IS NULL""",
+                    (concept_id,),
+                ).fetchone()
+                if concept is None:
+                    raise KeyError(f"active concept not found: {concept_id}")
+                if bool(concept["locked"]) or str(concept["verified_target"] or "").strip():
+                    continue
+                resolved += 1
+                existing_rules = [
+                    {
+                        "condition": json.loads(row["condition_json"]),
+                        "target": row["target"],
+                    }
+                    for row in connection.execute(
+                        """SELECT condition_json, target FROM rendering_rules
+                           WHERE concept_id=? AND retired_version IS NULL
+                             AND locked=0 AND status='provisional'""",
+                        (concept_id,),
+                    ).fetchall()
+                ]
+                if (
+                    str(concept["working_target"] or "") == target
+                    and self._normalized_working_rules(existing_rules)
+                    == self._normalized_working_rules(rules)
+                ):
+                    continue
+                changed.append(
+                    {"concept_id": concept_id, "target": target, "rules": rules}
+                )
+
+            if not changed:
+                return {
+                    "resolved": resolved,
+                    "changed": 0,
+                    "knowledge_version": None,
+                    "affected_blocks": 0,
+                }
+            version = self.create_knowledge_version(
+                "resolve provisional working translations", connection
+            )
+            for decision in changed:
+                concept_id = decision["concept_id"]
+                connection.execute(
+                    """UPDATE concepts
+                       SET working_target=?, default_target=?
+                       WHERE id=? AND locked=0 AND verified_target=''""",
+                    (decision["target"], decision["target"], concept_id),
+                )
+                connection.execute(
+                    """UPDATE rendering_rules SET retired_version=?
+                       WHERE concept_id=? AND retired_version IS NULL AND locked=0""",
+                    (version, concept_id),
+                )
+                for ordinal, rule in enumerate(decision["rules"]):
+                    condition = rule.get("condition") or {}
+                    target = str(rule.get("target") or "").strip()
+                    if not condition or not target:
+                        raise ValueError("working rendering rules cannot be empty")
+                    condition_json = json.dumps(
+                        condition, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+                    )
+                    rule_id = stable_id(
+                        "rule",
+                        f"working:{concept_id}:{version}:{ordinal}:{condition_json}:{target}",
+                        length=24,
+                    )
+                    connection.execute(
+                        """INSERT INTO rendering_rules(
+                               id, concept_id, condition_json, target, priority,
+                               status, scope, locked, created_version, created_at
+                           ) VALUES(?, ?, ?, ?, ?, 'provisional', 'book', 0, ?, ?)""",
+                        (
+                            rule_id,
+                            concept_id,
+                            condition_json,
+                            target,
+                            50 - ordinal,
+                            version,
+                            utc_now(),
+                        ),
+                    )
+            affected = self._invalidate_working_target_dependents(
+                connection, [item["concept_id"] for item in changed]
+            )
+            return {
+                "resolved": resolved,
+                "changed": len(changed),
+                "knowledge_version": version,
+                "affected_blocks": affected,
+            }
+
+    def concept_snapshot(self) -> List[Dict[str, Any]]:
+        """Materialize active rendering state once for a translation run."""
+
+        with closing(self.connect()) as connection:
+            rows = connection.execute(
+                """SELECT c.id, c.kind, c.canonical_source, c.default_target,
+                          c.working_target, c.verified_target, c.description,
                           c.status, c.locked, sf.form, sf.normalized_form
                    FROM concepts c JOIN source_forms sf ON sf.concept_id=c.id
-                   WHERE c.retired_version IS NULL"""
+                   WHERE c.retired_version IS NULL
+                   ORDER BY lower(c.canonical_source), c.id, lower(sf.form), sf.id"""
             ).fetchall()
-            matched: Dict[str, Dict[str, Any]] = {}
+            concepts: Dict[str, Dict[str, Any]] = {}
             for row in rows:
-                pattern = re.compile(rf"\b{re.escape(row['form'])}\b", re.IGNORECASE)
-                if pattern.search(text):
-                    item = matched.setdefault(
-                        row["id"],
-                        {
-                            "id": row["id"], "kind": row["kind"],
-                            "source": row["canonical_source"],
-                            "default_target": row["default_target"],
-                            "description": row["description"], "status": row["status"],
-                            "locked": bool(row["locked"]), "forms": [], "rules": [],
-                            "verification_pending": False,
-                        },
-                    )
-                    item["forms"].append(row["form"])
-            if not matched:
+                working = str(row["working_target"] or "").strip()
+                verified = str(row["verified_target"] or "").strip()
+                locked_fallback = (
+                    str(row["default_target"] or "").strip()
+                    if bool(row["locked"])
+                    else ""
+                )
+                effective = verified or working or locked_fallback
+                item = concepts.setdefault(
+                    str(row["id"]),
+                    {
+                        "id": str(row["id"]),
+                        "kind": str(row["kind"]),
+                        "source": str(row["canonical_source"]),
+                        "working_target": working,
+                        "verified_target": verified,
+                        "default_target": effective,
+                        "target_strength": (
+                            "verified"
+                            if verified or (bool(row["locked"]) and effective)
+                            else "working" if working else "unset"
+                        ),
+                        "description": str(row["description"] or ""),
+                        "status": str(row["status"]),
+                        "locked": bool(row["locked"]),
+                        "forms": [],
+                        "rules": [],
+                        "verification_pending": False,
+                    },
+                )
+                item["forms"].append(str(row["form"]))
+            if not concepts:
                 return []
-            placeholders = ",".join("?" for _ in matched)
-            pending_rows = connection.execute(
+            placeholders = ",".join("?" for _ in concepts)
+            for pending in connection.execute(
                 f"""SELECT DISTINCT subject_id FROM verification_tasks
                     WHERE subject_type='concept' AND status IN ('open','needs_human')
                       AND subject_id IN ({placeholders})""",
-                list(matched),
-            ).fetchall()
-            for pending in pending_rows:
-                concept = matched[pending["subject_id"]]
+                list(concepts),
+            ).fetchall():
+                concept = concepts[str(pending["subject_id"])]
                 if not concept["locked"]:
                     concept["verification_pending"] = True
-                    concept["default_target"] = ""
-            rule_rows = connection.execute(
-                f"""SELECT id, concept_id, condition_json, target, priority, status, locked
+            for row in connection.execute(
+                f"""SELECT id, concept_id, condition_json, target, priority,
+                           status, locked
                     FROM rendering_rules
                     WHERE retired_version IS NULL AND concept_id IN ({placeholders})
                     ORDER BY priority DESC, id""",
-                list(matched),
-            ).fetchall()
-            for row in rule_rows:
-                if matched[row["concept_id"]]["verification_pending"]:
+                list(concepts),
+            ).fetchall():
+                target = str(row["target"] or "").strip()
+                if not target:
                     continue
-                matched[row["concept_id"]]["rules"].append(
+                concepts[str(row["concept_id"])]["rules"].append(
                     {
-                        "id": row["id"], "condition": json.loads(row["condition_json"]),
-                        "target": row["target"], "priority": row["priority"],
-                        "status": row["status"], "locked": bool(row["locked"]),
+                        "id": str(row["id"]),
+                        "condition": json.loads(row["condition_json"]),
+                        "target": target,
+                        "priority": int(row["priority"]),
+                        "status": str(row["status"]),
+                        "locked": bool(row["locked"]),
                     }
                 )
-            return list(matched.values())
+            return list(concepts.values())
+
+    @staticmethod
+    def target_snapshot_signature(snapshot: Sequence[Dict[str, Any]]) -> str:
+        payload = []
+        for concept in snapshot:
+            target = str(concept.get("default_target") or "").strip()
+            rules = [
+                {
+                    "condition": rule.get("condition") or {},
+                    "target": str(rule.get("target") or "").strip(),
+                    "locked": bool(rule.get("locked")),
+                }
+                for rule in concept.get("rules", [])
+                if str(rule.get("target") or "").strip()
+            ]
+            if not target and not rules:
+                continue
+            payload.append(
+                {
+                    "id": concept["id"],
+                    "target": target,
+                    "strength": concept.get("target_strength") or "unset",
+                    "rules": rules,
+                }
+            )
+        raw = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+    def concepts_for_text(
+        self,
+        text: str,
+        concept_snapshot: Optional[Sequence[Dict[str, Any]]] = None,
+    ) -> List[Dict[str, Any]]:
+        import re
+
+        snapshot = list(concept_snapshot) if concept_snapshot is not None else self.concept_snapshot()
+        matched: List[Dict[str, Any]] = []
+        for concept in snapshot:
+            forms = [
+                str(form).strip()
+                for form in concept.get("forms", [])
+                if str(form).strip()
+            ]
+            if not any(
+                re.search(rf"(?<!\w){re.escape(form)}(?!\w)", text, re.I)
+                for form in forms
+            ):
+                continue
+            item = dict(concept)
+            item["forms"] = list(forms)
+            item["rules"] = [dict(rule) for rule in concept.get("rules", [])]
+            matched.append(item)
+        return matched
+
+    def invalidate_translation_run(self, run_id: str) -> int:
+        """Mark all output already committed by a stale frozen run for revalidation."""
+
+        with self.transaction() as connection:
+            rows = connection.execute(
+                """SELECT id, block_id FROM translation_versions
+                   WHERE run_id=? AND pipeline='parallel_v4' AND active=1""",
+                (run_id,),
+            ).fetchall()
+            for row in rows:
+                connection.execute(
+                    "UPDATE translation_versions SET status=? WHERE id=?",
+                    (V4BlockStatus.NEEDS_REVALIDATE.value, row["id"]),
+                )
+                connection.execute(
+                    "UPDATE blocks SET status=?, updated_at=? WHERE id=?",
+                    (V4BlockStatus.NEEDS_REVALIDATE.value, utc_now(), row["block_id"]),
+                )
+            return len(rows)
 
     def prior_concept_source_evidence(
         self,
@@ -4896,7 +5312,12 @@ class V4Database:
                 )
                 if task["subject_type"] == "concept":
                     connection.execute(
-                        "UPDATE concepts SET status='verified' WHERE id=? AND locked=0",
+                        """UPDATE concepts SET status='verified',
+                               verified_target=CASE
+                                   WHEN verified_target!='' THEN verified_target
+                                   WHEN working_target!='' THEN working_target
+                                   ELSE default_target END
+                           WHERE id=? AND locked=0""",
                         (task["subject_id"],),
                     )
                     connection.execute(
@@ -4995,8 +5416,21 @@ class V4Database:
                         connection.execute(
                             """UPDATE concepts SET
                                    default_target=CASE WHEN ?!='' THEN ? ELSE default_target END,
+                                   working_target=CASE WHEN ?!='' THEN ? ELSE working_target END,
+                                   verified_target=CASE WHEN ?!='' THEN ?
+                                       WHEN verified_target!='' THEN verified_target
+                                       WHEN working_target!='' THEN working_target
+                                       ELSE default_target END,
                                    status='verified', locked=1 WHERE id=?""",
-                            (replacement_target, replacement_target, subject_id),
+                            (
+                                replacement_target,
+                                replacement_target,
+                                replacement_target,
+                                replacement_target,
+                                replacement_target,
+                                replacement_target,
+                                subject_id,
+                            ),
                         )
                         if replacement_target:
                             connection.execute(
@@ -5111,13 +5545,16 @@ class V4Database:
                     if concept is None:
                         connection.execute(
                             """INSERT INTO concepts(
-                                   id, kind, canonical_source, default_target, description,
+                                   id, kind, canonical_source, default_target,
+                                   working_target, verified_target, description,
                                    status, scope, locked, created_version, created_at
-                               ) VALUES(?, ?, ?, ?, ?, 'verified', 'book', 1, ?, ?)""",
+                               ) VALUES(?, ?, ?, ?, ?, ?, ?, 'verified', 'book', 1, ?, ?)""",
                             (
                                 concept_id,
                                 proposal.get("type") or "concept",
                                 source,
+                                target,
+                                target,
                                 target,
                                 proposal.get("context") or "",
                                 version,
@@ -5132,9 +5569,10 @@ class V4Database:
                         )
                     else:
                         connection.execute(
-                            """UPDATE concepts SET default_target=?, status='verified', locked=1
+                            """UPDATE concepts SET default_target=?, working_target=?,
+                                      verified_target=?, status='verified', locked=1
                                WHERE id=?""",
-                            (target, concept_id),
+                            (target, target, target, concept_id),
                         )
                     if target:
                         rule_id = stable_id("rule", f"{concept_id}:human-default:{target}")

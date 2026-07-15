@@ -6,7 +6,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Annotated, Any, Dict, List, Literal, Optional
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 
 class V4BlockStatus(str, Enum):
@@ -119,6 +119,50 @@ class AdjudicationDecision(StrictModel):
 
 class AdjudicationResponse(StrictModel):
     decisions: List[AdjudicationDecision] = Field(default_factory=list, max_length=12)
+
+
+class WorkingTargetRule(StrictModel):
+    condition: Dict[str, str] = Field(min_length=1, max_length=8)
+    target: str = Field(min_length=1, max_length=200)
+
+    @field_validator("condition")
+    @classmethod
+    def _condition_must_be_concrete(cls, value: Dict[str, str]) -> Dict[str, str]:
+        normalized: Dict[str, str] = {}
+        for raw_key, raw_value in value.items():
+            key = str(raw_key).strip()
+            item = str(raw_value).strip()
+            if not key or not item:
+                raise ValueError("working-target rule conditions cannot be empty")
+            normalized[key] = item
+        return normalized
+
+    @field_validator("target")
+    @classmethod
+    def _rule_target_must_be_nonempty(cls, value: str) -> str:
+        target = value.strip()
+        if not target:
+            raise ValueError("working-target rule target cannot be empty")
+        return target
+
+
+class WorkingTargetDecision(StrictModel):
+    concept_id: str = Field(pattern=r"^Q(?:0[1-9]|1\d|2[0-4])$")
+    working_target: str = Field(min_length=1, max_length=200)
+    rules: List[WorkingTargetRule] = Field(default_factory=list, max_length=6)
+    confidence: float = Field(ge=0.0, le=1.0)
+
+    @field_validator("working_target")
+    @classmethod
+    def _target_must_be_nonempty(cls, value: str) -> str:
+        target = value.strip()
+        if not target:
+            raise ValueError("working target cannot be empty")
+        return target
+
+
+class WorkingTargetResponse(StrictModel):
+    decisions: List[WorkingTargetDecision] = Field(default_factory=list, max_length=24)
 
 
 class VerificationResponse(StrictModel):
