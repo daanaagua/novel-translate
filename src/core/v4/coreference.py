@@ -2146,7 +2146,6 @@ class CoreferenceCoordinator:
             _ProtectedBindingConflict,
             ConceptAnchorConflictError,
             ConceptMergeConflictError,
-            ValueError,
         ):
             return None, 0
 

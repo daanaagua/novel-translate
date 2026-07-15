@@ -476,11 +476,11 @@ class V4Database:
             (decision_id,),
         ).fetchone()
         if decision is None:
-            raise ValueError(
+            raise ConceptMergeConflictError(
                 "merge decision_id must reference an active same coreference decision"
             )
         if str(decision["lexeme_id"]) != lexeme_id:
-            raise ValueError(
+            raise ConceptMergeConflictError(
                 "merge decision lexeme does not match the concepts"
             )
         authorized: set[str] = set()
@@ -542,7 +542,7 @@ class V4Database:
                     continue
         if not concept_ids <= authorized:
             missing = sorted(concept_ids - authorized)
-            raise ValueError(
+            raise ConceptMergeConflictError(
                 "same decision does not authorize every merge concept: "
                 + ", ".join(missing[:8])
             )
@@ -705,12 +705,17 @@ class V4Database:
                 )
         self._require_active_transaction(connection)
         with self._method_savepoint(connection, "merge_concepts"):
-            resolved_ids = sorted(
-                {
-                    self.resolve_concept_id(value, connection=connection)
-                    for value in normalized_raw
-                }
-            )
+            try:
+                resolved_ids = sorted(
+                    {
+                        self.resolve_concept_id(value, connection=connection)
+                        for value in normalized_raw
+                    }
+                )
+            except (KeyError, ValueError) as exc:
+                raise ConceptMergeConflictError(
+                    "merge concept identity changed or cannot be resolved"
+                ) from exc
             placeholders = ",".join("?" for _ in resolved_ids)
             rows = connection.execute(
                 f"""WITH mention_counts AS (
@@ -736,7 +741,9 @@ class V4Database:
                 (*resolved_ids, *resolved_ids, *resolved_ids),
             ).fetchall()
             if len(rows) != len(resolved_ids):
-                raise ValueError("merge requires active canonical concepts")
+                raise ConceptMergeConflictError(
+                    "merge requires active canonical concepts"
+                )
             lexeme_ids = {
                 str(row["primary_lexeme_id"] or "").strip() for row in rows
             }
@@ -758,7 +765,9 @@ class V4Database:
                 )
             else:
                 if len(lexeme_ids) != 1 or not next(iter(lexeme_ids), ""):
-                    raise ValueError("merge concepts must belong to one active lexeme")
+                    raise ConceptMergeConflictError(
+                        "merge concepts must belong to one active lexeme"
+                    )
                 lexeme_id = next(iter(lexeme_ids))
                 linked = {
                     str(row["concept_id"])
@@ -771,7 +780,7 @@ class V4Database:
                     ).fetchall()
                 }
                 if linked != set(resolved_ids):
-                    raise ValueError(
+                    raise ConceptMergeConflictError(
                         "merge concepts must have active primary links to the same lexeme"
                     )
                 self._authorized_merge_decision(
@@ -6675,41 +6684,91 @@ class V4Database:
             if canonical is None:
                 raise KeyError(f"canonical concept does not exist: {canonical_source}")
 
+            current_version = int(
+                connection.execute(
+                    "SELECT MAX(id) FROM knowledge_versions"
+                ).fetchone()[0]
+            )
             active_ids = [canonical_id]
+            preparation_plan: list[dict[str, Any]] = []
             for alias, alias_id in zip(alias_values, alias_ids):
                 normalized_alias = normalize_english_form(alias)
+                lexeme_id = stable_id("lexeme", f"en:{normalized_alias}")
+                alias_row = connection.execute(
+                    "SELECT retired_version FROM concepts WHERE id=?",
+                    (alias_id,),
+                ).fetchone()
+                if alias_row is not None:
+                    if (
+                        alias_row["retired_version"] is None
+                        and alias_id != canonical_id
+                    ):
+                        active_ids.append(alias_id)
+                    needs_link = False
+                else:
+                    needs_link = connection.execute(
+                        """SELECT 1 FROM concept_lexemes
+                           WHERE concept_id=? AND lexeme_id=?
+                             AND retired_version IS NULL""",
+                        (canonical_id, lexeme_id),
+                    ).fetchone() is None
+                preparation_plan.append(
+                    {
+                        "alias": alias,
+                        "normalized": normalized_alias,
+                        "lexeme_id": lexeme_id,
+                        "needs_lexeme": connection.execute(
+                            """SELECT 1 FROM lexemes
+                               WHERE id=? AND retired_version IS NULL""",
+                            (lexeme_id,),
+                        ).fetchone()
+                        is None,
+                        "needs_source_form": connection.execute(
+                            """SELECT 1 FROM source_forms
+                               WHERE lexeme_id=? AND form=? AND normalized_form=?""",
+                            (lexeme_id, alias, normalized_alias),
+                        ).fetchone()
+                        is None,
+                        "needs_link": needs_link,
+                    }
+                )
+
+            active_ids = list(dict.fromkeys(active_ids))
+            preparation_changed = any(
+                plan["needs_lexeme"]
+                or plan["needs_source_form"]
+                or plan["needs_link"]
+                for plan in preparation_plan
+            )
+            preparation_version = current_version
+            if preparation_changed:
+                preparation_version = self.create_knowledge_version(
+                    f"human prepare concept forms: {canonical_source}",
+                    connection,
+                )
+            for plan in preparation_plan:
                 lexeme_id = self._ensure_schema8_lexeme(
                     connection,
-                    alias,
-                    normalized_form=normalized_alias,
+                    plan["alias"],
+                    normalized_form=plan["normalized"],
+                    knowledge_version=preparation_version,
                 )
                 connection.execute(
                     """INSERT OR IGNORE INTO source_forms(
                            lexeme_id, form, normalized_form, grammar_json
                        ) VALUES(?, ?, ?, '{}')""",
-                    (lexeme_id, alias, normalized_alias),
+                    (lexeme_id, plan["alias"], plan["normalized"]),
                 )
-                alias_row = connection.execute(
-                    "SELECT retired_version FROM concepts WHERE id=?",
-                    (alias_id,),
-                ).fetchone()
-                if alias_row is None:
+                if plan["needs_link"]:
                     self._associate_schema8_lexeme(
                         connection,
                         lexeme_id,
                         canonical_id,
+                        knowledge_version=preparation_version,
                     )
-                    continue
-                if alias_row["retired_version"] is None and alias_id != canonical_id:
-                    active_ids.append(alias_id)
 
-            active_ids = list(dict.fromkeys(active_ids))
-            if len(active_ids) < 2:
-                current_version = int(
-                    connection.execute(
-                        "SELECT MAX(id) FROM knowledge_versions"
-                    ).fetchone()[0]
-                )
+            needs_merge = len(active_ids) >= 2
+            if not preparation_changed and not needs_merge:
                 return {
                     "canonical_id": canonical_id,
                     "canonical_source": canonical_source,
@@ -6717,6 +6776,7 @@ class V4Database:
                     "merged_concept_ids": [],
                     "changed": False,
                     "knowledge_version": current_version,
+                    "authorization_audit_id": None,
                     "decision_id": None,
                     "reason": "human concept-form merge already canonical",
                     "selection_key": {
@@ -6727,26 +6787,23 @@ class V4Database:
                     "affected_translations": 0,
                 }
 
-            placeholders = ",".join("?" for _ in active_ids[1:])
-            affected_translations = int(
-                connection.execute(
-                    f"""SELECT COUNT(DISTINCT translation_id) FROM dependencies
-                         WHERE dependency_type='concept'
-                           AND dependency_id IN ({placeholders})""",
-                    active_ids[1:],
-                ).fetchone()[0]
-            )
-            current_version = int(
-                connection.execute(
-                    "SELECT MAX(id) FROM knowledge_versions"
-                ).fetchone()[0]
-            )
+            affected_translations = 0
+            if needs_merge:
+                placeholders = ",".join("?" for _ in active_ids[1:])
+                affected_translations = int(
+                    connection.execute(
+                        f"""SELECT COUNT(DISTINCT translation_id) FROM dependencies
+                             WHERE dependency_type='concept'
+                               AND dependency_id IN ({placeholders})""",
+                        active_ids[1:],
+                    ).fetchone()[0]
+                )
             authorization_id = self.record_audit_call(
                 run_id=None,
                 block_id=None,
                 purpose="human_concept_form_merge_authorization",
                 model="none",
-                knowledge_version=current_version,
+                knowledge_version=preparation_version,
                 request={
                     "actor_type": "human",
                     "call_type": "human_concept_form_merge_authorization",
@@ -6767,6 +6824,73 @@ class V4Database:
                 connection=connection,
                 archive_payload=False,
             )
+            if preparation_changed:
+                alias_digest = hashlib.sha256(
+                    json.dumps(
+                        alias_values,
+                        ensure_ascii=False,
+                        separators=(",", ":"),
+                    ).encode("utf-8")
+                ).hexdigest()
+                bounded_aliases = alias_values[:MAX_MERGE_AUDIT_IDS]
+                preparation_payload = {
+                    "authorization_audit_id": authorization_id,
+                    "canonical_concept_id": canonical_id,
+                    "aliases": bounded_aliases,
+                    "alias_count": len(alias_values),
+                    "omitted_aliases": max(
+                        0, len(alias_values) - MAX_MERGE_AUDIT_IDS
+                    ),
+                    "aliases_sha256": alias_digest,
+                    "created_lexeme_count": sum(
+                        int(plan["needs_lexeme"]) for plan in preparation_plan
+                    ),
+                    "created_source_form_count": sum(
+                        int(plan["needs_source_form"])
+                        for plan in preparation_plan
+                    ),
+                    "created_link_count": sum(
+                        int(plan["needs_link"]) for plan in preparation_plan
+                    ),
+                }
+                connection.execute(
+                    """INSERT INTO knowledge_changes(
+                           knowledge_version, subject_type, subject_id, change_kind,
+                           old_fingerprint, new_fingerprint, impact_level,
+                           payload_json, created_at)
+                       VALUES(?, 'concept', ?, 'concept_form_aliases', ?, ?, 1, ?, ?)""",
+                    (
+                        preparation_version,
+                        canonical_id,
+                        hashlib.sha256(canonical_id.encode("utf-8")).hexdigest(),
+                        alias_digest,
+                        json.dumps(
+                            preparation_payload,
+                            ensure_ascii=False,
+                            sort_keys=True,
+                            separators=(",", ":"),
+                        ),
+                        utc_now(),
+                    ),
+                )
+            if not needs_merge:
+                return {
+                    "canonical_id": canonical_id,
+                    "canonical_source": canonical_source,
+                    "aliases": alias_values,
+                    "merged_concept_ids": [],
+                    "changed": True,
+                    "knowledge_version": preparation_version,
+                    "authorization_audit_id": authorization_id,
+                    "decision_id": None,
+                    "reason": "human prepare concept form aliases",
+                    "selection_key": {
+                        "criterion": "human_alias_preparation",
+                        "concept_id": canonical_id,
+                    },
+                    "rule_conflicts": 0,
+                    "affected_translations": 0,
+                }
             reason = (
                 f"{HUMAN_CONCEPT_FORM_REDIRECT_PREFIX}{authorization_id}: "
                 f"{canonical_source}"
@@ -6783,6 +6907,7 @@ class V4Database:
                 **result,
                 "canonical_source": canonical_source,
                 "aliases": alias_values,
+                "authorization_audit_id": authorization_id,
                 "affected_translations": affected_translations,
             }
 

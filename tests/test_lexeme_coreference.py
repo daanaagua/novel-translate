@@ -4735,3 +4735,221 @@ def test_human_concept_form_merge_uses_redirects_and_readable_authorization(tmp_
     assert authorization_payload["parsed"]["canonical_concept_id"] == canonical_id
     assert merge_payload["parsed"]["canonical_id"] == canonical_id
     assert foreign_keys == []
+
+
+def test_dual_same_unexpected_merge_value_error_rolls_back_everything(
+    tmp_path, monkeypatch
+):
+    database, lexeme_id, mention_ids, _, _ = _coreference_case(tmp_path)
+    concept_ids = ("concept-unexpected-left", "concept-unexpected-right")
+    for concept_id, mention_id in zip(concept_ids, mention_ids):
+        _insert_test_concept(
+            database, lexeme_id, concept_id, anchor_mention_id=mention_id
+        )
+        _bind_test_mention(database, mention_id, concept_id)
+    case = CoreferenceCoordinator(database).freeze_cases()[0]
+    coordinator, _, _ = _dual_model_coordinator(
+        database,
+        case,
+        [_dual_model_response(case, "same")],
+        [_dual_model_response(case, "same")],
+    )
+
+    def fail_unexpected(*_args, **_kwargs):
+        raise ValueError("unexpected injected merge bug")
+
+    monkeypatch.setattr(database, "merge_concepts", fail_unexpected)
+    with pytest.raises(ValueError, match="unexpected injected merge bug"):
+        coordinator.resolve_dual_model(case)
+
+    with closing(database.connect()) as connection:
+        bindings = connection.execute(
+            "SELECT id, concept_id FROM mentions ORDER BY id"
+        ).fetchall()
+        assert connection.execute(
+            "SELECT COUNT(*) FROM coreference_decisions"
+        ).fetchone()[0] == 0
+        assert connection.execute(
+            "SELECT COUNT(*) FROM concept_redirects"
+        ).fetchone()[0] == 0
+        assert connection.execute("SELECT COUNT(*) FROM audit_calls").fetchone()[0] == 0
+    assert [(row["id"], row["concept_id"]) for row in bindings] == list(
+        zip(mention_ids, concept_ids)
+    )
+
+
+def test_dual_same_explicit_merge_conflict_is_conservative_without_fake_effect(
+    tmp_path, monkeypatch
+):
+    database, lexeme_id, mention_ids, _, _ = _coreference_case(tmp_path)
+    concept_ids = ("concept-protected-left", "concept-protected-right")
+    for concept_id, mention_id in zip(concept_ids, mention_ids):
+        _insert_test_concept(
+            database, lexeme_id, concept_id, anchor_mention_id=mention_id
+        )
+        _bind_test_mention(database, mention_id, concept_id)
+    case = CoreferenceCoordinator(database).freeze_cases()[0]
+    coordinator, _, _ = _dual_model_coordinator(
+        database,
+        case,
+        [_dual_model_response(case, "same")],
+        [_dual_model_response(case, "same")],
+    )
+
+    def fail_protected(*_args, **_kwargs):
+        raise ConceptMergeConflictError("protected merge")
+
+    monkeypatch.setattr(database, "merge_concepts", fail_protected)
+    summary = coordinator.run(max_cases=1)
+
+    assert summary["model_merges"] == 0
+    with closing(database.connect()) as connection:
+        decision = connection.execute(
+            "SELECT relation, votes_json FROM coreference_decisions"
+        ).fetchone()
+        bindings = connection.execute(
+            "SELECT id, concept_id FROM mentions ORDER BY id"
+        ).fetchall()
+        assert connection.execute(
+            "SELECT COUNT(*) FROM concept_redirects"
+        ).fetchone()[0] == 0
+        assert connection.execute(
+            "SELECT COUNT(*) FROM audit_calls WHERE purpose='concept_merge'"
+        ).fetchone()[0] == 0
+    effect = next(
+        vote["effect"]
+        for vote in json.loads(decision["votes_json"])
+        if vote.get("source") == "dual_model"
+    )
+    assert decision["relation"] == "same"
+    assert effect == {"bindings_changed": 0, "unified_identity": False}
+    assert [(row["id"], row["concept_id"]) for row in bindings] == list(
+        zip(mention_ids, concept_ids)
+    )
+
+
+def test_human_alias_only_change_is_versioned_audited_and_idempotent(tmp_path):
+    database = _db(tmp_path, source_text="Several scapes appeared.")
+    database.import_legacy_concept("scape", "拟境", "concept", "canonical")
+    canonical_id = stable_id("concept", normalize_english_form("scape"))
+    alias_lexeme_id = stable_id("lexeme", "en:scapes")
+    with closing(database.connect()) as connection:
+        before_versions = connection.execute(
+            "SELECT COUNT(*) FROM knowledge_versions"
+        ).fetchone()[0]
+        before_audits = connection.execute(
+            "SELECT COUNT(*) FROM audit_calls"
+        ).fetchone()[0]
+
+    first = database.merge_concept_forms("scape", ["scapes"])
+
+    assert first["canonical_id"] == canonical_id
+    assert first["canonical_source"] == "scape"
+    assert first["aliases"] == ["scapes"]
+    assert first["merged_concept_ids"] == []
+    assert first["affected_translations"] == 0
+    assert first["changed"] is True
+    assert isinstance(first["authorization_audit_id"], int)
+    with closing(database.connect()) as connection:
+        after_first = {
+            "versions": connection.execute(
+                "SELECT COUNT(*) FROM knowledge_versions"
+            ).fetchone()[0],
+            "audits": connection.execute(
+                "SELECT COUNT(*) FROM audit_calls"
+            ).fetchone()[0],
+            "changes": connection.execute(
+                """SELECT COUNT(*) FROM knowledge_changes
+                   WHERE change_kind='concept_form_aliases'"""
+            ).fetchone()[0],
+        }
+        link = connection.execute(
+            """SELECT role, created_version FROM concept_lexemes
+               WHERE concept_id=? AND lexeme_id=?
+                 AND retired_version IS NULL""",
+            (canonical_id, alias_lexeme_id),
+        ).fetchone()
+        source_form = connection.execute(
+            """SELECT form FROM source_forms
+               WHERE lexeme_id=? AND normalized_form='scapes'""",
+            (alias_lexeme_id,),
+        ).fetchone()
+    assert after_first == {
+        "versions": before_versions + 1,
+        "audits": before_audits + 1,
+        "changes": 1,
+    }
+    assert tuple(link) == ("alias", first["knowledge_version"])
+    assert source_form["form"] == "scapes"
+    authorization = database.read_audit_payload(first["authorization_audit_id"])
+    assert authorization["parsed"]["authorized"] is True
+    assert authorization["parsed"]["canonical_concept_id"] == canonical_id
+
+    replay = database.merge_concept_forms("scape", ["scapes"])
+
+    assert replay["changed"] is False
+    assert replay["authorization_audit_id"] is None
+    with closing(database.connect()) as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM knowledge_versions"
+        ).fetchone()[0] == after_first["versions"]
+        assert connection.execute(
+            "SELECT COUNT(*) FROM audit_calls"
+        ).fetchone()[0] == after_first["audits"]
+        assert connection.execute(
+            """SELECT COUNT(*) FROM knowledge_changes
+               WHERE change_kind='concept_form_aliases'"""
+        ).fetchone()[0] == after_first["changes"]
+
+
+def test_human_alias_preparation_rolls_back_with_later_concept_merge_failure(
+    tmp_path, monkeypatch
+):
+    database = _db(tmp_path, source_text="Scape variants and scapes appeared.")
+    database.import_legacy_concept("scape", "拟境", "concept", "canonical")
+    database.import_legacy_concept("scapes", "虚拟场景", "concept", "plural")
+    canonical_id = stable_id("concept", normalize_english_form("scape"))
+    alias_id = stable_id("concept", normalize_english_form("scapes"))
+    variant_lexeme_id = stable_id("lexeme", "en:scape variant")
+    with closing(database.connect()) as connection:
+        before = {
+            table: connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+            for table in (
+                "knowledge_versions",
+                "audit_calls",
+                "knowledge_changes",
+                "lexemes",
+                "source_forms",
+                "concept_lexemes",
+            )
+        }
+
+    def fail_after_preparation(*_args, **_kwargs):
+        raise RuntimeError("injected merge failure after alias preparation")
+
+    monkeypatch.setattr(
+        database, "_merge_concepts_authorized", fail_after_preparation
+    )
+    with pytest.raises(RuntimeError, match="after alias preparation"):
+        database.merge_concept_forms("scape", ["scape variant", "scapes"])
+
+    with closing(database.connect()) as connection:
+        after = {
+            table: connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+            for table in before
+        }
+        assert connection.execute(
+            "SELECT COUNT(*) FROM lexemes WHERE id=?", (variant_lexeme_id,)
+        ).fetchone()[0] == 0
+        assert connection.execute(
+            "SELECT COUNT(*) FROM concept_redirects"
+        ).fetchone()[0] == 0
+        assert connection.execute(
+            "SELECT retired_version FROM concepts WHERE id=?", (alias_id,)
+        ).fetchone()[0] is None
+        assert connection.execute(
+            """SELECT COUNT(*) FROM concept_lexemes
+               WHERE concept_id=? AND lexeme_id=? AND retired_version IS NULL""",
+            (canonical_id, variant_lexeme_id),
+        ).fetchone()[0] == 0
+    assert after == before
