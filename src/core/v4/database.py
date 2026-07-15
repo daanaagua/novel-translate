@@ -3047,6 +3047,7 @@ class V4Database:
         run_id: str,
         results: Sequence[Any],
         *,
+        audit_attempts: Sequence[Any] = (),
         require_lease: bool = False,
         finalize_run_status: Optional[str] = None,
     ) -> Dict[str, Any]:
@@ -3118,6 +3119,40 @@ class V4Database:
                         f"candidate cluster has no persisted alternatives: {cluster_id}"
                     )
                 cluster_members[cluster_id] = list(rows)
+
+            for audit in audit_attempts:
+                messages = self._adjudication_value(audit, "messages", ())
+                parsed = self._adjudication_value(audit, "parsed")
+                self.record_audit_call(
+                    run_id=run_id,
+                    block_id=None,
+                    purpose="candidate_adjudication",
+                    model=str(self._adjudication_value(audit, "model", "unknown")),
+                    knowledge_version=int(
+                        self._adjudication_value(audit, "knowledge_version", 0)
+                    ),
+                    request={
+                        "messages": [dict(message) for message in messages],
+                        "audit_mode": str(
+                            self._adjudication_value(audit, "audit_mode", "full")
+                        ),
+                    },
+                    raw_response=str(
+                        self._adjudication_value(audit, "raw_response", "") or ""
+                    ),
+                    parsed=dict(parsed) if parsed is not None else None,
+                    accepted=bool(
+                        self._adjudication_value(audit, "accepted", False)
+                    ),
+                    attempts=max(
+                        1, int(self._adjudication_value(audit, "attempt", 1))
+                    ),
+                    elapsed_ms=max(
+                        0, int(self._adjudication_value(audit, "elapsed_ms", 0))
+                    ),
+                    error=self._adjudication_value(audit, "error"),
+                    connection=connection,
+                )
 
             normalized_results: List[Dict[str, Any]] = []
             for result, cluster_id in zip(ordered, cluster_ids):

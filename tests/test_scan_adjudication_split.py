@@ -4,7 +4,11 @@ from contextlib import closing
 import pytest
 
 from src.core.v4 import database as database_module
-from src.core.v4.adjudicator import AdjudicationResult, V4Adjudicator
+from src.core.v4.adjudicator import (
+    AdjudicationAuditAttempt,
+    AdjudicationResult,
+    V4Adjudicator,
+)
 from src.core.v4.candidate_clusters import CandidateCluster
 from src.core.v4.database import (
     StaleAdjudicationCommit,
@@ -553,6 +557,60 @@ def test_adjudicator_run_records_failed_stage(database, monkeypatch):
     assert row["stage"] == "adjudicate"
     assert row["status"] == "failed"
     assert "storage failed" in row["error"]
+
+
+def test_commit_adjudications_rolls_back_audits_with_decisions(database, monkeypatch):
+    V4Scanner(database, ExplodingLLM()).scan_project(max_blocks=3)
+    database.start_run("judge-atomic", "adjudicate", {})
+    cluster = database.claim_pending_candidate_clusters("judge-atomic", 1)[0]
+    decision = AdjudicationResult(
+        cluster_id=cluster.id,
+        verdict="reject",
+        selected_candidate_ids=(),
+        entity_kind="concept",
+        confidence=0.99,
+    )
+    audit = AdjudicationAuditAttempt(
+        messages=(
+            {"role": "system", "content": "judge"},
+            {"role": "user", "content": "bounded aliases"},
+        ),
+        raw_response='{"decisions":[]}',
+        parsed={"decisions": []},
+        accepted=True,
+        attempt=1,
+        elapsed_ms=12,
+        error=None,
+        error_kind=None,
+        model="FakeModel",
+        knowledge_version=0,
+        audit_mode="full",
+    )
+    original_record = database.record_audit_call
+
+    def record_then_fail(**kwargs):
+        original_record(**kwargs)
+        raise RuntimeError("forced adjudication failure")
+
+    monkeypatch.setattr(database, "record_audit_call", record_then_fail)
+    with pytest.raises(RuntimeError, match="forced adjudication failure"):
+        database.commit_adjudications(
+            "judge-atomic",
+            [decision],
+            audit_attempts=[audit],
+            require_lease=True,
+        )
+
+    with closing(database.connect()) as connection:
+        assert connection.execute("SELECT COUNT(*) FROM audit_calls").fetchone()[0] == 0
+        assert connection.execute(
+            "SELECT COUNT(*) FROM candidate_adjudications"
+        ).fetchone()[0] == 0
+        state = connection.execute(
+            "SELECT state, lease_run_id FROM candidate_clusters WHERE id=?",
+            (cluster.id,),
+        ).fetchone()
+    assert tuple(state) == ("leased", "judge-atomic")
 
 
 def test_active_cluster_context_only_member_is_not_reclustered(tmp_path):

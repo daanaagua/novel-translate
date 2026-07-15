@@ -87,6 +87,7 @@ class AdjudicationAuditAttempt:
     error_kind: Optional[str]
     model: str
     knowledge_version: int
+    audit_mode: str
 
 
 @dataclass(frozen=True)
@@ -396,6 +397,7 @@ class V4Adjudicator:
                         error_kind=None,
                         model=model,
                         knowledge_version=int(knowledge_version),
+                        audit_mode=self.audit_mode,
                     )
                 )
                 continue
@@ -411,6 +413,7 @@ class V4Adjudicator:
                     error_kind=None,
                     model=model,
                     knowledge_version=int(knowledge_version),
+                    audit_mode=self.audit_mode,
                 )
             )
             return _RoundOutcome(resolved, tuple(audit_attempts))
@@ -431,7 +434,7 @@ class V4Adjudicator:
                 knowledge_version=audit.knowledge_version,
                 request={
                     "messages": [dict(message) for message in audit.messages],
-                    "audit_mode": self.audit_mode,
+                    "audit_mode": audit.audit_mode,
                 },
                 raw_response=audit.raw_response,
                 parsed=dict(audit.parsed) if audit.parsed is not None else None,
