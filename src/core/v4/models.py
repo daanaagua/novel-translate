@@ -192,6 +192,36 @@ class V4Block:
     legacy_id: str = ""
 
 
+@dataclass(frozen=True)
+class LexemeRef:
+    id: str
+    language: str
+    normalized_form: str
+    canonical_form: str
+
+
+@dataclass(frozen=True)
+class TypeObservation:
+    lexeme_id: str
+    kind: str
+    confidence: float
+    source: str
+    mention_id: int | None = None
+    concept_id: str | None = None
+    evidence_id: int | None = None
+    adjudication_id: str | None = None
+
+
+@dataclass(frozen=True)
+class FormOccurrence:
+    lexeme_id: str
+    block_id: str
+    start_offset: int
+    end_offset: int
+    source_form: str
+    source_hash: str
+
+
 @dataclass
 class ScanOutcome:
     block: V4Block

@@ -22,6 +22,7 @@ from .audit_archive import (
     StorageBudget,
 )
 from .models import (
+    FormOccurrence,
     ScanOutcome,
     TranslationOutcome,
     V4Block,
@@ -204,6 +205,242 @@ class V4Database:
             (concept_id, lexeme_id, role, knowledge_version, now),
         )
 
+    def _ensure_lexeme_record(
+        self,
+        connection: sqlite3.Connection,
+        source_form: str,
+        *,
+        language: str,
+        knowledge_version: int | None = None,
+        created_at: str | None = None,
+    ) -> tuple[str, str]:
+        if not isinstance(language, str) or not language.strip():
+            raise ValueError("lexeme language cannot be empty")
+        if not isinstance(source_form, str) or not source_form:
+            raise ValueError("lexeme source form cannot be empty")
+        normalized = normalize_english_form(source_form)
+        if not normalized:
+            raise ValueError("lexeme normalized form cannot be empty")
+        lexeme_id = stable_id("lexeme", f"{language}:{normalized}")
+        if knowledge_version is None:
+            knowledge_version = int(
+                connection.execute(
+                    "SELECT MAX(id) FROM knowledge_versions"
+                ).fetchone()[0]
+            )
+        connection.execute(
+            """INSERT OR IGNORE INTO lexemes(
+                   id, language, normalized_form, canonical_form,
+                   created_version, created_at)
+               VALUES(?, ?, ?, ?, ?, ?)""",
+            (
+                lexeme_id,
+                language,
+                normalized,
+                source_form,
+                knowledge_version,
+                created_at or utc_now(),
+            ),
+        )
+        active = connection.execute(
+            """SELECT id FROM lexemes
+               WHERE language=? AND normalized_form=?
+                     AND retired_version IS NULL""",
+            (language, normalized),
+        ).fetchone()
+        if active is None or str(active[0]) != lexeme_id:
+            raise RuntimeError(
+                "active lexeme violates the stable ownership identity"
+            )
+        return lexeme_id, normalized
+
+    def ensure_lexeme(
+        self,
+        source_form: str,
+        *,
+        language: str = "en",
+        connection: sqlite3.Connection | None = None,
+    ) -> str:
+        if connection is None:
+            with self.transaction() as owned_connection:
+                return self.ensure_lexeme(
+                    source_form,
+                    language=language,
+                    connection=owned_connection,
+                )
+        lexeme_id, normalized = self._ensure_lexeme_record(
+            connection,
+            source_form,
+            language=language,
+        )
+        connection.execute(
+            """INSERT OR IGNORE INTO source_forms(
+                   lexeme_id, form, normalized_form, grammar_json)
+               VALUES(?, ?, ?, '{}')""",
+            (lexeme_id, source_form, normalized),
+        )
+        return lexeme_id
+
+    def record_type_observation(
+        self,
+        lexeme_id: str,
+        kind: str,
+        *,
+        confidence: float,
+        source: str,
+        mention_id: int | None = None,
+        concept_id: str | None = None,
+        evidence_id: int | None = None,
+        adjudication_id: str | None = None,
+        connection: sqlite3.Connection | None = None,
+    ) -> int:
+        if not isinstance(kind, str) or not kind.strip():
+            raise ValueError("type observation kind cannot be empty")
+        if not isinstance(source, str) or not source.strip():
+            raise ValueError("type observation source cannot be empty")
+        try:
+            confidence = float(confidence)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("type observation confidence must be numeric") from exc
+        if not 0.0 <= confidence <= 1.0:
+            raise ValueError("type observation confidence must be between 0 and 1")
+        if connection is None:
+            with self.transaction() as owned_connection:
+                return self.record_type_observation(
+                    lexeme_id,
+                    kind,
+                    confidence=confidence,
+                    source=source,
+                    mention_id=mention_id,
+                    concept_id=concept_id,
+                    evidence_id=evidence_id,
+                    adjudication_id=adjudication_id,
+                    connection=owned_connection,
+                )
+        existing = connection.execute(
+            """SELECT id FROM concept_type_observations
+               WHERE lexeme_id=? AND kind=? AND confidence=? AND source=?
+                     AND mention_id IS ? AND concept_id IS ?
+                     AND evidence_id IS ? AND adjudication_id IS ?
+               ORDER BY id LIMIT 1""",
+            (
+                lexeme_id,
+                kind,
+                confidence,
+                source,
+                mention_id,
+                concept_id,
+                evidence_id,
+                adjudication_id,
+            ),
+        ).fetchone()
+        if existing is not None:
+            return int(existing[0])
+        version = int(
+            connection.execute(
+                "SELECT MAX(id) FROM knowledge_versions"
+            ).fetchone()[0]
+        )
+        cursor = connection.execute(
+            """INSERT INTO concept_type_observations(
+                   concept_id, lexeme_id, mention_id, evidence_id, kind,
+                   confidence, source, adjudication_id, created_version,
+                   created_at)
+               VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                concept_id,
+                lexeme_id,
+                mention_id,
+                evidence_id,
+                kind,
+                confidence,
+                source,
+                adjudication_id,
+                version,
+                utc_now(),
+            ),
+        )
+        return int(cursor.lastrowid)
+
+    def record_form_occurrences(
+        self,
+        rows: Sequence[FormOccurrence],
+        *,
+        connection: sqlite3.Connection | None = None,
+    ) -> int:
+        rows = tuple(rows)
+        if connection is None:
+            with self.transaction() as owned_connection:
+                return self.record_form_occurrences(
+                    rows,
+                    connection=owned_connection,
+                )
+        if not rows:
+            return 0
+
+        blocks: dict[str, Any] = {}
+        for occurrence in rows:
+            block = blocks.get(occurrence.block_id)
+            if block is None:
+                block = connection.execute(
+                    """SELECT b.source_text, b.source_hash, s.active
+                       FROM blocks b
+                       JOIN source_editions s ON s.id=b.source_edition_id
+                       WHERE b.id=?""",
+                    (occurrence.block_id,),
+                ).fetchone()
+                if block is None:
+                    raise KeyError(f"block does not exist: {occurrence.block_id}")
+                blocks[occurrence.block_id] = block
+            if int(block[2]) != 1:
+                raise ValueError(
+                    f"block is not part of the active source edition: "
+                    f"{occurrence.block_id}"
+                )
+            if str(block[1]) != occurrence.source_hash:
+                raise ValueError(
+                    f"source hash does not match block: {occurrence.block_id}"
+                )
+            start = occurrence.start_offset
+            end = occurrence.end_offset
+            source_text = str(block[0])
+            if (
+                not isinstance(start, int)
+                or isinstance(start, bool)
+                or not isinstance(end, int)
+                or isinstance(end, bool)
+                or not 0 <= start < end <= len(source_text)
+            ):
+                raise ValueError(
+                    f"invalid half-open occurrence offsets for block: "
+                    f"{occurrence.block_id}"
+                )
+            if source_text[start:end] != occurrence.source_form:
+                raise ValueError(
+                    f"source form does not match block slice: {occurrence.block_id}"
+                )
+
+        inserted = 0
+        now = utc_now()
+        for occurrence in rows:
+            cursor = connection.execute(
+                """INSERT OR IGNORE INTO form_occurrences(
+                       lexeme_id, block_id, start_offset, end_offset,
+                       source_form, source_hash, created_at)
+                   VALUES(?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    occurrence.lexeme_id,
+                    occurrence.block_id,
+                    occurrence.start_offset,
+                    occurrence.end_offset,
+                    occurrence.source_form,
+                    occurrence.source_hash,
+                    now,
+                ),
+            )
+            inserted += cursor.rowcount
+        return inserted
+
     def _ensure_schema8_lexeme(
         self,
         connection: sqlite3.Connection,
@@ -216,8 +453,9 @@ class V4Database:
     ) -> str:
         """Create neutral schema-8 ownership for legacy write paths."""
 
-        normalized = normalized_form or normalize_english_form(source_form)
-        lexeme_id = stable_id("lexeme", f"en:{normalized}")
+        normalized = normalize_english_form(source_form)
+        if normalized_form is not None and normalized_form != normalized:
+            raise ValueError("schema8 lexeme normalization does not match source form")
         if knowledge_version is None:
             knowledge_version = int(
                 connection.execute(
@@ -225,18 +463,12 @@ class V4Database:
                 ).fetchone()[0]
             )
         now = created_at or utc_now()
-        connection.execute(
-            """INSERT OR IGNORE INTO lexemes(
-                   id, language, normalized_form, canonical_form,
-                   created_version, created_at)
-               VALUES(?, 'en', ?, ?, ?, ?)""",
-            (
-                lexeme_id,
-                normalized,
-                source_form,
-                knowledge_version,
-                now,
-            ),
+        lexeme_id, _ = self._ensure_lexeme_record(
+            connection,
+            source_form,
+            language="en",
+            knowledge_version=knowledge_version,
+            created_at=now,
         )
         if concept_id is not None:
             self._associate_schema8_lexeme(
