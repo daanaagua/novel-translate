@@ -3290,13 +3290,28 @@ class V4Database:
                FROM candidate_resolutions WHERE adjudication_id=?""",
             (adjudication_id,),
         ).fetchall()
+        member_ids = {str(row["id"]) for row in members}
+        resolution_candidate_ids = [
+            str(row["candidate_id"]) for row in resolution_rows
+        ]
+        if (
+            len(resolution_rows) != len(members)
+            or len(set(resolution_candidate_ids)) != len(resolution_candidate_ids)
+            or set(resolution_candidate_ids) != member_ids
+        ):
+            return False
         resolutions = {
-            row["candidate_id"]: row
+            str(row["candidate_id"]): row
             for row in resolution_rows
         }
-        if set(resolutions) != {row["id"] for row in members}:
-            return False
         selected = set(result["selected_ids"])
+        selected_evidence_ids = [
+            resolutions[candidate_id]["evidence_id"] for candidate_id in selected
+        ]
+        if any(evidence_id is None for evidence_id in selected_evidence_ids) or len(
+            set(selected_evidence_ids)
+        ) != len(selected_evidence_ids):
+            return False
         chain_rows_by_candidate: Dict[str, List[sqlite3.Row]] = {
             candidate_id: [] for candidate_id in selected
         }
@@ -3341,8 +3356,19 @@ class V4Database:
             candidate_id = str(row["candidate_id"])
             if candidate_id in chain_rows_by_candidate:
                 chain_rows_by_candidate[candidate_id].append(row)
+        active_observation_ids = {
+            int(row["id"])
+            for row in connection.execute(
+                """SELECT id FROM concept_type_observations
+                   WHERE adjudication_id=? AND source='candidate_adjudication'
+                         AND retired_version IS NULL""",
+                (adjudication_id,),
+            ).fetchall()
+        }
+        consumed_mention_ids: set[int] = set()
+        consumed_observation_ids: set[int] = set()
         for member in members:
-            candidate_id = member["id"]
+            candidate_id = str(member["id"])
             resolution = resolutions[candidate_id]
             if V4Database._cluster_member_is_selected(member, selected):
                 expected_lexeme_id = stable_id(
@@ -3390,6 +3416,15 @@ class V4Database:
                     or chain["observation_retired_version"] is not None
                 ):
                     return False
+                mention_id = int(chain["mention_id"])
+                observation_id = int(chain["observation_id"])
+                if (
+                    mention_id in consumed_mention_ids
+                    or observation_id in consumed_observation_ids
+                ):
+                    return False
+                consumed_mention_ids.add(mention_id)
+                consumed_observation_ids.add(observation_id)
                 occurrence = connection.execute(
                     """SELECT 1 FROM form_occurrences
                        WHERE lexeme_id=? AND block_id=? AND start_offset=?
@@ -3423,7 +3458,7 @@ class V4Database:
                     or member["selected"]
                 ):
                     return False
-        return True
+        return consumed_observation_ids == active_observation_ids
 
     def commit_adjudications(
         self,

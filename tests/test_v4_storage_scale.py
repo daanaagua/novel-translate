@@ -1205,6 +1205,125 @@ def test_identical_payload_supersedes_drifted_mention_evidence_chain(tmp_path):
     )
 
 
+def test_identical_payload_supersedes_duplicate_candidate_resolution(tmp_path):
+    db, _, _, candidates = _seed_database(tmp_path)
+    db.persist_candidate_clusters("scan-run", [_cluster("cluster-1", candidates)])
+    result = AdjudicationResult(
+        "cluster-1", "promote", (candidates[0].id,), "person", 0.9
+    )
+    first = db.commit_adjudications("judge-run", [result])
+    with db.transaction() as connection:
+        connection.execute(
+            """INSERT INTO candidate_resolutions(
+                   id, adjudication_id, run_id, cluster_id, candidate_id,
+                   lexeme_id, concept_id, evidence_id, decision, ordinal,
+                   payload_json, created_at
+               )
+               SELECT 'duplicate-resolution', cr.adjudication_id, cr.run_id,
+                      cr.cluster_id, cr.candidate_id, cr.lexeme_id,
+                      cr.concept_id, cr.evidence_id, cr.decision, 99,
+                      cr.payload_json, cr.created_at
+               FROM candidate_resolutions cr
+               JOIN candidate_adjudications ca ON ca.id=cr.adjudication_id
+               WHERE ca.active=1 AND cr.candidate_id=?""",
+            (candidates[1].id,),
+        )
+
+    repaired = db.commit_adjudications("judge-run", [result])
+
+    assert repaired["knowledge_version"] != first["knowledge_version"]
+    assert repaired["changed"] == 1
+    with closing(db.connect()) as connection:
+        adjudications = connection.execute(
+            """SELECT active, superseded_at FROM candidate_adjudications
+               ORDER BY knowledge_version"""
+        ).fetchall()
+        resolution_counts = connection.execute(
+            """SELECT COUNT(*) AS total,
+                      COUNT(DISTINCT cr.candidate_id) AS candidates
+               FROM candidate_resolutions cr
+               JOIN candidate_adjudications ca ON ca.id=cr.adjudication_id
+               WHERE ca.active=1"""
+        ).fetchone()
+    assert [row["active"] for row in adjudications] == [0, 1]
+    assert adjudications[0]["superseded_at"] is not None
+    assert tuple(resolution_counts) == (len(candidates), len(candidates))
+
+
+def test_split_supersedes_reused_evidence_and_orphan_observation_chain(tmp_path):
+    db, _, _, candidates = _seed_database(tmp_path, names=("Drotte", "Drotte"))
+    db.persist_candidate_clusters("scan-run", [_cluster("cluster-1", candidates)])
+    result = AdjudicationResult(
+        "cluster-1",
+        "split",
+        tuple(candidate.id for candidate in candidates),
+        "person",
+        0.9,
+    )
+    first = db.commit_adjudications("judge-run", [result])
+    with db.transaction() as connection:
+        resolutions = connection.execute(
+            """SELECT cr.id, cr.evidence_id
+               FROM candidate_resolutions cr
+               JOIN candidate_adjudications ca ON ca.id=cr.adjudication_id
+               WHERE ca.active=1 ORDER BY cr.ordinal"""
+        ).fetchall()
+        connection.execute(
+            "UPDATE candidate_resolutions SET evidence_id=? WHERE id=?",
+            (resolutions[0]["evidence_id"], resolutions[1]["id"]),
+        )
+
+    repaired = db.commit_adjudications("judge-run", [result])
+
+    assert repaired["knowledge_version"] != first["knowledge_version"]
+    assert repaired["changed"] == 1
+    with closing(db.connect()) as connection:
+        adjudications = connection.execute(
+            """SELECT active, superseded_at FROM candidate_adjudications
+               ORDER BY knowledge_version"""
+        ).fetchall()
+        chains = connection.execute(
+            """SELECT cr.candidate_id, cr.evidence_id, cto.id AS observation_id,
+                      cto.mention_id, m.evidence_id AS mention_evidence_id
+               FROM candidate_resolutions cr
+               JOIN candidate_adjudications ca ON ca.id=cr.adjudication_id
+               JOIN concept_type_observations cto
+                 ON cto.adjudication_id=cr.adjudication_id
+                    AND cto.lexeme_id=cr.lexeme_id
+                    AND cto.evidence_id=cr.evidence_id
+               JOIN mentions m ON m.id=cto.mention_id
+               WHERE ca.active=1 AND cr.decision='split'
+               ORDER BY cr.ordinal"""
+        ).fetchall()
+        active_observations = connection.execute(
+            """SELECT COUNT(*) FROM concept_type_observations cto
+               JOIN candidate_adjudications ca ON ca.id=cto.adjudication_id
+               WHERE ca.active=1 AND cto.source='candidate_adjudication'"""
+        ).fetchone()[0]
+        orphan_observations = connection.execute(
+            """SELECT COUNT(*) FROM concept_type_observations cto
+               JOIN candidate_adjudications ca ON ca.id=cto.adjudication_id
+               WHERE ca.active=1 AND cto.source='candidate_adjudication'
+                 AND NOT EXISTS(
+                     SELECT 1 FROM candidate_resolutions cr
+                     WHERE cr.adjudication_id=cto.adjudication_id
+                       AND cr.lexeme_id=cto.lexeme_id
+                       AND cr.evidence_id=cto.evidence_id)"""
+        ).fetchone()[0]
+    assert [row["active"] for row in adjudications] == [0, 1]
+    assert adjudications[0]["superseded_at"] is not None
+    assert len(chains) == len(candidates)
+    assert len({row["candidate_id"] for row in chains}) == len(candidates)
+    assert len({row["evidence_id"] for row in chains}) == len(candidates)
+    assert len({row["mention_id"] for row in chains}) == len(candidates)
+    assert len({row["observation_id"] for row in chains}) == len(candidates)
+    assert all(
+        row["evidence_id"] == row["mention_evidence_id"] for row in chains
+    )
+    assert active_observations == len(candidates)
+    assert orphan_observations == 0
+
+
 def test_identical_payload_supersedes_drifted_evidence_metadata(tmp_path):
     db, _, block, candidates = _seed_database(tmp_path)
     db.persist_candidate_clusters("scan-run", [_cluster("cluster-1", candidates)])
