@@ -1,5 +1,8 @@
 import json
 import re
+from dataclasses import replace
+
+import pytest
 
 from src.core.v4.candidate_clusters import CandidateClusterBuilder
 from src.core.v4.lexical_index import LexicalCandidateExtractor
@@ -147,6 +150,55 @@ def test_cross_block_clustering_requires_an_exact_normalized_span_signature():
     assert drottes.affected_blocks == 1
 
 
+def test_cross_block_exact_signature_does_not_spread_local_overlap_alternatives():
+    blocks = [
+        make_block("Drotte and Roche waited.", block_id="block-a"),
+        make_block("Drotte answered.", block_id="block-b"),
+    ]
+    extractor = LexicalCandidateExtractor(blocks, max_candidates=80)
+    candidates = [candidate for block in blocks for candidate in extractor.extract(block)]
+
+    clusters = CandidateClusterBuilder().build(candidates)
+    cross_block_clusters = [cluster for cluster in clusters if cluster.affected_blocks == 2]
+
+    assert len(cross_block_clusters) == 1
+    assert set(cross_block_clusters[0].texts) == {"Drotte"}
+    assert all(
+        "Roche" not in cluster.texts and "Drotte and Roche" not in cluster.texts
+        for cluster in cross_block_clusters
+    )
+
+
+def test_alternative_selection_uses_the_longest_full_cluster_member():
+    block = make_block("Drotte waited.")
+    base = LexicalCandidateExtractor([block], max_candidates=80).extract(block)[0]
+    structural_short = replace(
+        base,
+        id="candidate-structural-short",
+        end_offset=6,
+        original_text="Drotte",
+        normalized_text="Drotte",
+        score=100,
+        risk_flags=("coordination",),
+    )
+    plain_long = replace(
+        base,
+        id="candidate-plain-long",
+        end_offset=8,
+        original_text="Drotte's",
+        normalized_text="Drotte",
+        score=1,
+        risk_flags=(),
+    )
+
+    cluster = CandidateClusterBuilder(max_alternatives=4).build(
+        [structural_short, plain_long]
+    )[0]
+
+    assert structural_short in cluster.alternatives
+    assert plain_long in cluster.alternatives
+
+
 def test_batches_cap_clusters_and_alternatives_and_use_reversible_local_aliases():
     blocks = [
         make_block(f"Zorga{chr(65 + index)} waited.", block_id=f"block-{index:02d}")
@@ -183,3 +235,30 @@ def test_batches_cap_clusters_and_alternatives_and_use_reversible_local_aliases(
             batch.alias_for_candidate(candidate_id) == alias
             for alias, candidate_id in batch.alias_map.items()
         )
+
+
+def test_batch_rejects_external_cluster_with_more_than_four_alternatives():
+    block = make_block("Drotte waited.")
+    base_cluster = CandidateClusterBuilder().build(
+        LexicalCandidateExtractor([block], max_candidates=80).extract(block)
+    )[0]
+    alternatives = tuple(
+        replace(base_cluster.alternatives[0], id=f"candidate-{index}")
+        for index in range(5)
+    )
+    invalid_cluster = replace(base_cluster, alternatives=alternatives)
+
+    with pytest.raises(ValueError, match="at most 4 alternatives"):
+        CandidateClusterBuilder().batch([invalid_cluster])
+
+
+def test_batch_rejects_duplicate_candidate_ids_before_building_reverse_aliases():
+    block = make_block("Drotte waited.")
+    base_cluster = CandidateClusterBuilder().build(
+        LexicalCandidateExtractor([block], max_candidates=80).extract(block)
+    )[0]
+    alternative = base_cluster.alternatives[0]
+    invalid_cluster = replace(base_cluster, alternatives=(alternative, alternative))
+
+    with pytest.raises(ValueError, match="candidate ids must be unique"):
+        CandidateClusterBuilder().batch([invalid_cluster])

@@ -123,35 +123,10 @@ class CandidateClusterBuilder:
         digest = hashlib.sha256(identity.encode("utf-8")).hexdigest()[:20]
         return f"cluster_{digest}"
 
-    @classmethod
-    def _representatives(
-        cls, members: Sequence[LexicalCandidate]
-    ) -> tuple[LexicalCandidate, ...]:
-        by_signature: Dict[str, LexicalCandidate] = {}
-        for candidate in members:
-            signature = cls._span_signature(candidate)
-            previous = by_signature.get(signature)
-            choice_key = (
-                -len(set(candidate.risk_flags) - {"span_competition"}),
-                -candidate.score,
-                cls._location_key(candidate),
-            )
-            if previous is None:
-                by_signature[signature] = candidate
-                continue
-            previous_key = (
-                -len(set(previous.risk_flags) - {"span_competition"}),
-                -previous.score,
-                cls._location_key(previous),
-            )
-            if choice_key < previous_key:
-                by_signature[signature] = candidate
-        return tuple(by_signature.values())
-
     def _select_alternatives(
         self, members: Sequence[LexicalCandidate]
     ) -> tuple[LexicalCandidate, ...]:
-        representatives = self._representatives(members)
+        eligible = tuple(members)
         selected: list[LexicalCandidate] = []
 
         def add(candidate: LexicalCandidate) -> None:
@@ -161,7 +136,7 @@ class CandidateClusterBuilder:
         structural = sorted(
             (
                 candidate
-                for candidate in representatives
+                for candidate in eligible
                 if set(candidate.risk_flags) - {"span_competition"}
             ),
             key=lambda candidate: (
@@ -176,7 +151,7 @@ class CandidateClusterBuilder:
             add(candidate)
 
         longest = min(
-            representatives,
+            eligible,
             key=lambda candidate: (
                 -(candidate.end_offset - candidate.start_offset),
                 -len(self._span_signature(candidate).split()),
@@ -188,7 +163,7 @@ class CandidateClusterBuilder:
         atoms = sorted(
             (
                 candidate
-                for candidate in representatives
+                for candidate in eligible
                 if len(self._span_signature(candidate).split()) == 1
             ),
             key=self._location_key,
@@ -197,7 +172,7 @@ class CandidateClusterBuilder:
             add(candidate)
 
         remaining = sorted(
-            representatives,
+            eligible,
             key=lambda candidate: (
                 -len(candidate.risk_flags),
                 -(candidate.end_offset - candidate.start_offset),
@@ -276,7 +251,19 @@ class CandidateClusterBuilder:
             by_paragraph.setdefault((candidate.block_id, candidate.paragraph_id), []).append(index)
             by_signature.setdefault(self._span_signature(candidate), []).append(index)
 
+        cross_block_signatures = {
+            signature
+            for signature, indexes in by_signature.items()
+            if len({ordered[index].block_id for index in indexes}) >= 2
+        }
+        cross_block_indexes = {
+            index
+            for signature in cross_block_signatures
+            for index in by_signature[signature]
+        }
+
         for indexes in by_paragraph.values():
+            indexes = [index for index in indexes if index not in cross_block_indexes]
             for offset, left_index in enumerate(indexes):
                 left = ordered[left_index]
                 for right_index in indexes[offset + 1 :]:
@@ -286,16 +273,17 @@ class CandidateClusterBuilder:
                     if self._overlaps(left, right):
                         union_find.union(left_index, right_index)
 
-        for indexes in by_signature.values():
-            if len({ordered[index].block_id for index in indexes}) < 2:
-                continue
-            first_index = indexes[0]
-            for index in indexes[1:]:
-                union_find.union(first_index, index)
-
         members_by_root: Dict[int, list[LexicalCandidate]] = {}
         for index, candidate in enumerate(ordered):
+            if index in cross_block_indexes:
+                continue
             members_by_root.setdefault(union_find.find(index), []).append(candidate)
+
+        for signature in sorted(cross_block_signatures):
+            indexes = by_signature[signature]
+            members_by_root[-(len(members_by_root) + 1)] = [
+                ordered[index] for index in indexes
+            ]
 
         clusters = []
         for members in members_by_root.values():
@@ -320,6 +308,14 @@ class CandidateClusterBuilder:
     ) -> tuple[CandidateClusterBatch, ...]:
         size = max(1, min(int(batch_size), 12))
         ordered = tuple(sorted(clusters, key=lambda cluster: cluster.id))
+        seen_candidate_ids: set[str] = set()
+        for cluster in ordered:
+            if len(cluster.alternatives) > 4:
+                raise ValueError("clusters may contain at most 4 alternatives")
+            for alternative in cluster.alternatives:
+                if alternative.id in seen_candidate_ids:
+                    raise ValueError("candidate ids must be unique within a batch request")
+                seen_candidate_ids.add(alternative.id)
         batches = []
         for start in range(0, len(ordered), size):
             batch_clusters = ordered[start : start + size]
