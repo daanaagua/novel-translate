@@ -265,6 +265,81 @@ def test_missing_alias_or_model_failure_goes_to_human_queue(tmp_path, responses)
     assert queued[0]["kind"] == "working_target_required"
 
 
+def test_success_closes_only_matching_working_target_queue_items(tmp_path):
+    database = _database(tmp_path, ["Severian waited.", "Severian spoke."])
+    concept_id = _seed_concept(database, "Severian")
+    other_id = database.import_legacy_concept("Other", "", "person", "other")
+    database.enqueue_working_target_review([concept_id], "first failure")
+    database.enqueue_working_target_review([concept_id], "same failure again")
+    with database.transaction() as connection:
+        connection.execute(
+            """INSERT INTO human_queue(
+                   block_id, kind, severity, payload_json, created_at
+               ) VALUES(NULL, 'working_target_required', 'blocking', ?, 'now')""",
+            (json.dumps({"concept_id": other_id}),),
+        )
+        connection.execute(
+            """INSERT INTO human_queue(
+                   block_id, kind, severity, payload_json, created_at
+               ) VALUES(NULL, 'unrelated', 'review', ?, 'now')""",
+            (json.dumps({"concept_id": concept_id}),),
+        )
+    assert len(database.list_human_queue()) == 3
+
+    result = TargetResolver(
+        database,
+        FakeTargetLLM(
+            [
+                _response(
+                    {
+                        "concept_id": "Q01",
+                        "working_target": "塞万里安",
+                        "rules": [],
+                        "confidence": 0.9,
+                    }
+                )
+            ]
+        ),
+        max_attempts=1,
+    ).run()
+
+    assert result["resolved"] == 1
+    with closing(database.connect()) as connection:
+        rows = connection.execute(
+            "SELECT kind, status, payload_json, resolved_at FROM human_queue ORDER BY id"
+        ).fetchall()
+    matching = [
+        row for row in rows
+        if row["kind"] == "working_target_required"
+        and json.loads(row["payload_json"])["concept_id"] == concept_id
+    ]
+    assert len(matching) == 1
+    assert matching[0]["status"] == "resolved"
+    assert matching[0]["resolved_at"] is not None
+    assert rows[1]["status"] == "open"
+    assert rows[2]["status"] == "open"
+
+
+def test_single_low_impact_concept_is_not_required_by_verification_queue(tmp_path):
+    database = _database(tmp_path, ["Scape shimmered once."])
+    concept_id = _seed_concept(
+        database, "Scape", kind="concept", blocks=database.list_blocks()[:1]
+    )
+    with database.transaction() as connection:
+        connection.execute(
+            """INSERT INTO verification_tasks(
+                   id, subject_type, subject_id, payload_json, status,
+                   required_votes, created_at
+               ) VALUES('ordinary-verify', 'concept', ?, '{}', 'open', 2, 'now')""",
+            (concept_id,),
+        )
+
+    assert database.working_target_candidates() == []
+    llm = FakeTargetLLM([])
+    assert TargetResolver(database, llm).run()["resolved"] == 0
+    assert llm.calls == []
+
+
 def test_resolver_batches_at_24_and_bounds_context_and_baseline_payloads(tmp_path):
     names = [f"Name{index:02d}" for index in range(25)]
     source = " ".join(names)
@@ -511,6 +586,12 @@ def test_all_islands_keep_one_frozen_target_snapshot_and_version(tmp_path, monke
         [{"concept_id": concept_id, "target": "塞万里安", "rules": []}]
     )
     bumps = {"count": 0}
+    freezes = {"count": 0}
+    original_freeze = database.freeze_translation_knowledge
+
+    def counted_freeze():
+        freezes["count"] += 1
+        return original_freeze()
 
     def unrelated_version(*_args, **_kwargs):
         bumps["count"] += 1
@@ -519,6 +600,7 @@ def test_all_islands_keep_one_frozen_target_snapshot_and_version(tmp_path, monke
         return None
 
     monkeypatch.setattr(database, "commit_translation_proposals", unrelated_version)
+    monkeypatch.setattr(database, "freeze_translation_knowledge", counted_freeze)
     pipeline = RecordingPipeline(
         database,
         lambda: None,
@@ -537,6 +619,48 @@ def test_all_islands_keep_one_frozen_target_snapshot_and_version(tmp_path, monke
     assert pipeline.seen[0][0] == pipeline.seen[1][0]
     assert pipeline.seen[0][1] == pipeline.seen[1][1] == ["塞万里安"]
     assert bumps["count"] == 2
+    assert freezes["count"] == 1
+    with closing(database.connect()) as connection:
+        run = connection.execute(
+            "SELECT knowledge_version, config_json FROM runs WHERE id=?",
+            (result["run_id"],),
+        ).fetchone()
+    config = json.loads(run["config_json"])
+    assert run["knowledge_version"] == result["frozen_knowledge_version"]
+    assert config["frozen_knowledge_version"] == result["frozen_knowledge_version"]
+    assert config["target_snapshot_signature"]
+
+
+def test_freeze_reads_version_and_targets_from_one_sqlite_snapshot(tmp_path, monkeypatch):
+    database = _database(tmp_path, ["Severian waited.", "Severian spoke."])
+    concept_id = _seed_concept(database, "Severian")
+    database.apply_working_target_decisions(
+        [{"concept_id": concept_id, "target": "旧译名", "rules": []}]
+    )
+    old_version = database.current_knowledge_version()
+    original_snapshot = database._concept_snapshot_from_connection
+    changed = {"done": False}
+
+    def change_between_reads(connection):
+        if not changed["done"]:
+            changed["done"] = True
+            database.apply_working_target_decisions(
+                [{"concept_id": concept_id, "target": "新译名", "rules": []}]
+            )
+        return original_snapshot(connection)
+
+    monkeypatch.setattr(
+        database, "_concept_snapshot_from_connection", change_between_reads
+    )
+
+    version, snapshot, signature = database.freeze_translation_knowledge()
+
+    frozen = next(item for item in snapshot if item["id"] == concept_id)
+    assert version == old_version
+    assert frozen["default_target"] == "旧译名"
+    assert signature == database.target_snapshot_signature(snapshot)
+    assert database.current_knowledge_version() > version
+    assert database.concepts_for_text("Severian")[0]["default_target"] == "新译名"
 
 
 def test_midrun_target_change_stops_before_mixing_and_revalidates_run(tmp_path):

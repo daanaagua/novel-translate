@@ -1027,9 +1027,27 @@ class V4Database:
                 (status, error, utc_now(), block_id),
             )
 
-    def start_run(self, run_id: str, stage: str, config: Dict[str, Any]) -> None:
+    def start_run(
+        self,
+        run_id: str,
+        stage: str,
+        config: Dict[str, Any],
+        knowledge_version: Optional[int] = None,
+    ) -> None:
         with self.transaction() as connection:
-            version = int(connection.execute("SELECT MAX(id) FROM knowledge_versions").fetchone()[0])
+            version = (
+                int(knowledge_version)
+                if knowledge_version is not None
+                else int(
+                    connection.execute(
+                        "SELECT MAX(id) FROM knowledge_versions"
+                    ).fetchone()[0]
+                )
+            )
+            if connection.execute(
+                "SELECT 1 FROM knowledge_versions WHERE id=?", (version,)
+            ).fetchone() is None:
+                raise ValueError(f"unknown knowledge version: {version}")
             connection.execute(
                 """INSERT INTO runs(id, stage, status, knowledge_version, config_json, started_at)
                    VALUES(?, ?, 'running', ?, ?, ?)""",
@@ -3683,10 +3701,15 @@ class V4Database:
                               WHERE cr.concept_id=c.id
                           ), 0) cluster_blocks,
                           EXISTS(
-                              SELECT 1 FROM verification_tasks vt
-                              WHERE vt.subject_type='concept' AND vt.subject_id=c.id
-                                AND vt.status IN ('open','needs_human')
-                          ) verification_pending
+                              SELECT 1
+                              FROM candidate_resolutions cr
+                              JOIN candidate_adjudications ca
+                                ON ca.id=cr.adjudication_id AND ca.active=1
+                              JOIN candidate_clusters cc ON cc.id=cr.cluster_id
+                              JOIN json_each(cc.risk_flags_json) risk
+                              WHERE cr.concept_id=c.id
+                                AND risk.value='high_impact'
+                          ) candidate_high_impact
                    FROM concepts c
                    LEFT JOIN mentions m ON m.concept_id=c.id
                    WHERE c.retired_version IS NULL
@@ -3708,8 +3731,8 @@ class V4Database:
                 identity_kind = str(row["kind"] or "concept") in {
                     "person", "place", "organization", "group", "unit"
                 }
-                high_impact = (
-                    affected_blocks >= 3 or bool(row["verification_pending"])
+                high_impact = affected_blocks >= 3 or bool(
+                    row["candidate_high_impact"]
                 )
                 required = (identity_kind and repeated) or high_impact
                 if effective or not required:
@@ -3872,6 +3895,7 @@ class V4Database:
         ordered = sorted(decisions, key=lambda item: str(item.get("concept_id") or ""))
         with self.transaction() as connection:
             changed: List[Dict[str, Any]] = []
+            processed_ids: List[str] = []
             resolved = 0
             for decision in ordered:
                 concept_id = str(decision.get("concept_id") or "")
@@ -3889,6 +3913,7 @@ class V4Database:
                 if bool(concept["locked"]) or str(concept["verified_target"] or "").strip():
                     continue
                 resolved += 1
+                processed_ids.append(concept_id)
                 existing_rules = [
                     {
                         "condition": json.loads(row["condition_json"]),
@@ -3909,6 +3934,16 @@ class V4Database:
                     continue
                 changed.append(
                     {"concept_id": concept_id, "target": target, "rules": rules}
+                )
+
+            resolved_at = utc_now()
+            for concept_id in processed_ids:
+                connection.execute(
+                    """UPDATE human_queue
+                       SET status='resolved', resolved_at=?
+                       WHERE kind='working_target_required' AND status='open'
+                         AND json_extract(payload_json, '$.concept_id')=?""",
+                    (resolved_at, concept_id),
                 )
 
             if not changed:
@@ -3972,85 +4007,115 @@ class V4Database:
                 "affected_blocks": affected,
             }
 
-    def concept_snapshot(self) -> List[Dict[str, Any]]:
-        """Materialize active rendering state once for a translation run."""
+    def _concept_snapshot_from_connection(
+        self, connection: sqlite3.Connection
+    ) -> List[Dict[str, Any]]:
+        rows = connection.execute(
+            """SELECT c.id, c.kind, c.canonical_source, c.default_target,
+                      c.working_target, c.verified_target, c.description,
+                      c.status, c.locked, sf.form, sf.normalized_form
+               FROM concepts c JOIN source_forms sf ON sf.concept_id=c.id
+               WHERE c.retired_version IS NULL
+               ORDER BY lower(c.canonical_source), c.id, lower(sf.form), sf.id"""
+        ).fetchall()
+        concepts: Dict[str, Dict[str, Any]] = {}
+        for row in rows:
+            working = str(row["working_target"] or "").strip()
+            verified = str(row["verified_target"] or "").strip()
+            locked_fallback = (
+                str(row["default_target"] or "").strip()
+                if bool(row["locked"])
+                else ""
+            )
+            effective = verified or working or locked_fallback
+            item = concepts.setdefault(
+                str(row["id"]),
+                {
+                    "id": str(row["id"]),
+                    "kind": str(row["kind"]),
+                    "source": str(row["canonical_source"]),
+                    "working_target": working,
+                    "verified_target": verified,
+                    "default_target": effective,
+                    "target_strength": (
+                        "verified"
+                        if verified or (bool(row["locked"]) and effective)
+                        else "working" if working else "unset"
+                    ),
+                    "description": str(row["description"] or ""),
+                    "status": str(row["status"]),
+                    "locked": bool(row["locked"]),
+                    "forms": [],
+                    "rules": [],
+                    "verification_pending": False,
+                },
+            )
+            item["forms"].append(str(row["form"]))
+        if not concepts:
+            return []
+        placeholders = ",".join("?" for _ in concepts)
+        for pending in connection.execute(
+            f"""SELECT DISTINCT subject_id FROM verification_tasks
+                WHERE subject_type='concept' AND status IN ('open','needs_human')
+                  AND subject_id IN ({placeholders})""",
+            list(concepts),
+        ).fetchall():
+            concept = concepts[str(pending["subject_id"])]
+            if not concept["locked"]:
+                concept["verification_pending"] = True
+        for row in connection.execute(
+            f"""SELECT id, concept_id, condition_json, target, priority,
+                       status, locked
+                FROM rendering_rules
+                WHERE retired_version IS NULL AND concept_id IN ({placeholders})
+                ORDER BY priority DESC, id""",
+            list(concepts),
+        ).fetchall():
+            target = str(row["target"] or "").strip()
+            if not target:
+                continue
+            concepts[str(row["concept_id"])]["rules"].append(
+                {
+                    "id": str(row["id"]),
+                    "condition": json.loads(row["condition_json"]),
+                    "target": target,
+                    "priority": int(row["priority"]),
+                    "status": str(row["status"]),
+                    "locked": bool(row["locked"]),
+                }
+            )
+        return list(concepts.values())
 
-        with closing(self.connect()) as connection:
-            rows = connection.execute(
-                """SELECT c.id, c.kind, c.canonical_source, c.default_target,
-                          c.working_target, c.verified_target, c.description,
-                          c.status, c.locked, sf.form, sf.normalized_form
-                   FROM concepts c JOIN source_forms sf ON sf.concept_id=c.id
-                   WHERE c.retired_version IS NULL
-                   ORDER BY lower(c.canonical_source), c.id, lower(sf.form), sf.id"""
-            ).fetchall()
-            concepts: Dict[str, Dict[str, Any]] = {}
-            for row in rows:
-                working = str(row["working_target"] or "").strip()
-                verified = str(row["verified_target"] or "").strip()
-                locked_fallback = (
-                    str(row["default_target"] or "").strip()
-                    if bool(row["locked"])
-                    else ""
-                )
-                effective = verified or working or locked_fallback
-                item = concepts.setdefault(
-                    str(row["id"]),
-                    {
-                        "id": str(row["id"]),
-                        "kind": str(row["kind"]),
-                        "source": str(row["canonical_source"]),
-                        "working_target": working,
-                        "verified_target": verified,
-                        "default_target": effective,
-                        "target_strength": (
-                            "verified"
-                            if verified or (bool(row["locked"]) and effective)
-                            else "working" if working else "unset"
-                        ),
-                        "description": str(row["description"] or ""),
-                        "status": str(row["status"]),
-                        "locked": bool(row["locked"]),
-                        "forms": [],
-                        "rules": [],
-                        "verification_pending": False,
-                    },
-                )
-                item["forms"].append(str(row["form"]))
-            if not concepts:
-                return []
-            placeholders = ",".join("?" for _ in concepts)
-            for pending in connection.execute(
-                f"""SELECT DISTINCT subject_id FROM verification_tasks
-                    WHERE subject_type='concept' AND status IN ('open','needs_human')
-                      AND subject_id IN ({placeholders})""",
-                list(concepts),
-            ).fetchall():
-                concept = concepts[str(pending["subject_id"])]
-                if not concept["locked"]:
-                    concept["verification_pending"] = True
-            for row in connection.execute(
-                f"""SELECT id, concept_id, condition_json, target, priority,
-                           status, locked
-                    FROM rendering_rules
-                    WHERE retired_version IS NULL AND concept_id IN ({placeholders})
-                    ORDER BY priority DESC, id""",
-                list(concepts),
-            ).fetchall():
-                target = str(row["target"] or "").strip()
-                if not target:
-                    continue
-                concepts[str(row["concept_id"])]["rules"].append(
-                    {
-                        "id": str(row["id"]),
-                        "condition": json.loads(row["condition_json"]),
-                        "target": target,
-                        "priority": int(row["priority"]),
-                        "status": str(row["status"]),
-                        "locked": bool(row["locked"]),
-                    }
-                )
-            return list(concepts.values())
+    def concept_snapshot(self) -> List[Dict[str, Any]]:
+        """Materialize active rendering state from one SQLite read snapshot."""
+
+        connection = self.connect()
+        try:
+            connection.execute("BEGIN")
+            return self._concept_snapshot_from_connection(connection)
+        finally:
+            connection.rollback()
+            connection.close()
+
+    def freeze_translation_knowledge(
+        self,
+    ) -> tuple[int, List[Dict[str, Any]], str]:
+        """Atomically freeze the version, concept rendering state, and signature."""
+
+        connection = self.connect()
+        try:
+            connection.execute("BEGIN")
+            version = int(
+                connection.execute(
+                    "SELECT MAX(id) FROM knowledge_versions"
+                ).fetchone()[0]
+            )
+            snapshot = self._concept_snapshot_from_connection(connection)
+            signature = self.target_snapshot_signature(snapshot)
+            return version, snapshot, signature
+        finally:
+            connection.rollback()
+            connection.close()
 
     @staticmethod
     def target_snapshot_signature(snapshot: Sequence[Dict[str, Any]]) -> str:

@@ -469,12 +469,19 @@ class V4TranslationPipeline:
         islands = self._make_islands(candidates, self.config.island_size)
         run_id = f"translate_{uuid4().hex}"
         run_config = dict(self.config.__dict__)
-        knowledge_version = self.database.current_knowledge_version()
-        concept_snapshot = self.database.concept_snapshot()
-        target_signature = self.database.target_snapshot_signature(concept_snapshot)
+        (
+            knowledge_version,
+            concept_snapshot,
+            target_signature,
+        ) = self.database.freeze_translation_knowledge()
         run_config["frozen_knowledge_version"] = knowledge_version
         run_config["target_snapshot_signature"] = target_signature
-        self.database.start_run(run_id, "translate", run_config)
+        self.database.start_run(
+            run_id,
+            "translate",
+            run_config,
+            knowledge_version=knowledge_version,
+        )
         workers = min(self.config.initial_workers, self.config.max_workers)
         completed = warnings = failed = manual = 0
         paused = False
