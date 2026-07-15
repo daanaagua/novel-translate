@@ -136,6 +136,10 @@ def _seed_concept(database, source, *, kind="person", blocks=None):
     concept_id = database.import_legacy_concept(source, "", kind, f"{source} description")
     selected = blocks or database.list_blocks()
     with database.transaction() as connection:
+        lexeme_id = connection.execute(
+            "SELECT primary_lexeme_id FROM concepts WHERE id=?",
+            (concept_id,),
+        ).fetchone()[0]
         for block in selected:
             evidence_id = connection.execute(
                 """INSERT INTO evidence(
@@ -147,9 +151,9 @@ def _seed_concept(database, source, *, kind="person", blocks=None):
             connection.execute(
                 """INSERT INTO mentions(
                        block_id, paragraph_id, source_form, normalized_form,
-                       discourse_function, concept_id, evidence_id
-                   ) VALUES(?, 'P000', ?, lower(?), 'referential', ?, ?)""",
-                (block.id, source, source, concept_id, evidence_id),
+                       discourse_function, lexeme_id, concept_id, evidence_id
+                   ) VALUES(?, 'P000', ?, lower(?), 'referential', ?, ?, ?)""",
+                (block.id, source, source, lexeme_id, concept_id, evidence_id),
             )
     return concept_id
 

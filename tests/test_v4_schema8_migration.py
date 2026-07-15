@@ -69,6 +69,13 @@ def test_empty_directory_creates_schema8_with_required_tables(tmp_path):
                 "dependencies",
             )
         }
+        column_info = {
+            table: {
+                row[1]: row
+                for row in connection.execute(f"PRAGMA table_info({table})")
+            }
+            for table in ("source_forms", "mentions")
+        }
 
     assert version == SCHEMA_VERSION == 8
     assert {
@@ -83,6 +90,9 @@ def test_empty_directory_creates_schema8_with_required_tables(tmp_path):
     } <= tables
     assert "lexeme_id" in columns["source_forms"]
     assert "lexeme_id" in columns["mentions"]
+    assert column_info["source_forms"]["lexeme_id"][3] == 1
+    assert "concept_id" not in column_info["source_forms"]
+    assert column_info["mentions"]["lexeme_id"][3] == 1
     assert {"lexeme_id", "concept_id"} <= columns["rendering_rules"]
     assert "lexeme_id" in columns["candidate_resolutions"]
     assert {
@@ -98,6 +108,89 @@ def test_empty_directory_creates_schema8_with_required_tables(tmp_path):
         "applied_rule_ids_json",
         "source_spans_json",
     } <= columns["dependencies"]
+
+
+def test_lexeme_owned_rows_reject_missing_lexeme(tmp_path):
+    database = V4Database(tmp_path)
+    with database.transaction() as connection:
+        version = connection.execute(
+            "SELECT MAX(id) FROM knowledge_versions"
+        ).fetchone()[0]
+        connection.execute(
+            """INSERT INTO concepts(
+                   id, kind, canonical_source, created_version, created_at)
+               VALUES('concept-1', 'person', 'Drotte', ?, 'now')""",
+            (version,),
+        )
+        connection.execute(
+            """INSERT INTO source_editions(
+                   raw_sha256, normalized_sha256, parser_version, source_path,
+                   created_at)
+               VALUES('raw', 'normalized', 'test', 'source.txt', 'now')"""
+        )
+        edition_id = connection.execute(
+            "SELECT id FROM source_editions"
+        ).fetchone()[0]
+        connection.execute(
+            """INSERT INTO blocks(
+                   id, legacy_id, source_edition_id, chapter_id, chapter_title,
+                   chapter_index, block_index, global_index, source_text,
+                   source_hash, updated_at)
+               VALUES('block-1', 'block-1', ?, 'chapter-1', 'One', 0, 0, 0,
+                      'Drotte', 'hash', 'now')""",
+            (edition_id,),
+        )
+        evidence_id = connection.execute(
+            """INSERT INTO evidence(
+                   block_id, paragraph_id, kind, evidence_quote, payload_json,
+                   confidence, extractor, created_at)
+               VALUES('block-1', 'P000', 'entity', 'Drotte', '{}', 1.0,
+                      'test', 'now')"""
+        ).lastrowid
+
+        with pytest.raises(sqlite3.IntegrityError):
+            connection.execute(
+                """INSERT INTO source_forms(form, normalized_form)
+                   VALUES('Drotte', 'drotte')"""
+            )
+        with pytest.raises(sqlite3.IntegrityError):
+            connection.execute(
+                """INSERT INTO mentions(
+                       block_id, paragraph_id, source_form, normalized_form,
+                       discourse_function, concept_id, evidence_id)
+                   VALUES('block-1', 'P000', 'Drotte', 'drotte',
+                          'referential', 'concept-1', ?)""",
+                (evidence_id,),
+            )
+
+
+def test_legacy_concept_import_populates_lexeme_ownership(tmp_path):
+    database = V4Database(tmp_path)
+    concept_id = database.import_legacy_concept(
+        "Drotte", "德罗特", "person", "a companion"
+    )
+    with closing(database.connect()) as connection:
+        concept = connection.execute(
+            "SELECT primary_lexeme_id FROM concepts WHERE id=?",
+            (concept_id,),
+        ).fetchone()
+        lexeme = connection.execute(
+            """SELECT language, normalized_form, canonical_form
+               FROM lexemes WHERE id=?""",
+            (concept["primary_lexeme_id"],),
+        ).fetchone()
+        association = connection.execute(
+            """SELECT role FROM concept_lexemes
+               WHERE concept_id=? AND lexeme_id=? AND retired_version IS NULL""",
+            (concept_id, concept["primary_lexeme_id"]),
+        ).fetchone()
+        source_form = connection.execute(
+            """SELECT lexeme_id, form, normalized_form FROM source_forms"""
+        ).fetchone()
+
+    assert tuple(lexeme) == ("en", "drotte", "Drotte")
+    assert association["role"] == "primary"
+    assert tuple(source_form) == (concept["primary_lexeme_id"], "Drotte", "drotte")
 
 
 def test_rendering_rule_requires_exactly_one_subject(tmp_path):

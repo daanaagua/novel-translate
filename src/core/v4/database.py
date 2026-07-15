@@ -164,6 +164,91 @@ class V4Database:
             self._active_database_bytes(connection)
         )
 
+    def _ensure_schema8_lexeme(
+        self,
+        connection: sqlite3.Connection,
+        source_form: str,
+        *,
+        normalized_form: str | None = None,
+        concept_id: str | None = None,
+        knowledge_version: int | None = None,
+        created_at: str | None = None,
+    ) -> str:
+        """Backfill the schema-8 lexeme link for legacy concept-oriented paths."""
+
+        normalized = normalized_form or normalize_english_form(source_form)
+        lexeme_id = stable_id("lexeme", f"en:{normalized}")
+        concept = None
+        if concept_id is not None:
+            concept = connection.execute(
+                """SELECT canonical_source, default_target, working_target,
+                          verified_target, status, locked, created_version,
+                          primary_lexeme_id
+                   FROM concepts WHERE id=?""",
+                (concept_id,),
+            ).fetchone()
+            if concept is None:
+                raise KeyError(f"concept does not exist: {concept_id}")
+        if knowledge_version is None:
+            knowledge_version = (
+                int(concept["created_version"])
+                if concept is not None
+                else int(
+                    connection.execute(
+                        "SELECT MAX(id) FROM knowledge_versions"
+                    ).fetchone()[0]
+                )
+            )
+        now = created_at or utc_now()
+        connection.execute(
+            """INSERT OR IGNORE INTO lexemes(
+                   id, language, normalized_form, canonical_form,
+                   default_target, working_target, verified_target,
+                   status, locked, created_version, created_at)
+               VALUES(?, 'en', ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                lexeme_id,
+                normalized,
+                source_form,
+                str(concept["default_target"] or "") if concept is not None else "",
+                str(concept["working_target"] or "") if concept is not None else "",
+                str(concept["verified_target"] or "") if concept is not None else "",
+                str(concept["status"] or "provisional")
+                if concept is not None
+                else "provisional",
+                int(bool(concept["locked"])) if concept is not None else 0,
+                knowledge_version,
+                now,
+            ),
+        )
+        if concept_id is not None:
+            connection.execute(
+                """UPDATE concepts
+                   SET primary_lexeme_id=COALESCE(primary_lexeme_id, ?)
+                   WHERE id=?""",
+                (lexeme_id, concept_id),
+            )
+            primary_lexeme_id = connection.execute(
+                "SELECT primary_lexeme_id FROM concepts WHERE id=?",
+                (concept_id,),
+            ).fetchone()[0]
+            role = "primary" if primary_lexeme_id == lexeme_id else "alias"
+            connection.execute(
+                """INSERT OR IGNORE INTO concept_lexemes(
+                       concept_id, lexeme_id, role, confidence, status,
+                       created_version, created_at)
+                   VALUES(?, ?, ?, 1.0, ?, ?, ?)""",
+                (
+                    concept_id,
+                    lexeme_id,
+                    role,
+                    str(concept["status"] or "provisional"),
+                    knowledge_version,
+                    now,
+                ),
+            )
+        return lexeme_id
+
     def initialize(self) -> None:
         with closing(self.connect()) as connection:
             connection.execute("PRAGMA journal_mode = WAL")
@@ -386,11 +471,11 @@ class V4Database:
 
                 CREATE TABLE IF NOT EXISTS source_forms (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    concept_id TEXT NOT NULL REFERENCES concepts(id),
+                    lexeme_id TEXT NOT NULL REFERENCES lexemes(id),
                     form TEXT NOT NULL,
                     normalized_form TEXT NOT NULL,
                     grammar_json TEXT NOT NULL DEFAULT '{}',
-                    UNIQUE(concept_id, normalized_form)
+                    UNIQUE(lexeme_id, normalized_form, form)
                 );
                 CREATE INDEX IF NOT EXISTS idx_source_forms_normalized
                     ON source_forms(normalized_form);
@@ -402,6 +487,7 @@ class V4Database:
                     source_form TEXT NOT NULL,
                     normalized_form TEXT NOT NULL,
                     discourse_function TEXT NOT NULL,
+                    lexeme_id TEXT NOT NULL REFERENCES lexemes(id),
                     concept_id TEXT REFERENCES concepts(id),
                     evidence_id INTEGER NOT NULL REFERENCES evidence(id),
                     UNIQUE(block_id, paragraph_id, source_form, evidence_id)
@@ -819,6 +905,7 @@ class V4Database:
             run_id TEXT NOT NULL REFERENCES runs(id),
             cluster_id TEXT NOT NULL,
             candidate_id TEXT REFERENCES lexical_candidates(id),
+            lexeme_id TEXT REFERENCES lexemes(id),
             concept_id TEXT REFERENCES concepts(id),
             evidence_id INTEGER REFERENCES evidence(id),
             decision TEXT NOT NULL,
@@ -970,11 +1057,11 @@ class V4Database:
             connection.execute(
                 """INSERT INTO candidate_resolutions(
                        id, adjudication_id, run_id, cluster_id, candidate_id,
-                       concept_id, evidence_id, decision, ordinal, payload_json,
-                       created_at)
+                       lexeme_id, concept_id, evidence_id, decision, ordinal,
+                       payload_json, created_at)
                    SELECT id, adjudication_id, run_id, cluster_id, candidate_id,
-                          concept_id, evidence_id, decision, ordinal, payload_json,
-                          created_at
+                          lexeme_id, concept_id, evidence_id, decision, ordinal,
+                          payload_json, created_at
                    FROM legacy_candidate_resolutions"""
             )
             connection.execute("DROP TABLE legacy_candidate_resolutions")
@@ -1521,17 +1608,24 @@ class V4Database:
                         ),
                     )
                     evidence_id = int(cursor.lastrowid)
+                    normalized_form = normalize_english_form(
+                        mention.canonical_form or mention.source_form
+                    )
+                    lexeme_id = self._ensure_schema8_lexeme(
+                        connection,
+                        mention.canonical_form or mention.source_form,
+                        normalized_form=normalized_form,
+                        knowledge_version=version,
+                    )
                     connection.execute(
                         """INSERT OR IGNORE INTO mentions(
                                block_id, paragraph_id, source_form, normalized_form,
-                               discourse_function, evidence_id
-                           ) VALUES(?, ?, ?, ?, ?, ?)""",
+                               discourse_function, lexeme_id, evidence_id
+                           ) VALUES(?, ?, ?, ?, ?, ?, ?)""",
                         (
                             outcome.block.id, mention.paragraph_id, mention.source_form,
-                            normalize_english_form(
-                                mention.canonical_form or mention.source_form
-                            ),
-                            mention.discourse_function, evidence_id,
+                            normalized_form, mention.discourse_function, lexeme_id,
+                            evidence_id,
                         ),
                     )
                 for ambiguity in outcome.response.ambiguities:
@@ -2901,7 +2995,9 @@ class V4Database:
         return connection.execute(
             """SELECT DISTINCT c.*
                FROM concepts c
-               LEFT JOIN source_forms sf ON sf.concept_id=c.id
+               LEFT JOIN concept_lexemes cl
+                 ON cl.concept_id=c.id AND cl.retired_version IS NULL
+               LEFT JOIN source_forms sf ON sf.lexeme_id=cl.lexeme_id
                WHERE c.retired_version IS NULL
                  AND (sf.normalized_form=? OR lower(c.canonical_source)=?)
                  AND (c.locked=1 OR c.kind=?)
@@ -3380,12 +3476,20 @@ class V4Database:
                             knowledge_version=version,
                             created_at=now,
                         )
+                        candidate_lexeme_id = self._ensure_schema8_lexeme(
+                            connection,
+                            candidate["original_text"],
+                            normalized_form=normalized_form,
+                            concept_id=candidate_concept_id,
+                            knowledge_version=version,
+                            created_at=now,
+                        )
                         connection.execute(
                             """INSERT OR IGNORE INTO source_forms(
-                                   concept_id, form, normalized_form, grammar_json
+                                   lexeme_id, form, normalized_form, grammar_json
                                ) VALUES(?, ?, ?, '{}')""",
                             (
-                                candidate_concept_id,
+                                candidate_lexeme_id,
                                 candidate["original_text"],
                                 normalized_form,
                             ),
@@ -3413,13 +3517,14 @@ class V4Database:
                             """INSERT INTO mentions(
                                    block_id, paragraph_id, source_form,
                                    normalized_form, discourse_function,
-                                   concept_id, evidence_id
-                               ) VALUES(?, ?, ?, ?, 'referential', ?, ?)""",
+                                   lexeme_id, concept_id, evidence_id
+                               ) VALUES(?, ?, ?, ?, 'referential', ?, ?, ?)""",
                             (
                                 candidate["block_id"],
                                 candidate["paragraph_id"],
                                 candidate["original_text"],
                                 normalized_form,
+                                candidate_lexeme_id,
                                 candidate_concept_id,
                                 evidence_id,
                             ),
@@ -3615,8 +3720,16 @@ class V4Database:
                SELECT ce.claim_id, ce.evidence_id FROM claim_evidence ce
                JOIN claims c ON c.id=ce.claim_id WHERE c.locked=1""",
             """CREATE TEMP TABLE reset_scan_source_forms AS
-               SELECT id FROM source_forms
-               WHERE concept_id IN (SELECT id FROM reset_scan_concepts)""",
+               SELECT sf.id FROM source_forms sf
+               WHERE EXISTS(
+                   SELECT 1 FROM concept_lexemes cl
+                   WHERE cl.lexeme_id=sf.lexeme_id
+                     AND cl.concept_id IN (SELECT id FROM reset_scan_concepts))
+                 AND NOT EXISTS(
+                   SELECT 1 FROM concept_lexemes cl
+                   WHERE cl.lexeme_id=sf.lexeme_id
+                     AND cl.concept_id NOT IN (SELECT id FROM reset_scan_concepts)
+                     AND cl.retired_version IS NULL)""",
             """CREATE TEMP TABLE reset_scan_rendering_rules AS
                SELECT id FROM rendering_rules
                WHERE concept_id IN (SELECT id FROM reset_scan_concepts)""",
@@ -3688,7 +3801,7 @@ class V4Database:
             "evidence": "SELECT id,extractor,created_at FROM evidence WHERE id IN (SELECT id FROM reset_scan_evidence) ORDER BY id",
             "claim_evidence": "SELECT claim_id,evidence_id FROM reset_scan_claim_evidence ORDER BY claim_id,evidence_id",
             "claims": "SELECT id,status,created_at FROM claims WHERE id IN (SELECT id FROM reset_scan_claims) ORDER BY id",
-            "source_forms": "SELECT id,concept_id,normalized_form FROM source_forms WHERE id IN (SELECT id FROM reset_scan_source_forms) ORDER BY id",
+            "source_forms": "SELECT id,lexeme_id,normalized_form FROM source_forms WHERE id IN (SELECT id FROM reset_scan_source_forms) ORDER BY id",
             "rendering_rules": "SELECT id,concept_id,status,locked FROM rendering_rules WHERE id IN (SELECT id FROM reset_scan_rendering_rules) ORDER BY id",
             "verification_votes": "SELECT id,task_id,verdict FROM verification_votes WHERE id IN (SELECT id FROM reset_scan_verification_votes) ORDER BY id",
             "verification_tasks": "SELECT id,subject_type,subject_id,status FROM verification_tasks WHERE id IN (SELECT id FROM reset_scan_verification_tasks) ORDER BY id",
@@ -3791,6 +3904,10 @@ class V4Database:
                 """UPDATE mentions SET concept_id=NULL
                    WHERE concept_id IN (SELECT id FROM reset_scan_concepts)"""
             )
+            connection.execute(
+                """DELETE FROM concept_lexemes
+                   WHERE concept_id IN (SELECT id FROM reset_scan_concepts)"""
+            )
             deleted["concepts"] = connection.execute(
                 "DELETE FROM concepts WHERE id IN (SELECT id FROM reset_scan_concepts)"
             ).rowcount
@@ -3869,12 +3986,19 @@ class V4Database:
                         version, utc_now(),
                     ),
                 )
+                lexeme_id = self._ensure_schema8_lexeme(
+                    connection,
+                    row["source_form"],
+                    normalized_form=normalize_english_form(row["source_form"]),
+                    concept_id=concept_id,
+                    knowledge_version=version,
+                )
                 connection.execute(
                     """INSERT OR IGNORE INTO source_forms(
-                           concept_id, form, normalized_form, grammar_json
+                           lexeme_id, form, normalized_form, grammar_json
                        ) VALUES(?, ?, ?, '{}')""",
                     (
-                        concept_id,
+                        lexeme_id,
                         row["source_form"],
                         normalize_english_form(row["source_form"]),
                     ),
@@ -3978,11 +4102,18 @@ class V4Database:
                    ) VALUES(?, ?, ?, ?, ?, ?, 'book', 0, ?, ?)""",
                 (concept_id, kind, source, target, description, status, version, utc_now()),
             )
+            lexeme_id = self._ensure_schema8_lexeme(
+                connection,
+                source,
+                normalized_form=normalized,
+                concept_id=concept_id,
+                knowledge_version=version,
+            )
             connection.execute(
                 """INSERT OR IGNORE INTO source_forms(
-                       concept_id, form, normalized_form, grammar_json
+                       lexeme_id, form, normalized_form, grammar_json
                    ) VALUES(?, ?, ?, '{}')""",
-                (concept_id, source, normalized),
+                (lexeme_id, source, normalized),
             )
             if target:
                 rule_id = stable_id("rule", f"{concept_id}:default:{target}")
@@ -4045,11 +4176,18 @@ class V4Database:
                         WHERE id=?""",
                     (target, target, target, description, description, concept_id),
                 )
+            lexeme_id = self._ensure_schema8_lexeme(
+                connection,
+                source,
+                normalized_form=normalized,
+                concept_id=concept_id,
+                knowledge_version=version,
+            )
             connection.execute(
                 """INSERT OR IGNORE INTO source_forms(
-                       concept_id, form, normalized_form, grammar_json
+                       lexeme_id, form, normalized_form, grammar_json
                    ) VALUES(?, ?, ?, '{}')""",
-                (concept_id, source, normalized),
+                (lexeme_id, source, normalized),
             )
             connection.execute(
                 """UPDATE rendering_rules SET retired_version=?
@@ -4133,11 +4271,18 @@ class V4Database:
             for alias in dict.fromkeys(alias_values):
                 normalized_alias = normalize_english_form(alias)
                 alias_id = stable_id("concept", normalized_alias)
+                alias_lexeme_id = self._ensure_schema8_lexeme(
+                    connection,
+                    alias,
+                    normalized_form=normalized_alias,
+                    concept_id=canonical_id,
+                    knowledge_version=version,
+                )
                 connection.execute(
                     """INSERT OR IGNORE INTO source_forms(
-                           concept_id, form, normalized_form, grammar_json
+                           lexeme_id, form, normalized_form, grammar_json
                        ) VALUES(?, ?, ?, '{}')""",
-                    (canonical_id, alias, normalized_alias),
+                    (alias_lexeme_id, alias, normalized_alias),
                 )
                 if alias_id == canonical_id:
                     continue
@@ -4149,19 +4294,23 @@ class V4Database:
                 if alias_concept is None:
                     continue
                 for form in connection.execute(
-                    """SELECT form, normalized_form, grammar_json
-                       FROM source_forms WHERE concept_id=?""",
+                    """SELECT sf.lexeme_id, sf.form, sf.normalized_form,
+                              sf.grammar_json
+                       FROM source_forms sf
+                       JOIN concept_lexemes cl ON cl.lexeme_id=sf.lexeme_id
+                       WHERE cl.concept_id=? AND cl.retired_version IS NULL""",
                     (alias_id,),
                 ).fetchall():
                     connection.execute(
-                        """INSERT OR IGNORE INTO source_forms(
-                               concept_id, form, normalized_form, grammar_json
-                           ) VALUES(?, ?, ?, ?)""",
+                        """INSERT OR IGNORE INTO concept_lexemes(
+                               concept_id, lexeme_id, role, confidence, status,
+                               created_version, created_at)
+                           VALUES(?, ?, 'alias', 1.0, 'verified', ?, ?)""",
                         (
                             canonical_id,
-                            form["form"],
-                            form["normalized_form"],
-                            form["grammar_json"],
+                            form["lexeme_id"],
+                            version,
+                            utc_now(),
                         ),
                     )
                 dependent_rows = connection.execute(
@@ -4196,8 +4345,9 @@ class V4Database:
                     (canonical_id, alias_id),
                 )
                 connection.execute(
-                    "DELETE FROM source_forms WHERE concept_id=?",
-                    (alias_id,),
+                    """UPDATE concept_lexemes SET retired_version=?
+                       WHERE concept_id=? AND retired_version IS NULL""",
+                    (version, alias_id),
                 )
                 connection.execute(
                     """UPDATE rendering_rules SET retired_version=?
@@ -4534,7 +4684,9 @@ class V4Database:
             forms = [
                 str(row["form"])
                 for row in connection.execute(
-                    "SELECT form FROM source_forms WHERE concept_id=?",
+                    """SELECT DISTINCT sf.form FROM source_forms sf
+                       JOIN concept_lexemes cl ON cl.lexeme_id=sf.lexeme_id
+                       WHERE cl.concept_id=? AND cl.retired_version IS NULL""",
                     (concept_id,),
                 ).fetchall()
                 if str(row["form"] or "").strip()
@@ -4712,7 +4864,9 @@ class V4Database:
                       c.working_target, c.verified_target, c.description,
                       c.status, c.locked, sf.form, sf.normalized_form
                FROM concepts c
-               JOIN source_forms sf ON sf.concept_id=c.id
+               JOIN concept_lexemes cl
+                 ON cl.concept_id=c.id AND cl.retired_version IS NULL
+               JOIN source_forms sf ON sf.lexeme_id=cl.lexeme_id
                JOIN knowledge_versions kv ON kv.id=c.created_version
                WHERE c.retired_version IS NULL
                  AND NOT (
@@ -5268,18 +5422,32 @@ class V4Database:
                         )
                     if concept_id in material_terms:
                         changed_concepts.add(concept_id)
+                    lexeme_id = self._ensure_schema8_lexeme(
+                        connection,
+                        source,
+                        normalized_form=normalized,
+                        concept_id=concept_id,
+                        knowledge_version=version,
+                    )
                     connection.execute(
                         """INSERT OR IGNORE INTO source_forms(
-                               concept_id, form, normalized_form, grammar_json
+                               lexeme_id, form, normalized_form, grammar_json
                            ) VALUES(?, ?, ?, '{}')""",
-                        (concept_id, source, normalized),
+                        (lexeme_id, source, normalized),
                     )
                     connection.execute(
                         """INSERT OR IGNORE INTO mentions(
                                block_id, paragraph_id, source_form, normalized_form,
-                               discourse_function, concept_id, evidence_id
-                           ) VALUES(?, 'P000', ?, ?, 'unknown', ?, ?)""",
-                        (outcome.block.id, source, normalized, concept_id, int(cursor.lastrowid)),
+                               discourse_function, lexeme_id, concept_id, evidence_id
+                           ) VALUES(?, 'P000', ?, ?, 'unknown', ?, ?, ?)""",
+                        (
+                            outcome.block.id,
+                            source,
+                            normalized,
+                            lexeme_id,
+                            concept_id,
+                            int(cursor.lastrowid),
+                        ),
                     )
                     translation = connection.execute(
                         """SELECT id FROM translation_versions
@@ -5336,7 +5504,11 @@ class V4Database:
                     forms = [
                         row["form"]
                         for row in connection.execute(
-                            "SELECT form FROM source_forms WHERE concept_id=?",
+                            """SELECT DISTINCT sf.form FROM source_forms sf
+                               JOIN concept_lexemes cl
+                                 ON cl.lexeme_id=sf.lexeme_id
+                               WHERE cl.concept_id=?
+                                 AND cl.retired_version IS NULL""",
                             (concept_id,),
                         )
                     ]
@@ -6412,11 +6584,18 @@ class V4Database:
                                 utc_now(),
                             ),
                         )
+                        lexeme_id = self._ensure_schema8_lexeme(
+                            connection,
+                            source,
+                            normalized_form=normalize_english_form(source),
+                            concept_id=concept_id,
+                            knowledge_version=version,
+                        )
                         connection.execute(
                             """INSERT INTO source_forms(
-                                   concept_id, form, normalized_form, grammar_json
+                                   lexeme_id, form, normalized_form, grammar_json
                                ) VALUES(?, ?, ?, '{}')""",
-                            (concept_id, source, normalize_english_form(source)),
+                            (lexeme_id, source, normalize_english_form(source)),
                         )
                     else:
                         connection.execute(

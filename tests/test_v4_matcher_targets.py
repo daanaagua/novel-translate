@@ -3,7 +3,7 @@ from contextlib import closing
 
 import pytest
 
-from src.core.v4.database import KnowledgeSnapshotError, V4Database
+from src.core.v4.database import KnowledgeSnapshotError, V4Database, stable_id
 from src.core.v4.matcher import (
     AhoConceptMatcher,
     ConceptMatcherCache,
@@ -104,18 +104,43 @@ def test_frozen_index_compiles_once_and_hot_matching_never_walks_vocabulary(
         for index in range(2000):
             concept_id = f"concept-{index:04d}"
             source = f"Name{index}"
+            normalized = source.lower()
+            lexeme_id = stable_id("lexeme", f"en:{normalized}")
+            connection.execute(
+                """INSERT INTO lexemes(
+                       id, language, normalized_form, canonical_form,
+                       default_target, working_target, created_version, created_at)
+                   VALUES(?, 'en', ?, ?, ?, ?, ?, 'now')""",
+                (lexeme_id, normalized, source, f"译名{index}", f"译名{index}", version),
+            )
             connection.execute(
                 """INSERT INTO concepts(
                        id, kind, canonical_source, default_target, working_target,
-                       description, status, scope, locked, created_version, created_at
-                   ) VALUES(?, 'person', ?, ?, ?, '', 'provisional', 'book', 0, ?, 'now')""",
-                (concept_id, source, f"译名{index}", f"译名{index}", version),
+                       description, status, scope, locked, primary_lexeme_id,
+                       created_version, created_at)
+                   VALUES(?, 'person', ?, ?, ?, '', 'provisional', 'book', 0,
+                          ?, ?, 'now')""",
+                (
+                    concept_id,
+                    source,
+                    f"译名{index}",
+                    f"译名{index}",
+                    lexeme_id,
+                    version,
+                ),
+            )
+            connection.execute(
+                """INSERT INTO concept_lexemes(
+                       concept_id, lexeme_id, role, confidence, status,
+                       created_version, created_at)
+                   VALUES(?, ?, 'primary', 1.0, 'provisional', ?, 'now')""",
+                (concept_id, lexeme_id, version),
             )
             connection.execute(
                 """INSERT INTO source_forms(
-                       concept_id, form, normalized_form, grammar_json
-                   ) VALUES(?, ?, lower(?), '{}')""",
-                (concept_id, source, source),
+                       lexeme_id, form, normalized_form, grammar_json
+                   ) VALUES(?, ?, ?, '{}')""",
+                (lexeme_id, source, normalized),
             )
 
     counts = {"signature": 0, "snapshot": 0, "map": 0, "matcher": 0}

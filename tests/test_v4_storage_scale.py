@@ -971,12 +971,17 @@ def test_reset_token_guards_snapshot_and_preserves_sources_baseline_and_locks(tm
                         '{}', 1.0, 'human', NULL, 'now')""",
             (block.id,),
         ).lastrowid
+        manual_lexeme_id = connection.execute(
+            "SELECT primary_lexeme_id FROM concepts WHERE id=?",
+            (manual_concept_id,),
+        ).fetchone()[0]
         connection.execute(
             """INSERT INTO mentions(
                    block_id, paragraph_id, source_form, normalized_form,
-                   discourse_function, concept_id, evidence_id
-               ) VALUES(?, 'P000', 'ManualTerm', 'manualterm', 'referential', ?, ?)""",
-            (block.id, manual_concept_id, evidence_id),
+                   discourse_function, lexeme_id, concept_id, evidence_id
+               ) VALUES(?, 'P000', 'ManualTerm', 'manualterm',
+                        'referential', ?, ?, ?)""",
+            (block.id, manual_lexeme_id, manual_concept_id, evidence_id),
         )
 
     preview = db.preview_scan_reset()
@@ -1058,12 +1063,16 @@ def test_reset_token_tracks_usage_lock_and_preserves_locked_occurrence_dependenc
             (block.id,),
         )
         evidence_id = cursor.lastrowid
+        lexeme_id = connection.execute(
+            "SELECT primary_lexeme_id FROM concepts WHERE id=?",
+            (concept_id,),
+        ).fetchone()[0]
         cursor = connection.execute(
             """INSERT INTO mentions(
                    block_id, paragraph_id, source_form, normalized_form,
-                   discourse_function, concept_id, evidence_id
-               ) VALUES(?, 'P000', 'Drotte', 'drotte', 'vocative', ?, ?)""",
-            (block.id, concept_id, evidence_id),
+                   discourse_function, lexeme_id, concept_id, evidence_id
+               ) VALUES(?, 'P000', 'Drotte', 'drotte', 'vocative', ?, ?, ?)""",
+            (block.id, lexeme_id, concept_id, evidence_id),
         )
         mention_id = cursor.lastrowid
         cursor = connection.execute(
@@ -1100,7 +1109,12 @@ def test_reset_token_tracks_usage_lock_and_preserves_locked_occurrence_dependenc
         assert mention["evidence_id"] == evidence_id
         assert mention["concept_id"] == concept_id
         assert connection.execute("SELECT COUNT(*) FROM evidence WHERE id=?", (evidence_id,)).fetchone()[0] == 1
-        assert connection.execute("SELECT COUNT(*) FROM source_forms WHERE concept_id=?", (concept_id,)).fetchone()[0] == 1
+        assert connection.execute(
+            """SELECT COUNT(*) FROM source_forms sf
+               JOIN concept_lexemes cl ON cl.lexeme_id=sf.lexeme_id
+               WHERE cl.concept_id=? AND cl.retired_version IS NULL""",
+            (concept_id,),
+        ).fetchone()[0] == 1
         assert connection.execute("SELECT COUNT(*) FROM concepts WHERE id=?", (concept_id,)).fetchone()[0] == 1
         assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
 

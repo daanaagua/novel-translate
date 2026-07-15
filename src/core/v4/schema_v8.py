@@ -114,14 +114,11 @@ def create_schema8(connection: sqlite3.Connection) -> None:
 
         CREATE TABLE IF NOT EXISTS source_forms (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            lexeme_id TEXT REFERENCES lexemes(id),
-            concept_id TEXT REFERENCES concepts(id),
+            lexeme_id TEXT NOT NULL REFERENCES lexemes(id),
             form TEXT NOT NULL,
             normalized_form TEXT NOT NULL,
             grammar_json TEXT NOT NULL DEFAULT '{}',
-            CHECK (lexeme_id IS NOT NULL OR concept_id IS NOT NULL),
-            UNIQUE(lexeme_id, normalized_form, form),
-            UNIQUE(concept_id, normalized_form)
+            UNIQUE(lexeme_id, normalized_form, form)
         );
         CREATE INDEX IF NOT EXISTS idx_source_forms_normalized
             ON source_forms(normalized_form);
@@ -135,7 +132,7 @@ def create_schema8(connection: sqlite3.Connection) -> None:
             source_form TEXT NOT NULL,
             normalized_form TEXT NOT NULL,
             discourse_function TEXT NOT NULL,
-            lexeme_id TEXT REFERENCES lexemes(id),
+            lexeme_id TEXT NOT NULL REFERENCES lexemes(id),
             concept_id TEXT REFERENCES concepts(id),
             evidence_id INTEGER NOT NULL REFERENCES evidence(id),
             UNIQUE(block_id, paragraph_id, source_form, evidence_id)
