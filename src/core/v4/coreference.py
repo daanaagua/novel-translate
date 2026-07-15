@@ -597,15 +597,18 @@ class CoreferenceCoordinator:
                 "uncertain": 3,
                 "mention": 4,
             }
+
+            def binding_priority(item: CoreferenceConceptAnchor) -> int:
+                if item.concept_id in selected_concept_ids:
+                    return 0
+                if item.anchor_mention_id in selected_ids:
+                    return 1
+                return 2
+
             prioritized_anchors = sorted(
                 anchors_by_lexeme[lexeme_id],
                 key=lambda item: (
-                    0
-                    if (
-                        item.anchor_mention_id in selected_ids
-                        or item.concept_id in selected_concept_ids
-                    )
-                    else 1,
+                    binding_priority(item),
                     anchor_role_order.get(item.role, 5),
                     item.concept_id,
                     item.evidence_id if item.evidence_id is not None else -1,

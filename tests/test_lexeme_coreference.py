@@ -1031,10 +1031,10 @@ def test_coreference_anchor_budget_prioritizes_selected_mention_binding(tmp_path
             connection.execute(
                 """INSERT INTO concepts(
                        id, kind, canonical_source, primary_lexeme_id,
-                       created_version, created_at)
-                   VALUES(?, 'person', ?, ?, ?,
+                       anchor_mention_id, created_version, created_at)
+                   VALUES(?, 'person', ?, ?, ?, ?,
                           '2000-01-01T00:00:00+00:00')""",
-                (concept_id, concept_id, lexeme_id, version),
+                (concept_id, concept_id, lexeme_id, mention_ids[1], version),
             )
             connection.execute(
                 """INSERT INTO concept_lexemes(
@@ -1060,9 +1060,10 @@ def test_coreference_anchor_budget_prioritizes_selected_mention_binding(tmp_path
     case = CoreferenceCoordinator(database).freeze_cases()[0]
     payload = json.loads(CoreferenceCoordinator.payload_bytes(case))["case"]
 
-    assert "concept-z-direct" in {
-        item["concept_id"] for item in payload["concept_anchors"]
+    anchors_by_id = {
+        item["concept_id"]: item for item in payload["concept_anchors"]
     }
+    assert anchors_by_id["concept-z-direct"]["role"] == "mention"
     assert payload["mentions"][0]["concept_anchor_ids"] == [
         "concept-z-direct"
     ]
