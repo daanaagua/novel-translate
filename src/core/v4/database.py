@@ -247,20 +247,25 @@ class V4Database:
                     run_id TEXT NOT NULL REFERENCES runs(id),
                     cluster_id TEXT NOT NULL,
                     verdict TEXT NOT NULL,
+                    payload_hash TEXT NOT NULL,
                     selected_candidate_ids_json TEXT NOT NULL DEFAULT '[]',
                     entity_kind TEXT NOT NULL DEFAULT '',
                     confidence REAL NOT NULL DEFAULT 0.0,
                     reason TEXT NOT NULL DEFAULT '',
                     rounds INTEGER NOT NULL DEFAULT 1,
                     payload_json TEXT NOT NULL DEFAULT '{}',
+                    knowledge_version INTEGER NOT NULL REFERENCES knowledge_versions(id),
+                    active INTEGER NOT NULL DEFAULT 1,
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL,
-                    UNIQUE(run_id, cluster_id),
+                    superseded_at TEXT,
                     FOREIGN KEY(cluster_id)
                         REFERENCES candidate_clusters(id) ON DELETE CASCADE
                 );
                 CREATE INDEX IF NOT EXISTS idx_candidate_adjudications_cluster
-                    ON candidate_adjudications(run_id, cluster_id, verdict);
+                    ON candidate_adjudications(run_id, cluster_id, active, created_at);
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_candidate_adjudications_active
+                    ON candidate_adjudications(run_id, cluster_id) WHERE active=1;
 
                 CREATE TABLE IF NOT EXISTS candidate_resolutions (
                     id TEXT PRIMARY KEY,
@@ -1160,6 +1165,54 @@ class V4Database:
             (normalized_form, normalized_form, entity_kind),
         ).fetchone()
 
+    @staticmethod
+    def _active_adjudication_matches(
+        connection: sqlite3.Connection,
+        adjudication_id: str,
+        result: Dict[str, Any],
+        members: Sequence[sqlite3.Row],
+    ) -> bool:
+        resolutions = {
+            row["candidate_id"]: row
+            for row in connection.execute(
+                """SELECT candidate_id, decision, concept_id, evidence_id
+                   FROM candidate_resolutions WHERE adjudication_id=?""",
+                (adjudication_id,),
+            ).fetchall()
+        }
+        if set(resolutions) != {row["id"] for row in members}:
+            return False
+        selected = set(result["selected_ids"])
+        for member in members:
+            candidate_id = member["id"]
+            resolution = resolutions[candidate_id]
+            if candidate_id in selected:
+                if (
+                    resolution["decision"] != result["verdict"]
+                    or resolution["concept_id"] is None
+                    or resolution["evidence_id"] is None
+                    or member["resolution_status"] != "promoted"
+                    or member["model_status"] != "accepted"
+                    or not member["selected"]
+                ):
+                    return False
+            else:
+                expected = (
+                    "deferred"
+                    if result["verdict"] == "defer"
+                    else "superseded"
+                    if result["verdict"] == "supersede"
+                    else "rejected"
+                )
+                if (
+                    resolution["decision"] != expected
+                    or member["resolution_status"] != expected
+                    or member["model_status"] != expected
+                    or member["selected"]
+                ):
+                    return False
+        return True
+
     def commit_adjudications(
         self, run_id: str, results: Sequence[Any]
     ) -> Dict[str, Any]:
@@ -1187,15 +1240,17 @@ class V4Database:
                 ).fetchone() is None:
                     raise ValueError(f"unknown candidate cluster: {cluster_id}")
                 rows = connection.execute(
-                    """SELECT lc.*
+                    """SELECT lc.*, cm.role AS member_role
                        FROM candidate_cluster_members cm
                        JOIN lexical_candidates lc ON lc.id=cm.candidate_id
-                       WHERE cm.cluster_id=?
+                       WHERE cm.cluster_id=? AND cm.role IN ('alternative', 'both')
                        ORDER BY cm.ordinal, lc.id""",
                     (cluster_id,),
                 ).fetchall()
                 if not rows:
-                    raise ValueError(f"candidate cluster has no persisted members: {cluster_id}")
+                    raise ValueError(
+                        f"candidate cluster has no persisted alternatives: {cluster_id}"
+                    )
                 cluster_members[cluster_id] = list(rows)
 
             normalized_results: List[Dict[str, Any]] = []
@@ -1215,99 +1270,143 @@ class V4Database:
                 missing = sorted(set(selected_ids) - member_ids)
                 if missing:
                     raise ValueError(
-                        f"candidate(s) do not belong to cluster {cluster_id}: {', '.join(missing)}"
+                        f"selected candidate(s) are not alternatives in cluster "
+                        f"{cluster_id}: {', '.join(missing)}"
                     )
                 if verdict in {"promote", "split", "supersede"} and not selected_ids:
                     raise ValueError(f"{verdict} requires selected candidates")
                 if verdict in {"reject", "defer"} and selected_ids:
                     raise ValueError(f"{verdict} cannot select candidates")
-                normalized_results.append(
-                    {
-                        "cluster_id": cluster_id,
-                        "verdict": verdict,
-                        "selected_ids": selected_ids,
-                        "entity_kind": str(
-                            self._adjudication_value(result, "entity_kind", "") or "concept"
-                        ),
-                        "confidence": float(
-                            self._adjudication_value(result, "confidence", 0.0)
-                        ),
-                        "reason": str(self._adjudication_value(result, "reason", "") or ""),
-                        "rounds": max(
-                            1, int(self._adjudication_value(result, "rounds", 1) or 1)
-                        ),
-                    }
-                )
-
-            version = (
-                self.create_knowledge_version(f"candidate adjudication {run_id}", connection)
-                if normalized_results
-                else int(connection.execute("SELECT MAX(id) FROM knowledge_versions").fetchone()[0])
-            )
-            for result in normalized_results:
-                cluster_id = result["cluster_id"]
-                adjudication_id = stable_id(
-                    "adjud", f"{run_id}:{cluster_id}", length=24
-                )
+                normalized = {
+                    "cluster_id": cluster_id,
+                    "verdict": verdict,
+                    "selected_ids": tuple(sorted(selected_ids)),
+                    "entity_kind": str(
+                        self._adjudication_value(result, "entity_kind", "") or "concept"
+                    ),
+                    "confidence": float(
+                        self._adjudication_value(result, "confidence", 0.0)
+                    ),
+                    "reason": str(self._adjudication_value(result, "reason", "") or ""),
+                    "rounds": max(
+                        1, int(self._adjudication_value(result, "rounds", 1) or 1)
+                    ),
+                }
                 payload = {
                     "cluster_id": cluster_id,
-                    "verdict": result["verdict"],
-                    "selected_candidate_ids": list(result["selected_ids"]),
-                    "entity_kind": result["entity_kind"],
-                    "confidence": result["confidence"],
-                    "reason": result["reason"],
-                    "rounds": result["rounds"],
+                    "verdict": verdict,
+                    "selected_candidate_ids": list(normalized["selected_ids"]),
+                    "entity_kind": normalized["entity_kind"],
+                    "confidence": normalized["confidence"],
+                    "reason": normalized["reason"],
+                    "rounds": normalized["rounds"],
                 }
+                payload_json = json.dumps(
+                    payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+                )
+                normalized["payload"] = payload
+                normalized["payload_json"] = payload_json
+                normalized["payload_hash"] = hashlib.sha256(
+                    payload_json.encode("utf-8")
+                ).hexdigest()
+                normalized["active"] = connection.execute(
+                    """SELECT id, payload_hash, knowledge_version
+                       FROM candidate_adjudications
+                       WHERE run_id=? AND cluster_id=? AND active=1""",
+                    (run_id, cluster_id),
+                ).fetchone()
+                normalized["state_matches"] = bool(
+                    normalized["active"]
+                    and self._active_adjudication_matches(
+                        connection,
+                        normalized["active"]["id"],
+                        normalized,
+                        cluster_members[cluster_id],
+                    )
+                )
+                normalized_results.append(normalized)
+
+            changed_results = [
+                result
+                for result in normalized_results
+                if result["active"] is None
+                or result["active"]["payload_hash"] != result["payload_hash"]
+                or not result["state_matches"]
+            ]
+            if not changed_results:
+                version = (
+                    max(int(result["active"]["knowledge_version"]) for result in normalized_results)
+                    if normalized_results
+                    else int(connection.execute("SELECT MAX(id) FROM knowledge_versions").fetchone()[0])
+                )
+                active_concepts = [
+                    row[0]
+                    for row in connection.execute(
+                        """SELECT DISTINCT cr.concept_id
+                           FROM candidate_resolutions cr
+                           JOIN candidate_adjudications ca ON ca.id=cr.adjudication_id
+                           WHERE ca.run_id=? AND ca.active=1 AND cr.concept_id IS NOT NULL
+                           ORDER BY cr.concept_id""",
+                        (run_id,),
+                    ).fetchall()
+                ]
+                return {
+                    "knowledge_version": version,
+                    "adjudications": len(normalized_results),
+                    "concept_ids": active_concepts,
+                    "changed": 0,
+                }
+
+            version = self.create_knowledge_version(
+                f"candidate adjudication {run_id}", connection
+            )
+            for result in changed_results:
+                cluster_id = result["cluster_id"]
                 now = utc_now()
+                previous_concept_ids: List[str] = []
+                if result["active"] is not None:
+                    previous_concept_ids = [
+                        row[0]
+                        for row in connection.execute(
+                            """SELECT DISTINCT concept_id FROM candidate_resolutions
+                               WHERE adjudication_id=? AND concept_id IS NOT NULL""",
+                            (result["active"]["id"],),
+                        ).fetchall()
+                    ]
+                    connection.execute(
+                        """UPDATE candidate_adjudications
+                           SET active=0, superseded_at=?, updated_at=? WHERE id=?""",
+                        (now, now, result["active"]["id"]),
+                    )
+                adjudication_id = stable_id(
+                    "adjud",
+                    f"{run_id}:{cluster_id}:{version}:{result['payload_hash']}",
+                    length=24,
+                )
                 connection.execute(
                     """INSERT INTO candidate_adjudications(
-                           id, run_id, cluster_id, verdict,
+                           id, run_id, cluster_id, verdict, payload_hash,
                            selected_candidate_ids_json, entity_kind, confidence,
-                           reason, rounds, payload_json, created_at, updated_at
-                       ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                       ON CONFLICT(run_id, cluster_id) DO UPDATE SET
-                           verdict=excluded.verdict,
-                           selected_candidate_ids_json=excluded.selected_candidate_ids_json,
-                           entity_kind=excluded.entity_kind,
-                           confidence=excluded.confidence,
-                           reason=excluded.reason,
-                           rounds=excluded.rounds,
-                           payload_json=excluded.payload_json,
-                           updated_at=excluded.updated_at""",
+                           reason, rounds, payload_json, knowledge_version,
+                           active, created_at, updated_at
+                       ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)""",
                     (
                         adjudication_id,
                         run_id,
                         cluster_id,
                         result["verdict"],
+                        result["payload_hash"],
                         json.dumps(result["selected_ids"], ensure_ascii=False),
                         result["entity_kind"],
                         result["confidence"],
                         result["reason"],
                         result["rounds"],
-                        json.dumps(payload, ensure_ascii=False, sort_keys=True),
+                        result["payload_json"],
+                        version,
                         now,
                         now,
                     ),
                 )
-                existing_evidence_ids = [
-                    row[0]
-                    for row in connection.execute(
-                        """SELECT evidence_id FROM candidate_resolutions
-                           WHERE adjudication_id=? AND evidence_id IS NOT NULL""",
-                        (adjudication_id,),
-                    ).fetchall()
-                ]
-                connection.execute(
-                    "DELETE FROM candidate_resolutions WHERE adjudication_id=?",
-                    (adjudication_id,),
-                )
-                for evidence_id in existing_evidence_ids:
-                    connection.execute(
-                        "DELETE FROM mentions WHERE evidence_id=?", (evidence_id,)
-                    )
-                    connection.execute(
-                        "DELETE FROM evidence WHERE id=?", (evidence_id,)
-                    )
 
                 selected = set(result["selected_ids"])
                 member_rows = cluster_members[cluster_id]
@@ -1364,7 +1463,7 @@ class V4Database:
                                 candidate["paragraph_id"],
                                 candidate["original_text"],
                                 candidate["original_text"],
-                                json.dumps(payload, ensure_ascii=False, sort_keys=True),
+                                result["payload_json"],
                                 result["confidence"],
                                 run_id,
                                 now,
@@ -1430,14 +1529,37 @@ class V4Database:
                             evidence_id,
                             member_decision,
                             ordinal,
-                            json.dumps(payload, ensure_ascii=False, sort_keys=True),
+                            result["payload_json"],
                             now,
                         ),
                     )
+                for previous_concept_id in previous_concept_ids:
+                    connection.execute(
+                        """UPDATE concepts SET status='retired', retired_version=?
+                           WHERE id=? AND locked=0 AND retired_version IS NULL
+                             AND default_target='' AND working_target=''
+                             AND verified_target=''
+                             AND NOT EXISTS(
+                                 SELECT 1 FROM candidate_resolutions cr
+                                 JOIN candidate_adjudications ca
+                                   ON ca.id=cr.adjudication_id
+                                 WHERE cr.concept_id=concepts.id AND ca.active=1)
+                             AND NOT EXISTS(
+                                 SELECT 1 FROM mentions m JOIN evidence e
+                                   ON e.id=m.evidence_id
+                                 WHERE m.concept_id=concepts.id
+                                   AND e.extractor!='candidate_adjudication')
+                             AND NOT EXISTS(
+                                 SELECT 1 FROM rendering_rules rr
+                                 WHERE rr.concept_id=concepts.id
+                                   AND rr.retired_version IS NULL)""",
+                        (version, previous_concept_id),
+                    )
             return {
                 "knowledge_version": version,
-                "adjudications": len(normalized_results),
+                "adjudications": len(changed_results),
                 "concept_ids": sorted(set(concept_ids)),
+                "changed": len(changed_results),
             }
 
     @staticmethod
@@ -1447,73 +1569,139 @@ class V4Database:
             f"OR {alias}.extractor='candidate_adjudication')"
         )
 
+    def _prepare_scan_reset_selection(self, connection: sqlite3.Connection) -> None:
+        evidence_where = self._scan_evidence_where("e")
+        statements = (
+            """CREATE TEMP TABLE reset_protected_mentions AS
+               SELECT DISTINCT m.id FROM mentions m
+               JOIN usage_decisions ud ON ud.mention_id=m.id
+               WHERE ud.locked=1 OR ud.status='verified'""",
+            f"""CREATE TEMP TABLE reset_protected_concepts AS
+                SELECT id FROM concepts WHERE locked=1
+                UNION SELECT m.concept_id FROM mentions m
+                      WHERE m.id IN (SELECT id FROM reset_protected_mentions)
+                        AND m.concept_id IS NOT NULL
+                UNION SELECT DISTINCT m.concept_id FROM mentions m
+                      JOIN evidence e ON e.id=m.evidence_id
+                      WHERE m.concept_id IS NOT NULL AND NOT {evidence_where}
+                UNION SELECT concept_id FROM rendering_rules
+                      WHERE locked=1 OR status='verified'""",
+            f"""CREATE TEMP TABLE reset_scan_evidence AS
+                SELECT e.id FROM evidence e WHERE {evidence_where}
+                  AND NOT EXISTS(
+                      SELECT 1 FROM mentions m
+                      WHERE m.evidence_id=e.id
+                        AND m.id IN (SELECT id FROM reset_protected_mentions))""",
+            """CREATE TEMP TABLE reset_scan_mentions AS
+               SELECT m.id FROM mentions m
+               WHERE m.evidence_id IN (SELECT id FROM reset_scan_evidence)""",
+            """CREATE TEMP TABLE reset_scan_claims AS
+               SELECT DISTINCT c.id FROM claims c
+               JOIN claim_evidence ce ON ce.claim_id=c.id
+               WHERE c.locked=0
+                 AND ce.evidence_id IN (SELECT id FROM reset_scan_evidence)""",
+            """CREATE TEMP TABLE reset_scan_concepts AS
+               SELECT DISTINCT c.id FROM concepts c
+               WHERE c.locked=0
+                 AND c.id NOT IN (SELECT id FROM reset_protected_concepts)
+                 AND (EXISTS(SELECT 1 FROM candidate_resolutions cr
+                             WHERE cr.concept_id=c.id)
+                      OR EXISTS(SELECT 1 FROM mentions m JOIN evidence e
+                                ON e.id=m.evidence_id
+                                WHERE m.concept_id=c.id
+                                  AND (e.extractor LIKE 'scan_%'
+                                       OR e.extractor='candidate_adjudication')))""",
+            """CREATE TEMP TABLE reset_scan_usage_decisions AS
+               SELECT ud.id FROM usage_decisions ud
+               WHERE ud.mention_id IN (SELECT id FROM reset_scan_mentions)
+                 AND ud.locked=0 AND ud.status!='verified'""",
+            """CREATE TEMP TABLE reset_scan_claim_evidence AS
+               SELECT ce.claim_id, ce.evidence_id FROM claim_evidence ce
+               WHERE ce.evidence_id IN (SELECT id FROM reset_scan_evidence)
+                  OR ce.claim_id IN (SELECT id FROM reset_scan_claims)""",
+            """CREATE TEMP TABLE reset_scan_source_forms AS
+               SELECT id FROM source_forms
+               WHERE concept_id IN (SELECT id FROM reset_scan_concepts)""",
+            """CREATE TEMP TABLE reset_scan_rendering_rules AS
+               SELECT id FROM rendering_rules
+               WHERE concept_id IN (SELECT id FROM reset_scan_concepts)""",
+            """CREATE TEMP TABLE reset_scan_verification_tasks AS
+               SELECT id FROM verification_tasks
+               WHERE (subject_type='claim'
+                      AND subject_id IN (SELECT id FROM reset_scan_claims))
+                  OR (subject_type='concept'
+                      AND subject_id IN (SELECT id FROM reset_scan_concepts))""",
+            """CREATE TEMP TABLE reset_scan_verification_votes AS
+               SELECT id FROM verification_votes
+               WHERE task_id IN (SELECT id FROM reset_scan_verification_tasks)""",
+        )
+        for statement in statements:
+            connection.execute(statement)
+
+    @staticmethod
+    def _scan_reset_queries() -> Dict[str, str]:
+        return {
+            "lexical_candidates": "SELECT id,updated_at,resolution_status,selected FROM lexical_candidates ORDER BY id",
+            "candidate_clusters": "SELECT id,run_id,updated_at FROM candidate_clusters ORDER BY id",
+            "candidate_cluster_members": "SELECT cluster_id,candidate_id,role FROM candidate_cluster_members ORDER BY cluster_id,candidate_id",
+            "candidate_adjudications": "SELECT id,active,payload_hash,updated_at FROM candidate_adjudications ORDER BY id",
+            "candidate_resolutions": "SELECT id,adjudication_id,decision FROM candidate_resolutions ORDER BY id",
+            "usage_decisions": "SELECT id,mention_id,status,locked,created_at FROM usage_decisions WHERE id IN (SELECT id FROM reset_scan_usage_decisions) ORDER BY id",
+            "mentions": "SELECT id,evidence_id,concept_id FROM mentions WHERE id IN (SELECT id FROM reset_scan_mentions) ORDER BY id",
+            "evidence": "SELECT id,extractor,created_at FROM evidence WHERE id IN (SELECT id FROM reset_scan_evidence) ORDER BY id",
+            "claim_evidence": "SELECT claim_id,evidence_id FROM reset_scan_claim_evidence ORDER BY claim_id,evidence_id",
+            "claims": "SELECT id,status,created_at FROM claims WHERE id IN (SELECT id FROM reset_scan_claims) ORDER BY id",
+            "source_forms": "SELECT id,concept_id,normalized_form FROM source_forms WHERE id IN (SELECT id FROM reset_scan_source_forms) ORDER BY id",
+            "rendering_rules": "SELECT id,concept_id,status,locked FROM rendering_rules WHERE id IN (SELECT id FROM reset_scan_rendering_rules) ORDER BY id",
+            "verification_votes": "SELECT id,task_id,verdict FROM verification_votes WHERE id IN (SELECT id FROM reset_scan_verification_votes) ORDER BY id",
+            "verification_tasks": "SELECT id,subject_type,subject_id,status FROM verification_tasks WHERE id IN (SELECT id FROM reset_scan_verification_tasks) ORDER BY id",
+            "concepts": "SELECT id,status,retired_version FROM concepts WHERE id IN (SELECT id FROM reset_scan_concepts) ORDER BY id",
+        }
+
     def _scan_reset_preview(
         self, connection: sqlite3.Connection
     ) -> Dict[str, Any]:
-        evidence_where = self._scan_evidence_where("e")
-        derived_concepts = f"""SELECT DISTINCT c.id FROM concepts c
-            WHERE c.locked=0 AND (
-                EXISTS(SELECT 1 FROM candidate_resolutions cr WHERE cr.concept_id=c.id)
-                OR EXISTS(SELECT 1 FROM mentions m JOIN evidence e ON e.id=m.evidence_id
-                          WHERE m.concept_id=c.id AND {evidence_where}))"""
-        count_queries = {
-            "lexical_candidates": "SELECT COUNT(*) FROM lexical_candidates",
-            "candidate_clusters": "SELECT COUNT(*) FROM candidate_clusters",
-            "candidate_cluster_members": "SELECT COUNT(*) FROM candidate_cluster_members",
-            "candidate_adjudications": "SELECT COUNT(*) FROM candidate_adjudications",
-            "candidate_resolutions": "SELECT COUNT(*) FROM candidate_resolutions",
-            "scan_evidence": f"SELECT COUNT(*) FROM evidence e WHERE {evidence_where}",
-            "scan_mentions": f"""SELECT COUNT(*) FROM mentions m WHERE EXISTS(
-                SELECT 1 FROM evidence e WHERE e.id=m.evidence_id AND {evidence_where})""",
-            "scan_claims": f"""SELECT COUNT(DISTINCT c.id) FROM claims c
-                JOIN claim_evidence ce ON ce.claim_id=c.id
-                JOIN evidence e ON e.id=ce.evidence_id
-                WHERE c.locked=0 AND {evidence_where}""",
-            "unlocked_concepts": f"SELECT COUNT(*) FROM ({derived_concepts})",
-            "source_editions": "SELECT COUNT(*) FROM source_editions",
-            "blocks": "SELECT COUNT(*) FROM blocks",
-            "source_paragraphs": "SELECT COUNT(*) FROM source_paragraphs",
-            "baseline_documents": "SELECT COUNT(*) FROM baseline_documents",
-            "baseline_paragraphs": "SELECT COUNT(*) FROM baseline_paragraphs",
-            "block_baseline_links": "SELECT COUNT(*) FROM block_baseline_links",
-            "locked_concepts": """SELECT COUNT(*) FROM concepts
+        self._prepare_scan_reset_selection(connection)
+        queries = self._scan_reset_queries()
+        preview: Dict[str, Any] = {}
+        row_digests: Dict[str, str] = {}
+        for table, query in queries.items():
+            row_hasher = hashlib.sha256()
+            count = 0
+            for row in connection.execute(query):
+                count += 1
+                row_hasher.update(
+                    json.dumps(list(row), ensure_ascii=False, separators=(",", ":")).encode(
+                        "utf-8"
+                    )
+                )
+            preview[table] = count
+            row_digests[table] = row_hasher.hexdigest()
+        retained_queries = {
+            "preserved_source_editions": "SELECT COUNT(*) FROM source_editions",
+            "preserved_blocks": "SELECT COUNT(*) FROM blocks",
+            "preserved_source_paragraphs": "SELECT COUNT(*) FROM source_paragraphs",
+            "preserved_baseline_documents": "SELECT COUNT(*) FROM baseline_documents",
+            "preserved_baseline_paragraphs": "SELECT COUNT(*) FROM baseline_paragraphs",
+            "preserved_block_baseline_links": "SELECT COUNT(*) FROM block_baseline_links",
+            "preserved_locked_concepts": """SELECT COUNT(*) FROM concepts
                 WHERE locked=1 AND retired_version IS NULL""",
+            "preserved_locked_usage_decisions": """SELECT COUNT(*) FROM usage_decisions
+                WHERE locked=1 OR status='verified'""",
         }
-        counts = {
-            key: int(connection.execute(query).fetchone()[0])
-            for key, query in count_queries.items()
-        }
+        preview.update(
+            {
+                key: int(connection.execute(query).fetchone()[0])
+                for key, query in retained_queries.items()
+            }
+        )
         hasher = hashlib.sha256()
         hasher.update(
-            json.dumps(counts, sort_keys=True, separators=(",", ":")).encode("utf-8")
+            json.dumps(preview, sort_keys=True, separators=(",", ":")).encode("utf-8")
         )
-        token_queries = (
-            ("lexical_candidates", "SELECT id,updated_at,resolution_status,selected FROM lexical_candidates ORDER BY id"),
-            ("candidate_clusters", "SELECT run_id,id,updated_at FROM candidate_clusters ORDER BY run_id,id"),
-            ("candidate_cluster_members", "SELECT run_id,cluster_id,candidate_id,role FROM candidate_cluster_members ORDER BY run_id,cluster_id,candidate_id"),
-            ("candidate_adjudications", "SELECT id,updated_at,verdict FROM candidate_adjudications ORDER BY id"),
-            ("candidate_resolutions", "SELECT id,decision,created_at FROM candidate_resolutions ORDER BY id"),
-            ("scan_evidence", f"SELECT e.id,e.created_at,e.extractor FROM evidence e WHERE {evidence_where} ORDER BY e.id"),
-            ("unlocked_concepts", f"SELECT c.id,c.created_at,c.status FROM concepts c WHERE c.id IN ({derived_concepts}) ORDER BY c.id"),
-            ("blocks", "SELECT id,status,updated_at FROM blocks ORDER BY id"),
-            ("source_editions", "SELECT id,active,normalized_sha256 FROM source_editions ORDER BY id"),
-            ("source_paragraphs", "SELECT source_edition_id,paragraph_index,source_hash FROM source_paragraphs ORDER BY source_edition_id,paragraph_index"),
-            ("baseline_documents", "SELECT id,active,file_sha256 FROM baseline_documents ORDER BY id"),
-            ("baseline_paragraphs", "SELECT baseline_document_id,paragraph_index,target_hash FROM baseline_paragraphs ORDER BY baseline_document_id,paragraph_index"),
-            ("block_baseline_links", "SELECT block_id,baseline_document_id,paragraph_index FROM block_baseline_links ORDER BY block_id,baseline_document_id,paragraph_index"),
-            ("locked_concepts", "SELECT id,created_at,default_target FROM concepts WHERE locked=1 AND retired_version IS NULL ORDER BY id"),
-        )
-        for label, query in token_queries:
-            hasher.update(label.encode("utf-8"))
-            for row in connection.execute(query):
-                hasher.update(
-                    json.dumps(
-                        list(row),
-                        ensure_ascii=False,
-                        separators=(",", ":"),
-                    ).encode("utf-8")
-                )
-        preview: Dict[str, Any] = dict(counts)
+        for table, digest in row_digests.items():
+            hasher.update(table.encode("utf-8"))
+            hasher.update(digest.encode("ascii"))
         preview["token"] = hasher.hexdigest()
         return preview
 
@@ -1539,94 +1727,39 @@ class V4Database:
                 raise ValueError(
                     "scan reset token mismatch; request a fresh preview before retrying"
                 )
-            evidence_where = self._scan_evidence_where("e")
-            connection.execute(
-                f"""CREATE TEMP TABLE reset_scan_evidence AS
-                    SELECT e.id FROM evidence e WHERE {evidence_where}"""
-            )
-            connection.execute(
-                """CREATE TEMP TABLE reset_scan_mentions AS SELECT m.id FROM mentions m
-                   WHERE m.evidence_id IN (SELECT id FROM reset_scan_evidence)"""
-            )
-            connection.execute(
-                """CREATE TEMP TABLE reset_scan_claims AS SELECT DISTINCT c.id FROM claims c
-                   JOIN claim_evidence ce ON ce.claim_id=c.id
-                   WHERE c.locked=0
-                     AND ce.evidence_id IN (SELECT id FROM reset_scan_evidence)"""
-            )
-            connection.execute(
-                """CREATE TEMP TABLE reset_scan_concepts AS SELECT DISTINCT c.id FROM concepts c
-                   WHERE c.locked=0 AND (
-                       EXISTS(SELECT 1 FROM candidate_resolutions cr
-                              WHERE cr.concept_id=c.id)
-                       OR EXISTS(
-                           SELECT 1 FROM mentions m
-                           WHERE m.concept_id=c.id
-                             AND m.evidence_id IN (SELECT id FROM reset_scan_evidence)
-                       )
-                   )"""
-            )
-
             deleted: Dict[str, int] = {}
-
-            task_ids_sql = """SELECT id FROM verification_tasks
-                WHERE (subject_type='claim'
-                       AND subject_id IN (SELECT id FROM reset_scan_claims))
-                   OR (subject_type='concept'
-                       AND subject_id IN (SELECT id FROM reset_scan_concepts))"""
-            connection.execute(
-                f"DELETE FROM verification_votes WHERE task_id IN ({task_ids_sql})"
+            deletion_statements = (
+                ("verification_votes", "DELETE FROM verification_votes WHERE id IN (SELECT id FROM reset_scan_verification_votes)"),
+                ("verification_tasks", "DELETE FROM verification_tasks WHERE id IN (SELECT id FROM reset_scan_verification_tasks)"),
+                ("candidate_resolutions", "DELETE FROM candidate_resolutions"),
+                ("candidate_adjudications", "DELETE FROM candidate_adjudications"),
+                ("candidate_cluster_members", "DELETE FROM candidate_cluster_members"),
+                ("candidate_clusters", "DELETE FROM candidate_clusters"),
+                ("usage_decisions", "DELETE FROM usage_decisions WHERE id IN (SELECT id FROM reset_scan_usage_decisions)"),
+                ("mentions", "DELETE FROM mentions WHERE id IN (SELECT id FROM reset_scan_mentions)"),
+                ("claim_evidence", """DELETE FROM claim_evidence WHERE EXISTS(
+                    SELECT 1 FROM reset_scan_claim_evidence r
+                    WHERE r.claim_id=claim_evidence.claim_id
+                      AND r.evidence_id=claim_evidence.evidence_id)"""),
+                ("claims", "DELETE FROM claims WHERE id IN (SELECT id FROM reset_scan_claims)"),
+                ("rendering_rules", "DELETE FROM rendering_rules WHERE id IN (SELECT id FROM reset_scan_rendering_rules)"),
+                ("source_forms", "DELETE FROM source_forms WHERE id IN (SELECT id FROM reset_scan_source_forms)"),
             )
-            connection.execute(f"DELETE FROM verification_tasks WHERE id IN ({task_ids_sql})")
-
-            cursor = connection.execute("DELETE FROM candidate_resolutions")
-            deleted["candidate_resolutions"] = cursor.rowcount
-            cursor = connection.execute("DELETE FROM candidate_adjudications")
-            deleted["candidate_adjudications"] = cursor.rowcount
-            cursor = connection.execute("DELETE FROM candidate_cluster_members")
-            deleted["candidate_cluster_members"] = cursor.rowcount
-            cursor = connection.execute("DELETE FROM candidate_clusters")
-            deleted["candidate_clusters"] = cursor.rowcount
-
-            connection.execute(
-                """DELETE FROM usage_decisions
-                   WHERE mention_id IN (SELECT id FROM reset_scan_mentions)"""
-            )
-            cursor = connection.execute(
-                "DELETE FROM mentions WHERE id IN (SELECT id FROM reset_scan_mentions)"
-            )
-            deleted["scan_mentions"] = cursor.rowcount
+            for key, statement in deletion_statements:
+                deleted[key] = connection.execute(statement).rowcount
             connection.execute(
                 """UPDATE mentions SET concept_id=NULL
                    WHERE concept_id IN (SELECT id FROM reset_scan_concepts)"""
             )
-            connection.execute(
-                """DELETE FROM claim_evidence
-                   WHERE evidence_id IN (SELECT id FROM reset_scan_evidence)
-                      OR claim_id IN (SELECT id FROM reset_scan_claims)"""
-            )
-            cursor = connection.execute(
-                "DELETE FROM claims WHERE id IN (SELECT id FROM reset_scan_claims)"
-            )
-            deleted["scan_claims"] = cursor.rowcount
-            connection.execute(
-                """DELETE FROM rendering_rules
-                   WHERE concept_id IN (SELECT id FROM reset_scan_concepts)"""
-            )
-            connection.execute(
-                """DELETE FROM source_forms
-                   WHERE concept_id IN (SELECT id FROM reset_scan_concepts)"""
-            )
-            cursor = connection.execute(
+            deleted["concepts"] = connection.execute(
                 "DELETE FROM concepts WHERE id IN (SELECT id FROM reset_scan_concepts)"
-            )
-            deleted["unlocked_concepts"] = cursor.rowcount
-            cursor = connection.execute(
+            ).rowcount
+            deleted["evidence"] = connection.execute(
                 "DELETE FROM evidence WHERE id IN (SELECT id FROM reset_scan_evidence)"
-            )
-            deleted["scan_evidence"] = cursor.rowcount
-            cursor = connection.execute("DELETE FROM lexical_candidates")
-            deleted["lexical_candidates"] = cursor.rowcount
+            ).rowcount
+            deleted["lexical_candidates"] = connection.execute(
+                "DELETE FROM lexical_candidates"
+            ).rowcount
             connection.execute(
                 """UPDATE blocks SET status=?, last_error=NULL, updated_at=?
                    WHERE status!=? OR last_error IS NOT NULL""",
@@ -1636,8 +1769,6 @@ class V4Database:
                     V4BlockStatus.PENDING.value,
                 ),
             )
-            for key, value in tuple(deleted.items()):
-                deleted[f"{key}_deleted"] = value
             return deleted
 
     def source_block_count(self) -> int:
