@@ -14,7 +14,7 @@ from src.core.v4.audit_archive import (
 from src.core.v4.candidate_clusters import CandidateCluster, CandidateContext
 from src.core.v4.database import SCHEMA_VERSION, V4Database
 from src.core.v4.lexical_index import LexicalCandidate
-from src.core.v4.models import ScanOutcome
+from src.core.v4.models import ScanOutcome, TranslationOutcome, V4BlockStatus
 
 
 def _candidate(candidate_id, block, start, text, *, risk_flags=()):
@@ -1335,6 +1335,85 @@ def test_database_externalizes_only_successful_automatic_audits(tmp_path):
     assert manual["raw_response"] == "accepted by editor"
 
 
+def test_audit_mode_never_truncates_persisted_success_or_failure(tmp_path):
+    db, _, block, _ = _seed_database(tmp_path)
+    db.start_run("translate-audit", "translate", {})
+    accepted = {
+        "purpose": "translate",
+        "model": "fake",
+        "request": {"messages": [{"content": "complete accepted request"}]},
+        "raw_response": "complete accepted response",
+        "parsed": {"translation": "完整译文"},
+        "accepted": True,
+    }
+    failed = {
+        "purpose": "polish",
+        "model": "fake",
+        "request": {"messages": [{"content": "complete failed request"}]},
+        "raw_response": "complete failed response",
+        "parsed": {"partial": True},
+        "accepted": False,
+        "error": "strict validation failed",
+    }
+
+    db.commit_translation_batch(
+        "translate-audit",
+        [
+            TranslationOutcome(
+                block=block,
+                knowledge_version=db.current_knowledge_version(),
+                status=V4BlockStatus.COMPLETED.value,
+                final_translation="完整译文",
+                audit_calls=[accepted, failed],
+            )
+        ],
+        audit_mode="minimal",
+    )
+
+    with closing(db.connect()) as connection:
+        rows = connection.execute(
+            "SELECT * FROM audit_calls WHERE run_id='translate-audit' ORDER BY id"
+        ).fetchall()
+    assert len(rows) == 2
+    assert db.read_audit_payload(rows[0]["id"]) == {
+        "request": accepted["request"],
+        "raw_response": accepted["raw_response"],
+        "parsed": accepted["parsed"],
+    }
+    assert rows[1]["archive_relative_path"] is None
+    assert json.loads(rows[1]["request_json"]) == failed["request"]
+    assert rows[1]["raw_response"] == failed["raw_response"]
+    assert json.loads(rows[1]["parsed_json"]) == failed["parsed"]
+
+
+def test_human_model_is_kept_inline_even_with_ordinary_purpose(tmp_path):
+    db, _, block, _ = _seed_database(tmp_path)
+    audit_id = db.record_audit_call(
+        "scan-run",
+        block.id,
+        "translate",
+        "human",
+        db.current_knowledge_version(),
+        {"note": "ordinary purpose, human model"},
+        "editor response",
+        {"choice": "B"},
+        True,
+        1,
+        0,
+        None,
+    )
+
+    with closing(db.connect()) as connection:
+        row = connection.execute(
+            "SELECT * FROM audit_calls WHERE id=?", (audit_id,)
+        ).fetchone()
+    assert row["archive_relative_path"] is None
+    assert json.loads(row["request_json"]) == {
+        "note": "ordinary purpose, human model"
+    }
+    assert row["raw_response"] == "editor response"
+
+
 def test_existing_schema7_audit_table_gains_archive_locator_columns(tmp_path):
     root = tmp_path / "legacy-audit"
     path = root / "artifacts" / "parallel_v4" / "book.db"
@@ -1396,4 +1475,122 @@ def test_storage_budget_formula_and_batch_rollback(tmp_path, monkeypatch):
         ).fetchone()[0] == 0
         assert connection.execute(
             "SELECT COUNT(*) FROM candidate_cluster_members WHERE cluster_id='cluster-over-budget'"
+        ).fetchone()[0] == 0
+
+
+def test_storage_budget_rolls_back_repair_failure_and_human_queue(
+    tmp_path, monkeypatch
+):
+    db, _, block, _ = _seed_database(tmp_path)
+    db.start_run("translate-repair-base", "translate", {})
+    db.commit_translation_batch(
+        "translate-repair-base",
+        [
+            TranslationOutcome(
+                block=block,
+                knowledge_version=db.current_knowledge_version(),
+                status=V4BlockStatus.COMPLETED.value,
+                final_translation="旧译文",
+            )
+        ],
+    )
+    task_id = db.request_repair(block.id, ["遗漏"])
+    db.start_run("repair-over-budget", "repair", {})
+    monkeypatch.setattr(StorageBudget, "FIXED_ALLOWANCE_BYTES", 0)
+
+    with pytest.raises(StorageBudgetExceeded):
+        db.commit_repair_failure(
+            task_id,
+            "repair failed",
+            run_id="repair-over-budget",
+            audit={
+                "model": "fake",
+                "request": {"messages": [{"content": "repair"}]},
+                "raw_response": "bad repair",
+                "parsed": None,
+            },
+        )
+
+    with closing(db.connect()) as connection:
+        assert connection.execute(
+            "SELECT status FROM repair_tasks WHERE id=?", (task_id,)
+        ).fetchone()[0] == "open"
+        assert connection.execute(
+            "SELECT COUNT(*) FROM human_queue WHERE kind='repair_failed'"
+        ).fetchone()[0] == 0
+        assert connection.execute(
+            "SELECT COUNT(*) FROM audit_calls WHERE run_id='repair-over-budget'"
+        ).fetchone()[0] == 0
+
+
+def test_storage_budget_rolls_back_verification_batch(tmp_path, monkeypatch):
+    db, _, _, _ = _seed_database(tmp_path)
+    db.start_run("verify-over-budget", "verify", {})
+    with db.transaction() as connection:
+        connection.execute(
+            """INSERT INTO verification_tasks(
+                   id, subject_type, subject_id, payload_json, status,
+                   required_votes, created_at
+               ) VALUES('verify-budget', 'claim', 'claim-budget', '{}',
+                        'open', 1, 'now')"""
+        )
+    task = {
+        "id": "verify-budget",
+        "subject_type": "claim",
+        "subject_id": "claim-budget",
+        "payload_json": "{}",
+        "required_votes": 1,
+    }
+    monkeypatch.setattr(StorageBudget, "FIXED_ALLOWANCE_BYTES", 0)
+
+    with pytest.raises(StorageBudgetExceeded):
+        db.commit_verification_result(
+            "verify-over-budget",
+            task,
+            [
+                {
+                    "model": "fake",
+                    "request": {"messages": [{"content": "verify"}]},
+                    "raw_response": "uncertain",
+                    "parsed": {
+                        "verdict": "uncertain",
+                        "rationale": "insufficient evidence",
+                        "evidence_quotes": [],
+                    },
+                    "accepted": True,
+                }
+            ],
+        )
+
+    with closing(db.connect()) as connection:
+        assert connection.execute(
+            "SELECT status FROM verification_tasks WHERE id='verify-budget'"
+        ).fetchone()[0] == "open"
+        assert connection.execute(
+            "SELECT COUNT(*) FROM verification_votes WHERE task_id='verify-budget'"
+        ).fetchone()[0] == 0
+        assert connection.execute(
+            "SELECT COUNT(*) FROM audit_calls WHERE run_id='verify-over-budget'"
+        ).fetchone()[0] == 0
+
+
+def test_storage_budget_rolls_back_legacy_translation(tmp_path, monkeypatch):
+    db, _, block, _ = _seed_database(tmp_path)
+    monkeypatch.setattr(StorageBudget, "FIXED_ALLOWANCE_BYTES", 0)
+
+    with pytest.raises(StorageBudgetExceeded):
+        db.import_legacy_translation(
+            block.id,
+            V4BlockStatus.COMPLETED.value,
+            "legacy draft",
+            "legacy final",
+            "legacy analysis",
+            [],
+        )
+
+    with closing(db.connect()) as connection:
+        assert connection.execute(
+            """SELECT COUNT(*) FROM translation_versions
+               WHERE block_id=? AND pipeline='serial_v3'""",
+            (block.id,),
         ).fetchone()[0] == 0

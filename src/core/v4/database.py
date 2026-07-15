@@ -95,15 +95,12 @@ class V4Database:
         return connection
 
     @contextmanager
-    def transaction(
-        self, *, enforce_storage_budget: bool = False
-    ) -> Iterator[sqlite3.Connection]:
+    def transaction(self) -> Iterator[sqlite3.Connection]:
         connection = self.connect()
         try:
             connection.execute("BEGIN IMMEDIATE")
             yield connection
-            if enforce_storage_budget:
-                self._check_storage_budget(connection)
+            self._check_storage_budget(connection)
             connection.commit()
         except Exception:
             connection.rollback()
@@ -1220,7 +1217,7 @@ class V4Database:
         connection: Optional[sqlite3.Connection] = None,
     ) -> int:
         if connection is None:
-            with self.transaction(enforce_storage_budget=True) as owned_connection:
+            with self.transaction() as owned_connection:
                 return self.record_audit_call(
                     run_id=run_id,
                     block_id=block_id,
@@ -1240,8 +1237,7 @@ class V4Database:
         archive_eligible = (
             accepted
             and not error
-            and "human" not in purpose.casefold()
-            and "manual" not in purpose.casefold()
+            and not self._is_human_audit(purpose, model, request, parsed)
         )
         locator: Optional[AuditLocator] = None
         request_json = json.dumps(request, ensure_ascii=False)
@@ -1310,6 +1306,34 @@ class V4Database:
         }
 
     @staticmethod
+    def _is_human_audit(
+        purpose: str,
+        model: str,
+        request: Dict[str, Any],
+        parsed: Optional[Dict[str, Any]],
+    ) -> bool:
+        values = [
+            purpose,
+            model,
+            request.get("provider"),
+            request.get("call_type"),
+            request.get("actor_type"),
+            (parsed or {}).get("provider"),
+            (parsed or {}).get("call_type"),
+            (parsed or {}).get("actor_type"),
+        ]
+        for value in values:
+            normalized = str(value or "").strip().casefold()
+            tokens = {
+                token
+                for token in normalized.replace("-", "_").split("_")
+                if token
+            }
+            if {"human", "manual"} & tokens:
+                return True
+        return False
+
+    @staticmethod
     def _audit_fields(
         mode: str,
         request: Dict[str, Any],
@@ -1318,16 +1342,7 @@ class V4Database:
     ) -> tuple[Dict[str, Any], str, Optional[Dict[str, Any]]]:
         if mode not in {"full", "response", "minimal"}:
             raise ValueError("audit_mode 必须是 full、response 或 minimal")
-        if mode == "full":
-            return request, raw_response, parsed
-        summary = {
-            "redacted": True,
-            "message_count": len(request.get("messages") or []),
-            "schema_version": request.get("schema_version"),
-        }
-        if mode == "response":
-            return summary, raw_response, parsed
-        return summary, "", None
+        return request, raw_response, parsed
 
     def commit_scan_batch(
         self,
@@ -1338,7 +1353,7 @@ class V4Database:
     ) -> int:
         """Commit worker results in deterministic block order and create one version."""
         ordered = sorted(outcomes, key=lambda item: item.block.global_index)
-        with self.transaction(enforce_storage_budget=True) as connection:
+        with self.transaction() as connection:
             version = (
                 self.create_knowledge_version(f"scan batch {run_id}", connection)
                 if any(outcome.response is not None for outcome in ordered)
@@ -1549,7 +1564,7 @@ class V4Database:
         """
         ordered = sorted(outcomes, key=lambda item: item.block.global_index)
         indexed = failed = lexical_count = 0
-        with self.transaction(enforce_storage_budget=True) as connection:
+        with self.transaction() as connection:
             if connection.execute(
                 "SELECT 1 FROM runs WHERE id=?", (run_id,)
             ).fetchone() is None:
@@ -1885,7 +1900,7 @@ class V4Database:
         self, run_id: str, clusters: Sequence[Any]
     ) -> Dict[str, int]:
         """Persist bounded cluster decisions without removing source occurrences."""
-        with self.transaction(enforce_storage_budget=True) as connection:
+        with self.transaction() as connection:
             return self._persist_candidate_clusters(connection, run_id, clusters)
 
     def _persist_candidate_clusters(
@@ -1989,7 +2004,7 @@ class V4Database:
         expected_snapshot_token: Optional[str] = None,
     ) -> Dict[str, int]:
         """Atomically rebuild undecided clusters while preserving all history."""
-        with self.transaction(enforce_storage_budget=True) as connection:
+        with self.transaction() as connection:
             if expected_snapshot_token is not None:
                 current_rows = self._pending_lexical_rows(connection)
                 current_token = self._candidate_snapshot_token(current_rows)
@@ -2782,7 +2797,7 @@ class V4Database:
             raise ValueError("adjudication results require unique cluster ids")
         valid_verdicts = {"promote", "split", "supersede", "reject", "defer"}
         concept_ids: List[str] = []
-        with self.transaction(enforce_storage_budget=True) as connection:
+        with self.transaction() as connection:
             if connection.execute("SELECT 1 FROM runs WHERE id=?", (run_id,)).fetchone() is None:
                 raise ValueError(f"unknown run: {run_id}")
             cluster_members: Dict[str, List[sqlite3.Row]] = {}
@@ -4191,7 +4206,7 @@ class V4Database:
         ordered = sorted(
             validated, key=lambda item: str(item.get("concept_id") or "")
         )
-        with self.transaction(enforce_storage_budget=True) as connection:
+        with self.transaction() as connection:
             changed: List[Dict[str, Any]] = []
             processed_ids: List[str] = []
             resolved = 0
@@ -4666,7 +4681,7 @@ class V4Database:
         audit_mode: str = "full",
     ) -> None:
         ordered = sorted(outcomes, key=lambda item: item.block.global_index)
-        with self.transaction(enforce_storage_budget=True) as connection:
+        with self.transaction() as connection:
             for outcome in ordered:
                 if pipeline == "parallel_v4":
                     previous_vote = connection.execute(
@@ -4777,7 +4792,7 @@ class V4Database:
         if not proposals:
             return None
         proposals.sort(key=lambda item: (item[0].block.global_index, item[1], json.dumps(item[2], sort_keys=True)))
-        with self.transaction(enforce_storage_budget=True) as connection:
+        with self.transaction() as connection:
             material_terms: Dict[str, tuple[str, str]] = {}
             for _, kind, payload in proposals:
                 if kind != "term":
