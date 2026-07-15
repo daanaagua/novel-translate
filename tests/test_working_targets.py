@@ -340,6 +340,45 @@ def test_single_low_impact_concept_is_not_required_by_verification_queue(tmp_pat
     assert llm.calls == []
 
 
+def test_single_low_impact_concept_ignores_candidate_high_impact_flag(tmp_path):
+    database = _database(tmp_path, ["Scape shimmered once."])
+    concept_id = _seed_concept(
+        database, "Scape", kind="concept", blocks=database.list_blocks()[:1]
+    )
+    database.start_run("risk-run", "adjudicate", {})
+    version = database.current_knowledge_version()
+    with database.transaction() as connection:
+        connection.execute(
+            """INSERT INTO candidate_clusters(
+                   id, run_id, risk_flags_json, affected_blocks_json,
+                   affected_block_count, ordinal, state, created_at, updated_at
+               ) VALUES('risk-cluster', 'risk-run', '["high_impact"]',
+                        '["block_000"]', 1, 0, 'adjudicated', 'now', 'now')"""
+        )
+        connection.execute(
+            """INSERT INTO candidate_adjudications(
+                   id, run_id, cluster_id, verdict, payload_hash,
+                   selected_candidate_ids_json, entity_kind, confidence, reason,
+                   rounds, payload_json, knowledge_version, active, created_at,
+                   updated_at
+               ) VALUES('risk-adjudication', 'risk-run', 'risk-cluster', 'promote',
+                        'hash', '[]', 'concept', 1.0, '', 1, '{}', ?, 1,
+                        'now', 'now')""",
+            (version,),
+        )
+        connection.execute(
+            """INSERT INTO candidate_resolutions(
+                   id, adjudication_id, run_id, cluster_id, candidate_id,
+                   concept_id, evidence_id, decision, ordinal, payload_json,
+                   created_at
+               ) VALUES('risk-resolution', 'risk-adjudication', 'risk-run',
+                        'risk-cluster', NULL, ?, NULL, 'promote', 0, '{}', 'now')""",
+            (concept_id,),
+        )
+
+    assert database.working_target_candidates() == []
+
+
 def test_resolver_batches_at_24_and_bounds_context_and_baseline_payloads(tmp_path):
     names = [f"Name{index:02d}" for index in range(25)]
     source = " ".join(names)

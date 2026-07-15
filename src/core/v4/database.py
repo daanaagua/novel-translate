@@ -3699,17 +3699,7 @@ class V4Database:
                                 ON ca.id=cr.adjudication_id AND ca.active=1
                               JOIN candidate_clusters cc ON cc.id=cr.cluster_id
                               WHERE cr.concept_id=c.id
-                          ), 0) cluster_blocks,
-                          EXISTS(
-                              SELECT 1
-                              FROM candidate_resolutions cr
-                              JOIN candidate_adjudications ca
-                                ON ca.id=cr.adjudication_id AND ca.active=1
-                              JOIN candidate_clusters cc ON cc.id=cr.cluster_id
-                              JOIN json_each(cc.risk_flags_json) risk
-                              WHERE cr.concept_id=c.id
-                                AND risk.value='high_impact'
-                          ) candidate_high_impact
+                          ), 0) cluster_blocks
                    FROM concepts c
                    LEFT JOIN mentions m ON m.concept_id=c.id
                    WHERE c.retired_version IS NULL
@@ -3731,9 +3721,7 @@ class V4Database:
                 identity_kind = str(row["kind"] or "concept") in {
                     "person", "place", "organization", "group", "unit"
                 }
-                high_impact = affected_blocks >= 3 or bool(
-                    row["candidate_high_impact"]
-                )
+                high_impact = affected_blocks >= 3
                 required = (identity_kind and repeated) or high_impact
                 if effective or not required:
                     continue
