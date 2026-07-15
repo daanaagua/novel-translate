@@ -16,7 +16,12 @@ from src.core.v4.audit_archive import (
 from src.core.v4.candidate_clusters import CandidateCluster, CandidateContext
 from src.core.v4.database import SCHEMA_VERSION, V4Database
 from src.core.v4.lexical_index import LexicalCandidate
-from src.core.v4.models import ScanOutcome, TranslationOutcome, V4BlockStatus
+from src.core.v4.models import (
+    FormOccurrence,
+    ScanOutcome,
+    TranslationOutcome,
+    V4BlockStatus,
+)
 from src.core.v4.schema_v8 import SchemaUpgradeRequired
 
 
@@ -557,19 +562,26 @@ def test_promotions_with_different_entity_kinds_share_lexeme_and_keep_observatio
         "judge-run",
         [AdjudicationResult("cluster-1", "promote", (candidates[0].id,), "place", 0.8)],
     )
+    identical = db.commit_adjudications(
+        "judge-run",
+        [AdjudicationResult("cluster-1", "promote", (candidates[0].id,), "place", 0.8)],
+    )
     with closing(db.connect()) as connection:
-        selected_resolutions = connection.execute(
-            """SELECT cr.lexeme_id, cr.concept_id, cr.decision
+        chains = connection.execute(
+            """SELECT ca.knowledge_version, ca.active, cr.lexeme_id,
+                      cr.concept_id, cr.evidence_id AS resolution_evidence_id,
+                      cto.mention_id, cto.evidence_id AS observation_evidence_id,
+                      m.evidence_id AS mention_evidence_id,
+                      cto.kind, cto.confidence
                FROM candidate_resolutions cr
                JOIN candidate_adjudications ca ON ca.id=cr.adjudication_id
+               JOIN concept_type_observations cto
+                 ON cto.adjudication_id=ca.id AND cto.lexeme_id=cr.lexeme_id
+                    AND cto.evidence_id=cr.evidence_id
+               JOIN mentions m ON m.id=cto.mention_id
                WHERE cr.candidate_id=? AND cr.decision='promote'
                ORDER BY ca.knowledge_version""",
             (candidates[0].id,),
-        ).fetchall()
-        observations = connection.execute(
-            """SELECT lexeme_id, kind, confidence, concept_id, mention_id,
-                      evidence_id, adjudication_id
-               FROM concept_type_observations ORDER BY created_version, id"""
         ).fetchall()
         counts = {
             "concepts": connection.execute("SELECT COUNT(*) FROM concepts").fetchone()[0],
@@ -581,21 +593,25 @@ def test_promotions_with_different_entity_kinds_share_lexeme_and_keep_observatio
         }
 
     assert first["concept_ids"] == second["concept_ids"] == []
-    assert len(selected_resolutions) == 2
-    assert len({row["lexeme_id"] for row in selected_resolutions}) == 1
-    assert all(row["concept_id"] is None for row in selected_resolutions)
-    assert [(row["kind"], row["confidence"]) for row in observations] == [
+    assert identical["knowledge_version"] == second["knowledge_version"]
+    assert identical["changed"] == 0
+    assert len(chains) == 2
+    assert [row["active"] for row in chains] == [0, 1]
+    assert len({row["lexeme_id"] for row in chains}) == 1
+    assert all(row["concept_id"] is None for row in chains)
+    assert [(row["kind"], row["confidence"]) for row in chains] == [
         ("person", 0.9),
         ("place", 0.8),
     ]
-    assert {row["lexeme_id"] for row in observations} == {
-        selected_resolutions[0]["lexeme_id"]
-    }
-    assert all(row["concept_id"] is None for row in observations)
-    assert all(row["mention_id"] is not None for row in observations)
-    assert all(row["evidence_id"] is not None for row in observations)
-    assert all(row["adjudication_id"] is not None for row in observations)
-    assert counts == {"concepts": 0, "lexemes": 1, "mentions": 1, "occurrences": 1}
+    assert len({row["mention_id"] for row in chains}) == 2
+    assert len({row["resolution_evidence_id"] for row in chains}) == 2
+    assert all(
+        row["resolution_evidence_id"]
+        == row["observation_evidence_id"]
+        == row["mention_evidence_id"]
+        for row in chains
+    )
+    assert counts == {"concepts": 0, "lexemes": 1, "mentions": 2, "occurrences": 1}
 
 
 def test_promotion_reuses_locked_concept_lexeme_without_binding_or_modifying_concept(
@@ -838,7 +854,9 @@ def test_changed_adjudication_keeps_history_and_exact_retry_is_idempotent(tmp_pa
         assert connection.execute("SELECT COUNT(*) FROM candidate_adjudications").fetchone()[0] == 2
 
 
-def test_promote_reject_promote_reuses_exact_span_mention_and_occurrence(tmp_path):
+def test_promote_reject_promote_keeps_mentions_per_evidence_and_reuses_occurrence(
+    tmp_path,
+):
     db, _, _, candidates = _seed_database(tmp_path)
     db.persist_candidate_clusters("scan-run", [_cluster("cluster-1", candidates)])
     promote = AdjudicationResult(
@@ -875,7 +893,7 @@ def test_promote_reject_promote_reuses_exact_span_mention_and_occurrence(tmp_pat
     assert third["concept_ids"] == []
     assert active_resolution["lexeme_id"] is not None
     assert active_resolution["concept_id"] is None
-    assert counts == {"concepts": 0, "mentions": 1, "occurrences": 1, "observations": 2}
+    assert counts == {"concepts": 0, "mentions": 2, "occurrences": 1, "observations": 2}
 
 
 def test_split_reuses_each_existing_lexeme_without_creating_composite_identity(tmp_path):
@@ -1122,6 +1140,71 @@ def test_identical_payload_repairs_drifted_active_candidate_state(tmp_path):
         ).fetchone()[0] == 2
 
 
+def test_identical_payload_supersedes_drifted_mention_evidence_chain(tmp_path):
+    db, _, block, candidates = _seed_database(tmp_path)
+    db.persist_candidate_clusters("scan-run", [_cluster("cluster-1", candidates)])
+    result = AdjudicationResult(
+        "cluster-1", "promote", (candidates[0].id,), "person", 0.9
+    )
+    first = db.commit_adjudications("judge-run", [result])
+    with db.transaction() as connection:
+        active = connection.execute(
+            """SELECT ca.id AS adjudication_id, cr.lexeme_id
+               FROM candidate_adjudications ca
+               JOIN candidate_resolutions cr ON cr.adjudication_id=ca.id
+               WHERE ca.active=1 AND cr.candidate_id=?""",
+            (candidates[0].id,),
+        ).fetchone()
+        drift_evidence_id = connection.execute(
+            """INSERT INTO evidence(
+                   block_id, paragraph_id, kind, source_form, evidence_quote,
+                   payload_json, confidence, extractor, run_id, created_at
+               ) VALUES(?, 'P000', 'candidate_adjudication', 'Drotte',
+                        'Drotte', '{}', 0.9, 'candidate_adjudication',
+                        'judge-run', 'now')""",
+            (block.id,),
+        ).lastrowid
+        drift_mention_id = connection.execute(
+            """INSERT INTO mentions(
+                   block_id, paragraph_id, source_form, normalized_form,
+                   discourse_function, lexeme_id, concept_id, evidence_id
+               ) VALUES(?, 'P000', 'Drotte', 'drotte', 'referential',
+                        ?, NULL, ?)""",
+            (block.id, active["lexeme_id"], drift_evidence_id),
+        ).lastrowid
+        connection.execute(
+            """UPDATE concept_type_observations SET mention_id=?
+               WHERE adjudication_id=?""",
+            (drift_mention_id, active["adjudication_id"]),
+        )
+
+    repaired = db.commit_adjudications("judge-run", [result])
+
+    assert repaired["knowledge_version"] != first["knowledge_version"]
+    assert repaired["changed"] == 1
+    with closing(db.connect()) as connection:
+        chain = connection.execute(
+            """SELECT cr.evidence_id AS resolution_evidence_id,
+                      cto.evidence_id AS observation_evidence_id,
+                      cto.mention_id, m.evidence_id AS mention_evidence_id
+               FROM candidate_adjudications ca
+               JOIN candidate_resolutions cr ON cr.adjudication_id=ca.id
+               JOIN concept_type_observations cto
+                 ON cto.adjudication_id=ca.id AND cto.lexeme_id=cr.lexeme_id
+               JOIN mentions m ON m.id=cto.mention_id
+               WHERE ca.active=1 AND cr.candidate_id=?""",
+            (candidates[0].id,),
+        ).fetchone()
+        assert connection.execute(
+            "SELECT COUNT(*) FROM candidate_adjudications"
+        ).fetchone()[0] == 2
+    assert (
+        chain["resolution_evidence_id"]
+        == chain["observation_evidence_id"]
+        == chain["mention_evidence_id"]
+    )
+
+
 def test_reset_token_guards_snapshot_and_preserves_sources_baseline_and_locks(tmp_path):
     db, edition, block, candidates = _seed_database(tmp_path)
     db.persist_candidate_clusters("scan-run", [_cluster("cluster-1", candidates)])
@@ -1203,7 +1286,6 @@ def test_reset_token_guards_snapshot_and_preserves_sources_baseline_and_locks(tm
         "candidate_adjudications",
         "candidate_resolutions",
         "concept_type_observations",
-        "form_occurrences",
         "usage_decisions",
         "mentions",
         "evidence",
@@ -1244,16 +1326,35 @@ def test_reset_token_guards_snapshot_and_preserves_sources_baseline_and_locks(tm
 
 def test_reset_token_tracks_usage_lock_and_preserves_locked_occurrence_dependencies(tmp_path):
     db, _, block, candidates = _seed_database(tmp_path)
+    preexisting_lexeme_id = db.ensure_lexeme("Drotte")
+    with db.transaction() as connection:
+        db.record_form_occurrences(
+            [
+                FormOccurrence(
+                    lexeme_id=preexisting_lexeme_id,
+                    block_id=block.id,
+                    start_offset=candidates[0].start_offset,
+                    end_offset=candidates[0].end_offset,
+                    source_form=candidates[0].original_text,
+                    source_hash=block.source_hash,
+                )
+            ],
+            connection=connection,
+        )
     db.persist_candidate_clusters("scan-run", [_cluster("cluster-1", candidates)])
     db.commit_adjudications(
         "judge-run",
         [AdjudicationResult("cluster-1", "promote", (candidates[0].id,), "person", 0.9)],
     )
-    concept_id = db.import_legacy_concept(
-        "Drotte", "", "person", "post-adjudication identity fixture"
+    locked = db.lock_concept_translation(
+        "Drotte", "德罗特", kind="person", description="human identity fixture"
     )
+    concept_id = locked["concept_id"]
     with db.transaction() as connection:
         version = connection.execute("SELECT MAX(id) FROM knowledge_versions").fetchone()[0]
+        adjudication_id = connection.execute(
+            "SELECT id FROM candidate_adjudications WHERE active=1"
+        ).fetchone()[0]
         cursor = connection.execute(
             """INSERT INTO evidence(
                    block_id, paragraph_id, kind, source_form, evidence_quote,
@@ -1283,7 +1384,6 @@ def test_reset_token_tracks_usage_lock_and_preserves_locked_occurrence_dependenc
             (mention_id, version),
         )
         usage_id = cursor.lastrowid
-
     preview = db.preview_scan_reset()
     assert preview["usage_decisions"] == 1
     with db.transaction() as connection:
@@ -1292,12 +1392,25 @@ def test_reset_token_tracks_usage_lock_and_preserves_locked_occurrence_dependenc
                WHERE id=?""",
             (usage_id,),
         )
+        human_observation_id = db.record_type_observation(
+            lexeme_id,
+            "person",
+            confidence=1.0,
+            source="human",
+            mention_id=mention_id,
+            concept_id=concept_id,
+            evidence_id=evidence_id,
+            adjudication_id=adjudication_id,
+            connection=connection,
+        )
     with pytest.raises(ValueError, match="token"):
         db.reset_scan_derivatives(preview["token"])
 
     fresh = db.preview_scan_reset()
     assert fresh["usage_decisions"] == 0
-    db.reset_scan_derivatives(fresh["token"])
+    assert fresh["concept_type_observations"] == 1
+    deleted = db.reset_scan_derivatives(fresh["token"])
+    assert deleted["concept_type_observations"] == 1
     with closing(db.connect()) as connection:
         usage = connection.execute(
             "SELECT locked, status, mention_id FROM usage_decisions WHERE id=?", (usage_id,)
@@ -1308,6 +1421,39 @@ def test_reset_token_tracks_usage_lock_and_preserves_locked_occurrence_dependenc
         assert tuple(usage) == (1, "verified", mention_id)
         assert mention["evidence_id"] == evidence_id
         assert mention["concept_id"] == concept_id
+        occurrence = connection.execute(
+            """SELECT source_form, source_hash FROM form_occurrences
+               WHERE lexeme_id=? AND block_id=? AND start_offset=? AND end_offset=?""",
+            (
+                preexisting_lexeme_id,
+                block.id,
+                candidates[0].start_offset,
+                candidates[0].end_offset,
+            ),
+        ).fetchone()
+        human_observation = connection.execute(
+            """SELECT source, lexeme_id, mention_id, concept_id, evidence_id,
+                      adjudication_id
+               FROM concept_type_observations WHERE id=?""",
+            (human_observation_id,),
+        ).fetchone()
+        assert tuple(occurrence) == (candidates[0].original_text, block.source_hash)
+        assert tuple(human_observation) == (
+            "human",
+            preexisting_lexeme_id,
+            mention_id,
+            concept_id,
+            evidence_id,
+            adjudication_id,
+        )
+        assert connection.execute(
+            """SELECT COUNT(*) FROM concept_type_observations
+               WHERE source='candidate_adjudication'"""
+        ).fetchone()[0] == 0
+        assert connection.execute(
+            "SELECT COUNT(*) FROM candidate_adjudications WHERE id=?",
+            (adjudication_id,),
+        ).fetchone()[0] == 1
         assert connection.execute("SELECT COUNT(*) FROM evidence WHERE id=?", (evidence_id,)).fetchone()[0] == 1
         assert connection.execute(
             """SELECT COUNT(*) FROM source_forms sf
@@ -1316,6 +1462,9 @@ def test_reset_token_tracks_usage_lock_and_preserves_locked_occurrence_dependenc
             (concept_id,),
         ).fetchone()[0] == 1
         assert connection.execute("SELECT COUNT(*) FROM concepts WHERE id=?", (concept_id,)).fetchone()[0] == 1
+        assert connection.execute(
+            "SELECT COUNT(*) FROM lexemes WHERE id=?", (preexisting_lexeme_id,)
+        ).fetchone()[0] == 1
         assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
 
 

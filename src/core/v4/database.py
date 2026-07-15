@@ -3348,13 +3348,19 @@ class V4Database:
                              AND cto.evidence_id=? AND cto.concept_id IS NULL
                              AND cto.retired_version IS NULL
                              AND m.lexeme_id=cto.lexeme_id
-                             AND m.concept_id IS NULL""",
+                             AND m.concept_id IS NULL
+                             AND m.evidence_id=cto.evidence_id
+                             AND m.block_id=? AND m.paragraph_id=?
+                             AND m.source_form=?""",
                     (
                         adjudication_id,
                         resolution["lexeme_id"],
                         result["entity_kind"],
                         result["confidence"],
                         resolution["evidence_id"],
+                        member["block_id"],
+                        member["paragraph_id"],
+                        member["original_text"],
                     ),
                 ).fetchone()
                 if evidence is None or occurrence is None or observation is None:
@@ -3719,34 +3725,22 @@ class V4Database:
                             ),
                         )
                         evidence_id = int(cursor.lastrowid)
-                        existing_mention = connection.execute(
-                            """SELECT m.id
-                               FROM candidate_resolutions cr
-                               JOIN mentions m ON m.evidence_id=cr.evidence_id
-                               WHERE cr.candidate_id=? AND m.lexeme_id=?
-                                     AND m.concept_id IS NULL
-                               ORDER BY m.id LIMIT 1""",
-                            (candidate_id, candidate_lexeme_id),
-                        ).fetchone()
-                        if existing_mention is None:
-                            mention_cursor = connection.execute(
-                                """INSERT INTO mentions(
-                                       block_id, paragraph_id, source_form,
-                                       normalized_form, discourse_function,
-                                       lexeme_id, concept_id, evidence_id
-                                   ) VALUES(?, ?, ?, ?, 'referential', ?, NULL, ?)""",
-                                (
-                                    candidate["block_id"],
-                                    candidate["paragraph_id"],
-                                    candidate["original_text"],
-                                    normalized_form,
-                                    candidate_lexeme_id,
-                                    evidence_id,
-                                ),
-                            )
-                            mention_id = int(mention_cursor.lastrowid)
-                        else:
-                            mention_id = int(existing_mention["id"])
+                        mention_cursor = connection.execute(
+                            """INSERT INTO mentions(
+                                   block_id, paragraph_id, source_form,
+                                   normalized_form, discourse_function,
+                                   lexeme_id, concept_id, evidence_id
+                               ) VALUES(?, ?, ?, ?, 'referential', ?, NULL, ?)""",
+                            (
+                                candidate["block_id"],
+                                candidate["paragraph_id"],
+                                candidate["original_text"],
+                                normalized_form,
+                                candidate_lexeme_id,
+                                evidence_id,
+                            ),
+                        )
+                        mention_id = int(mention_cursor.lastrowid)
                         self.record_form_occurrences(
                             [
                                 FormOccurrence(
@@ -3901,48 +3895,97 @@ class V4Database:
                WHERE (b.status!='pending' OR b.last_error IS NOT NULL)
                  AND NOT EXISTS(
                      SELECT 1 FROM translation_versions t WHERE t.block_id=b.id)""",
+            """CREATE TEMP TABLE reset_protected_type_observations AS
+               SELECT cto.id FROM concept_type_observations cto
+               LEFT JOIN concepts c ON c.id=cto.concept_id
+               WHERE cto.source!='candidate_adjudication'
+                  OR COALESCE(c.locked, 0)=1""",
+            """CREATE TEMP TABLE reset_protected_adjudications AS
+               SELECT DISTINCT cto.adjudication_id AS id
+               FROM concept_type_observations cto
+               WHERE cto.id IN (
+                         SELECT id FROM reset_protected_type_observations)
+                 AND cto.adjudication_id IS NOT NULL""",
+            """CREATE TEMP TABLE reset_protected_clusters AS
+               SELECT DISTINCT ca.cluster_id AS id
+               FROM candidate_adjudications ca
+               WHERE ca.id IN (SELECT id FROM reset_protected_adjudications)""",
+            """CREATE TEMP TABLE reset_protected_candidates AS
+               SELECT cm.candidate_id AS id
+               FROM candidate_cluster_members cm
+               WHERE cm.cluster_id IN (SELECT id FROM reset_protected_clusters)
+               UNION
+               SELECT cr.candidate_id AS id FROM candidate_resolutions cr
+               WHERE cr.adjudication_id IN (
+                         SELECT id FROM reset_protected_adjudications)
+                 AND cr.candidate_id IS NOT NULL""",
+            """CREATE TEMP TABLE reset_scan_candidate_adjudications AS
+               SELECT id FROM candidate_adjudications
+               WHERE id NOT IN (SELECT id FROM reset_protected_adjudications)""",
+            """CREATE TEMP TABLE reset_scan_candidate_resolutions AS
+               SELECT id FROM candidate_resolutions
+               WHERE adjudication_id IN (
+                   SELECT id FROM reset_scan_candidate_adjudications)""",
+            """CREATE TEMP TABLE reset_scan_candidate_clusters AS
+               SELECT id FROM candidate_clusters
+               WHERE id NOT IN (SELECT id FROM reset_protected_clusters)""",
+            """CREATE TEMP TABLE reset_scan_candidate_cluster_members AS
+               SELECT cluster_id, candidate_id FROM candidate_cluster_members
+               WHERE cluster_id IN (SELECT id FROM reset_scan_candidate_clusters)""",
+            """CREATE TEMP TABLE reset_scan_lexical_candidates AS
+               SELECT id FROM lexical_candidates
+               WHERE id NOT IN (SELECT id FROM reset_protected_candidates)""",
             """CREATE TEMP TABLE reset_protected_mentions AS
                SELECT DISTINCT m.id FROM mentions m
                JOIN usage_decisions ud ON ud.mention_id=m.id
-               WHERE ud.locked=1 OR ud.status='verified'""",
+               WHERE ud.locked=1 OR ud.status='verified'
+               UNION
+               SELECT cto.mention_id FROM concept_type_observations cto
+               WHERE cto.id IN (
+                         SELECT id FROM reset_protected_type_observations)
+                 AND cto.mention_id IS NOT NULL""",
             """CREATE TEMP TABLE reset_protected_evidence AS
                SELECT ce.evidence_id FROM claim_evidence ce
                JOIN claims c ON c.id=ce.claim_id
                WHERE c.locked=1
                UNION
                SELECT m.evidence_id FROM mentions m
-               WHERE m.id IN (SELECT id FROM reset_protected_mentions)""",
+               WHERE m.id IN (SELECT id FROM reset_protected_mentions)
+               UNION
+               SELECT cto.evidence_id FROM concept_type_observations cto
+               WHERE cto.id IN (
+                         SELECT id FROM reset_protected_type_observations)
+                 AND cto.evidence_id IS NOT NULL
+               UNION
+               SELECT cr.evidence_id FROM candidate_resolutions cr
+               WHERE cr.adjudication_id IN (
+                         SELECT id FROM reset_protected_adjudications)
+                 AND cr.evidence_id IS NOT NULL""",
             f"""CREATE TEMP TABLE reset_protected_concepts AS
-                SELECT id FROM concepts WHERE locked=1
-                UNION SELECT m.concept_id FROM mentions m
-                      WHERE m.id IN (SELECT id FROM reset_protected_mentions)
-                        AND m.concept_id IS NOT NULL
-                UNION SELECT DISTINCT m.concept_id FROM mentions m
-                      JOIN evidence e ON e.id=m.evidence_id
-                      WHERE m.concept_id IS NOT NULL AND NOT {evidence_where}
-                UNION SELECT concept_id FROM rendering_rules
-                      WHERE locked=1 OR status='verified'""",
+                 SELECT id FROM concepts WHERE locked=1
+                 UNION SELECT m.concept_id FROM mentions m
+                       WHERE m.id IN (SELECT id FROM reset_protected_mentions)
+                         AND m.concept_id IS NOT NULL
+                 UNION SELECT cto.concept_id FROM concept_type_observations cto
+                       WHERE cto.id IN (
+                                 SELECT id FROM reset_protected_type_observations)
+                         AND cto.concept_id IS NOT NULL
+                 UNION SELECT DISTINCT m.concept_id FROM mentions m
+                       JOIN evidence e ON e.id=m.evidence_id
+                       WHERE m.concept_id IS NOT NULL AND NOT {evidence_where}
+                 UNION SELECT concept_id FROM rendering_rules
+                       WHERE locked=1 OR status='verified'""",
             f"""CREATE TEMP TABLE reset_scan_evidence AS
-                SELECT e.id FROM evidence e WHERE {evidence_where}
-                  AND e.id NOT IN (SELECT evidence_id FROM reset_protected_evidence)
-                  AND NOT EXISTS(
-                      SELECT 1 FROM mentions m
-                      WHERE m.evidence_id=e.id
-                        AND m.id IN (SELECT id FROM reset_protected_mentions))""",
+                 SELECT e.id FROM evidence e WHERE {evidence_where}
+                   AND e.id NOT IN (SELECT evidence_id FROM reset_protected_evidence)
+                   AND NOT EXISTS(
+                       SELECT 1 FROM mentions m
+                       WHERE m.evidence_id=e.id
+                         AND m.id IN (SELECT id FROM reset_protected_mentions))""",
             """CREATE TEMP TABLE reset_scan_mentions AS
                SELECT m.id FROM mentions m
-               WHERE m.evidence_id IN (SELECT id FROM reset_scan_evidence)""",
-            """CREATE TEMP TABLE reset_scan_form_occurrences AS
-               SELECT fo.lexeme_id, fo.block_id, fo.start_offset, fo.end_offset
-               FROM form_occurrences fo
-               WHERE EXISTS(
-                   SELECT 1
-                   FROM candidate_resolutions cr
-                   JOIN lexical_candidates lc ON lc.id=cr.candidate_id
-                   WHERE cr.lexeme_id=fo.lexeme_id
-                     AND lc.block_id=fo.block_id
-                     AND lc.start_offset=fo.start_offset
-                     AND lc.end_offset=fo.end_offset)""",
+               WHERE m.evidence_id IN (SELECT id FROM reset_scan_evidence)
+                 AND m.id NOT IN (SELECT id FROM reset_protected_mentions)""",
             """CREATE TEMP TABLE reset_scan_claims AS
                SELECT DISTINCT c.id FROM claims c
                JOIN claim_evidence ce ON ce.claim_id=c.id
@@ -3952,8 +3995,10 @@ class V4Database:
                SELECT DISTINCT c.id FROM concepts c
                WHERE c.locked=0
                  AND c.id NOT IN (SELECT id FROM reset_protected_concepts)
-                 AND (EXISTS(SELECT 1 FROM candidate_resolutions cr
-                             WHERE cr.concept_id=c.id)
+                  AND (EXISTS(SELECT 1 FROM candidate_resolutions cr
+                              WHERE cr.concept_id=c.id
+                                AND cr.id IN (
+                                    SELECT id FROM reset_scan_candidate_resolutions))
                       OR EXISTS(SELECT 1 FROM mentions m JOIN evidence e
                                 ON e.id=m.evidence_id
                                 WHERE m.concept_id=c.id
@@ -3961,21 +4006,26 @@ class V4Database:
                                         OR e.extractor='candidate_adjudication')))""",
             """CREATE TEMP TABLE reset_scan_type_observations AS
                SELECT cto.id FROM concept_type_observations cto
-               WHERE cto.adjudication_id IN (
-                         SELECT id FROM candidate_adjudications)
-                  OR cto.mention_id IN (SELECT id FROM reset_scan_mentions)
-                  OR cto.evidence_id IN (SELECT id FROM reset_scan_evidence)
-                  OR cto.concept_id IN (SELECT id FROM reset_scan_concepts)""",
+               LEFT JOIN concepts c ON c.id=cto.concept_id
+               WHERE cto.source='candidate_adjudication'
+                 AND COALESCE(c.locked, 0)=0
+                 AND cto.id NOT IN (
+                     SELECT id FROM reset_protected_type_observations)
+                 AND (cto.adjudication_id IN (
+                          SELECT id FROM candidate_adjudications)
+                      OR cto.mention_id IN (SELECT id FROM reset_scan_mentions)
+                      OR cto.evidence_id IN (SELECT id FROM reset_scan_evidence)
+                      OR cto.concept_id IN (SELECT id FROM reset_scan_concepts))""",
             """CREATE TEMP TABLE reset_scan_lexemes AS
                SELECT DISTINCT l.id FROM lexemes l
                WHERE (
                    EXISTS(SELECT 1 FROM candidate_resolutions cr
-                          WHERE cr.lexeme_id=l.id)
+                          WHERE cr.lexeme_id=l.id
+                            AND cr.id IN (
+                                SELECT id FROM reset_scan_candidate_resolutions))
                    OR EXISTS(SELECT 1 FROM mentions m
                              WHERE m.lexeme_id=l.id
                                AND m.id IN (SELECT id FROM reset_scan_mentions))
-                   OR EXISTS(SELECT 1 FROM reset_scan_form_occurrences r
-                             WHERE r.lexeme_id=l.id)
                    OR EXISTS(SELECT 1 FROM concept_type_observations cto
                              WHERE cto.lexeme_id=l.id
                                AND cto.id IN (
@@ -3994,13 +4044,7 @@ class V4Database:
                        AND m.id NOT IN (SELECT id FROM reset_scan_mentions))
                  AND NOT EXISTS(
                      SELECT 1 FROM form_occurrences fo
-                     WHERE fo.lexeme_id=l.id
-                       AND NOT EXISTS(
-                           SELECT 1 FROM reset_scan_form_occurrences r
-                           WHERE r.lexeme_id=fo.lexeme_id
-                             AND r.block_id=fo.block_id
-                             AND r.start_offset=fo.start_offset
-                             AND r.end_offset=fo.end_offset))
+                     WHERE fo.lexeme_id=l.id)
                  AND NOT EXISTS(
                      SELECT 1 FROM concept_type_observations cto
                      WHERE cto.lexeme_id=l.id
@@ -4090,18 +4134,16 @@ class V4Database:
                                ORDER BY id""",
             "runs": "SELECT id,stage,status,started_at,finished_at FROM runs WHERE id IN (SELECT id FROM reset_scan_runs) ORDER BY id",
             "blocks_reset": "SELECT id,status,last_error,updated_at FROM blocks WHERE id IN (SELECT id FROM reset_scan_blocks) ORDER BY id",
-            "lexical_candidates": "SELECT id,updated_at,resolution_status,selected FROM lexical_candidates ORDER BY id",
-            "candidate_clusters": "SELECT id,run_id,updated_at FROM candidate_clusters ORDER BY id",
-            "candidate_cluster_members": "SELECT cluster_id,candidate_id,role FROM candidate_cluster_members ORDER BY cluster_id,candidate_id",
-            "candidate_adjudications": "SELECT id,active,payload_hash,updated_at FROM candidate_adjudications ORDER BY id",
-            "candidate_resolutions": "SELECT id,adjudication_id,decision FROM candidate_resolutions ORDER BY id",
+            "lexical_candidates": "SELECT id,updated_at,resolution_status,selected FROM lexical_candidates WHERE id IN (SELECT id FROM reset_scan_lexical_candidates) ORDER BY id",
+            "candidate_clusters": "SELECT id,run_id,updated_at FROM candidate_clusters WHERE id IN (SELECT id FROM reset_scan_candidate_clusters) ORDER BY id",
+            "candidate_cluster_members": """SELECT cluster_id,candidate_id,role
+                FROM candidate_cluster_members m WHERE EXISTS(
+                    SELECT 1 FROM reset_scan_candidate_cluster_members r
+                    WHERE r.cluster_id=m.cluster_id AND r.candidate_id=m.candidate_id)
+                ORDER BY cluster_id,candidate_id""",
+            "candidate_adjudications": "SELECT id,active,payload_hash,updated_at FROM candidate_adjudications WHERE id IN (SELECT id FROM reset_scan_candidate_adjudications) ORDER BY id",
+            "candidate_resolutions": "SELECT id,adjudication_id,decision FROM candidate_resolutions WHERE id IN (SELECT id FROM reset_scan_candidate_resolutions) ORDER BY id",
             "concept_type_observations": "SELECT id,lexeme_id,mention_id,evidence_id,adjudication_id FROM concept_type_observations WHERE id IN (SELECT id FROM reset_scan_type_observations) ORDER BY id",
-            "form_occurrences": """SELECT lexeme_id,block_id,start_offset,end_offset,source_hash
-                FROM form_occurrences fo WHERE EXISTS(
-                    SELECT 1 FROM reset_scan_form_occurrences r
-                    WHERE r.lexeme_id=fo.lexeme_id AND r.block_id=fo.block_id
-                      AND r.start_offset=fo.start_offset AND r.end_offset=fo.end_offset)
-                ORDER BY lexeme_id,block_id,start_offset,end_offset""",
             "usage_decisions": "SELECT id,mention_id,status,locked,created_at FROM usage_decisions WHERE id IN (SELECT id FROM reset_scan_usage_decisions) ORDER BY id",
             "mentions": "SELECT id,evidence_id,concept_id FROM mentions WHERE id IN (SELECT id FROM reset_scan_mentions) ORDER BY id",
             "evidence": "SELECT id,extractor,created_at FROM evidence WHERE id IN (SELECT id FROM reset_scan_evidence) ORDER BY id",
@@ -4192,14 +4234,12 @@ class V4Database:
                 ("verification_votes", "DELETE FROM verification_votes WHERE id IN (SELECT id FROM reset_scan_verification_votes)"),
                 ("verification_tasks", "DELETE FROM verification_tasks WHERE id IN (SELECT id FROM reset_scan_verification_tasks)"),
                 ("concept_type_observations", "DELETE FROM concept_type_observations WHERE id IN (SELECT id FROM reset_scan_type_observations)"),
-                ("candidate_resolutions", "DELETE FROM candidate_resolutions"),
-                ("candidate_adjudications", "DELETE FROM candidate_adjudications"),
-                ("candidate_cluster_members", "DELETE FROM candidate_cluster_members"),
-                ("candidate_clusters", "DELETE FROM candidate_clusters"),
-                ("form_occurrences", """DELETE FROM form_occurrences AS fo WHERE EXISTS(
-                    SELECT 1 FROM reset_scan_form_occurrences r
-                    WHERE r.lexeme_id=fo.lexeme_id AND r.block_id=fo.block_id
-                      AND r.start_offset=fo.start_offset AND r.end_offset=fo.end_offset)"""),
+                ("candidate_resolutions", "DELETE FROM candidate_resolutions WHERE id IN (SELECT id FROM reset_scan_candidate_resolutions)"),
+                ("candidate_adjudications", "DELETE FROM candidate_adjudications WHERE id IN (SELECT id FROM reset_scan_candidate_adjudications)"),
+                ("candidate_cluster_members", """DELETE FROM candidate_cluster_members AS m WHERE EXISTS(
+                    SELECT 1 FROM reset_scan_candidate_cluster_members r
+                    WHERE r.cluster_id=m.cluster_id AND r.candidate_id=m.candidate_id)"""),
+                ("candidate_clusters", "DELETE FROM candidate_clusters WHERE id IN (SELECT id FROM reset_scan_candidate_clusters)"),
                 ("usage_decisions", "DELETE FROM usage_decisions WHERE id IN (SELECT id FROM reset_scan_usage_decisions)"),
                 ("mentions", "DELETE FROM mentions WHERE id IN (SELECT id FROM reset_scan_mentions)"),
                 ("claim_evidence", """DELETE FROM claim_evidence WHERE EXISTS(
@@ -4230,7 +4270,7 @@ class V4Database:
                 "DELETE FROM lexemes WHERE id IN (SELECT id FROM reset_scan_lexemes)"
             ).rowcount
             deleted["lexical_candidates"] = connection.execute(
-                "DELETE FROM lexical_candidates"
+                "DELETE FROM lexical_candidates WHERE id IN (SELECT id FROM reset_scan_lexical_candidates)"
             ).rowcount
             deleted["blocks_reset"] = connection.execute(
                 """UPDATE blocks SET status=?, last_error=NULL, updated_at=?
