@@ -189,7 +189,8 @@ def test_isolated_exact_local_components_merge_across_blocks():
 
     assert len(clusters) == 1
     assert clusters[0].affected_blocks == 2
-    assert {alternative.id for alternative in clusters[0].alternatives} == {
+    assert len(clusters[0].alternatives) == 1
+    assert {context.candidate_id for context in clusters[0].contexts} == {
         "candidate-a",
         "candidate-b",
     }
@@ -221,8 +222,29 @@ def test_alternative_selection_uses_the_longest_full_cluster_member():
         [structural_short, plain_long]
     )[0]
 
-    assert structural_short in cluster.alternatives
     assert plain_long in cluster.alternatives
+    assert structural_short not in cluster.alternatives
+    assert len(cluster.alternatives) == 1
+
+
+def test_cross_block_occurrences_do_not_displace_distinct_atomic_alternatives():
+    source_text = "Astra and Boreal and Cyra waited."
+    blocks = [
+        make_block(source_text, block_id="block-a"),
+        make_block(source_text, block_id="block-b"),
+    ]
+    extractor = LexicalCandidateExtractor(blocks, max_candidates=80)
+    candidates = [candidate for block in blocks for candidate in extractor.extract(block)]
+
+    cluster = CandidateClusterBuilder(max_alternatives=4).build(candidates)[0]
+
+    assert set(cluster.texts) == {
+        "Astra",
+        "Boreal",
+        "Cyra",
+        "Astra and Boreal and Cyra",
+    }
+    assert len(cluster.alternatives) == 4
 
 
 def test_batches_cap_clusters_and_alternatives_and_use_reversible_local_aliases():
@@ -287,4 +309,18 @@ def test_batch_rejects_duplicate_candidate_ids_before_building_reverse_aliases()
     invalid_cluster = replace(base_cluster, alternatives=(alternative, alternative))
 
     with pytest.raises(ValueError, match="candidate ids must be unique"):
+        CandidateClusterBuilder().batch([invalid_cluster])
+
+
+def test_batch_rejects_external_cluster_with_more_than_three_contexts():
+    block = make_block("Drotte waited.")
+    base_cluster = CandidateClusterBuilder().build(
+        LexicalCandidateExtractor([block], max_candidates=80).extract(block)
+    )[0]
+    invalid_cluster = replace(
+        base_cluster,
+        contexts=(base_cluster.contexts[0],) * 4,
+    )
+
+    with pytest.raises(ValueError, match="at most 3 contexts"):
         CandidateClusterBuilder().batch([invalid_cluster])

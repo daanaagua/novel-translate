@@ -127,28 +127,33 @@ class CandidateClusterBuilder:
         self, members: Sequence[LexicalCandidate]
     ) -> tuple[LexicalCandidate, ...]:
         eligible = tuple(members)
-        selected: list[LexicalCandidate] = []
+        by_signature: Dict[str, list[LexicalCandidate]] = {}
+        for candidate in eligible:
+            by_signature.setdefault(self._span_signature(candidate), []).append(candidate)
 
-        def add(candidate: LexicalCandidate) -> None:
-            if candidate not in selected and len(selected) < self.max_alternatives:
-                selected.append(candidate)
+        def structural_risk_count(candidate: LexicalCandidate) -> int:
+            return len(set(candidate.risk_flags) - {"span_competition"})
 
-        structural = sorted(
-            (
-                candidate
-                for candidate in eligible
-                if set(candidate.risk_flags) - {"span_competition"}
-            ),
-            key=lambda candidate: (
-                -len(set(candidate.risk_flags) - {"span_competition"}),
-                -(candidate.end_offset - candidate.start_offset),
-                self._span_signature(candidate),
-                self._location_key(candidate),
-            ),
-        )
-        structural_slots = max(1, self.max_alternatives // 2)
-        for candidate in structural[:structural_slots]:
-            add(candidate)
+        def representative(signature: str, *, prefer_longest: bool) -> LexicalCandidate:
+            if prefer_longest:
+                return min(
+                    by_signature[signature],
+                    key=lambda candidate: (
+                        -(candidate.end_offset - candidate.start_offset),
+                        -structural_risk_count(candidate),
+                        -candidate.score,
+                        self._location_key(candidate),
+                    ),
+                )
+            return min(
+                by_signature[signature],
+                key=lambda candidate: (
+                    -structural_risk_count(candidate),
+                    -(candidate.end_offset - candidate.start_offset),
+                    -candidate.score,
+                    self._location_key(candidate),
+                ),
+            )
 
         longest = min(
             eligible,
@@ -158,33 +163,56 @@ class CandidateClusterBuilder:
                 self._location_key(candidate),
             ),
         )
-        add(longest)
+        longest_signature = self._span_signature(longest)
+        selected_signatures: list[str] = []
 
-        atoms = sorted(
-            (
-                candidate
-                for candidate in eligible
-                if len(self._span_signature(candidate).split()) == 1
+        def add_signature(signature: str) -> None:
+            if (
+                signature not in selected_signatures
+                and len(selected_signatures) < self.max_alternatives
+            ):
+                selected_signatures.append(signature)
+
+        add_signature(longest_signature)
+
+        atomic_signatures = sorted(
+            (signature for signature in by_signature if len(signature.split()) == 1),
+            key=lambda signature: min(
+                self._location_key(candidate) for candidate in by_signature[signature]
             ),
-            key=self._location_key,
         )
-        for candidate in atoms:
-            add(candidate)
+        for signature in atomic_signatures:
+            add_signature(signature)
 
-        remaining = sorted(
-            eligible,
-            key=lambda candidate: (
-                -len(candidate.risk_flags),
+        def structural_signature_key(signature: str) -> tuple[object, ...]:
+            candidate = representative(signature, prefer_longest=False)
+            return (
+                -structural_risk_count(candidate),
                 -(candidate.end_offset - candidate.start_offset),
-                -candidate.score,
-                self._span_signature(candidate),
-                self._location_key(candidate),
-            ),
-        )
-        for candidate in remaining:
-            add(candidate)
+                signature,
+            )
 
-        return tuple(selected)
+        structural_signatures = sorted(
+            (
+                signature
+                for signature, candidates in by_signature.items()
+                if any(structural_risk_count(candidate) for candidate in candidates)
+            ),
+            key=structural_signature_key,
+        )
+        for signature in structural_signatures:
+            add_signature(signature)
+
+        for signature in sorted(by_signature):
+            add_signature(signature)
+
+        return tuple(
+            representative(
+                signature,
+                prefer_longest=signature == longest_signature,
+            )
+            for signature in selected_signatures
+        )
 
     @staticmethod
     def _as_context(candidate: LexicalCandidate) -> CandidateContext:
@@ -315,6 +343,8 @@ class CandidateClusterBuilder:
         for cluster in ordered:
             if len(cluster.alternatives) > 4:
                 raise ValueError("clusters may contain at most 4 alternatives")
+            if len(cluster.contexts) > 3:
+                raise ValueError("clusters may contain at most 3 contexts")
             for alternative in cluster.alternatives:
                 if alternative.id in seen_candidate_ids:
                     raise ValueError("candidate ids must be unique within a batch request")
