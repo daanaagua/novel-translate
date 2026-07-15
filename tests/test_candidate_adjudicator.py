@@ -778,6 +778,27 @@ def test_invalid_first_attempt_can_retry_with_the_same_local_aliases():
     assert user_payload(llm.requests[0]) == user_payload(llm.requests[1])
 
 
+def test_batch_outcome_buffers_audits_without_database_writes():
+    source = "Alpha waited."
+    item = cluster("cluster-a", [candidate("candidate-a", source, 0, 5)])
+    llm = FakeLLM([response()])
+
+    outcome = V4Adjudicator(llm, max_attempts=1)._adjudicate_batch_outcome(
+        3,
+        (item,),
+        {"block-1": source},
+        knowledge_version=7,
+    )
+
+    assert outcome.batch_index == 3
+    assert outcome.results[0].verdict == "promote"
+    assert outcome.model_calls == 1
+    assert len(outcome.audit_attempts) == 1
+    assert outcome.audit_attempts[0].accepted is True
+    assert outcome.audit_attempts[0].knowledge_version == 7
+    assert outcome.audit_attempts[0].model == "FakeLLM"
+
+
 def test_full_audit_records_each_adjudication_attempt_without_stable_ids():
     source = "Alpha waited."
     item = cluster("cluster-a", [candidate("candidate-a", source, 0, 5)])

@@ -74,6 +74,40 @@ class AdjudicationResult:
 
 
 @dataclass(frozen=True)
+class AdjudicationAuditAttempt:
+    """One model attempt buffered until the coordinator persists its batch."""
+
+    messages: tuple[Mapping[str, str], ...]
+    raw_response: str
+    parsed: Optional[Mapping[str, Any]]
+    accepted: bool
+    attempt: int
+    elapsed_ms: int
+    error: Optional[str]
+    error_kind: Optional[str]
+    model: str
+    knowledge_version: int
+
+
+@dataclass(frozen=True)
+class AdjudicationBatchOutcome:
+    """Pure worker output; it contains no database side effects."""
+
+    batch_index: int
+    results: tuple[AdjudicationResult, ...]
+    audit_attempts: tuple[AdjudicationAuditAttempt, ...]
+    model_calls: int
+    model_elapsed_ms_sum: int
+    error_kinds: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class _RoundOutcome:
+    results: Optional[Mapping[str, AdjudicationResult]]
+    audit_attempts: tuple[AdjudicationAuditAttempt, ...]
+
+
+@dataclass(frozen=True)
 class _RoundBatch:
     clusters: tuple[CandidateCluster, ...]
     cluster_by_alias: Mapping[str, CandidateCluster]
@@ -300,14 +334,18 @@ class V4Adjudicator:
             )
         return resolved
 
+    def _model_name(self) -> str:
+        try:
+            return str(self.llm.get_model("candidate_adjudication"))
+        except (AttributeError, KeyError, TypeError):
+            return type(self.llm).__name__
+
     def _call_round(
         self,
         round_batch: _RoundBatch,
         *,
-        run_id: Optional[str] = None,
-        database: Optional[Any] = None,
-        knowledge_version: Optional[int] = None,
-    ) -> Dict[str, AdjudicationResult] | None:
+        knowledge_version: int,
+    ) -> _RoundOutcome:
         base_messages = [
             {"role": "system", "content": ADJUDICATION_SYSTEM},
             {
@@ -316,6 +354,8 @@ class V4Adjudicator:
             },
         ]
         last_error = ""
+        audit_attempts = []
+        model = self._model_name()
         for _attempt in range(1, self.max_attempts + 1):
             messages = list(base_messages)
             if last_error:
@@ -344,73 +384,62 @@ class V4Adjudicator:
                 resolved = self._resolve_decisions(parsed, round_batch)
             except Exception as exc:
                 last_error = str(exc)
-                if run_id and database is not None:
-                    self._record_audit_attempt(
-                        database,
-                        run_id,
-                        messages,
-                        raw,
-                        parsed_payload,
+                audit_attempts.append(
+                    AdjudicationAuditAttempt(
+                        messages=tuple(dict(message) for message in messages),
+                        raw_response=str(raw or ""),
+                        parsed=parsed_payload,
                         accepted=False,
                         attempt=_attempt,
                         elapsed_ms=int((time.perf_counter() - started) * 1000),
                         error=last_error,
-                        knowledge_version=knowledge_version,
+                        error_kind=None,
+                        model=model,
+                        knowledge_version=int(knowledge_version),
                     )
+                )
                 continue
-            if run_id and database is not None:
-                self._record_audit_attempt(
-                    database,
-                    run_id,
-                    messages,
-                    raw,
-                    parsed_payload,
+            audit_attempts.append(
+                AdjudicationAuditAttempt(
+                    messages=tuple(dict(message) for message in messages),
+                    raw_response=str(raw or ""),
+                    parsed=parsed_payload,
                     accepted=True,
                     attempt=_attempt,
                     elapsed_ms=int((time.perf_counter() - started) * 1000),
                     error=None,
-                    knowledge_version=knowledge_version,
+                    error_kind=None,
+                    model=model,
+                    knowledge_version=int(knowledge_version),
                 )
-            return resolved
-        return None
+            )
+            return _RoundOutcome(resolved, tuple(audit_attempts))
+        return _RoundOutcome(None, tuple(audit_attempts))
 
-    def _record_audit_attempt(
+    def _persist_audit_attempts(
         self,
         database: Any,
         run_id: str,
-        messages: Sequence[Dict[str, str]],
-        raw_response: str,
-        parsed: Optional[Dict[str, Any]],
-        *,
-        accepted: bool,
-        attempt: int,
-        elapsed_ms: int,
-        error: Optional[str],
-        knowledge_version: Optional[int],
+        audit_attempts: Sequence[AdjudicationAuditAttempt],
     ) -> None:
-        version = (
-            int(knowledge_version)
-            if knowledge_version is not None
-            else int(database.current_knowledge_version())
-        )
-        try:
-            model = self.llm.get_model("candidate_adjudication")
-        except (AttributeError, KeyError, TypeError):
-            model = type(self.llm).__name__
-        database.record_audit_call(
-            run_id=run_id,
-            block_id=None,
-            purpose="candidate_adjudication",
-            model=str(model),
-            knowledge_version=version,
-            request={"messages": list(messages), "audit_mode": self.audit_mode},
-            raw_response=str(raw_response or ""),
-            parsed=parsed,
-            accepted=accepted,
-            attempts=attempt,
-            elapsed_ms=elapsed_ms,
-            error=error,
-        )
+        for audit in audit_attempts:
+            database.record_audit_call(
+                run_id=run_id,
+                block_id=None,
+                purpose="candidate_adjudication",
+                model=audit.model,
+                knowledge_version=audit.knowledge_version,
+                request={
+                    "messages": [dict(message) for message in audit.messages],
+                    "audit_mode": self.audit_mode,
+                },
+                raw_response=audit.raw_response,
+                parsed=dict(audit.parsed) if audit.parsed is not None else None,
+                accepted=audit.accepted,
+                attempts=audit.attempt,
+                elapsed_ms=audit.elapsed_ms,
+                error=audit.error,
+            )
 
     @staticmethod
     def _needs_independent_round(
@@ -472,60 +501,69 @@ class V4Adjudicator:
             rounds=rounds,
         )
 
-    def _adjudicate_one_batch(
+    def _adjudicate_batch_outcome(
         self,
+        batch_index: int,
         clusters: Sequence[CandidateCluster],
         source_texts: Mapping[str, str],
         *,
-        run_id: Optional[str] = None,
-        database: Optional[Any] = None,
-        knowledge_version: Optional[int] = None,
-    ) -> tuple[AdjudicationResult, ...]:
+        knowledge_version: int,
+    ) -> AdjudicationBatchOutcome:
         ordered = tuple(sorted(clusters, key=lambda cluster: cluster.id))
         if not self._source_spans_are_valid(ordered, source_texts):
-            return tuple(
+            results = tuple(
                 self._deferred(cluster, "model_protocol_failure", rounds=0)
                 for cluster in ordered
+            )
+            return AdjudicationBatchOutcome(
+                batch_index=batch_index,
+                results=results,
+                audit_attempts=(),
+                model_calls=0,
+                model_elapsed_ms_sum=0,
+                error_kinds=(),
             )
 
         first_round = self._round_batch(ordered, reverse_alternatives=False)
         first = self._call_round(
             first_round,
-            run_id=run_id,
-            database=database,
             knowledge_version=knowledge_version,
         )
-        if first is None:
-            return tuple(
+        if first.results is None:
+            results = tuple(
                 self._deferred(cluster, "model_protocol_failure", rounds=1)
                 for cluster in ordered
+            )
+            return self._batch_outcome(
+                batch_index, results, first.audit_attempts
             )
 
         risky = tuple(
             cluster
             for cluster in ordered
-            if self._needs_independent_round(cluster, first[cluster.id])
+            if self._needs_independent_round(cluster, first.results[cluster.id])
         )
         if not risky:
-            return tuple(first[cluster.id] for cluster in ordered)
+            results = tuple(first.results[cluster.id] for cluster in ordered)
+            return self._batch_outcome(
+                batch_index, results, first.audit_attempts
+            )
 
         second_round = self._round_batch(risky, reverse_alternatives=True)
         second = self._call_round(
             second_round,
-            run_id=run_id,
-            database=database,
             knowledge_version=knowledge_version,
         )
-        final = dict(first)
-        if second is None:
+        final = dict(first.results)
+        if second.results is None:
             for cluster in risky:
                 final[cluster.id] = self._deferred(
                     cluster, "model_protocol_failure", rounds=2
                 )
         else:
             for cluster in risky:
-                first_decision = first[cluster.id]
-                second_decision = second[cluster.id]
+                first_decision = first.results[cluster.id]
+                second_decision = second.results[cluster.id]
                 if not self._semantically_equal(first_decision, second_decision):
                     final[cluster.id] = self._deferred(
                         cluster, "independent_verdict_conflict", rounds=2
@@ -538,7 +576,56 @@ class V4Adjudicator:
                         ),
                         rounds=2,
                     )
-        return tuple(final[cluster.id] for cluster in ordered)
+        results = tuple(final[cluster.id] for cluster in ordered)
+        return self._batch_outcome(
+            batch_index,
+            results,
+            first.audit_attempts + second.audit_attempts,
+        )
+
+    @staticmethod
+    def _batch_outcome(
+        batch_index: int,
+        results: Sequence[AdjudicationResult],
+        audit_attempts: Sequence[AdjudicationAuditAttempt],
+    ) -> AdjudicationBatchOutcome:
+        attempts = tuple(audit_attempts)
+        return AdjudicationBatchOutcome(
+            batch_index=batch_index,
+            results=tuple(results),
+            audit_attempts=attempts,
+            model_calls=len(attempts),
+            model_elapsed_ms_sum=sum(item.elapsed_ms for item in attempts),
+            error_kinds=tuple(
+                item.error_kind for item in attempts if item.error_kind is not None
+            ),
+        )
+
+    def _adjudicate_one_batch(
+        self,
+        clusters: Sequence[CandidateCluster],
+        source_texts: Mapping[str, str],
+        *,
+        run_id: Optional[str] = None,
+        database: Optional[Any] = None,
+        knowledge_version: Optional[int] = None,
+    ) -> tuple[AdjudicationResult, ...]:
+        version = knowledge_version
+        if version is None:
+            version = (
+                int(database.current_knowledge_version())
+                if database is not None
+                else 0
+            )
+        outcome = self._adjudicate_batch_outcome(
+            0,
+            clusters,
+            source_texts,
+            knowledge_version=int(version),
+        )
+        if run_id and database is not None:
+            self._persist_audit_attempts(database, run_id, outcome.audit_attempts)
+        return outcome.results
 
     def adjudicate(
         self,
