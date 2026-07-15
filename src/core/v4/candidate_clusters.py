@@ -6,7 +6,7 @@ import hashlib
 from dataclasses import dataclass
 from typing import Dict, Mapping, Sequence
 
-from .lexical_index import LexicalCandidate, lexical_key
+from .lexical_index import LexicalCandidate, lexical_key, normalize_punctuation
 
 
 @dataclass(frozen=True)
@@ -103,6 +103,19 @@ class CandidateClusterBuilder:
         return lexical_key(candidate.normalized_text or candidate.original_text)
 
     @classmethod
+    def _alternative_equivalence_key(
+        cls, candidate: LexicalCandidate
+    ) -> tuple[str, str, tuple[str, ...]]:
+        normalized_surface = " ".join(
+            normalize_punctuation(candidate.original_text).casefold().split()
+        )
+        return (
+            cls._span_signature(candidate),
+            normalized_surface,
+            tuple(sorted(set(candidate.risk_flags))),
+        )
+
+    @classmethod
     def _candidate_key(cls, candidate: LexicalCandidate) -> tuple[object, ...]:
         return cls._location_key(candidate) + (
             cls._span_signature(candidate),
@@ -127,17 +140,24 @@ class CandidateClusterBuilder:
         self, members: Sequence[LexicalCandidate]
     ) -> tuple[LexicalCandidate, ...]:
         eligible = tuple(members)
-        by_signature: Dict[str, list[LexicalCandidate]] = {}
+        by_equivalence: Dict[
+            tuple[str, str, tuple[str, ...]], list[LexicalCandidate]
+        ] = {}
         for candidate in eligible:
-            by_signature.setdefault(self._span_signature(candidate), []).append(candidate)
+            key = self._alternative_equivalence_key(candidate)
+            by_equivalence.setdefault(key, []).append(candidate)
 
         def structural_risk_count(candidate: LexicalCandidate) -> int:
             return len(set(candidate.risk_flags) - {"span_competition"})
 
-        def representative(signature: str, *, prefer_longest: bool) -> LexicalCandidate:
+        def representative(
+            key: tuple[str, str, tuple[str, ...]],
+            *,
+            prefer_longest: bool,
+        ) -> LexicalCandidate:
             if prefer_longest:
                 return min(
-                    by_signature[signature],
+                    by_equivalence[key],
                     key=lambda candidate: (
                         -(candidate.end_offset - candidate.start_offset),
                         -structural_risk_count(candidate),
@@ -146,7 +166,7 @@ class CandidateClusterBuilder:
                     ),
                 )
             return min(
-                by_signature[signature],
+                by_equivalence[key],
                 key=lambda candidate: (
                     -structural_risk_count(candidate),
                     -(candidate.end_offset - candidate.start_offset),
@@ -163,55 +183,57 @@ class CandidateClusterBuilder:
                 self._location_key(candidate),
             ),
         )
-        longest_signature = self._span_signature(longest)
-        selected_signatures: list[str] = []
+        longest_key = self._alternative_equivalence_key(longest)
+        selected_keys: list[tuple[str, str, tuple[str, ...]]] = []
 
-        def add_signature(signature: str) -> None:
+        def add_key(key: tuple[str, str, tuple[str, ...]]) -> None:
             if (
-                signature not in selected_signatures
-                and len(selected_signatures) < self.max_alternatives
+                key not in selected_keys
+                and len(selected_keys) < self.max_alternatives
             ):
-                selected_signatures.append(signature)
+                selected_keys.append(key)
 
-        add_signature(longest_signature)
+        add_key(longest_key)
 
-        atomic_signatures = sorted(
-            (signature for signature in by_signature if len(signature.split()) == 1),
-            key=lambda signature: min(
-                self._location_key(candidate) for candidate in by_signature[signature]
+        atomic_keys = sorted(
+            (key for key in by_equivalence if len(key[0].split()) == 1),
+            key=lambda key: min(
+                self._location_key(candidate) for candidate in by_equivalence[key]
             ),
         )
-        for signature in atomic_signatures:
-            add_signature(signature)
+        for key in atomic_keys:
+            add_key(key)
 
-        def structural_signature_key(signature: str) -> tuple[object, ...]:
-            candidate = representative(signature, prefer_longest=False)
+        def structural_key(
+            key: tuple[str, str, tuple[str, ...]]
+        ) -> tuple[object, ...]:
+            candidate = representative(key, prefer_longest=False)
             return (
                 -structural_risk_count(candidate),
                 -(candidate.end_offset - candidate.start_offset),
-                signature,
+                key,
             )
 
-        structural_signatures = sorted(
+        structural_keys = sorted(
             (
-                signature
-                for signature, candidates in by_signature.items()
+                key
+                for key, candidates in by_equivalence.items()
                 if any(structural_risk_count(candidate) for candidate in candidates)
             ),
-            key=structural_signature_key,
+            key=structural_key,
         )
-        for signature in structural_signatures:
-            add_signature(signature)
+        for key in structural_keys:
+            add_key(key)
 
-        for signature in sorted(by_signature):
-            add_signature(signature)
+        for key in sorted(by_equivalence):
+            add_key(key)
 
         return tuple(
             representative(
-                signature,
-                prefer_longest=signature == longest_signature,
+                key,
+                prefer_longest=key == longest_key,
             )
-            for signature in selected_signatures
+            for key in selected_keys
         )
 
     @staticmethod

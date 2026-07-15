@@ -223,8 +223,8 @@ def test_alternative_selection_uses_the_longest_full_cluster_member():
     )[0]
 
     assert plain_long in cluster.alternatives
-    assert structural_short not in cluster.alternatives
-    assert len(cluster.alternatives) == 1
+    assert structural_short in cluster.alternatives
+    assert len(cluster.alternatives) == 2
 
 
 def test_cross_block_occurrences_do_not_displace_distinct_atomic_alternatives():
