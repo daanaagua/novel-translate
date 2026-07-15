@@ -420,10 +420,6 @@ _TITLE_DIRECTORY_BLOCK_KINDS = {
 }
 
 
-def _title_fingerprint(value: Any) -> str:
-    return normalize_english_form(str(value or ""))
-
-
 class CoreferenceCoordinator:
     """Freeze same-lexeme cases and coordinate their local protocol."""
 
@@ -751,26 +747,128 @@ class CoreferenceCoordinator:
         connection: sqlite3.Connection,
         concept_id: str,
     ) -> tuple[str | None, bool]:
-        current = concept_id
-        visited: set[str] = set()
-        redirected = False
-        while current not in visited:
-            visited.add(current)
+        return V4Database._active_canonical_concept(connection, concept_id)
+
+    @staticmethod
+    def _validate_case_anchors(
+        case: CoreferenceCase,
+        rows: Sequence[Mapping[str, Any]],
+        connection: sqlite3.Connection,
+    ) -> None:
+        payload_anchor_ids = tuple(
+            anchor.concept_id for anchor in case.concept_anchors
+        )
+        if len(set(payload_anchor_ids)) != len(payload_anchor_ids):
+            raise CoreferenceProtocolError(
+                "coreference case contains duplicate concept anchors"
+            )
+
+        persisted: dict[str, sqlite3.Row] = {}
+        for anchor in case.concept_anchors:
             row = connection.execute(
-                """SELECT canonical_concept_id FROM concept_redirects
-                   WHERE retired_concept_id=?""",
-                (current,),
+                """SELECT c.kind, c.canonical_source, c.status,
+                          c.primary_lexeme_id, c.anchor_mention_id,
+                          c.retired_version
+                   FROM concepts c WHERE c.id=?""",
+                (anchor.concept_id,),
             ).fetchone()
-            if row is None:
-                active = connection.execute(
-                    """SELECT 1 FROM concepts
-                       WHERE id=? AND retired_version IS NULL""",
-                    (current,),
-                ).fetchone()
-                return (current if active is not None else None, redirected)
-            current = str(row["canonical_concept_id"])
-            redirected = True
-        return (None, redirected)
+            if row is None or row["retired_version"] is not None:
+                raise CoreferenceProtocolError(
+                    f"concept anchor is not active: {anchor.concept_id}"
+                )
+            best_link = connection.execute(
+                """SELECT role, evidence_id FROM concept_lexemes
+                   WHERE concept_id=? AND lexeme_id=?
+                         AND retired_version IS NULL
+                   ORDER BY CASE role
+                                WHEN 'primary' THEN 0
+                                WHEN 'title' THEN 1
+                                WHEN 'alias' THEN 2
+                                ELSE 3
+                            END,
+                            COALESCE(evidence_id, -1)
+                   LIMIT 1""",
+                (anchor.concept_id, case.lexeme_id),
+            ).fetchone()
+            direct_binding = connection.execute(
+                """SELECT 1 FROM mentions m
+                   JOIN blocks b ON b.id=m.block_id
+                   JOIN source_editions se
+                     ON se.id=b.source_edition_id AND se.active=1
+                   WHERE m.lexeme_id=? AND m.concept_id=?
+                   LIMIT 1""",
+                (case.lexeme_id, anchor.concept_id),
+            ).fetchone()
+            if (
+                str(row["primary_lexeme_id"] or "") != case.lexeme_id
+                and best_link is None
+            ):
+                raise CoreferenceProtocolError(
+                    f"concept anchor belongs to another lexeme: "
+                    f"{anchor.concept_id}"
+                )
+            expected_role = (
+                str(best_link["role"])
+                if best_link is not None
+                else "mention"
+            )
+            expected_evidence_id = (
+                best_link["evidence_id"]
+                if best_link is not None
+                else None
+            )
+            if best_link is None and direct_binding is None:
+                raise CoreferenceProtocolError(
+                    f"concept anchor is not legal for the current lexeme: "
+                    f"{anchor.concept_id}"
+                )
+            if (
+                str(row["kind"]) != anchor.kind
+                or str(row["canonical_source"]) != anchor.canonical_source
+                or str(row["status"]) != anchor.status
+                or expected_role != anchor.role
+                or expected_evidence_id != anchor.evidence_id
+            ):
+                raise CoreferenceProtocolError(
+                    f"concept anchor metadata does not match persisted data: "
+                    f"{anchor.concept_id}"
+                )
+            if row["anchor_mention_id"] != anchor.anchor_mention_id:
+                raise CoreferenceProtocolError(
+                    f"concept anchor mention does not match persisted data: "
+                    f"{anchor.concept_id}"
+                )
+            persisted[anchor.concept_id] = row
+
+        row_by_mention = {
+            int(row["mention_id"]): row
+            for row in rows
+        }
+        available = set(payload_anchor_ids)
+        for mention in case.mentions:
+            if len(set(mention.concept_anchor_ids)) != len(
+                mention.concept_anchor_ids
+            ):
+                raise CoreferenceProtocolError(
+                    f"mention {mention.mention_id} contains duplicate anchors"
+                )
+            for anchor_id in mention.concept_anchor_ids:
+                if anchor_id not in available:
+                    raise CoreferenceProtocolError(
+                        f"mention anchor is not present in case payload: "
+                        f"{anchor_id}"
+                    )
+                mention_row = row_by_mention[mention.mention_id]
+                persisted_anchor = persisted[anchor_id]
+                if (
+                    str(mention_row["concept_id"] or "") != anchor_id
+                    and persisted_anchor["anchor_mention_id"]
+                    != mention.mention_id
+                ):
+                    raise CoreferenceProtocolError(
+                        f"mention anchor is inconsistent with persisted data: "
+                        f"{anchor_id}"
+                    )
 
     @staticmethod
     def _candidate_span(
@@ -887,6 +985,7 @@ class CoreferenceCoordinator:
             int(row["mention_id"]): _decoded_mapping(row["payload_json"])
             for row in rows
         }
+        self._validate_case_anchors(case, rows, connection)
 
         raw_anchor_ids = {
             str(row["concept_id"])
@@ -950,7 +1049,7 @@ class CoreferenceCoordinator:
                 str(decision["right_anchor_id"]),
             }
             if (
-                str(decision["relation"]) == "different"
+                str(decision["relation"]) in {"different", "non_entity"}
                 and bool(set(mention_ids) & members)
             ) or set(mention_ids) <= members or (
                 len(raw_anchor_ids & decision_anchors) >= 2
@@ -973,26 +1072,47 @@ class CoreferenceCoordinator:
                 }
             return {"relation": None, "rule": None, "target": None}
 
-        concept_rows = {
-            str(row["id"]): row
-            for row in connection.execute(
-                """SELECT id, kind, locked, status FROM concepts
-                   WHERE id IN ("""
-                + (",".join("?" for _ in raw_anchor_ids) or "NULL")
-                + ")",
-                tuple(sorted(raw_anchor_ids)),
-            ).fetchall()
-        }
-        protected_distinct = protected_concept_ids & raw_anchor_ids
-        person_anchor_ids = {
-            concept_id
-            for concept_id, row in concept_rows.items()
-            if str(row["kind"]).strip().casefold()
-            in {"character", "human", "person", "personage"}
-        }
-        if len(canonical_anchor_ids) > 1 and (
-            len(protected_distinct) > 1 or len(person_anchor_ids) > 1
-        ):
+        duplicate_subset = False
+        duplicate_targets: set[str] = set()
+        duplicate_has_invalid_target = False
+        for decision in connection.execute(
+            """SELECT left_anchor_type, left_anchor_id,
+                      right_anchor_type, right_anchor_id,
+                      anchor_members_json
+               FROM coreference_decisions
+               WHERE lexeme_id=? AND retired_version IS NULL
+                     AND relation='same'
+               ORDER BY id""",
+            (case.lexeme_id,),
+        ).fetchall():
+            previous = _anchor_member_ids(decision["anchor_members_json"])
+            if not set(mention_ids) <= previous:
+                continue
+            duplicate_subset = True
+            for side in ("left", "right"):
+                if decision[f"{side}_anchor_type"] != "concept":
+                    continue
+                canonical, _ = self._redirect_target(
+                    connection, str(decision[f"{side}_anchor_id"])
+                )
+                if canonical is None:
+                    duplicate_has_invalid_target = True
+                else:
+                    duplicate_targets.add(canonical)
+
+        if any(value is None for value in canonical_by_anchor.values()):
+            return {"relation": None, "rule": None, "target": None}
+        if len(canonical_anchor_ids) > 1:
+            if (
+                duplicate_subset
+                and not duplicate_has_invalid_target
+                and len(duplicate_targets) == 1
+            ):
+                return {
+                    "relation": "same",
+                    "rule": "same_anchor_or_duplicate_subset",
+                    "target": next(iter(duplicate_targets)),
+                }
             return {"relation": None, "rule": None, "target": None}
 
         replay_candidates: set[tuple[str, str, str | None]] = set()
@@ -1126,26 +1246,23 @@ class CoreferenceCoordinator:
             eligible = bool(title_kinds[mention_id] & _TITLE_OBSERVATION_KINDS)
             title_eligible = title_eligible and eligible
             payload = payload_by_id[mention_id]
+            fingerprint = payload.get("title_fingerprint")
             fingerprints.append(
-                _title_fingerprint(
-                    payload.get("title_fingerprint")
-                    or row["evidence_quote"]
-                )
+                fingerprint
+                if isinstance(fingerprint, str) and fingerprint.strip()
+                else ""
             )
+        directory_count = sum(
+            str(row["block_type"]).strip().casefold()
+            in _TITLE_DIRECTORY_BLOCK_KINDS
+            for row in rows
+        )
         if (
             title_eligible
             and all(fingerprints)
             and len(set(fingerprints)) == 1
-            and any(
-                str(row["block_type"]).strip().casefold()
-                in _TITLE_DIRECTORY_BLOCK_KINDS
-                for row in rows
-            )
-            and any(
-                str(row["block_type"]).strip().casefold()
-                not in _TITLE_DIRECTORY_BLOCK_KINDS
-                for row in rows
-            )
+            and len(rows) == 2
+            and directory_count == 1
         ):
             return {
                 "relation": "same",
@@ -1167,31 +1284,9 @@ class CoreferenceCoordinator:
             if per_mention_anchors and all(per_mention_anchors)
             else set()
         )
-        duplicate_subset = False
-        duplicate_targets: set[str] = set()
-        for decision in connection.execute(
-            """SELECT left_anchor_type, left_anchor_id,
-                      right_anchor_type, right_anchor_id,
-                      anchor_members_json
-               FROM coreference_decisions
-               WHERE lexeme_id=? AND retired_version IS NULL
-                     AND relation='same'
-               ORDER BY id""",
-            (case.lexeme_id,),
-        ).fetchall():
-            previous = _anchor_member_ids(decision["anchor_members_json"])
-            if set(mention_ids) <= previous:
-                duplicate_subset = True
-                for side in ("left", "right"):
-                    if decision[f"{side}_anchor_type"] != "concept":
-                        continue
-                    canonical, _ = self._redirect_target(
-                        connection, str(decision[f"{side}_anchor_id"])
-                    )
-                    if canonical is not None:
-                        duplicate_targets.add(canonical)
-                break
-        if duplicate_subset and len(duplicate_targets) > 1:
+        if duplicate_subset and (
+            duplicate_has_invalid_target or len(duplicate_targets) > 1
+        ):
             return {"relation": None, "rule": None, "target": None}
         if common_anchors or duplicate_subset:
             common_canonical = {
@@ -1259,6 +1354,19 @@ class CoreferenceCoordinator:
                 return self.resolve_deterministic(
                     case, connection=owned_connection
                 )
+
+        with self.database._method_savepoint(
+            connection, "deterministic_resolution"
+        ):
+            return self._resolve_deterministic_in_transaction(
+                case, connection
+            )
+
+    def _resolve_deterministic_in_transaction(
+        self,
+        case: CoreferenceCase,
+        connection: sqlite3.Connection,
+    ) -> tuple[str | None, str | None]:
 
         evaluation = self._deterministic_evaluation(case, connection)
         relation = evaluation["relation"]
@@ -1398,6 +1506,7 @@ class CoreferenceCoordinator:
                 elapsed_ms=0,
                 error=None,
                 connection=connection,
+                archive_payload=False,
             )
         elif (
             str(existing["relation"]) != relation

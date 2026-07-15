@@ -163,6 +163,37 @@ class V4Database:
                 "external database connection requires an active transaction"
             )
 
+    @staticmethod
+    def _active_canonical_concept(
+        connection: sqlite3.Connection,
+        concept_id: str,
+    ) -> tuple[str | None, bool]:
+        """Follow retired-concept redirects to one active canonical concept."""
+
+        current = concept_id
+        visited: set[str] = set()
+        redirected = False
+        while current not in visited:
+            visited.add(current)
+            concept = connection.execute(
+                "SELECT retired_version FROM concepts WHERE id=?",
+                (current,),
+            ).fetchone()
+            if concept is None:
+                return (None, redirected)
+            if concept["retired_version"] is None:
+                return (current, redirected)
+            redirect = connection.execute(
+                """SELECT canonical_concept_id FROM concept_redirects
+                   WHERE retired_concept_id=?""",
+                (current,),
+            ).fetchone()
+            if redirect is None:
+                return (None, redirected)
+            current = str(redirect["canonical_concept_id"])
+            redirected = True
+        return (None, redirected)
+
     def _audit_transaction_for(
         self, connection: sqlite3.Connection
     ) -> AuditArchiveTransaction:
@@ -509,15 +540,23 @@ class V4Database:
                     connection=owned_connection,
                 )
 
-        target = connection.execute(
-            """SELECT primary_lexeme_id, retired_version
-               FROM concepts WHERE id=?""",
+        requested_target = connection.execute(
+            "SELECT 1 FROM concepts WHERE id=?",
             (concept_id,),
         ).fetchone()
-        if target is None:
+        if requested_target is None:
             raise KeyError(f"concept does not exist: {concept_id}")
-        if target["retired_version"] is not None:
-            raise ValueError(f"cannot bind mentions to retired concept: {concept_id}")
+        canonical_id, _ = self._active_canonical_concept(connection, concept_id)
+        if canonical_id is None:
+            raise ValueError(
+                f"concept redirect has no active canonical target: {concept_id}"
+            )
+        concept_id = canonical_id
+        target = connection.execute(
+            "SELECT primary_lexeme_id FROM concepts WHERE id=?",
+            (concept_id,),
+        ).fetchone()
+        assert target is not None
         lexeme_id = str(target["primary_lexeme_id"] or "")
         active_primary = connection.execute(
             """SELECT lexeme_id FROM concept_lexemes
@@ -557,10 +596,12 @@ class V4Database:
             raise ValueError("all mentions must belong to the same lexeme as concept")
 
         protected_decisions = connection.execute(
-            """SELECT left_anchor_id, right_anchor_id, anchor_members_json
+            """SELECT left_anchor_type, left_anchor_id,
+                      right_anchor_type, right_anchor_id,
+                      anchor_members_json
                FROM coreference_decisions
                WHERE lexeme_id=? AND retired_version IS NULL
-                     AND relation='different'
+                     AND relation IN ('different', 'non_entity')
                      AND (locked=1 OR decision_source='human')
                ORDER BY id""",
             (lexeme_id,),
@@ -594,13 +635,20 @@ class V4Database:
         requested_mention_set_id = stable_id(
             "mention-set", ":".join(str(value) for value in ordered_ids)
         )
-        protected_members = [
-            (
-                {str(row["left_anchor_id"]), str(row["right_anchor_id"])},
-                member_ids(row["anchor_members_json"]),
+        protected_members: list[tuple[set[str], set[int]]] = []
+        for row in protected_decisions:
+            anchors: set[str] = set()
+            for side in ("left", "right"):
+                anchor_id = str(row[f"{side}_anchor_id"])
+                if row[f"{side}_anchor_type"] == "concept":
+                    canonical, _ = self._active_canonical_concept(
+                        connection, anchor_id
+                    )
+                    anchor_id = canonical or anchor_id
+                anchors.add(anchor_id)
+            protected_members.append(
+                (anchors, member_ids(row["anchor_members_json"]))
             )
-            for row in protected_decisions
-        ]
         bindable: list[int] = []
         for row in rows:
             mention_id = int(row["id"])
@@ -609,13 +657,24 @@ class V4Database:
                 if row["concept_id"] is not None
                 else None
             )
+            current_canonical = current_id
+            if current_id is not None:
+                resolved_current, _ = self._active_canonical_concept(
+                    connection, current_id
+                )
+                current_canonical = resolved_current or current_id
             if current_id == concept_id:
                 continue
+            protected_pair = {
+                value
+                for value in (current_canonical, concept_id)
+                if value is not None
+            }
             if any(
                 requested_mention_set_id in anchors
                 or (
-                    current_id is not None
-                    and {current_id, concept_id} <= anchors
+                    len(protected_pair) == 2
+                    and protected_pair <= anchors
                 )
                 or mention_id in members
                 for anchors, members in protected_members
@@ -633,13 +692,10 @@ class V4Database:
                     if bool(current["locked"]) or str(current["status"]) == "verified":
                         continue
                 else:
-                    redirected = connection.execute(
-                        """SELECT 1 FROM concept_redirects
-                           WHERE retired_concept_id=?
-                                 AND canonical_concept_id=?""",
-                        (current_id, concept_id),
-                    ).fetchone()
-                    if redirected is None:
+                    current_canonical, _ = self._active_canonical_concept(
+                        connection, current_id
+                    )
+                    if current_canonical != concept_id:
                         continue
             bindable.append(mention_id)
 
@@ -1963,6 +2019,7 @@ class V4Database:
         elapsed_ms: int,
         error: Optional[str],
         connection: Optional[sqlite3.Connection] = None,
+        archive_payload: bool = True,
     ) -> int:
         if connection is None:
             with self.transaction() as owned_connection:
@@ -1980,10 +2037,12 @@ class V4Database:
                     elapsed_ms=elapsed_ms,
                     error=error,
                     connection=owned_connection,
+                    archive_payload=archive_payload,
                 )
         assert connection is not None
         archive_eligible = (
-            accepted
+            archive_payload
+            and accepted
             and not error
             and not self._is_human_audit(purpose, model, request, parsed)
         )

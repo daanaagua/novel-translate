@@ -1,6 +1,7 @@
 from contextlib import closing
 from dataclasses import FrozenInstanceError, replace
 import json
+import sqlite3
 
 import pytest
 
@@ -1171,6 +1172,22 @@ def _bind_test_mention(database, mention_id, concept_id):
         )
 
 
+def _insert_test_redirects(database, pairs):
+    with database.transaction() as connection:
+        version = connection.execute(
+            "SELECT MAX(id) FROM knowledge_versions"
+        ).fetchone()[0]
+        for retired_id, canonical_id in pairs:
+            connection.execute(
+                """INSERT INTO concept_redirects(
+                       retired_concept_id, canonical_concept_id, reason,
+                       knowledge_version, created_at)
+                   VALUES(?, ?, 'test redirect', ?,
+                          '2000-01-01T00:00:00+00:00')""",
+                (retired_id, canonical_id, version),
+            )
+
+
 def _insert_locked_coreference_decision(
     database,
     lexeme_id,
@@ -1372,8 +1389,6 @@ def test_anchor_database_apis_follow_caller_rollback_atomically(tmp_path):
         assert connection.execute(
             "SELECT COUNT(*) FROM mentions WHERE concept_id IS NOT NULL"
         ).fetchone()[0] == 0
-
-
 def test_bind_mentions_validates_the_full_batch_before_writing(tmp_path):
     database, lexeme_id, mention_ids, _, _ = _coreference_case(tmp_path)
     other_lexeme = database.ensure_lexeme("John")
@@ -2047,3 +2062,536 @@ def test_coreference_dual_model_names_must_be_nonempty_and_distinct(
         coordinator.cache_key(case, model_names)
     with pytest.raises(ValueError):
         coordinator.model_payloads(case, model_names)
+
+
+def test_deterministic_method_savepoint_rolls_back_when_decision_insert_fails(
+    tmp_path,
+):
+    database, _, _, evidence_ids, _ = _coreference_case(tmp_path)
+    _set_evidence_payload(
+        database,
+        evidence_ids,
+        {"evidence_hash": "savepoint-decision-failure"},
+    )
+    coordinator = CoreferenceCoordinator(database)
+    case = coordinator.freeze_cases()[0]
+
+    with database.transaction() as connection:
+        connection.execute(
+            """CREATE TEMP TRIGGER reject_deterministic_decision
+               BEFORE INSERT ON coreference_decisions
+               WHEN NEW.decision_source='deterministic'
+               BEGIN
+                   SELECT RAISE(ABORT, 'forced decision insert failure');
+               END"""
+        )
+        with pytest.raises(
+            sqlite3.IntegrityError, match="forced decision insert failure"
+        ):
+            coordinator.resolve_deterministic(case, connection=connection)
+
+        assert connection.execute(
+            "SELECT COUNT(*) FROM concepts"
+        ).fetchone()[0] == 0
+        assert connection.execute(
+            "SELECT COUNT(*) FROM mentions WHERE concept_id IS NOT NULL"
+        ).fetchone()[0] == 0
+        assert connection.execute(
+            "SELECT COUNT(*) FROM coreference_decisions"
+        ).fetchone()[0] == 0
+        assert connection.execute(
+            """SELECT COUNT(*) FROM audit_calls
+               WHERE purpose='deterministic_coreference'"""
+        ).fetchone()[0] == 0
+
+
+def test_deterministic_method_savepoint_rolls_back_when_audit_insert_fails(
+    tmp_path,
+):
+    database, _, _, evidence_ids, _ = _coreference_case(tmp_path)
+    _set_evidence_payload(
+        database,
+        evidence_ids,
+        {"evidence_hash": "savepoint-audit-failure"},
+    )
+    coordinator = CoreferenceCoordinator(database)
+    case = coordinator.freeze_cases()[0]
+
+    with database.transaction() as connection:
+        connection.execute(
+            """CREATE TEMP TRIGGER reject_deterministic_audit
+               BEFORE INSERT ON audit_calls
+               WHEN NEW.purpose='deterministic_coreference'
+               BEGIN
+                   SELECT RAISE(ABORT, 'forced audit insert failure');
+               END"""
+        )
+        with pytest.raises(
+            sqlite3.IntegrityError, match="forced audit insert failure"
+        ):
+            coordinator.resolve_deterministic(case, connection=connection)
+
+        for table in (
+            "concepts",
+            "concept_lexemes",
+            "coreference_decisions",
+            "audit_calls",
+        ):
+            assert connection.execute(
+                f"SELECT COUNT(*) FROM {table}"
+            ).fetchone()[0] == 0
+        assert connection.execute(
+            "SELECT COUNT(*) FROM mentions WHERE concept_id IS NOT NULL"
+        ).fetchone()[0] == 0
+    assert not list(database.audit_archive.root.glob("*.jsonl.zst"))
+
+
+def test_deterministic_conflicting_provisional_place_anchors_block_hash_merge(
+    tmp_path,
+):
+    database, lexeme_id, mention_ids, evidence_ids, _ = _coreference_case(tmp_path)
+    anchors = ("concept-place-left", "concept-place-right")
+    for concept_id, mention_id in zip(anchors, mention_ids):
+        _insert_test_concept(
+            database,
+            lexeme_id,
+            concept_id,
+            anchor_mention_id=mention_id,
+            kind="place",
+        )
+        _bind_test_mention(database, mention_id, concept_id)
+    _set_evidence_payload(
+        database,
+        evidence_ids,
+        {"evidence_hash": "same-place-evidence"},
+    )
+    coordinator = CoreferenceCoordinator(database)
+    case = coordinator.freeze_cases()[0]
+
+    assert coordinator._deterministic_relation(case) == (None, None)
+    assert coordinator.resolve_deterministic(case) == (None, None)
+    with closing(database.connect()) as connection:
+        assert [
+            row[0]
+            for row in connection.execute(
+                "SELECT concept_id FROM mentions ORDER BY id"
+            )
+        ] == list(anchors)
+        assert connection.execute(
+            "SELECT COUNT(*) FROM coreference_decisions"
+        ).fetchone()[0] == 0
+
+
+def test_deterministic_rejects_foreign_lexeme_payload_anchor(tmp_path):
+    database, _, _, evidence_ids, case = _coreference_case(tmp_path)
+    foreign_lexeme = database.ensure_lexeme("John")
+    foreign_mention, _ = _insert_coreference_mention(
+        database,
+        foreign_lexeme,
+        paragraph_id="P999",
+        evidence_quote="John",
+        source_form="John",
+    )
+    foreign_concept = "concept-foreign-john"
+    _insert_test_concept(
+        database,
+        foreign_lexeme,
+        foreign_concept,
+        anchor_mention_id=foreign_mention,
+    )
+    _set_evidence_payload(
+        database,
+        evidence_ids,
+        {"evidence_hash": "forged-anchor"},
+    )
+    forged = replace(
+        case,
+        concept_anchors=(
+            v4_models.CoreferenceConceptAnchor(
+                concept_id=foreign_concept,
+                kind="person",
+                canonical_source="John",
+                status="provisional",
+                role="primary",
+                anchor_mention_id=foreign_mention,
+            ),
+        ),
+    )
+    coordinator = CoreferenceCoordinator(database)
+
+    with pytest.raises(CoreferenceProtocolError, match="anchor.*lexeme"):
+        coordinator._deterministic_relation(forged)
+    with pytest.raises(CoreferenceProtocolError, match="anchor.*lexeme"):
+        coordinator.resolve_deterministic(forged)
+
+
+def test_deterministic_rejects_mention_anchor_missing_from_case_payload(tmp_path):
+    database, lexeme_id, mention_ids, evidence_ids, case = _coreference_case(
+        tmp_path
+    )
+    concept_id = "concept-unlisted-anchor"
+    _insert_test_concept(
+        database,
+        lexeme_id,
+        concept_id,
+        anchor_mention_id=mention_ids[0],
+    )
+    _set_evidence_payload(
+        database,
+        evidence_ids,
+        {"evidence_hash": "unlisted-anchor"},
+    )
+    forged_mentions = (
+        replace(case.mentions[0], concept_anchor_ids=(concept_id,)),
+        case.mentions[1],
+    )
+    forged = replace(case, mentions=forged_mentions, concept_anchors=())
+    coordinator = CoreferenceCoordinator(database)
+
+    with pytest.raises(CoreferenceProtocolError, match="not present"):
+        coordinator._deterministic_relation(forged)
+    with pytest.raises(CoreferenceProtocolError, match="not present"):
+        coordinator.resolve_deterministic(forged)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("kind", "forged-kind"),
+        ("canonical_source", "forged source"),
+        ("status", "verified"),
+        ("role", "alias"),
+        ("evidence_id", 999999),
+    ],
+)
+def test_deterministic_rejects_forged_anchor_metadata(
+    tmp_path, field, value
+):
+    database, lexeme_id, mention_ids, _, _ = _coreference_case(tmp_path)
+    concept_id = "concept-anchor-metadata"
+    _insert_test_concept(
+        database,
+        lexeme_id,
+        concept_id,
+        anchor_mention_id=mention_ids[0],
+    )
+    _bind_test_mention(database, mention_ids[0], concept_id)
+    coordinator = CoreferenceCoordinator(database)
+    case = coordinator.freeze_cases()[0]
+    forged_anchor = replace(
+        case.concept_anchors[0],
+        **{field: value},
+    )
+    forged = replace(case, concept_anchors=(forged_anchor,))
+
+    with pytest.raises(CoreferenceProtocolError, match="anchor"):
+        coordinator._deterministic_relation(forged)
+    with pytest.raises(CoreferenceProtocolError, match="anchor"):
+        coordinator.resolve_deterministic(forged)
+
+
+def test_deterministic_locked_non_entity_subset_blocks_expanded_hash_merge(
+    tmp_path,
+):
+    database, lexeme_id, mention_ids, evidence_ids, case = _coreference_case(
+        tmp_path, count=3
+    )
+    _set_evidence_payload(
+        database,
+        evidence_ids,
+        {"evidence_hash": "protected-non-entity"},
+    )
+    protected_set_id = stable_id("mention-set", str(mention_ids[1]))
+    with database.transaction() as connection:
+        version = connection.execute(
+            "SELECT MAX(id) FROM knowledge_versions"
+        ).fetchone()[0]
+        connection.execute(
+            """INSERT INTO coreference_decisions(
+                   id, lexeme_id, left_anchor_type, left_anchor_id,
+                   right_anchor_type, right_anchor_id, relation,
+                   decision_source, confidence, locked, votes_json,
+                   evidence_ids_json, anchor_members_json, payload_hash,
+                   created_version, created_at)
+               VALUES('coref-human-non-entity-subset', ?, 'mention_set', ?,
+                      'mention_set', ?, 'non_entity', 'human', 1.0, 1,
+                      '[]', '[]', ?, 'human-non-entity-subset', ?,
+                      '2000-01-01T00:00:00+00:00')""",
+            (
+                lexeme_id,
+                protected_set_id,
+                protected_set_id,
+                json.dumps([mention_ids[1]]),
+                version,
+            ),
+        )
+
+    assert CoreferenceCoordinator(database).resolve_deterministic(case) == (
+        "non_entity",
+        "locked_decision",
+    )
+    with closing(database.connect()) as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM concepts"
+        ).fetchone()[0] == 0
+        assert connection.execute(
+            "SELECT COUNT(*) FROM mentions WHERE concept_id IS NOT NULL"
+        ).fetchone()[0] == 0
+        assert [
+            tuple(row)
+            for row in connection.execute(
+                "SELECT relation, decision_source FROM coreference_decisions"
+            )
+        ] == [("non_entity", "human")]
+
+
+def _multihop_redirect_case(tmp_path):
+    database, lexeme_id, mention_ids, _, _ = _coreference_case(tmp_path)
+    retired_a = "concept-redirect-a"
+    retired_b = "concept-redirect-b"
+    canonical_c = "concept-redirect-c"
+    _insert_test_concept(
+        database,
+        lexeme_id,
+        retired_a,
+        anchor_mention_id=mention_ids[0],
+        retired=True,
+    )
+    _insert_test_concept(
+        database,
+        lexeme_id,
+        retired_b,
+        retired=True,
+    )
+    _insert_test_concept(
+        database,
+        lexeme_id,
+        canonical_c,
+        anchor_mention_id=mention_ids[1],
+    )
+    _bind_test_mention(database, mention_ids[0], retired_a)
+    _bind_test_mention(database, mention_ids[1], canonical_c)
+    _insert_test_redirects(
+        database,
+        ((retired_a, retired_b), (retired_b, canonical_c)),
+    )
+    return database, lexeme_id, mention_ids, retired_a, canonical_c
+
+
+def test_deterministic_multihop_redirect_reuses_final_active_canonical(tmp_path):
+    database, lexeme_id, _, _, canonical_id = _multihop_redirect_case(tmp_path)
+    coordinator = CoreferenceCoordinator(database)
+    case = coordinator.freeze_cases()[0]
+
+    assert coordinator.resolve_deterministic(case) == ("same", "redirect")
+    with closing(database.connect()) as connection:
+        assert {
+            row[0]
+            for row in connection.execute(
+                "SELECT concept_id FROM mentions WHERE lexeme_id=?",
+                (lexeme_id,),
+            )
+        } == {canonical_id}
+
+
+def test_bind_mentions_normalizes_multihop_redirect_source_to_canonical(tmp_path):
+    database, lexeme_id, mention_ids, retired_id, canonical_id = (
+        _multihop_redirect_case(tmp_path)
+    )
+
+    assert database.bind_mentions(retired_id, mention_ids) == 1
+    with closing(database.connect()) as connection:
+        assert {
+            row[0]
+            for row in connection.execute(
+                "SELECT concept_id FROM mentions WHERE lexeme_id=?",
+                (lexeme_id,),
+            )
+        } == {canonical_id}
+
+
+def test_bind_mentions_canonicalizes_protected_redirect_anchors(tmp_path):
+    database, lexeme_id, mention_ids, _, _ = _coreference_case(tmp_path)
+    retired_id = "concept-protected-retired"
+    canonical_id = "concept-protected-canonical"
+    different_id = "concept-protected-different"
+    _insert_test_concept(
+        database,
+        lexeme_id,
+        retired_id,
+        anchor_mention_id=mention_ids[0],
+        retired=True,
+    )
+    _insert_test_concept(database, lexeme_id, canonical_id)
+    _insert_test_concept(
+        database,
+        lexeme_id,
+        different_id,
+        anchor_mention_id=mention_ids[1],
+    )
+    _bind_test_mention(database, mention_ids[0], retired_id)
+    _bind_test_mention(database, mention_ids[1], different_id)
+    _insert_test_redirects(database, [(retired_id, canonical_id)])
+    with database.transaction() as connection:
+        version = connection.execute(
+            "SELECT MAX(id) FROM knowledge_versions"
+        ).fetchone()[0]
+        connection.execute(
+            """INSERT INTO coreference_decisions(
+                   id, lexeme_id, left_anchor_type, left_anchor_id,
+                   right_anchor_type, right_anchor_id, relation,
+                   decision_source, confidence, locked, votes_json,
+                   evidence_ids_json, anchor_members_json, payload_hash,
+                   created_version, created_at)
+               VALUES('coref-protected-redirect', ?, 'concept', ?,
+                      'concept', ?, 'different', 'human', 1.0, 1,
+                      '[]', '[]', '[]', 'protected-redirect', ?,
+                      '2000-01-01T00:00:00+00:00')""",
+            (lexeme_id, retired_id, different_id, version),
+        )
+
+    assert database.bind_mentions(canonical_id, mention_ids) == 1
+    with closing(database.connect()) as connection:
+        assert [
+            row[0]
+            for row in connection.execute(
+                "SELECT concept_id FROM mentions ORDER BY id"
+            )
+        ] == [canonical_id, different_id]
+
+
+@pytest.mark.parametrize("cycle", [False, True], ids=["dangling", "cycle"])
+def test_deterministic_invalid_redirect_graph_is_conservative(tmp_path, cycle):
+    database, lexeme_id, mention_ids, evidence_ids, _ = _coreference_case(tmp_path)
+    retired_a = "concept-invalid-redirect-a"
+    retired_b = "concept-invalid-redirect-b"
+    _insert_test_concept(
+        database,
+        lexeme_id,
+        retired_a,
+        anchor_mention_id=mention_ids[0],
+        retired=True,
+    )
+    _insert_test_concept(
+        database,
+        lexeme_id,
+        retired_b,
+        anchor_mention_id=mention_ids[1],
+        retired=True,
+    )
+    _bind_test_mention(database, mention_ids[0], retired_a)
+    _bind_test_mention(database, mention_ids[1], retired_b)
+    redirects = [(retired_a, retired_b)]
+    if cycle:
+        redirects.append((retired_b, retired_a))
+    _insert_test_redirects(database, redirects)
+    _set_evidence_payload(
+        database,
+        evidence_ids,
+        {"evidence_hash": "invalid-redirect-graph"},
+    )
+    coordinator = CoreferenceCoordinator(database)
+    case = coordinator.freeze_cases()[0]
+
+    assert coordinator._deterministic_relation(case) == (None, None)
+    assert coordinator.resolve_deterministic(case) == (None, None)
+    with pytest.raises(ValueError, match="canonical"):
+        database.bind_mentions(retired_a, mention_ids)
+    with closing(database.connect()) as connection:
+        assert [
+            row[0]
+            for row in connection.execute(
+                "SELECT concept_id FROM mentions ORDER BY id"
+            )
+        ] == [retired_a, retired_b]
+        assert connection.execute(
+            "SELECT COUNT(*) FROM coreference_decisions"
+        ).fetchone()[0] == 0
+
+
+def test_deterministic_title_rule_requires_explicit_fingerprints(tmp_path):
+    database = _db(tmp_path, source_text="II The Fleshing")
+    lexeme_id = database.ensure_lexeme("The Fleshing")
+    with database.transaction() as connection:
+        edition_id = connection.execute(
+            "SELECT id FROM source_editions WHERE active=1"
+        ).fetchone()[0]
+        connection.execute(
+            """INSERT INTO blocks(
+                   id, legacy_id, source_edition_id, chapter_id, chapter_title,
+                   chapter_index, block_index, global_index, block_type,
+                   source_text, source_hash, token_count, status, updated_at)
+               VALUES('block-title-no-fingerprint', 'block-title-no-fingerprint',
+                      ?, 'toc', 'Contents', 0, 1, 1, 'toc',
+                      'II The Fleshing', 'hash-title-no-fingerprint', 3,
+                      'ready', '2000-01-01T00:00:00+00:00')""",
+            (edition_id,),
+        )
+    for paragraph_id, block_id in (
+        ("P001", "block-title-no-fingerprint"),
+        ("P002", "block-1"),
+    ):
+        _insert_coreference_mention(
+            database,
+            lexeme_id,
+            paragraph_id=paragraph_id,
+            evidence_quote="II The Fleshing",
+            kind="title",
+            source_form="The Fleshing",
+            block_id=block_id,
+        )
+    case = CoreferenceCoordinator(database).freeze_cases()[0]
+
+    assert CoreferenceCoordinator(database).resolve_deterministic(case) == (
+        None,
+        None,
+    )
+
+
+def test_deterministic_title_fingerprints_require_exact_payload_equality(tmp_path):
+    database = _db(tmp_path, source_text="The Fleshing")
+    lexeme_id = database.ensure_lexeme("The Fleshing")
+    with database.transaction() as connection:
+        edition_id = connection.execute(
+            "SELECT id FROM source_editions WHERE active=1"
+        ).fetchone()[0]
+        connection.execute(
+            """INSERT INTO blocks(
+                   id, legacy_id, source_edition_id, chapter_id, chapter_title,
+                   chapter_index, block_index, global_index, block_type,
+                   source_text, source_hash, token_count, status, updated_at)
+               VALUES('block-title-exact', 'block-title-exact', ?, 'toc',
+                      'Contents', 0, 1, 1, 'toc', 'The Fleshing',
+                      'hash-title-exact', 2, 'ready',
+                      '2000-01-01T00:00:00+00:00')""",
+            (edition_id,),
+        )
+    evidence_ids = []
+    for paragraph_id, block_id in (
+        ("P001", "block-title-exact"),
+        ("P002", "block-1"),
+    ):
+        _, evidence_id = _insert_coreference_mention(
+            database,
+            lexeme_id,
+            paragraph_id=paragraph_id,
+            evidence_quote="The Fleshing",
+            kind="title",
+            source_form="The Fleshing",
+            block_id=block_id,
+        )
+        evidence_ids.append(evidence_id)
+    with database.transaction() as connection:
+        for evidence_id, fingerprint in zip(
+            evidence_ids, ("Title-Key", "title-key")
+        ):
+            connection.execute(
+                "UPDATE evidence SET payload_json=? WHERE id=?",
+                (json.dumps({"title_fingerprint": fingerprint}), evidence_id),
+            )
+    case = CoreferenceCoordinator(database).freeze_cases()[0]
+
+    assert CoreferenceCoordinator(database).resolve_deterministic(case) == (
+        None,
+        None,
+    )
