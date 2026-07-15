@@ -1,4 +1,5 @@
 import json
+import re
 from dataclasses import replace
 
 import pytest
@@ -202,6 +203,30 @@ def test_split_rejects_overlapping_source_spans():
     assert result[0].reason == "model_protocol_failure"
 
 
+def test_split_rejects_same_block_overlap_even_when_paragraph_ids_disagree():
+    source = "Alpha Beta waited."
+    whole = candidate("candidate-whole", source, 0, 10)
+    alpha = replace(
+        candidate("candidate-alpha", source, 0, 5), paragraph_id="P999"
+    )
+    item = cluster("cluster-a", [whole, alpha], risk_flags=("span_competition",))
+
+    llm = FakeLLM(
+        [
+            response(verdict="split", selected_ids=["K01A", "K01B"]),
+            response(verdict="split", selected_ids=["K01A", "K01B"]),
+        ]
+    )
+
+    result = V4Adjudicator(llm, max_attempts=1).adjudicate(
+        batch(item), {"block-1": source}
+    )
+
+    assert result[0].verdict == "defer"
+    assert result[0].reason == "model_protocol_failure"
+    assert len(llm.requests) == 1
+
+
 def test_supersede_requires_selected_existing_span_to_contain_replaced_span():
     source = "Alpha Beta waited."
     short = candidate("candidate-short", source, 0, 5)
@@ -217,6 +242,55 @@ def test_supersede_requires_selected_existing_span_to_contain_replaced_span():
 
     assert result[0].verdict == "defer"
     assert result[0].reason == "model_protocol_failure"
+
+
+def test_supersede_containment_uses_same_block_offsets_not_paragraph_label():
+    source = "Alpha Beta waited."
+    selected = candidate("candidate-selected", source, 0, 10)
+    contained = replace(
+        candidate("candidate-contained", source, 0, 5), paragraph_id="P999"
+    )
+    item = cluster(
+        "cluster-a", [selected, contained], risk_flags=("span_competition",)
+    )
+    llm = FakeLLM(
+        [
+            response(verdict="supersede", selected_ids=["K01A"]),
+            response(verdict="supersede", selected_ids=["K01B"]),
+        ]
+    )
+
+    result = V4Adjudicator(llm).adjudicate(batch(item), {"block-1": source})
+
+    assert result[0].verdict == "supersede"
+    assert result[0].selected_candidate_ids == ("candidate-selected",)
+
+
+def test_supersede_cannot_treat_equal_offsets_in_different_blocks_as_containment():
+    sources = {"block-1": "Alpha Beta waited.", "block-2": "Alpha waited."}
+    selected = candidate("candidate-selected", sources["block-1"], 0, 10)
+    other_block = candidate(
+        "candidate-other-block",
+        sources["block-2"],
+        0,
+        5,
+        block_id="block-2",
+    )
+    item = cluster(
+        "cluster-a", [selected, other_block], risk_flags=("span_competition",)
+    )
+    llm = FakeLLM(
+        [
+            response(verdict="supersede", selected_ids=["K01A"]),
+            response(verdict="supersede", selected_ids=["K01B"]),
+        ]
+    )
+
+    result = V4Adjudicator(llm, max_attempts=1).adjudicate(batch(item), sources)
+
+    assert result[0].verdict == "defer"
+    assert result[0].reason == "model_protocol_failure"
+    assert len(llm.requests) == 1
 
 
 def test_legal_split_and_supersede_survive_realiased_independent_review():
@@ -276,7 +350,7 @@ def test_supersede_can_ignore_a_different_partially_overlapping_alternative():
     llm = FakeLLM(
         [
             response(verdict="supersede", selected_ids=["K01A"]),
-            response(verdict="supersede", selected_ids=["K01C"]),
+            response(verdict="supersede", selected_ids=["K01B"]),
         ]
     )
 
@@ -365,7 +439,7 @@ def test_independent_promote_vs_split_conflict_is_deferred():
     llm = FakeLLM(
         [
             response(selected_ids=["K01A"]),
-            response(verdict="split", selected_ids=["K01A", "K01B"]),
+            response(verdict="split", selected_ids=["K01D", "K01C"]),
         ]
     )
 
@@ -385,7 +459,7 @@ def test_second_round_reverses_alternatives_and_regenerates_alias_mapping():
     llm = FakeLLM(
         [
             response(selected_ids=["K01A"]),
-            response(selected_ids=["K01C"]),
+            response(selected_ids=["K01B"]),
         ]
     )
 
@@ -401,36 +475,60 @@ def test_second_round_reverses_alternatives_and_regenerates_alias_mapping():
         for alternative in second["clusters"][0]["alternatives"]
     }
     assert first_aliases["K01A"] == "Alpha and Beta"
-    assert second_aliases["K01A"] == "Beta"
-    assert second_aliases["K01C"] == "Alpha and Beta"
+    assert second_aliases["K01D"] == "Beta"
+    assert second_aliases["K01B"] == "Alpha and Beta"
     assert result[0].verdict == "promote"
     assert result[0].selected_candidate_ids == ("candidate-whole",)
     assert result[0].rounds == 2
 
 
-def test_single_alternative_risk_review_uses_a_different_alias_mapping():
-    source = "Alpha waited."
+@pytest.mark.parametrize(
+    ("alternative_count", "second_selected_alias"),
+    [(1, "K01D"), (2, "K01B"), (3, "K01B"), (4, "K01D")],
+)
+def test_risk_review_changes_every_candidate_alias_mapping(
+    alternative_count, second_selected_alias
+):
+    source = "Alpha Beta Gamma Delta waited."
+    spans = [(0, 5), (6, 10), (11, 16), (17, 22)]
+    alternatives = [
+        candidate(f"candidate-{index}", source, start, end)
+        for index, (start, end) in enumerate(spans[:alternative_count])
+    ]
     item = cluster(
         "cluster-a",
-        [candidate("candidate-alpha", source, 0, 5)],
+        alternatives,
         affected_blocks=3,
     )
     llm = FakeLLM(
         [
             response(selected_ids=["K01A"]),
-            response(selected_ids=["K01D"]),
+            response(selected_ids=[second_selected_alias]),
         ]
     )
 
     result = V4Adjudicator(llm).adjudicate(batch(item), {"block-1": source})
 
     first, second = map(user_payload, llm.requests)
-    first_alternative = first["clusters"][0]["alternatives"][0]
-    second_alternative = second["clusters"][0]["alternatives"][0]
-    assert first_alternative == {"id": "K01A", "text": "Alpha", "risk_flags": []}
-    assert second_alternative == {"id": "K01D", "text": "Alpha", "risk_flags": []}
+    first_alias_by_text = {
+        alternative["text"]: alternative["id"]
+        for alternative in first["clusters"][0]["alternatives"]
+    }
+    second_alias_by_text = {
+        alternative["text"]: alternative["id"]
+        for alternative in second["clusters"][0]["alternatives"]
+    }
+    assert set(first_alias_by_text) == set(second_alias_by_text)
+    assert all(
+        first_alias_by_text[text] != second_alias_by_text[text]
+        for text in first_alias_by_text
+    )
+    assert len(set(second_alias_by_text.values())) == alternative_count
+    assert all(
+        re.fullmatch(r"K01[A-D]", alias) for alias in second_alias_by_text.values()
+    )
     assert result[0].verdict == "promote"
-    assert result[0].selected_candidate_ids == ("candidate-alpha",)
+    assert result[0].selected_candidate_ids == ("candidate-0",)
     assert result[0].rounds == 2
 
 

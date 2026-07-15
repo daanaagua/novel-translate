@@ -108,10 +108,16 @@ class V4Adjudicator:
                 alternatives = tuple(reversed(alternatives))
             rendered_alternatives = []
             local_aliases = []
+            alias_letters = "ABCD"
+            if reverse_alternatives:
+                alias_letters = {
+                    1: "D",
+                    2: "AB",
+                    3: "DCB",
+                    4: "ABCD",
+                }[len(alternatives)]
             for alternative_index, alternative in enumerate(alternatives):
-                alias_letter = chr(ord("A") + alternative_index)
-                if reverse_alternatives and len(alternatives) == 1:
-                    alias_letter = "D"
+                alias_letter = alias_letters[alternative_index]
                 alias = f"{cluster_alias}{alias_letter}"
                 candidate_by_alias[alias] = alternative
                 local_aliases.append(alias)
@@ -165,7 +171,6 @@ class V4Adjudicator:
     def _overlap(left: LexicalCandidate, right: LexicalCandidate) -> bool:
         return (
             left.block_id == right.block_id
-            and left.paragraph_id == right.paragraph_id
             and left.start_offset < right.end_offset
             and right.start_offset < left.end_offset
         )
@@ -181,7 +186,6 @@ class V4Adjudicator:
                 continue
             if (
                 selected.block_id == other.block_id
-                and selected.paragraph_id == other.paragraph_id
                 and selected.start_offset <= other.start_offset
                 and other.end_offset <= selected.end_offset
             ):
