@@ -19,6 +19,7 @@ from pydantic import BaseModel, ValidationError
 
 from .database import (
     ConceptAnchorConflictError,
+    ConceptMergeConflictError,
     V4Database,
     normalize_english_form,
     stable_id,
@@ -1877,8 +1878,8 @@ class CoreferenceCoordinator:
         decision_payload_hash: str,
         *,
         connection: sqlite3.Connection | None = None,
-    ) -> tuple[str, str] | None:
-        query = """SELECT relation, votes_json FROM coreference_decisions
+    ) -> tuple[str, str, str] | None:
+        query = """SELECT id, relation, votes_json FROM coreference_decisions
                    WHERE payload_hash=? AND lexeme_id=?
                      AND decision_source='dual_model'
                      AND retired_version IS NULL"""
@@ -1893,7 +1894,11 @@ class CoreferenceCoordinator:
             ).fetchone()
         if row is None:
             return None
-        return str(row["relation"]), self._cached_reason(row["votes_json"])
+        return (
+            str(row["relation"]),
+            self._cached_reason(row["votes_json"]),
+            str(row["id"]),
+        )
 
     def _has_matching_dual_same(self, case: CoreferenceCase) -> bool:
         mention_ids = {mention.mention_id for mention in case.mentions}
@@ -2095,6 +2100,97 @@ class CoreferenceCoordinator:
         except (_ProtectedBindingConflict, ConceptAnchorConflictError):
             return None, 0
 
+    def _merge_model_same_anchors(
+        self,
+        case: CoreferenceCase,
+        decision_id: str,
+        connection: sqlite3.Connection,
+    ) -> tuple[str | None, int]:
+        """Complete one persisted same decision without overstating its effect."""
+
+        related = self._related_active_concepts(case, connection)
+        if len(related) < 2:
+            return self._safe_model_same_binding(case, connection)
+        mention_ids = tuple(mention.mention_id for mention in case.mentions)
+        try:
+            with self.database._method_savepoint(
+                connection, "dual_model_concept_merge"
+            ):
+                result = self.database.merge_concepts(
+                    sorted(related),
+                    reason=f"dual-model same decision {decision_id}",
+                    decision_id=decision_id,
+                    connection=connection,
+                )
+                if not bool(result.get("changed")):
+                    return str(result["canonical_id"]), 0
+                canonical_id = str(result["canonical_id"])
+                self.database.bind_mentions(
+                    canonical_id,
+                    mention_ids,
+                    connection=connection,
+                )
+                placeholders = ",".join("?" for _ in mention_ids)
+                remaining = connection.execute(
+                    f"""SELECT COUNT(*) FROM mentions
+                         WHERE id IN ({placeholders})
+                           AND concept_id IS NOT ?""",
+                    (*mention_ids, canonical_id),
+                ).fetchone()[0]
+                if int(remaining):
+                    raise _ProtectedBindingConflict(
+                        "dual-model same cannot safely bind every merged mention"
+                    )
+                return canonical_id, 1
+        except (
+            _ProtectedBindingConflict,
+            ConceptAnchorConflictError,
+            ConceptMergeConflictError,
+            ValueError,
+        ):
+            return None, 0
+
+    def _complete_cached_same(
+        self,
+        case: CoreferenceCase,
+        decision_id: str,
+        *,
+        connection: sqlite3.Connection | None = None,
+    ) -> int:
+        if connection is None:
+            with self.database.transaction() as owned_connection:
+                return self._complete_cached_same(
+                    case,
+                    decision_id,
+                    connection=owned_connection,
+                )
+        target, changed = self._merge_model_same_anchors(
+            case,
+            decision_id,
+            connection,
+        )
+        if changed:
+            row = connection.execute(
+                "SELECT votes_json FROM coreference_decisions WHERE id=?",
+                (decision_id,),
+            ).fetchone()
+            try:
+                votes = json.loads(str(row["votes_json"] or "[]")) if row else []
+            except (TypeError, ValueError, json.JSONDecodeError):
+                votes = []
+            if isinstance(votes, list):
+                for vote in votes:
+                    if isinstance(vote, dict) and vote.get("source") == "dual_model":
+                        vote["effect"] = {
+                            "bindings_changed": 1,
+                            "unified_identity": target is not None,
+                        }
+                connection.execute(
+                    "UPDATE coreference_decisions SET votes_json=? WHERE id=?",
+                    (self._decision_votes_json(votes), decision_id),
+                )
+        return changed
+
     @staticmethod
     def _model_vote_payload(
         side: str,
@@ -2216,7 +2312,12 @@ class CoreferenceCoordinator:
                 case, cache_key(case, model_names)
             )
             if cached is not None:
-                return cached[0], cached[1], 0, True, False
+                changed = (
+                    self._complete_cached_same(case, cached[2])
+                    if cached[0] == "same"
+                    else 0
+                )
+                return cached[0], cached[1], changed, True, False
         deterministic = self._resolve_deterministic_with_effect(case)
         if deterministic[0] is not None:
             return (
@@ -2236,7 +2337,12 @@ class CoreferenceCoordinator:
         decision_payload_hash = cache_key(case, model_names)
         cached = self._cached_dual_decision(case, decision_payload_hash)
         if cached is not None:
-            return cached[0], cached[1], 0, True, False
+            changed = (
+                self._complete_cached_same(case, cached[2])
+                if cached[0] == "same"
+                else 0
+            )
+            return cached[0], cached[1], changed, True, False
 
         frozen_payload_a, frozen_payload_b = self.model_payloads(
             case, model_names
@@ -2321,11 +2427,26 @@ class CoreferenceCoordinator:
                     connection=connection,
                 )
                 if raced is not None:
-                    return raced[0], raced[1], 0, True, False
+                    changed = (
+                        self._complete_cached_same(
+                            case,
+                            raced[2],
+                            connection=connection,
+                        )
+                        if raced[0] == "same"
+                        else 0
+                    )
+                    return raced[0], raced[1], changed, True, False
 
                 target_concept_id = None
                 bindings_changed = 0
-                if relation == "same":
+                related_before = (
+                    self._related_active_concepts(case, connection)
+                    if relation == "same"
+                    else set()
+                )
+                merge_after_decision = relation == "same" and len(related_before) > 1
+                if relation == "same" and not merge_after_decision:
                     (
                         target_concept_id,
                         bindings_changed,
@@ -2404,6 +2525,24 @@ class CoreferenceCoordinator:
                         utc_now(),
                     ),
                 )
+                if merge_after_decision:
+                    (
+                        target_concept_id,
+                        bindings_changed,
+                    ) = self._merge_model_same_anchors(
+                        case,
+                        decision_id,
+                        connection,
+                    )
+                    resolution_vote["effect"] = {
+                        "bindings_changed": bindings_changed,
+                        "unified_identity": target_concept_id is not None,
+                    }
+                    votes_json = self._decision_votes_json(model_votes)
+                    connection.execute(
+                        "UPDATE coreference_decisions SET votes_json=? WHERE id=?",
+                        (votes_json, decision_id),
+                    )
                 for attempt in (*attempts_a, *attempts_b):
                     self.database.record_audit_call(
                         run_id=None,

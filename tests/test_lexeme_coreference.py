@@ -8,7 +8,12 @@ import pytest
 from src.core.v4 import models as v4_models
 from src.core.v4 import coreference as coreference_module
 from src.core.v4.coreference import CoreferenceCoordinator, CoreferenceProtocolError
-from src.core.v4.database import V4Database, normalize_english_form, stable_id
+from src.core.v4.database import (
+    ConceptMergeConflictError,
+    V4Database,
+    normalize_english_form,
+    stable_id,
+)
 
 
 def _db(tmp_path, source_text="Briah met BRIAH.", source_hash="hash-1"):
@@ -1224,6 +1229,583 @@ def _insert_locked_coreference_decision(
                 version,
             ),
         )
+
+
+def _insert_same_coreference_decision(
+    database,
+    lexeme_id,
+    mention_ids,
+    concept_ids,
+    *,
+    decision_id="coref-authorized-merge",
+    relation="same",
+    retired=False,
+):
+    with database.transaction() as connection:
+        version = connection.execute(
+            "SELECT MAX(id) FROM knowledge_versions"
+        ).fetchone()[0]
+        retired_version = (
+            database.create_knowledge_version("retire merge decision", connection)
+            if retired
+            else None
+        )
+        connection.execute(
+            """INSERT INTO coreference_decisions(
+                   id, lexeme_id, left_anchor_type, left_anchor_id,
+                   right_anchor_type, right_anchor_id, relation,
+                   decision_source, confidence, locked, votes_json,
+                   evidence_ids_json, anchor_members_json, payload_hash,
+                   created_version, retired_version, created_at)
+               VALUES(?, ?, 'concept', ?, 'concept', ?, ?, 'human', 1.0, 1,
+                      '[]', '[]', ?, ?, ?, ?,
+                      '2000-01-01T00:00:00+00:00')""",
+            (
+                decision_id,
+                lexeme_id,
+                concept_ids[0],
+                concept_ids[-1],
+                relation,
+                json.dumps(sorted(mention_ids)),
+                f"payload:{decision_id}",
+                version,
+                retired_version,
+            ),
+        )
+    return decision_id
+
+
+def _prepare_authorized_merge(tmp_path, concept_ids=("concept-a", "concept-b")):
+    database, lexeme_id, mention_ids, evidence_ids, case = _coreference_case(
+        tmp_path, count=max(2, len(concept_ids))
+    )
+    for concept_id, mention_id in zip(concept_ids, mention_ids):
+        _insert_test_concept(
+            database,
+            lexeme_id,
+            concept_id,
+            anchor_mention_id=mention_id,
+        )
+        _bind_test_mention(database, mention_id, concept_id)
+    decision_id = _insert_same_coreference_decision(
+        database,
+        lexeme_id,
+        mention_ids,
+        concept_ids,
+    )
+    return database, lexeme_id, mention_ids, evidence_ids, case, decision_id
+
+
+def test_resolve_concept_redirect_is_read_only_and_follows_multiple_hops(tmp_path):
+    database, lexeme_id, mention_ids, _, _ = _coreference_case(tmp_path, count=3)
+    concept_ids = ("concept-oldest", "concept-middle", "concept-canonical")
+    for concept_id, mention_id in zip(concept_ids, mention_ids):
+        _insert_test_concept(
+            database,
+            lexeme_id,
+            concept_id,
+            anchor_mention_id=mention_id,
+            retired=concept_id != concept_ids[-1],
+        )
+    _insert_test_redirects(
+        database,
+        [(concept_ids[0], concept_ids[1]), (concept_ids[1], concept_ids[2])],
+    )
+    resolve = _require_method(database, "resolve_concept_id")
+    with closing(database.connect()) as connection:
+        before = {
+            table: connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+            for table in ("knowledge_versions", "concept_redirects", "audit_calls")
+        }
+
+    assert resolve(concept_ids[2]) == concept_ids[2]
+    assert resolve(concept_ids[0]) == concept_ids[2]
+    assert resolve(concept_ids[0]) == concept_ids[2]
+
+    with closing(database.connect()) as connection:
+        after = {
+            table: connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+            for table in before
+        }
+    assert after == before
+
+
+@pytest.mark.parametrize("invalid", ["missing", "dangling", "cycle", "cross_lexeme", "depth"])
+def test_resolve_concept_redirect_rejects_invalid_graphs(tmp_path, invalid):
+    database, lexeme_id, mention_ids, _, _ = _coreference_case(tmp_path)
+    resolve = _require_method(database, "resolve_concept_id")
+    if invalid == "missing":
+        with pytest.raises(KeyError, match="does not exist"):
+            resolve("concept-missing")
+        return
+    if invalid == "cross_lexeme":
+        old_id = "concept-cross-old"
+        new_id = "concept-cross-new"
+        _insert_test_concept(
+            database, lexeme_id, old_id, anchor_mention_id=mention_ids[0], retired=True
+        )
+        other_lexeme = database.ensure_lexeme("Elsewhere")
+        _insert_test_concept(database, other_lexeme, new_id)
+        _insert_test_redirects(database, [(old_id, new_id)])
+        with pytest.raises(ValueError, match="cross-lexeme"):
+            resolve(old_id)
+        return
+    if invalid == "depth":
+        ids = [f"concept-depth-{index:03d}" for index in range(67)]
+        with database.transaction() as connection:
+            version = connection.execute(
+                "SELECT MAX(id) FROM knowledge_versions"
+            ).fetchone()[0]
+            connection.executemany(
+                """INSERT INTO concepts(
+                       id, kind, canonical_source, primary_lexeme_id,
+                       created_version, retired_version, created_at)
+                   VALUES(?, 'person', ?, ?, ?, ?,
+                          '2000-01-01T00:00:00+00:00')""",
+                [
+                    (concept_id, concept_id, lexeme_id, version, None if index == 66 else version)
+                    for index, concept_id in enumerate(ids)
+                ],
+            )
+            connection.executemany(
+                """INSERT INTO concept_redirects(
+                       retired_concept_id, canonical_concept_id, reason,
+                       knowledge_version, created_at)
+                   VALUES(?, ?, 'depth test', ?,
+                          '2000-01-01T00:00:00+00:00')""",
+                [(ids[index], ids[index + 1], version) for index in range(66)],
+            )
+        with pytest.raises(ValueError, match="depth"):
+            resolve(ids[0])
+        return
+
+    first = "concept-invalid-first"
+    second = "concept-invalid-second"
+    _insert_test_concept(
+        database, lexeme_id, first, anchor_mention_id=mention_ids[0], retired=True
+    )
+    if invalid == "dangling":
+        with pytest.raises(ValueError, match="dangling"):
+            resolve(first)
+        return
+    _insert_test_concept(
+        database, lexeme_id, second, anchor_mention_id=mention_ids[1], retired=True
+    )
+    _insert_test_redirects(database, [(first, second), (second, first)])
+    with pytest.raises(ValueError, match="cycle"):
+        resolve(first)
+
+
+@pytest.mark.parametrize(
+    ("criterion", "expected"),
+    [
+        ("locked", "concept-z"),
+        ("verified", "concept-z"),
+        ("target", "concept-z"),
+        ("references", "concept-z"),
+        ("created_at", "concept-z"),
+        ("unicode_id", "concept-a"),
+    ],
+)
+def test_merge_concept_redirect_canonical_tie_breaks_ignore_input_order(
+    tmp_path, criterion, expected
+):
+    chosen = []
+    for suffix, reverse in (("forward", False), ("reverse", True)):
+        root = tmp_path / suffix
+        root.mkdir()
+        concept_ids = ("concept-a", "concept-z")
+        database, _, mention_ids, _, _, decision_id = _prepare_authorized_merge(
+            root, concept_ids
+        )
+        with database.transaction() as connection:
+            if criterion == "locked":
+                connection.execute("UPDATE concepts SET locked=1 WHERE id='concept-z'")
+            elif criterion == "verified":
+                connection.execute(
+                    "UPDATE concepts SET status='verified' WHERE id='concept-z'"
+                )
+            elif criterion == "target":
+                connection.execute(
+                    "UPDATE concepts SET working_target='译名' WHERE id='concept-z'"
+                )
+            elif criterion == "references":
+                connection.execute(
+                    "UPDATE mentions SET concept_id='concept-z' WHERE id=?",
+                    (mention_ids[0],),
+                )
+            elif criterion == "created_at":
+                connection.execute(
+                    "UPDATE concepts SET created_at='1999-01-01T00:00:00+00:00' "
+                    "WHERE id='concept-z'"
+                )
+        ordered = tuple(reversed(concept_ids)) if reverse else concept_ids
+        result = database.merge_concepts(
+            ordered, reason=f"test {criterion}", decision_id=decision_id
+        )
+        chosen.append(result["canonical_id"])
+        assert result["selection_key"]["criterion"] == criterion
+        assert database.merge_concepts(
+            tuple(reversed(ordered)),
+            reason=f"replay {criterion}",
+            decision_id=decision_id,
+        )["changed"] is False
+    assert chosen == [expected, expected]
+
+
+def test_merge_concept_redirect_moves_active_associations_and_preserves_history(tmp_path):
+    database, lexeme_id, mention_ids, evidence_ids, _, decision_id = (
+        _prepare_authorized_merge(tmp_path)
+    )
+    canonical_id, old_id = "concept-a", "concept-b"
+    alias_lexeme = database.ensure_lexeme("Briah-title")
+    database.start_run("merge-run", "adjudicate", {})
+    with database.transaction() as connection:
+        version = connection.execute(
+            "SELECT MAX(id) FROM knowledge_versions"
+        ).fetchone()[0]
+        connection.execute(
+            """INSERT INTO concept_lexemes(
+                   concept_id, lexeme_id, role, confidence, status, evidence_id,
+                   created_version, created_at)
+               VALUES(?, ?, 'title', 0.8, 'verified', ?, ?,
+                      '2001-01-01T00:00:00+00:00')""",
+            (old_id, alias_lexeme, evidence_ids[1], version),
+        )
+        connection.execute(
+            """INSERT INTO concept_type_observations(
+                   concept_id, lexeme_id, mention_id, evidence_id, kind,
+                   confidence, source, created_version, created_at)
+               VALUES(?, ?, ?, ?, 'person', 0.9, 'merge-test', ?,
+                      '2001-01-01T00:00:00+00:00')""",
+            (old_id, lexeme_id, mention_ids[1], evidence_ids[1], version),
+        )
+        retired_observation = connection.execute(
+            """INSERT INTO concept_type_observations(
+                   concept_id, lexeme_id, mention_id, evidence_id, kind,
+                   confidence, source, created_version, retired_version, created_at)
+               VALUES(?, ?, ?, ?, 'place', 0.5, 'historical', ?, ?,
+                      '1999-01-01T00:00:00+00:00')""",
+            (old_id, lexeme_id, mention_ids[1], evidence_ids[1], version, version),
+        ).lastrowid
+        connection.execute(
+            """INSERT INTO candidate_clusters(
+                   id, run_id, ordinal, created_at, updated_at)
+               VALUES('merge-cluster', 'merge-run', 0,
+                      '2001-01-01T00:00:00+00:00',
+                      '2001-01-01T00:00:00+00:00')"""
+        )
+        connection.execute(
+            """INSERT INTO candidate_adjudications(
+                   id, run_id, cluster_id, verdict, payload_hash,
+                   knowledge_version, active, created_at, updated_at)
+               VALUES('merge-adjudication', 'merge-run', 'merge-cluster',
+                      'entity', 'merge-payload', ?, 1,
+                      '2001-01-01T00:00:00+00:00',
+                      '2001-01-01T00:00:00+00:00')""",
+            (version,),
+        )
+        connection.execute(
+            """INSERT INTO candidate_resolutions(
+                   id, adjudication_id, run_id, cluster_id, lexeme_id,
+                   concept_id, evidence_id, decision, ordinal, created_at)
+               VALUES('merge-resolution', 'merge-adjudication', 'merge-run',
+                      'merge-cluster', ?, ?, ?, 'create', 0,
+                      '2001-01-01T00:00:00+00:00')""",
+            (lexeme_id, old_id, evidence_ids[1]),
+        )
+        old_audit = database.record_audit_call(
+            run_id="merge-run",
+            block_id=None,
+            purpose="historical-human-note",
+            model="manual",
+            knowledge_version=version,
+            request={"actor_type": "human", "concept_id": old_id},
+            raw_response="old concept evidence",
+            parsed={"actor_type": "human", "concept_id": old_id},
+            accepted=True,
+            attempts=1,
+            elapsed_ms=0,
+            error=None,
+            connection=connection,
+        )
+
+    result = database.merge_concepts(
+        [old_id, canonical_id], reason="same identity", decision_id=decision_id
+    )
+
+    assert result["canonical_id"] == canonical_id
+    assert result["changed"] is True
+    assert database.resolve_concept_id(old_id) == canonical_id
+    with closing(database.connect()) as connection:
+        assert {
+            row[0]
+            for row in connection.execute(
+                "SELECT concept_id FROM mentions WHERE id IN (?, ?)", mention_ids
+            )
+        } == {canonical_id}
+        assert connection.execute(
+            "SELECT concept_id FROM candidate_resolutions WHERE id='merge-resolution'"
+        ).fetchone()[0] == canonical_id
+        assert connection.execute(
+            """SELECT concept_id FROM concept_type_observations
+               WHERE source='merge-test'"""
+        ).fetchone()[0] == canonical_id
+        assert connection.execute(
+            "SELECT concept_id FROM concept_type_observations WHERE id=?",
+            (retired_observation,),
+        ).fetchone()[0] == old_id
+        title = connection.execute(
+            """SELECT concept_id, confidence, status, evidence_id
+               FROM concept_lexemes WHERE lexeme_id=? AND role='title'
+                 AND retired_version IS NULL""",
+            (alias_lexeme,),
+        ).fetchone()
+        old_primary = connection.execute(
+            """SELECT retired_version FROM concept_lexemes
+               WHERE concept_id=? AND lexeme_id=? AND role='primary'""",
+            (old_id, lexeme_id),
+        ).fetchone()[0]
+        old_concept = connection.execute(
+            "SELECT status, retired_version FROM concepts WHERE id=?", (old_id,)
+        ).fetchone()
+        changes = connection.execute(
+            """SELECT change_kind FROM knowledge_changes
+               WHERE knowledge_version=? ORDER BY id""",
+            (result["knowledge_version"],),
+        ).fetchall()
+    assert tuple(title) == (canonical_id, 0.8, "verified", evidence_ids[1])
+    assert old_primary == result["knowledge_version"]
+    assert tuple(old_concept) == ("merged", result["knowledge_version"])
+    assert {row[0] for row in changes} == {"concept_merge", "concept_redirect"}
+    assert database.read_audit_payload(old_audit)["raw_response"] == "old concept evidence"
+
+
+def test_merge_concept_redirect_combines_dependency_evidence_and_identical_rules(tmp_path):
+    database, _, _, _, _, decision_id = _prepare_authorized_merge(tmp_path)
+    canonical_id, old_id = "concept-a", "concept-b"
+    with database.transaction() as connection:
+        version = connection.execute(
+            "SELECT MAX(id) FROM knowledge_versions"
+        ).fetchone()[0]
+        translation_id = connection.execute(
+            """INSERT INTO translation_versions(
+                   block_id, pipeline, knowledge_version, status,
+                   final_translation, active, created_at)
+               VALUES('block-1', 'parallel_v4', ?, 'completed', '译文', 1,
+                      '2001-01-01T00:00:00+00:00')""",
+            (version,),
+        ).lastrowid
+        connection.executemany(
+            """INSERT INTO rendering_rules(
+                   id, concept_id, condition_json, target, priority, status,
+                   locked, created_version, created_at)
+               VALUES(?, ?, ?, '同译', 10, 'verified', ?, ?, ?)""",
+            [
+                (
+                    "rule-canonical",
+                    canonical_id,
+                    '{"chapter":1,"speaker":"A"}',
+                    0,
+                    version,
+                    "2001-01-01T00:00:00+00:00",
+                ),
+                (
+                    "rule-old-locked",
+                    old_id,
+                    '{ "speaker" : "A", "chapter" : 1 }',
+                    1,
+                    version,
+                    "2002-01-01T00:00:00+00:00",
+                ),
+            ],
+        )
+        connection.executemany(
+            """INSERT INTO dependencies(
+                   translation_id, dependency_type, dependency_id,
+                   knowledge_version, dependency_fingerprint, matched_form,
+                   occurrence_count, rendered_target, applied_rule_ids_json,
+                   source_spans_json)
+               VALUES(?, 'concept', ?, ?, ?, ?, ?, '同译', ?, ?)""",
+            [
+                (
+                    translation_id,
+                    canonical_id,
+                    version,
+                    "fp-a",
+                    "Briah",
+                    1,
+                    '["rule-canonical"]',
+                    '[[0,5]]',
+                ),
+                (
+                    translation_id,
+                    old_id,
+                    version,
+                    "fp-b",
+                    "BRIAH",
+                    2,
+                    '["rule-old-locked"]',
+                    '[[10,15],[0,5]]',
+                ),
+            ],
+        )
+
+    result = database.merge_concepts(
+        [canonical_id, old_id], reason="merge evidence", decision_id=decision_id
+    )
+
+    with closing(database.connect()) as connection:
+        active_rules = connection.execute(
+            """SELECT id, concept_id, condition_json FROM rendering_rules
+               WHERE retired_version IS NULL ORDER BY id"""
+        ).fetchall()
+        retired = connection.execute(
+            "SELECT retired_version FROM rendering_rules WHERE id='rule-canonical'"
+        ).fetchone()[0]
+        dependency = connection.execute(
+            """SELECT dependency_id, occurrence_count, applied_rule_ids_json,
+                      source_spans_json
+               FROM dependencies WHERE translation_id=? AND dependency_type='concept'""",
+            (translation_id,),
+        ).fetchone()
+    assert [tuple(row) for row in active_rules] == [
+        (
+            "rule-old-locked",
+            result["canonical_id"],
+            '{"chapter":1,"speaker":"A"}',
+        )
+    ]
+    assert retired == result["knowledge_version"]
+    assert dependency["dependency_id"] == result["canonical_id"]
+    assert dependency["occurrence_count"] == 3
+    assert json.loads(dependency["applied_rule_ids_json"]) == ["rule-old-locked"]
+    assert json.loads(dependency["source_spans_json"]) == [[0, 5], [10, 15]]
+
+
+def test_merge_concept_redirect_retires_conflicting_rules_and_queues_one_warning(tmp_path):
+    database, _, _, _, _, decision_id = _prepare_authorized_merge(tmp_path)
+    with database.transaction() as connection:
+        version = connection.execute(
+            "SELECT MAX(id) FROM knowledge_versions"
+        ).fetchone()[0]
+        connection.executemany(
+            """INSERT INTO rendering_rules(
+                   id, concept_id, condition_json, target, priority,
+                   created_version, created_at)
+               VALUES(?, ?, ?, ?, 10, ?,
+                      '2001-01-01T00:00:00+00:00')""",
+            [
+                ("rule-a", "concept-a", '{"speaker":"A"}', "甲", version),
+                ("rule-b", "concept-b", '{ "speaker" : "A" }', "乙", version),
+            ],
+        )
+
+    first = database.merge_concepts(
+        ["concept-a", "concept-b"], reason="rule conflict", decision_id=decision_id
+    )
+    second = database.merge_concepts(
+        ["concept-b", "concept-a"], reason="replay", decision_id=decision_id
+    )
+
+    assert first["rule_conflicts"] == 1
+    assert second["changed"] is False
+    with closing(database.connect()) as connection:
+        rules = connection.execute(
+            "SELECT id, retired_version FROM rendering_rules ORDER BY id"
+        ).fetchall()
+        queue = connection.execute(
+            """SELECT severity, status, payload_json FROM human_queue
+               WHERE kind='render_rule_conflict'"""
+        ).fetchall()
+    assert {row["retired_version"] for row in rules} == {first["knowledge_version"]}
+    assert len(queue) == 1
+    assert tuple(queue[0])[:2] == ("warning", "open")
+    payload = json.loads(queue[0]["payload_json"])
+    assert payload["canonical_concept_id"] == first["canonical_id"]
+    assert payload["decision_id"] == decision_id
+    assert payload["rule_count"] == 2
+    assert set(payload["targets"]) == {"甲", "乙"}
+
+
+@pytest.mark.parametrize("bad_relation", ["different", "uncertain"])
+def test_merge_concept_redirect_rejects_wrong_or_retired_decision(tmp_path, bad_relation):
+    database, lexeme_id, mention_ids, _, _ = _coreference_case(tmp_path)
+    concept_ids = ("concept-a", "concept-b")
+    for concept_id, mention_id in zip(concept_ids, mention_ids):
+        _insert_test_concept(database, lexeme_id, concept_id, anchor_mention_id=mention_id)
+        _bind_test_mention(database, mention_id, concept_id)
+    decision_id = _insert_same_coreference_decision(
+        database,
+        lexeme_id,
+        mention_ids,
+        concept_ids,
+        relation=bad_relation,
+        retired=bad_relation == "uncertain",
+    )
+
+    with pytest.raises(ValueError, match="active same"):
+        database.merge_concepts(
+            concept_ids, reason="not authorized", decision_id=decision_id
+        )
+    with closing(database.connect()) as connection:
+        assert connection.execute("SELECT COUNT(*) FROM concept_redirects").fetchone()[0] == 0
+
+
+def test_merge_concept_redirect_method_savepoint_rolls_back_every_write(tmp_path):
+    database, _, mention_ids, _, _, decision_id = _prepare_authorized_merge(tmp_path)
+    with database.transaction() as connection:
+        version = connection.execute(
+            "SELECT MAX(id) FROM knowledge_versions"
+        ).fetchone()[0]
+        translation_id = connection.execute(
+            """INSERT INTO translation_versions(
+                   block_id, pipeline, knowledge_version, status, active, created_at)
+               VALUES('block-1', 'parallel_v4', ?, 'completed', 1,
+                      '2001-01-01T00:00:00+00:00')""",
+            (version,),
+        ).lastrowid
+        connection.execute(
+            """INSERT INTO dependencies(
+                   translation_id, dependency_type, dependency_id, knowledge_version)
+               VALUES(?, 'concept', 'concept-b', ?)""",
+            (translation_id, version),
+        )
+        before = {
+            "versions": connection.execute("SELECT COUNT(*) FROM knowledge_versions").fetchone()[0],
+            "audits": connection.execute("SELECT COUNT(*) FROM audit_calls").fetchone()[0],
+        }
+        connection.execute(
+            """CREATE TEMP TRIGGER reject_merge_redirect
+               BEFORE INSERT ON concept_redirects
+               BEGIN
+                   SELECT RAISE(ABORT, 'forced redirect failure');
+               END"""
+        )
+        with pytest.raises(sqlite3.IntegrityError, match="forced redirect failure"):
+            database.merge_concepts(
+                ["concept-a", "concept-b"],
+                reason="must roll back",
+                decision_id=decision_id,
+                connection=connection,
+            )
+
+    with closing(database.connect()) as connection:
+        assert connection.execute("SELECT COUNT(*) FROM concept_redirects").fetchone()[0] == 0
+        assert connection.execute("SELECT COUNT(*) FROM knowledge_versions").fetchone()[0] == before["versions"]
+        assert connection.execute("SELECT COUNT(*) FROM audit_calls").fetchone()[0] == before["audits"]
+        assert connection.execute(
+            "SELECT dependency_id FROM dependencies WHERE translation_id=?",
+            (translation_id,),
+        ).fetchone()[0] == "concept-b"
+        assert [
+            row[0]
+            for row in connection.execute(
+                "SELECT concept_id FROM mentions WHERE id IN (?, ?) ORDER BY id",
+                mention_ids,
+            )
+        ] == ["concept-a", "concept-b"]
+    assert not list(database.audit_archive.root.glob("*.jsonl.zst"))
 
 
 def test_ensure_concept_for_anchor_is_stable_idempotent_and_anchor_immutable(
@@ -3354,7 +3936,7 @@ def test_dual_model_locked_decision_wins_without_model_calls(tmp_path):
         ).fetchone()[0] == 1
 
 
-def test_dual_model_same_records_but_does_not_rebind_multiple_anchors(tmp_path):
+def test_dual_model_same_merges_multiple_active_anchors_through_redirect(tmp_path):
     database, lexeme_id, mention_ids, _, _ = _coreference_case(tmp_path)
     concept_ids = ("concept-left", "concept-right")
     for concept_id, mention_id in zip(concept_ids, mention_ids):
@@ -3372,16 +3954,28 @@ def test_dual_model_same_records_but_does_not_rebind_multiple_anchors(tmp_path):
 
     assert coordinator.resolve_dual_model(case) == ("same", "model_agreement")
     with closing(database.connect()) as connection:
-        assert [
-            row[0]
-            for row in connection.execute(
-                "SELECT concept_id FROM mentions ORDER BY id"
-            )
-        ] == list(concept_ids)
-        assert connection.execute(
-            """SELECT relation FROM coreference_decisions
+        decision = connection.execute(
+            """SELECT id, relation, votes_json FROM coreference_decisions
                WHERE decision_source='dual_model'"""
-        ).fetchone()[0] == "same"
+        ).fetchone()
+        redirects = connection.execute(
+            """SELECT retired_concept_id, canonical_concept_id
+               FROM concept_redirects"""
+        ).fetchall()
+        bindings = connection.execute(
+            "SELECT concept_id FROM mentions ORDER BY id"
+        ).fetchall()
+    assert decision["relation"] == "same"
+    assert len(redirects) == 1
+    canonical_id = redirects[0]["canonical_concept_id"]
+    assert {row[0] for row in bindings} == {canonical_id}
+    effect = next(
+        vote["effect"]
+        for vote in json.loads(decision["votes_json"])
+        if vote.get("source") == "dual_model"
+    )
+    assert effect == {"bindings_changed": 1, "unified_identity": True}
+    assert database.resolve_concept_id(redirects[0]["retired_concept_id"]) == canonical_id
 
 
 def test_dual_model_fallback_priority_and_unicode_tie_are_audited(tmp_path):
@@ -3769,7 +4363,7 @@ def test_dual_model_run_counts_only_an_actual_safe_single_anchor_binding(tmp_pat
         } == {concept_id}
 
 
-def test_dual_model_run_does_not_count_multi_anchor_same_without_binding(tmp_path):
+def test_dual_model_run_counts_fresh_multi_anchor_redirect_merge(tmp_path):
     database, lexeme_id, mention_ids, _, _ = _coreference_case(tmp_path)
     concept_ids = ("concept-run-left", "concept-run-right")
     for concept_id, mention_id in zip(concept_ids, mention_ids):
@@ -3787,15 +4381,19 @@ def test_dual_model_run_does_not_count_multi_anchor_same_without_binding(tmp_pat
 
     summary = coordinator.run(max_cases=1)
 
-    assert summary["model_merges"] == 0
+    assert summary["model_merges"] == 1
     assert summary["deterministic_merges"] == 0
     with closing(database.connect()) as connection:
-        assert [
+        bindings = [
             row[0]
             for row in connection.execute(
                 "SELECT concept_id FROM mentions ORDER BY id"
             )
-        ] == list(concept_ids)
+        ]
+        assert len(set(bindings)) == 1
+        assert connection.execute(
+            "SELECT COUNT(*) FROM concept_redirects"
+        ).fetchone()[0] == 1
 
 
 def test_dual_model_run_cached_same_reports_zero_changes(tmp_path):
@@ -3830,6 +4428,111 @@ def test_dual_model_run_cached_same_reports_zero_changes(tmp_path):
 
     assert summary["model_merges"] == 0
     assert cached_a[0].calls == cached_b[0].calls == []
+
+
+def test_dual_model_cached_same_compensates_a_previously_unfinished_redirect_merge(
+    tmp_path, monkeypatch
+):
+    database, lexeme_id, mention_ids, _, _ = _coreference_case(tmp_path)
+    concept_ids = ("concept-cache-unfinished-left", "concept-cache-unfinished-right")
+    for concept_id, mention_id in zip(concept_ids, mention_ids):
+        _insert_test_concept(
+            database, lexeme_id, concept_id, anchor_mention_id=mention_id
+        )
+        _bind_test_mention(database, mention_id, concept_id)
+    case = CoreferenceCoordinator(database).freeze_cases()[0]
+    first, _, _ = _dual_model_coordinator(
+        database,
+        case,
+        [_dual_model_response(case, "same")],
+        [_dual_model_response(case, "same")],
+    )
+    merge_concepts = database.merge_concepts
+
+    def protected_once(*_args, **_kwargs):
+        raise ConceptMergeConflictError("temporarily protected")
+
+    monkeypatch.setattr(database, "merge_concepts", protected_once)
+    assert first.resolve_dual_model(case) == ("same", "model_agreement")
+    monkeypatch.setattr(database, "merge_concepts", merge_concepts)
+    cached_a = []
+    cached_b = []
+    cached = CoreferenceCoordinator(
+        database,
+        llm_factory_a=_dual_model_factory(
+            "model-a", [AssertionError("must not call A")], cached_a
+        ),
+        llm_factory_b=_dual_model_factory(
+            "model-b", [AssertionError("must not call B")], cached_b
+        ),
+    )
+
+    summary = cached.run(max_cases=1)
+
+    assert summary["model_merges"] == 1
+    assert cached_a[0].calls == cached_b[0].calls == []
+    with closing(database.connect()) as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM coreference_decisions"
+        ).fetchone()[0] == 1
+        assert connection.execute(
+            "SELECT COUNT(*) FROM concept_redirects"
+        ).fetchone()[0] == 1
+        assert connection.execute(
+            "SELECT COUNT(DISTINCT concept_id) FROM mentions"
+        ).fetchone()[0] == 1
+
+
+def test_dual_model_same_protected_merge_is_non_destructive_and_not_reported(tmp_path):
+    database, lexeme_id, mention_ids, _, _ = _coreference_case(tmp_path)
+    concept_ids = ("concept-protected-left", "concept-protected-right")
+    for index, (concept_id, mention_id) in enumerate(zip(concept_ids, mention_ids)):
+        _insert_test_concept(
+            database,
+            lexeme_id,
+            concept_id,
+            anchor_mention_id=mention_id,
+            locked=True,
+        )
+        _bind_test_mention(database, mention_id, concept_id)
+        with database.transaction() as connection:
+            connection.execute(
+                "UPDATE concepts SET verified_target=? WHERE id=?",
+                (f"locked-{index}", concept_id),
+            )
+    case = CoreferenceCoordinator(database).freeze_cases()[0]
+    coordinator, _, _ = _dual_model_coordinator(
+        database,
+        case,
+        [_dual_model_response(case, "same")],
+        [_dual_model_response(case, "same")],
+    )
+
+    summary = coordinator.run(max_cases=1)
+
+    assert summary["model_merges"] == 0
+    with closing(database.connect()) as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM concept_redirects"
+        ).fetchone()[0] == 0
+        assert [
+            row[0]
+            for row in connection.execute(
+                "SELECT concept_id FROM mentions ORDER BY id"
+            )
+        ] == list(concept_ids)
+        decision = connection.execute(
+            """SELECT relation, votes_json FROM coreference_decisions
+               WHERE decision_source='dual_model'"""
+        ).fetchone()
+    assert decision["relation"] == "same"
+    effect = next(
+        vote["effect"]
+        for vote in json.loads(decision["votes_json"])
+        if vote.get("source") == "dual_model"
+    )
+    assert effect["bindings_changed"] == 0
+    assert effect["unified_identity"] is False
 
 
 def test_dual_model_run_cached_uncertain_does_not_repeat_fallback(tmp_path):
@@ -3980,3 +4683,55 @@ def test_dual_model_persistence_failure_rolls_back_decision_binding_and_audits(
         assert connection.execute(
             "SELECT COUNT(*) FROM mentions WHERE concept_id IS NOT NULL"
         ).fetchone()[0] == 0
+
+
+def test_human_concept_form_merge_uses_redirects_and_readable_authorization(tmp_path):
+    database = _db(tmp_path, source_text="Several scapes framed one scape.")
+    database.import_legacy_concept("scape", "拟境", "concept", "canonical")
+    database.import_legacy_concept("scapes", "虚拟场景", "concept", "plural")
+    canonical_id = stable_id("concept", normalize_english_form("scape"))
+    alias_id = stable_id("concept", normalize_english_form("scapes"))
+
+    result = database.merge_concept_forms("scape", ["scapes"])
+
+    assert result["canonical_id"] == canonical_id
+    assert result["merged_concept_ids"] == [alias_id]
+    assert database.resolve_concept_id(alias_id) == canonical_id
+    with closing(database.connect()) as connection:
+        redirect = connection.execute(
+            """SELECT canonical_concept_id, reason, knowledge_version
+               FROM concept_redirects WHERE retired_concept_id=?""",
+            (alias_id,),
+        ).fetchone()
+        alias_link = connection.execute(
+            """SELECT cl.role, l.normalized_form
+               FROM concept_lexemes cl
+               JOIN lexemes l ON l.id=cl.lexeme_id
+               WHERE cl.concept_id=? AND cl.retired_version IS NULL
+                 AND l.normalized_form='scapes'""",
+            (canonical_id,),
+        ).fetchone()
+        authorization = connection.execute(
+            """SELECT id FROM audit_calls
+               WHERE purpose='human_concept_form_merge_authorization'
+                 AND accepted=1 ORDER BY id DESC LIMIT 1"""
+        ).fetchone()
+        merge_audit = connection.execute(
+            """SELECT id FROM audit_calls
+               WHERE purpose='concept_merge' AND accepted=1
+               ORDER BY id DESC LIMIT 1"""
+        ).fetchone()
+        foreign_keys = connection.execute("PRAGMA foreign_key_check").fetchall()
+
+    assert redirect is not None
+    assert redirect["canonical_concept_id"] == canonical_id
+    assert "human concept-form merge authorization audit:" in redirect["reason"]
+    assert tuple(alias_link) == ("alias", "scapes")
+    assert authorization is not None
+    assert merge_audit is not None
+    authorization_payload = database.read_audit_payload(int(authorization["id"]))
+    merge_payload = database.read_audit_payload(int(merge_audit["id"]))
+    assert authorization_payload["request"]["actor_type"] == "human"
+    assert authorization_payload["parsed"]["canonical_concept_id"] == canonical_id
+    assert merge_payload["parsed"]["canonical_id"] == canonical_id
+    assert foreign_keys == []

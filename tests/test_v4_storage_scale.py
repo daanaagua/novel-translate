@@ -117,6 +117,187 @@ def _seed_database(tmp_path, names=("Drotte", "Roche")):
     return db, edition, block, candidates
 
 
+def test_concept_redirect_merge_scales_without_read_n_plus_one_or_unbounded_growth(
+    tmp_path,
+):
+    db, _, _, _ = _seed_database(tmp_path, names=("Briah",))
+    lexeme_id = db.ensure_lexeme("Briah")
+    canonical_id = "concept-scale-canonical"
+    old_id = "concept-scale-old"
+    count = 1_000
+    with db.transaction() as connection:
+        version = connection.execute(
+            "SELECT MAX(id) FROM knowledge_versions"
+        ).fetchone()[0]
+        connection.executemany(
+            """INSERT INTO concepts(
+                   id, kind, canonical_source, locked, primary_lexeme_id,
+                   created_version, created_at)
+               VALUES(?, 'person', ?, ?, ?, ?,
+                      '2000-01-01T00:00:00+00:00')""",
+            [
+                (canonical_id, "canonical", 1, lexeme_id, version),
+                (old_id, "old", 0, lexeme_id, version),
+            ],
+        )
+        connection.executemany(
+            """INSERT INTO concept_lexemes(
+                   concept_id, lexeme_id, role, confidence, status,
+                   created_version, created_at)
+               VALUES(?, ?, 'primary', 1.0, 'provisional', ?,
+                      '2000-01-01T00:00:00+00:00')""",
+            [(canonical_id, lexeme_id, version), (old_id, lexeme_id, version)],
+        )
+        evidence_rows = [
+            (
+                "block-1",
+                f"P{index:04d}",
+                "Briah",
+                f"Briah evidence {index}",
+            )
+            for index in range(count * 2)
+        ]
+        connection.executemany(
+            """INSERT INTO evidence(
+                   block_id, paragraph_id, kind, source_form, evidence_quote,
+                   payload_json, confidence, extractor, created_at)
+               VALUES(?, ?, 'scale', ?, ?, '{}', 1.0, 'scale-test',
+                      '2000-01-01T00:00:00+00:00')""",
+            evidence_rows,
+        )
+        evidence_ids = [
+            int(row[0])
+            for row in connection.execute(
+                """SELECT id FROM evidence WHERE kind='scale' ORDER BY id"""
+            ).fetchall()
+        ]
+        connection.executemany(
+            """INSERT INTO mentions(
+                   block_id, paragraph_id, source_form, normalized_form,
+                   discourse_function, lexeme_id, concept_id, evidence_id)
+               VALUES('block-1', ?, 'Briah', 'briah', 'referential', ?, ?, ?)""",
+            [
+                (
+                    f"P{index:04d}",
+                    lexeme_id,
+                    canonical_id if index % 2 == 0 else old_id,
+                    evidence_ids[index],
+                )
+                for index in range(count * 2)
+            ],
+        )
+        translation_ids = []
+        for _ in range(count):
+            translation_ids.append(
+                int(
+                    connection.execute(
+                        """INSERT INTO translation_versions(
+                               block_id, pipeline, knowledge_version, status,
+                               active, created_at)
+                           VALUES('block-1', 'scale', ?, 'completed', 1,
+                                  '2000-01-01T00:00:00+00:00')""",
+                        (version,),
+                    ).lastrowid
+                )
+            )
+        connection.executemany(
+            """INSERT INTO rendering_rules(
+                   id, concept_id, condition_json, target, priority,
+                   created_version, created_at)
+               VALUES(?, ?, ?, '译名', 0, ?,
+                      '2000-01-01T00:00:00+00:00')""",
+            [
+                (
+                    f"rule-scale-{index:04d}",
+                    old_id,
+                    json.dumps({"occurrence": index}),
+                    version,
+                )
+                for index in range(count)
+            ],
+        )
+        dependency_rows = []
+        for index, translation_id in enumerate(translation_ids):
+            dependency_rows.extend(
+                [
+                    (
+                        translation_id,
+                        canonical_id,
+                        version,
+                        1,
+                        "[]",
+                        json.dumps([[index, index + 1]]),
+                    ),
+                    (
+                        translation_id,
+                        old_id,
+                        version,
+                        1,
+                        json.dumps([f"rule-scale-{index:04d}"]),
+                        json.dumps([[index + 1, index + 2]]),
+                    ),
+                ]
+            )
+        connection.executemany(
+            """INSERT INTO dependencies(
+                   translation_id, dependency_type, dependency_id,
+                   knowledge_version, occurrence_count, applied_rule_ids_json,
+                   source_spans_json)
+               VALUES(?, 'concept', ?, ?, ?, ?, ?)""",
+            dependency_rows,
+        )
+        connection.execute(
+            """INSERT INTO coreference_decisions(
+                   id, lexeme_id, left_anchor_type, left_anchor_id,
+                   right_anchor_type, right_anchor_id, relation,
+                   decision_source, confidence, locked, votes_json,
+                   evidence_ids_json, anchor_members_json, payload_hash,
+                   created_version, created_at)
+               VALUES('coref-scale-merge', ?, 'concept', ?, 'concept', ?,
+                      'same', 'human', 1.0, 1, '[]', '[]', '[]',
+                      'scale-merge-payload', ?,
+                      '2000-01-01T00:00:00+00:00')""",
+            (lexeme_id, canonical_id, old_id, version),
+        )
+    before_bytes = db.path.stat().st_size
+    statements = []
+    with db.transaction() as connection:
+        connection.set_trace_callback(statements.append)
+        result = db.merge_concepts(
+            [old_id, canonical_id],
+            reason="scale merge",
+            decision_id="coref-scale-merge",
+            connection=connection,
+        )
+        connection.set_trace_callback(None)
+    after_bytes = db.path.stat().st_size
+
+    read_statements = [
+        statement
+        for statement in statements
+        if statement.lstrip().upper().startswith(("SELECT", "WITH"))
+    ]
+    assert result["canonical_id"] == canonical_id
+    assert len(read_statements) <= 40
+    assert after_bytes - before_bytes <= 2 * 1024**2
+    with closing(db.connect()) as connection:
+        assert connection.execute(
+            "SELECT COUNT(DISTINCT concept_id) FROM mentions WHERE lexeme_id=?",
+            (lexeme_id,),
+        ).fetchone()[0] == 1
+        assert connection.execute(
+            """SELECT COUNT(*) FROM dependencies
+               WHERE dependency_type='concept' AND dependency_id=?""",
+            (canonical_id,),
+        ).fetchone()[0] == count
+        assert connection.execute(
+            """SELECT COUNT(*) FROM rendering_rules
+               WHERE concept_id=? AND retired_version IS NULL""",
+            (canonical_id,),
+        ).fetchone()[0] == count
+        assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
+
+
 def test_schema6_requires_explicit_upgrade_without_mutating_data(tmp_path):
     root = tmp_path / "legacy"
     path = root / "artifacts" / "parallel_v4" / "book.db"

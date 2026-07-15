@@ -90,9 +90,21 @@ class ConceptAnchorConflictError(RuntimeError, ValueError):
     """An immutable mention anchor prevents safe concept creation."""
 
 
+class ConceptMergeConflictError(RuntimeError, ValueError):
+    """Protected knowledge makes an otherwise authorized merge unsafe."""
+
+
 MAX_COREFERENCE_FALLBACK_CANDIDATES = 16
 MAX_COREFERENCE_FALLBACK_SOURCES = 8
 MAX_COREFERENCE_FALLBACK_TEXT_CHARS = 120
+MAX_CONCEPT_REDIRECT_DEPTH = 64
+MAX_MERGE_AUDIT_IDS = 64
+MAX_RULE_CONFLICT_IDS = 64
+MAX_RULE_CONFLICT_TARGETS = 32
+MAX_RULE_CONFLICT_CONDITION_CHARS = 2_048
+HUMAN_CONCEPT_FORM_REDIRECT_PREFIX = (
+    "human concept-form merge authorization audit:"
+)
 
 
 class V4Database:
@@ -173,6 +185,45 @@ class V4Database:
             )
 
     @staticmethod
+    def _human_concept_form_redirect_is_authorized(
+        connection: sqlite3.Connection,
+        redirect: sqlite3.Row,
+        retired_concept_id: str,
+    ) -> bool:
+        reason = str(redirect["reason"] or "")
+        if not reason.startswith(HUMAN_CONCEPT_FORM_REDIRECT_PREFIX):
+            return False
+        suffix = reason[len(HUMAN_CONCEPT_FORM_REDIRECT_PREFIX) :]
+        match = re.match(r"(\d+)(?:\b|:)", suffix)
+        if match is None:
+            return False
+        audit = connection.execute(
+            """SELECT request_json, parsed_json FROM audit_calls
+               WHERE id=?
+                 AND purpose='human_concept_form_merge_authorization'
+                 AND model='none' AND accepted=1""",
+            (int(match.group(1)),),
+        ).fetchone()
+        if audit is None:
+            return False
+        try:
+            request = json.loads(str(audit["request_json"] or "{}"))
+            parsed = json.loads(str(audit["parsed_json"] or "{}"))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return False
+        concept_ids = request.get("concept_ids")
+        return (
+            request.get("actor_type") == "human"
+            and request.get("call_type")
+            == "human_concept_form_merge_authorization"
+            and isinstance(concept_ids, list)
+            and retired_concept_id in concept_ids
+            and parsed.get("authorized") is True
+            and parsed.get("canonical_concept_id")
+            == str(redirect["canonical_concept_id"])
+        )
+
+    @staticmethod
     def _active_canonical_concept(
         connection: sqlite3.Connection,
         concept_id: str,
@@ -184,7 +235,12 @@ class V4Database:
         current = concept_id
         visited: set[str] = set()
         redirected = False
-        while current not in visited:
+        chain_lexeme_id = expected_lexeme_id
+        allow_next_cross_lexeme = False
+        human_form_redirect = False
+        for _ in range(MAX_CONCEPT_REDIRECT_DEPTH + 1):
+            if current in visited:
+                return (None, redirected)
             visited.add(current)
             concept = connection.execute(
                 """SELECT primary_lexeme_id, retired_version
@@ -193,6 +249,16 @@ class V4Database:
             ).fetchone()
             if concept is None:
                 return (None, redirected)
+            row_lexeme_id = str(concept["primary_lexeme_id"] or "").strip() or None
+            if chain_lexeme_id is None:
+                chain_lexeme_id = row_lexeme_id
+            elif row_lexeme_id != chain_lexeme_id:
+                if not allow_next_cross_lexeme:
+                    return (None, redirected)
+                chain_lexeme_id = row_lexeme_id
+                allow_next_cross_lexeme = False
+            else:
+                allow_next_cross_lexeme = False
             if concept["retired_version"] is None:
                 if expected_lexeme_id is not None:
                     primary_ids = {
@@ -204,7 +270,16 @@ class V4Database:
                             (current,),
                         ).fetchall()
                     }
-                    if (
+                    if human_form_redirect:
+                        alias_link = connection.execute(
+                            """SELECT 1 FROM concept_lexemes
+                               WHERE concept_id=? AND lexeme_id=?
+                                 AND role='alias' AND retired_version IS NULL""",
+                            (current, expected_lexeme_id),
+                        ).fetchone()
+                        if alias_link is None:
+                            return (None, redirected)
+                    elif (
                         str(concept["primary_lexeme_id"] or "")
                         != expected_lexeme_id
                         or primary_ids != {expected_lexeme_id}
@@ -212,15 +287,1111 @@ class V4Database:
                         return (None, redirected)
                 return (current, redirected)
             redirect = connection.execute(
-                """SELECT canonical_concept_id FROM concept_redirects
+                """SELECT canonical_concept_id, reason, knowledge_version
+                   FROM concept_redirects
                    WHERE retired_concept_id=?""",
                 (current,),
             ).fetchone()
             if redirect is None:
                 return (None, redirected)
+            allow_next_cross_lexeme = (
+                V4Database._human_concept_form_redirect_is_authorized(
+                    connection, redirect, current
+                )
+            )
+            human_form_redirect = human_form_redirect or allow_next_cross_lexeme
             current = str(redirect["canonical_concept_id"])
             redirected = True
         return (None, redirected)
+
+    def resolve_concept_id(
+        self,
+        concept_id: str,
+        *,
+        connection: sqlite3.Connection | None = None,
+    ) -> str:
+        """Resolve one historical concept identity to an active canonical row."""
+
+        if not isinstance(concept_id, str) or not concept_id.strip():
+            raise ValueError("concept_id cannot be empty")
+        normalized_id = concept_id.strip()
+        if connection is None:
+            with closing(self.connect()) as owned_connection:
+                owned_connection.execute("BEGIN")
+                return self.resolve_concept_id(
+                    normalized_id,
+                    connection=owned_connection,
+                )
+        self._require_active_transaction(connection)
+
+        current = normalized_id
+        visited: set[str] = set()
+        expected_lexeme_id: str | None = None
+        allow_next_cross_lexeme = False
+        for depth in range(MAX_CONCEPT_REDIRECT_DEPTH + 1):
+            if current in visited:
+                raise ValueError(
+                    f"concept redirect cycle detected at {current}"
+                )
+            visited.add(current)
+            row = connection.execute(
+                """SELECT id, primary_lexeme_id, retired_version
+                   FROM concepts WHERE id=?""",
+                (current,),
+            ).fetchone()
+            if row is None:
+                if depth == 0:
+                    raise KeyError(f"concept does not exist: {normalized_id}")
+                raise ValueError(
+                    f"dangling concept redirect target: {current}"
+                )
+            row_lexeme = str(row["primary_lexeme_id"] or "").strip() or None
+            if expected_lexeme_id is None:
+                expected_lexeme_id = row_lexeme
+            elif row_lexeme is not None and row_lexeme != expected_lexeme_id:
+                if not allow_next_cross_lexeme:
+                    raise ValueError(
+                        "cross-lexeme concept redirect chain is invalid: "
+                        f"{normalized_id} -> {current}"
+                    )
+                expected_lexeme_id = row_lexeme
+                allow_next_cross_lexeme = False
+            else:
+                allow_next_cross_lexeme = False
+            if row["retired_version"] is None:
+                return current
+            if depth == MAX_CONCEPT_REDIRECT_DEPTH:
+                raise ValueError(
+                    "concept redirect depth exceeds "
+                    f"{MAX_CONCEPT_REDIRECT_DEPTH}: {normalized_id}"
+                )
+            redirect = connection.execute(
+                """SELECT canonical_concept_id, reason, knowledge_version
+                   FROM concept_redirects
+                   WHERE retired_concept_id=?""",
+                (current,),
+            ).fetchone()
+            if redirect is None:
+                raise ValueError(
+                    f"dangling concept redirect chain at retired concept: {current}"
+                )
+            target = str(redirect["canonical_concept_id"] or "").strip()
+            if not target:
+                raise ValueError(
+                    f"dangling concept redirect target from: {current}"
+                )
+            if target == current:
+                raise ValueError(f"self concept redirect detected: {current}")
+            allow_next_cross_lexeme = (
+                self._human_concept_form_redirect_is_authorized(
+                    connection, redirect, current
+                )
+            )
+            current = target
+        raise ValueError(
+            f"concept redirect depth exceeds {MAX_CONCEPT_REDIRECT_DEPTH}: {normalized_id}"
+        )
+
+    @staticmethod
+    def _canonical_json_text(raw: Any, *, field: str) -> str:
+        try:
+            value = json.loads(str(raw))
+        except (TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise ValueError(f"invalid {field} JSON") from exc
+        return json.dumps(
+            value,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+
+    @staticmethod
+    def _decoded_json_array(raw: Any, *, field: str) -> list[Any]:
+        try:
+            value = json.loads(str(raw or "[]"))
+        except (TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise ValueError(f"invalid {field} JSON") from exc
+        if not isinstance(value, list):
+            raise ValueError(f"{field} must be a JSON array")
+        return value
+
+    @staticmethod
+    def _stable_json_union(values: Iterable[Any]) -> list[Any]:
+        unique: dict[str, Any] = {}
+        for value in values:
+            encoded = json.dumps(
+                value,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            unique.setdefault(encoded, value)
+        return [unique[key] for key in sorted(unique)]
+
+    @staticmethod
+    def _merged_text(values: Iterable[Any]) -> str:
+        unique = sorted(
+            {
+                str(value).strip()
+                for value in values
+                if str(value or "").strip()
+            }
+        )
+        if not unique:
+            return ""
+        if len(unique) == 1:
+            return unique[0]
+        return json.dumps(unique, ensure_ascii=False, separators=(",", ":"))
+
+    @staticmethod
+    def _merge_fingerprints(values: Iterable[Any]) -> str:
+        unique = sorted(
+            {
+                str(value).strip()
+                for value in values
+                if str(value or "").strip()
+            }
+        )
+        if not unique:
+            return ""
+        if len(unique) == 1:
+            return unique[0]
+        payload = json.dumps(
+            unique,
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        return f"merged:{hashlib.sha256(payload).hexdigest()}"
+
+    def _authorized_merge_decision(
+        self,
+        connection: sqlite3.Connection,
+        decision_id: str,
+        concept_ids: set[str],
+        lexeme_id: str,
+    ) -> sqlite3.Row:
+        decision = connection.execute(
+            """SELECT * FROM coreference_decisions
+               WHERE id=? AND relation='same' AND retired_version IS NULL""",
+            (decision_id,),
+        ).fetchone()
+        if decision is None:
+            raise ValueError(
+                "merge decision_id must reference an active same coreference decision"
+            )
+        if str(decision["lexeme_id"]) != lexeme_id:
+            raise ValueError(
+                "merge decision lexeme does not match the concepts"
+            )
+        authorized: set[str] = set()
+        for side in ("left", "right"):
+            if decision[f"{side}_anchor_type"] != "concept":
+                continue
+            anchor_id = str(decision[f"{side}_anchor_id"])
+            try:
+                authorized.add(
+                    self.resolve_concept_id(anchor_id, connection=connection)
+                )
+            except (KeyError, ValueError):
+                continue
+        members = self._decoded_json_array(
+            decision["anchor_members_json"],
+            field="anchor_members_json",
+        )
+        member_ids = sorted(
+            {
+                int(value)
+                for value in members
+                if isinstance(value, int) and not isinstance(value, bool)
+                or isinstance(value, str) and value.strip().isdigit()
+            }
+        )
+        if member_ids:
+            placeholders = ",".join("?" for _ in member_ids)
+            rows = connection.execute(
+                f"""SELECT DISTINCT concept_id FROM mentions
+                     WHERE id IN ({placeholders}) AND lexeme_id=?
+                       AND concept_id IS NOT NULL""",
+                (*member_ids, lexeme_id),
+            ).fetchall()
+            for row in rows:
+                try:
+                    authorized.add(
+                        self.resolve_concept_id(
+                            str(row["concept_id"]),
+                            connection=connection,
+                        )
+                    )
+                except (KeyError, ValueError):
+                    continue
+            anchor_rows = connection.execute(
+                f"""SELECT id FROM concepts
+                     WHERE anchor_mention_id IN ({placeholders})
+                       AND primary_lexeme_id=?""",
+                (*member_ids, lexeme_id),
+            ).fetchall()
+            for row in anchor_rows:
+                try:
+                    authorized.add(
+                        self.resolve_concept_id(
+                            str(row["id"]),
+                            connection=connection,
+                        )
+                    )
+                except (KeyError, ValueError):
+                    continue
+        if not concept_ids <= authorized:
+            missing = sorted(concept_ids - authorized)
+            raise ValueError(
+                "same decision does not authorize every merge concept: "
+                + ", ".join(missing[:8])
+            )
+        return decision
+
+    def _reject_protected_merge_conflicts(
+        self,
+        connection: sqlite3.Connection,
+        rows: Sequence[sqlite3.Row],
+        concept_ids: set[str],
+        lexeme_id: str,
+    ) -> None:
+        locked_rows = [row for row in rows if bool(row["locked"])]
+        locked_targets = {
+            str(
+                row["verified_target"]
+                or row["working_target"]
+                or row["default_target"]
+                or ""
+            ).strip()
+            for row in locked_rows
+            if str(
+                row["verified_target"]
+                or row["working_target"]
+                or row["default_target"]
+                or ""
+            ).strip()
+        }
+        if len(locked_targets) > 1:
+            raise ConceptMergeConflictError(
+                "locked concepts have conflicting translations"
+            )
+        if len({str(row["kind"]) for row in locked_rows}) > 1:
+            raise ConceptMergeConflictError(
+                "locked concepts have conflicting kinds"
+            )
+        protected = connection.execute(
+            """SELECT * FROM coreference_decisions
+               WHERE lexeme_id=? AND retired_version IS NULL
+                 AND relation!='same' AND (locked=1 OR decision_source='human')
+               ORDER BY id""",
+            (lexeme_id,),
+        ).fetchall()
+        if not protected:
+            return
+        all_member_ids: set[int] = set()
+        decoded_members: dict[str, set[int]] = {}
+        for decision in protected:
+            members = {
+                int(value)
+                for value in self._decoded_json_array(
+                    decision["anchor_members_json"],
+                    field="anchor_members_json",
+                )
+                if isinstance(value, int) and not isinstance(value, bool)
+                or isinstance(value, str) and value.strip().isdigit()
+            }
+            decoded_members[str(decision["id"])] = members
+            all_member_ids.update(members)
+        member_concepts: dict[int, str] = {}
+        if all_member_ids:
+            ordered_members = sorted(all_member_ids)
+            placeholders = ",".join("?" for _ in ordered_members)
+            for row in connection.execute(
+                f"""SELECT id, concept_id FROM mentions
+                     WHERE id IN ({placeholders}) AND concept_id IS NOT NULL""",
+                ordered_members,
+            ).fetchall():
+                try:
+                    member_concepts[int(row["id"])] = self.resolve_concept_id(
+                        str(row["concept_id"]), connection=connection
+                    )
+                except (KeyError, ValueError):
+                    continue
+        for decision in protected:
+            identities: set[str] = set()
+            for side in ("left", "right"):
+                if decision[f"{side}_anchor_type"] != "concept":
+                    continue
+                try:
+                    identities.add(
+                        self.resolve_concept_id(
+                            str(decision[f"{side}_anchor_id"]),
+                            connection=connection,
+                        )
+                    )
+                except (KeyError, ValueError):
+                    continue
+            identities.update(
+                member_concepts[member_id]
+                for member_id in decoded_members[str(decision["id"])]
+                if member_id in member_concepts
+            )
+            overlap = identities & concept_ids
+            if overlap and (
+                str(decision["relation"]) in {"uncertain", "non_entity"}
+                or len(overlap) >= 2
+            ):
+                raise ConceptMergeConflictError(
+                    "protected human/locked coreference decision conflicts with merge: "
+                    f"{decision['id']}"
+                )
+
+    def merge_concepts(
+        self,
+        concept_ids: Sequence[str],
+        *,
+        reason: str,
+        decision_id: str,
+        connection: sqlite3.Connection | None = None,
+    ) -> Dict[str, Any]:
+        """Atomically merge active same-lexeme concepts through redirects."""
+
+        return self._merge_concepts_authorized(
+            concept_ids,
+            reason=reason,
+            decision_id=decision_id,
+            connection=connection,
+            human_authorized_cross_lexeme=False,
+            preferred_canonical_id=None,
+        )
+
+    def _merge_concepts_authorized(
+        self,
+        concept_ids: Sequence[str],
+        *,
+        reason: str,
+        decision_id: str,
+        connection: sqlite3.Connection | None,
+        human_authorized_cross_lexeme: bool,
+        preferred_canonical_id: str | None,
+    ) -> Dict[str, Any]:
+        """Private primitive shared by decision and explicit-human merge APIs."""
+
+        if isinstance(concept_ids, (str, bytes)):
+            raise ValueError("merge_concepts requires a sequence of concept IDs")
+        raw_ids = list(concept_ids)
+        if len(raw_ids) < 2:
+            raise ValueError("merge_concepts requires at least two concept IDs")
+        if not isinstance(reason, str) or not reason.strip():
+            raise ValueError("merge reason cannot be empty")
+        if not isinstance(decision_id, str) or not decision_id.strip():
+            raise ValueError("merge decision_id cannot be empty")
+        normalized_raw: list[str] = []
+        for value in raw_ids:
+            if not isinstance(value, str) or not value.strip():
+                raise ValueError("merge concept IDs cannot be empty")
+            normalized_raw.append(value.strip())
+        reason = reason.strip()
+        decision_id = decision_id.strip()
+        if connection is None:
+            with self.transaction() as owned_connection:
+                return self._merge_concepts_authorized(
+                    normalized_raw,
+                    reason=reason,
+                    decision_id=decision_id,
+                    connection=owned_connection,
+                    human_authorized_cross_lexeme=human_authorized_cross_lexeme,
+                    preferred_canonical_id=preferred_canonical_id,
+                )
+        self._require_active_transaction(connection)
+        with self._method_savepoint(connection, "merge_concepts"):
+            resolved_ids = sorted(
+                {
+                    self.resolve_concept_id(value, connection=connection)
+                    for value in normalized_raw
+                }
+            )
+            placeholders = ",".join("?" for _ in resolved_ids)
+            rows = connection.execute(
+                f"""WITH mention_counts AS (
+                         SELECT concept_id, COUNT(*) AS count
+                         FROM mentions WHERE concept_id IN ({placeholders})
+                         GROUP BY concept_id
+                     ), dependency_counts AS (
+                         SELECT dependency_id, COUNT(*) AS count
+                         FROM dependencies
+                         WHERE dependency_type='concept'
+                           AND dependency_id IN ({placeholders})
+                         GROUP BY dependency_id
+                     )
+                     SELECT c.*,
+                            COALESCE(m.count, 0) AS mention_count,
+                            COALESCE(d.count, 0) AS dependency_count
+                     FROM concepts c
+                     LEFT JOIN mention_counts m ON m.concept_id=c.id
+                     LEFT JOIN dependency_counts d ON d.dependency_id=c.id
+                     WHERE c.id IN ({placeholders})
+                       AND c.retired_version IS NULL
+                     ORDER BY c.id""",
+                (*resolved_ids, *resolved_ids, *resolved_ids),
+            ).fetchall()
+            if len(rows) != len(resolved_ids):
+                raise ValueError("merge requires active canonical concepts")
+            lexeme_ids = {
+                str(row["primary_lexeme_id"] or "").strip() for row in rows
+            }
+            if human_authorized_cross_lexeme:
+                if preferred_canonical_id not in resolved_ids:
+                    raise ValueError(
+                        "human concept-form merge canonical concept is not active"
+                    )
+                if "" in lexeme_ids:
+                    raise ValueError(
+                        "human concept-form merge requires active primary lexemes"
+                    )
+                lexeme_id = str(
+                    next(
+                        row["primary_lexeme_id"]
+                        for row in rows
+                        if str(row["id"]) == preferred_canonical_id
+                    )
+                )
+            else:
+                if len(lexeme_ids) != 1 or not next(iter(lexeme_ids), ""):
+                    raise ValueError("merge concepts must belong to one active lexeme")
+                lexeme_id = next(iter(lexeme_ids))
+                linked = {
+                    str(row["concept_id"])
+                    for row in connection.execute(
+                        f"""SELECT concept_id FROM concept_lexemes
+                             WHERE concept_id IN ({placeholders})
+                               AND lexeme_id=? AND role='primary'
+                               AND retired_version IS NULL""",
+                        (*resolved_ids, lexeme_id),
+                    ).fetchall()
+                }
+                if linked != set(resolved_ids):
+                    raise ValueError(
+                        "merge concepts must have active primary links to the same lexeme"
+                    )
+                self._authorized_merge_decision(
+                    connection,
+                    decision_id,
+                    set(resolved_ids),
+                    lexeme_id,
+                )
+            if len(resolved_ids) < 2:
+                current_version = int(
+                    connection.execute(
+                        "SELECT MAX(id) FROM knowledge_versions"
+                    ).fetchone()[0]
+                )
+                canonical_id = resolved_ids[0]
+                return {
+                    "canonical_id": canonical_id,
+                    "merged_concept_ids": [],
+                    "changed": False,
+                    "knowledge_version": current_version,
+                    "decision_id": decision_id,
+                    "reason": reason,
+                    "selection_key": {
+                        "criterion": "already_canonical",
+                        "concept_id": canonical_id,
+                    },
+                    "rule_conflicts": 0,
+                }
+            if not human_authorized_cross_lexeme:
+                self._reject_protected_merge_conflicts(
+                    connection,
+                    rows,
+                    set(resolved_ids),
+                    lexeme_id,
+                )
+
+            def effective_target(row: sqlite3.Row) -> str:
+                return str(
+                    row["verified_target"]
+                    or row["working_target"]
+                    or row["default_target"]
+                    or ""
+                ).strip()
+
+            def selection_values(row: sqlite3.Row) -> tuple[Any, ...]:
+                verified = bool(str(row["verified_target"] or "").strip()) or (
+                    str(row["status"]) == "verified"
+                )
+                references = int(row["mention_count"]) + int(
+                    row["dependency_count"]
+                )
+                return (
+                    bool(row["locked"]),
+                    verified,
+                    bool(effective_target(row)),
+                    references,
+                    str(row["created_at"]),
+                    str(row["id"]),
+                )
+
+            ranked = sorted(
+                rows,
+                key=lambda row: (
+                    -int(selection_values(row)[0]),
+                    -int(selection_values(row)[1]),
+                    -int(selection_values(row)[2]),
+                    -int(selection_values(row)[3]),
+                    selection_values(row)[4],
+                    selection_values(row)[5],
+                ),
+            )
+            if human_authorized_cross_lexeme:
+                ranked = sorted(
+                    ranked,
+                    key=lambda row: str(row["id"]) != preferred_canonical_id,
+                )
+            canonical = ranked[0]
+            runner_up = ranked[1]
+            canonical_values = selection_values(canonical)
+            runner_values = selection_values(runner_up)
+            criteria = (
+                "locked",
+                "verified",
+                "target",
+                "references",
+                "created_at",
+                "unicode_id",
+            )
+            criterion = (
+                "human_canonical_source"
+                if human_authorized_cross_lexeme
+                else next(
+                    (
+                        name
+                        for index, name in enumerate(criteria)
+                        if canonical_values[index] != runner_values[index]
+                    ),
+                    "unicode_id",
+                )
+            )
+            canonical_id = str(canonical["id"])
+            merged_ids = sorted(set(resolved_ids) - {canonical_id})
+            merged_placeholders = ",".join("?" for _ in merged_ids)
+            version = self.create_knowledge_version(
+                f"merge concepts: {reason}", connection
+            )
+            now = utc_now()
+
+            rule_rows = connection.execute(
+                f"""SELECT * FROM rendering_rules
+                     WHERE concept_id IN ({placeholders})
+                       AND retired_version IS NULL
+                     ORDER BY id""",
+                resolved_ids,
+            ).fetchall()
+            rules_by_condition: dict[str, list[sqlite3.Row]] = {}
+            normalized_conditions: dict[str, str] = {}
+            for row in rule_rows:
+                normalized = self._canonical_json_text(
+                    row["condition_json"], field="rendering rule condition"
+                )
+                normalized_conditions[str(row["id"])] = normalized
+                rules_by_condition.setdefault(normalized, []).append(row)
+            rule_mapping: dict[str, str] = {}
+            rule_survivors: set[str] = set()
+            retired_rule_ids: set[str] = set()
+            conflicts: list[dict[str, Any]] = []
+            for condition, condition_rows in sorted(rules_by_condition.items()):
+                targets = {str(row["target"]) for row in condition_rows}
+                if len(targets) > 1:
+                    ids = sorted(str(row["id"]) for row in condition_rows)
+                    retired_rule_ids.update(ids)
+                    conflict_material = json.dumps(
+                        [
+                            (
+                                str(row["id"]),
+                                str(row["target"]),
+                                int(row["priority"]),
+                            )
+                            for row in sorted(
+                                condition_rows, key=lambda item: str(item["id"])
+                            )
+                        ],
+                        ensure_ascii=False,
+                        separators=(",", ":"),
+                    )
+                    conflicts.append(
+                        {
+                            "condition": condition,
+                            "condition_sha256": hashlib.sha256(
+                                condition.encode("utf-8")
+                            ).hexdigest(),
+                            "conflict_digest": hashlib.sha256(
+                                (condition + "\n" + conflict_material).encode("utf-8")
+                            ).hexdigest(),
+                            "ids": ids,
+                            "targets": sorted(targets),
+                        }
+                    )
+                    continue
+                exact: dict[tuple[str, str, int], list[sqlite3.Row]] = {}
+                for row in condition_rows:
+                    exact.setdefault(
+                        (condition, str(row["target"]), int(row["priority"])),
+                        [],
+                    ).append(row)
+                for duplicates in exact.values():
+                    winner = min(
+                        duplicates,
+                        key=lambda row: (
+                            -int(bool(row["locked"])),
+                            str(row["created_at"]),
+                            str(row["id"]),
+                        ),
+                    )
+                    winner_id = str(winner["id"])
+                    rule_survivors.add(winner_id)
+                    for duplicate in duplicates:
+                        duplicate_id = str(duplicate["id"])
+                        if duplicate_id == winner_id:
+                            continue
+                        retired_rule_ids.add(duplicate_id)
+                        rule_mapping[duplicate_id] = winner_id
+
+            dependency_rows = connection.execute(
+                f"""SELECT * FROM dependencies
+                     WHERE dependency_type='concept'
+                       AND dependency_id IN ({placeholders})
+                     ORDER BY translation_id, id""",
+                resolved_ids,
+            ).fetchall()
+            dependency_groups: dict[int, list[sqlite3.Row]] = {}
+            for row in dependency_rows:
+                dependency_groups.setdefault(int(row["translation_id"]), []).append(row)
+            dependency_plan: list[tuple[Any, ...]] = []
+            for translation_id, group in sorted(dependency_groups.items()):
+                winner = min(
+                    group,
+                    key=lambda row: (
+                        str(row["dependency_id"]) != canonical_id,
+                        int(row["id"]),
+                    ),
+                )
+                applied_values: list[Any] = []
+                span_values: list[Any] = []
+                for row in group:
+                    for rule_id in self._decoded_json_array(
+                        row["applied_rule_ids_json"],
+                        field="applied_rule_ids_json",
+                    ):
+                        normalized_rule_id = rule_mapping.get(str(rule_id), str(rule_id))
+                        applied_values.append(normalized_rule_id)
+                    span_values.extend(
+                        self._decoded_json_array(
+                            row["source_spans_json"],
+                            field="source_spans_json",
+                        )
+                    )
+                dependency_plan.append(
+                    (
+                        int(winner["id"]),
+                        translation_id,
+                        canonical_id,
+                        version,
+                        self._merge_fingerprints(
+                            row["dependency_fingerprint"] for row in group
+                        ),
+                        self._merged_text(row["matched_form"] for row in group),
+                        sum(int(row["occurrence_count"] or 0) for row in group),
+                        self._merged_text(row["rendered_target"] for row in group),
+                        json.dumps(
+                            self._stable_json_union(applied_values),
+                            ensure_ascii=False,
+                            separators=(",", ":"),
+                        ),
+                        json.dumps(
+                            self._stable_json_union(span_values),
+                            ensure_ascii=False,
+                            separators=(",", ":"),
+                        ),
+                    )
+                )
+
+            dependency_temp = f"merge_dependency_{uuid.uuid4().hex}"
+            connection.execute(
+                f"""CREATE TEMP TABLE {dependency_temp}(
+                       winner_id INTEGER PRIMARY KEY,
+                       translation_id INTEGER NOT NULL,
+                       dependency_id TEXT NOT NULL,
+                       knowledge_version INTEGER NOT NULL,
+                       dependency_fingerprint TEXT NOT NULL,
+                       matched_form TEXT NOT NULL,
+                       occurrence_count INTEGER NOT NULL,
+                       rendered_target TEXT NOT NULL,
+                       applied_rule_ids_json TEXT NOT NULL,
+                       source_spans_json TEXT NOT NULL)"""
+            )
+            if dependency_plan:
+                connection.executemany(
+                    f"INSERT INTO {dependency_temp} VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    dependency_plan,
+                )
+                connection.execute(
+                    f"""DELETE FROM dependencies
+                         WHERE dependency_type='concept'
+                           AND dependency_id IN ({placeholders})
+                           AND id NOT IN (SELECT winner_id FROM {dependency_temp})""",
+                    resolved_ids,
+                )
+                connection.execute(
+                    f"""UPDATE dependencies
+                         SET dependency_id=(SELECT dependency_id FROM {dependency_temp}
+                                            WHERE winner_id=dependencies.id),
+                             knowledge_version=(SELECT knowledge_version FROM {dependency_temp}
+                                                WHERE winner_id=dependencies.id),
+                             dependency_fingerprint=(SELECT dependency_fingerprint FROM {dependency_temp}
+                                                     WHERE winner_id=dependencies.id),
+                             matched_form=(SELECT matched_form FROM {dependency_temp}
+                                           WHERE winner_id=dependencies.id),
+                             occurrence_count=(SELECT occurrence_count FROM {dependency_temp}
+                                               WHERE winner_id=dependencies.id),
+                             rendered_target=(SELECT rendered_target FROM {dependency_temp}
+                                              WHERE winner_id=dependencies.id),
+                             applied_rule_ids_json=(SELECT applied_rule_ids_json FROM {dependency_temp}
+                                                    WHERE winner_id=dependencies.id),
+                             source_spans_json=(SELECT source_spans_json FROM {dependency_temp}
+                                               WHERE winner_id=dependencies.id)
+                         WHERE id IN (SELECT winner_id FROM {dependency_temp})"""
+                )
+            connection.execute(f"DROP TABLE {dependency_temp}")
+
+            connection.execute(
+                f"UPDATE mentions SET concept_id=? WHERE concept_id IN ({merged_placeholders})",
+                (canonical_id, *merged_ids),
+            )
+            connection.execute(
+                f"""UPDATE candidate_resolutions SET concept_id=?
+                     WHERE concept_id IN ({merged_placeholders})
+                       AND adjudication_id IN (
+                           SELECT id FROM candidate_adjudications WHERE active=1)""",
+                (canonical_id, *merged_ids),
+            )
+            connection.execute(
+                f"""UPDATE concept_type_observations SET concept_id=?
+                     WHERE concept_id IN ({merged_placeholders})
+                       AND retired_version IS NULL""",
+                (canonical_id, *merged_ids),
+            )
+
+            active_links = connection.execute(
+                f"""SELECT * FROM concept_lexemes
+                     WHERE concept_id IN ({placeholders})
+                       AND retired_version IS NULL
+                     ORDER BY lexeme_id, role, concept_id, created_at""",
+                resolved_ids,
+            ).fetchall()
+
+            def transferred_role(row: sqlite3.Row) -> str:
+                role = str(row["role"])
+                if (
+                    human_authorized_cross_lexeme
+                    and str(row["concept_id"]) != canonical_id
+                    and str(row["lexeme_id"]) != lexeme_id
+                    and role == "primary"
+                ):
+                    return "alias"
+                return role
+
+            canonical_link_keys = {
+                (str(row["lexeme_id"]), str(row["role"]))
+                for row in active_links
+                if str(row["concept_id"]) == canonical_id
+            }
+            transfer_links: dict[tuple[str, str], sqlite3.Row] = {}
+            for row in active_links:
+                if str(row["concept_id"]) == canonical_id:
+                    continue
+                key = (str(row["lexeme_id"]), transferred_role(row))
+                if key in canonical_link_keys:
+                    continue
+                previous = transfer_links.get(key)
+                if previous is None or (
+                    -int(str(row["status"]) == "verified"),
+                    -float(row["confidence"]),
+                    -int(row["evidence_id"] is not None),
+                    str(row["created_at"]),
+                    str(row["concept_id"]),
+                ) < (
+                    -int(str(previous["status"]) == "verified"),
+                    -float(previous["confidence"]),
+                    -int(previous["evidence_id"] is not None),
+                    str(previous["created_at"]),
+                    str(previous["concept_id"]),
+                ):
+                    transfer_links[key] = row
+            if transfer_links:
+                connection.executemany(
+                    """INSERT INTO concept_lexemes(
+                           concept_id, lexeme_id, role, confidence, status,
+                           evidence_id, created_version, created_at)
+                       VALUES(?, ?, ?, ?, ?, ?, ?, ?)""",
+                    [
+                        (
+                            canonical_id,
+                            row["lexeme_id"],
+                            transferred_role(row),
+                            row["confidence"],
+                            row["status"],
+                            row["evidence_id"],
+                            version,
+                            now,
+                        )
+                        for _, row in sorted(transfer_links.items())
+                    ],
+                )
+            connection.execute(
+                f"""UPDATE concept_lexemes SET retired_version=?
+                     WHERE concept_id IN ({merged_placeholders})
+                       AND retired_version IS NULL""",
+                (version, *merged_ids),
+            )
+
+            rule_temp = f"merge_rule_{uuid.uuid4().hex}"
+            connection.execute(
+                f"""CREATE TEMP TABLE {rule_temp}(
+                       id TEXT PRIMARY KEY,
+                       retire INTEGER NOT NULL,
+                       concept_id TEXT,
+                       condition_json TEXT)"""
+            )
+            rule_plan = [
+                (
+                    str(row["id"]),
+                    int(str(row["id"]) in retired_rule_ids),
+                    canonical_id if str(row["id"]) in rule_survivors else None,
+                    normalized_conditions[str(row["id"])]
+                    if str(row["id"]) in rule_survivors
+                    else None,
+                )
+                for row in rule_rows
+            ]
+            if rule_plan:
+                connection.executemany(
+                    f"INSERT INTO {rule_temp} VALUES(?, ?, ?, ?)",
+                    rule_plan,
+                )
+                connection.execute(
+                    f"""UPDATE rendering_rules
+                         SET retired_version=CASE
+                                 WHEN (SELECT retire FROM {rule_temp}
+                                       WHERE id=rendering_rules.id)=1
+                                 THEN ? ELSE retired_version END,
+                             concept_id=COALESCE(
+                                 (SELECT concept_id FROM {rule_temp}
+                                  WHERE id=rendering_rules.id), concept_id),
+                             condition_json=COALESCE(
+                                 (SELECT condition_json FROM {rule_temp}
+                                  WHERE id=rendering_rules.id), condition_json)
+                         WHERE id IN (SELECT id FROM {rule_temp})""",
+                    (version,),
+                )
+            connection.execute(f"DROP TABLE {rule_temp}")
+
+            existing_conflicts = {
+                str(row[0])
+                for row in connection.execute(
+                    """SELECT json_extract(payload_json, '$.conflict_digest')
+                       FROM human_queue
+                       WHERE kind='render_rule_conflict' AND status='open'"""
+                ).fetchall()
+                if row[0]
+            }
+            queue_rows: list[tuple[str, str]] = []
+            for conflict in conflicts:
+                if conflict["conflict_digest"] in existing_conflicts:
+                    continue
+                condition = str(conflict["condition"])
+                condition_payload: Any
+                if len(condition) <= MAX_RULE_CONFLICT_CONDITION_CHARS:
+                    condition_payload = json.loads(condition)
+                else:
+                    condition_payload = {
+                        "sha256": conflict["condition_sha256"],
+                        "preview": condition[:MAX_RULE_CONFLICT_CONDITION_CHARS],
+                        "truncated": True,
+                    }
+                payload = {
+                    "canonical_concept_id": canonical_id,
+                    "decision_id": decision_id,
+                    "condition": condition_payload,
+                    "condition_sha256": conflict["condition_sha256"],
+                    "conflict_digest": conflict["conflict_digest"],
+                    "rule_count": len(conflict["ids"]),
+                    "rule_ids": conflict["ids"][:MAX_RULE_CONFLICT_IDS],
+                    "omitted_rule_ids": max(
+                        0, len(conflict["ids"]) - MAX_RULE_CONFLICT_IDS
+                    ),
+                    "targets": [
+                        target[:512]
+                        for target in conflict["targets"][:MAX_RULE_CONFLICT_TARGETS]
+                    ],
+                    "target_count": len(conflict["targets"]),
+                    "omitted_targets": max(
+                        0,
+                        len(conflict["targets"]) - MAX_RULE_CONFLICT_TARGETS,
+                    ),
+                }
+                queue_rows.append(
+                    (
+                        json.dumps(
+                            payload,
+                            ensure_ascii=False,
+                            sort_keys=True,
+                            separators=(",", ":"),
+                        ),
+                        now,
+                    )
+                )
+            if queue_rows:
+                connection.executemany(
+                    """INSERT INTO human_queue(
+                           block_id, kind, severity, status, payload_json, created_at)
+                       VALUES(NULL, 'render_rule_conflict', 'warning', 'open', ?, ?)""",
+                    queue_rows,
+                )
+
+            connection.executemany(
+                """INSERT INTO concept_redirects(
+                       retired_concept_id, canonical_concept_id, reason,
+                       knowledge_version, created_at)
+                   VALUES(?, ?, ?, ?, ?)""",
+                [
+                    (old_id, canonical_id, reason, version, now)
+                    for old_id in merged_ids
+                ],
+            )
+            connection.execute(
+                f"""UPDATE concepts SET status='merged', retired_version=?
+                     WHERE id IN ({merged_placeholders})
+                       AND retired_version IS NULL""",
+                (version, *merged_ids),
+            )
+
+            merged_digest = hashlib.sha256(
+                json.dumps(
+                    merged_ids,
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                ).encode("utf-8")
+            ).hexdigest()
+            bounded_ids = merged_ids[:MAX_MERGE_AUDIT_IDS]
+            canonical_payload = {
+                "canonical_id": canonical_id,
+                "decision_id": decision_id,
+                "authorization_type": (
+                    "human_concept_form"
+                    if human_authorized_cross_lexeme
+                    else "coreference_decision"
+                ),
+                "reason": reason[:2_000],
+                "merged_concept_ids": bounded_ids,
+                "merged_count": len(merged_ids),
+                "omitted_concept_ids": max(
+                    0, len(merged_ids) - MAX_MERGE_AUDIT_IDS
+                ),
+                "merged_ids_sha256": merged_digest,
+                "dependency_count": len(dependency_groups),
+                "rule_conflict_count": len(conflicts),
+                "rule_redirect_count": len(rule_mapping),
+                "selection_criterion": criterion,
+            }
+            connection.execute(
+                """INSERT INTO knowledge_changes(
+                       knowledge_version, subject_type, subject_id, change_kind,
+                       old_fingerprint, new_fingerprint, impact_level,
+                       payload_json, created_at)
+                   VALUES(?, 'concept', ?, 'concept_merge', ?, ?, 2, ?, ?)""",
+                (
+                    version,
+                    canonical_id,
+                    merged_digest,
+                    hashlib.sha256(canonical_id.encode("utf-8")).hexdigest(),
+                    json.dumps(
+                        canonical_payload,
+                        ensure_ascii=False,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    ),
+                    now,
+                ),
+            )
+            connection.executemany(
+                """INSERT INTO knowledge_changes(
+                       knowledge_version, subject_type, subject_id, change_kind,
+                       old_fingerprint, new_fingerprint, impact_level,
+                       payload_json, created_at)
+                   VALUES(?, 'concept', ?, 'concept_redirect', ?, ?, 2, ?, ?)""",
+                [
+                    (
+                        version,
+                        old_id,
+                        hashlib.sha256(old_id.encode("utf-8")).hexdigest(),
+                        hashlib.sha256(canonical_id.encode("utf-8")).hexdigest(),
+                        json.dumps(
+                            {
+                                "canonical_id": canonical_id,
+                                "decision_id": decision_id,
+                                "reason": reason[:2_000],
+                            },
+                            ensure_ascii=False,
+                            sort_keys=True,
+                            separators=(",", ":"),
+                        ),
+                        now,
+                    )
+                    for old_id in merged_ids
+                ],
+            )
+            self.record_audit_call(
+                run_id=None,
+                block_id=None,
+                purpose="concept_merge",
+                model="none",
+                knowledge_version=version,
+                request={
+                    "actor_type": (
+                        "human"
+                        if human_authorized_cross_lexeme
+                        else "deterministic"
+                    ),
+                    "decision_id": decision_id,
+                    "merged_ids_sha256": merged_digest,
+                },
+                raw_response="",
+                parsed=canonical_payload,
+                accepted=True,
+                attempts=1,
+                elapsed_ms=0,
+                error=None,
+                connection=connection,
+                archive_payload=False,
+            )
+            return {
+                "canonical_id": canonical_id,
+                "merged_concept_ids": merged_ids,
+                "changed": True,
+                "knowledge_version": version,
+                "decision_id": decision_id,
+                "reason": reason,
+                "selection_key": {
+                    "criterion": criterion,
+                    "locked": canonical_values[0],
+                    "verified": canonical_values[1],
+                    "has_target": canonical_values[2],
+                    "reference_count": canonical_values[3],
+                    "created_at": canonical_values[4],
+                    "concept_id": canonical_id,
+                },
+                "rule_conflicts": len(conflicts),
+            }
 
     def _audit_transaction_for(
         self, connection: sqlite3.Connection
@@ -5483,153 +6654,137 @@ class V4Database:
         singular and plural without teaching the scanner unsafe alias guesses.
         """
         canonical_source = canonical_source.strip()
-        alias_values = [value.strip() for value in aliases if value.strip()]
+        alias_values = list(
+            dict.fromkeys(value.strip() for value in aliases if value.strip())
+        )
         if not canonical_source or not alias_values:
             raise ValueError("合并概念词形时必须提供核心词形和至少一个别名")
         canonical_id = stable_id(
             "concept", normalize_english_form(canonical_source)
         )
+        alias_ids = [
+            stable_id("concept", normalize_english_form(alias))
+            for alias in alias_values
+        ]
         with self.transaction() as connection:
             canonical = connection.execute(
-                """SELECT * FROM concepts
+                """SELECT id FROM concepts
                    WHERE id=? AND retired_version IS NULL""",
                 (canonical_id,),
             ).fetchone()
             if canonical is None:
-                raise KeyError(f"核心概念不存在: {canonical_source}")
-            version = self.create_knowledge_version(
-                f"human merge concept forms: {canonical_source}", connection
-            )
-            merged_ids: List[str] = []
-            affected_translation_ids: set[int] = set()
-            for alias in dict.fromkeys(alias_values):
+                raise KeyError(f"canonical concept does not exist: {canonical_source}")
+
+            active_ids = [canonical_id]
+            for alias, alias_id in zip(alias_values, alias_ids):
                 normalized_alias = normalize_english_form(alias)
-                alias_id = stable_id("concept", normalized_alias)
-                alias_lexeme_id = self._ensure_schema8_lexeme(
+                lexeme_id = self._ensure_schema8_lexeme(
                     connection,
                     alias,
                     normalized_form=normalized_alias,
-                    concept_id=canonical_id,
-                    knowledge_version=version,
                 )
                 connection.execute(
                     """INSERT OR IGNORE INTO source_forms(
                            lexeme_id, form, normalized_form, grammar_json
                        ) VALUES(?, ?, ?, '{}')""",
-                    (alias_lexeme_id, alias, normalized_alias),
+                    (lexeme_id, alias, normalized_alias),
                 )
-                if alias_id == canonical_id:
-                    continue
-                alias_concept = connection.execute(
-                    """SELECT id FROM concepts
-                       WHERE id=? AND retired_version IS NULL""",
+                alias_row = connection.execute(
+                    "SELECT retired_version FROM concepts WHERE id=?",
                     (alias_id,),
                 ).fetchone()
-                if alias_concept is None:
+                if alias_row is None:
+                    self._associate_schema8_lexeme(
+                        connection,
+                        lexeme_id,
+                        canonical_id,
+                    )
                     continue
-                for form in connection.execute(
-                    """SELECT sf.lexeme_id, sf.form, sf.normalized_form,
-                              sf.grammar_json
-                       FROM source_forms sf
-                       JOIN concept_lexemes cl ON cl.lexeme_id=sf.lexeme_id
-                       WHERE cl.concept_id=? AND cl.retired_version IS NULL""",
-                    (alias_id,),
-                ).fetchall():
+                if alias_row["retired_version"] is None and alias_id != canonical_id:
+                    active_ids.append(alias_id)
+
+            active_ids = list(dict.fromkeys(active_ids))
+            if len(active_ids) < 2:
+                current_version = int(
                     connection.execute(
-                        """INSERT OR IGNORE INTO concept_lexemes(
-                               concept_id, lexeme_id, role, confidence, status,
-                               created_version, created_at)
-                           VALUES(?, ?, 'alias', 1.0, 'verified', ?, ?)""",
-                        (
-                            canonical_id,
-                            form["lexeme_id"],
-                            version,
-                            utc_now(),
-                        ),
-                    )
-                dependent_rows = connection.execute(
-                    """SELECT DISTINCT translation_id FROM dependencies
-                       WHERE dependency_type='concept' AND dependency_id=?""",
-                    (alias_id,),
-                ).fetchall()
-                for dependent in dependent_rows:
-                    translation_id = int(dependent["translation_id"])
-                    affected_translation_ids.add(translation_id)
-                    connection.execute(
-                        """INSERT OR IGNORE INTO dependencies(
-                               translation_id, dependency_type, dependency_id,
-                               knowledge_version
-                           ) SELECT translation_id, dependency_type, ?, ?
-                             FROM dependencies
-                            WHERE translation_id=? AND dependency_type='concept'
-                              AND dependency_id=?""",
-                        (
-                            canonical_id,
-                            version,
-                            translation_id,
-                            alias_id,
-                        ),
-                    )
-                connection.execute(
-                    "DELETE FROM dependencies WHERE dependency_type='concept' AND dependency_id=?",
-                    (alias_id,),
+                        "SELECT MAX(id) FROM knowledge_versions"
+                    ).fetchone()[0]
                 )
+                return {
+                    "canonical_id": canonical_id,
+                    "canonical_source": canonical_source,
+                    "aliases": alias_values,
+                    "merged_concept_ids": [],
+                    "changed": False,
+                    "knowledge_version": current_version,
+                    "decision_id": None,
+                    "reason": "human concept-form merge already canonical",
+                    "selection_key": {
+                        "criterion": "already_canonical",
+                        "concept_id": canonical_id,
+                    },
+                    "rule_conflicts": 0,
+                    "affected_translations": 0,
+                }
+
+            placeholders = ",".join("?" for _ in active_ids[1:])
+            affected_translations = int(
                 connection.execute(
-                    "UPDATE mentions SET concept_id=? WHERE concept_id=?",
-                    (canonical_id, alias_id),
-                )
+                    f"""SELECT COUNT(DISTINCT translation_id) FROM dependencies
+                         WHERE dependency_type='concept'
+                           AND dependency_id IN ({placeholders})""",
+                    active_ids[1:],
+                ).fetchone()[0]
+            )
+            current_version = int(
                 connection.execute(
-                    """UPDATE concept_lexemes SET retired_version=?
-                       WHERE concept_id=? AND retired_version IS NULL""",
-                    (version, alias_id),
-                )
-                connection.execute(
-                    """UPDATE rendering_rules SET retired_version=?
-                       WHERE concept_id=? AND retired_version IS NULL""",
-                    (version, alias_id),
-                )
-                connection.execute(
-                    """UPDATE concepts SET status='merged', retired_version=?
-                       WHERE id=?""",
-                    (version, alias_id),
-                )
-                connection.execute(
-                    """UPDATE verification_tasks
-                       SET status='resolved', resolved_at=?
-                       WHERE subject_type='concept' AND subject_id=?
-                         AND status IN ('open','needs_human')""",
-                    (utc_now(), alias_id),
-                )
-                merged_ids.append(alias_id)
-            if affected_translation_ids:
-                placeholders = ",".join("?" for _ in affected_translation_ids)
-                rows = connection.execute(
-                    f"""SELECT id, block_id FROM translation_versions
-                        WHERE id IN ({placeholders}) AND active=1
-                          AND pipeline='parallel_v4'""",
-                    list(affected_translation_ids),
-                ).fetchall()
-                for row in rows:
-                    connection.execute(
-                        "UPDATE translation_versions SET status=? WHERE id=?",
-                        (V4BlockStatus.NEEDS_REVALIDATE.value, row["id"]),
-                    )
-                    connection.execute(
-                        "UPDATE blocks SET status=?, updated_at=? WHERE id=?",
-                        (
-                            V4BlockStatus.NEEDS_REVALIDATE.value,
-                            utc_now(),
-                            row["block_id"],
-                        ),
-                    )
-        return {
-            "canonical_id": canonical_id,
-            "canonical_source": canonical_source,
-            "aliases": list(dict.fromkeys(alias_values)),
-            "merged_concept_ids": merged_ids,
-            "knowledge_version": version,
-            "affected_translations": len(affected_translation_ids),
-        }
+                    "SELECT MAX(id) FROM knowledge_versions"
+                ).fetchone()[0]
+            )
+            authorization_id = self.record_audit_call(
+                run_id=None,
+                block_id=None,
+                purpose="human_concept_form_merge_authorization",
+                model="none",
+                knowledge_version=current_version,
+                request={
+                    "actor_type": "human",
+                    "call_type": "human_concept_form_merge_authorization",
+                    "canonical_source": canonical_source,
+                    "concept_ids": active_ids,
+                    "aliases": alias_values,
+                },
+                raw_response="",
+                parsed={
+                    "actor_type": "human",
+                    "authorized": True,
+                    "canonical_concept_id": canonical_id,
+                },
+                accepted=True,
+                attempts=1,
+                elapsed_ms=0,
+                error=None,
+                connection=connection,
+                archive_payload=False,
+            )
+            reason = (
+                f"{HUMAN_CONCEPT_FORM_REDIRECT_PREFIX}{authorization_id}: "
+                f"{canonical_source}"
+            )
+            result = self._merge_concepts_authorized(
+                active_ids,
+                reason=reason,
+                decision_id=f"human-audit:{authorization_id}",
+                connection=connection,
+                human_authorized_cross_lexeme=True,
+                preferred_canonical_id=canonical_id,
+            )
+            return {
+                **result,
+                "canonical_source": canonical_source,
+                "aliases": alias_values,
+                "affected_translations": affected_translations,
+            }
 
     def import_legacy_translation(
         self,
