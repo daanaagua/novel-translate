@@ -2450,14 +2450,14 @@ def test_bind_mentions_canonicalizes_protected_redirect_anchors(tmp_path):
             (lexeme_id, retired_id, different_id, version),
         )
 
-    assert database.bind_mentions(canonical_id, mention_ids) == 1
+    assert database.bind_mentions(canonical_id, mention_ids) == 0
     with closing(database.connect()) as connection:
         assert [
             row[0]
             for row in connection.execute(
                 "SELECT concept_id FROM mentions ORDER BY id"
             )
-        ] == [canonical_id, different_id]
+        ] == [retired_id, different_id]
 
 
 @pytest.mark.parametrize("cycle", [False, True], ids=["dangling", "cycle"])
@@ -2595,3 +2595,238 @@ def test_deterministic_title_fingerprints_require_exact_payload_equality(tmp_pat
         None,
         None,
     )
+
+
+def test_deterministic_conflicting_active_anchors_ignore_prior_automatic_same(
+    tmp_path,
+):
+    database, lexeme_id, mention_ids, evidence_ids, _ = _coreference_case(tmp_path)
+    left_id = "concept-conflict-prior-left"
+    right_id = "concept-conflict-prior-right"
+    for concept_id, mention_id in zip((left_id, right_id), mention_ids):
+        _insert_test_concept(
+            database,
+            lexeme_id,
+            concept_id,
+            anchor_mention_id=mention_id,
+            kind="place",
+        )
+        _bind_test_mention(database, mention_id, concept_id)
+    with database.transaction() as connection:
+        version = connection.execute(
+            "SELECT MAX(id) FROM knowledge_versions"
+        ).fetchone()[0]
+        connection.execute(
+            """INSERT INTO coreference_decisions(
+                   id, lexeme_id, left_anchor_type, left_anchor_id,
+                   right_anchor_type, right_anchor_id, relation,
+                   decision_source, confidence, locked, votes_json,
+                   evidence_ids_json, anchor_members_json, payload_hash,
+                   created_version, created_at)
+               VALUES('coref-prior-automatic-same', ?, 'concept', ?,
+                      'mention_set', ?, 'same', 'deterministic', 1.0, 0,
+                      '[{"source":"deterministic","rule":"same_anchor_or_duplicate_subset"}]',
+                      ?, ?, 'prior-automatic-same', ?,
+                      '2000-01-01T00:00:00+00:00')""",
+            (
+                lexeme_id,
+                left_id,
+                stable_id(
+                    "mention-set",
+                    ":".join(sorted(str(value) for value in mention_ids)),
+                ),
+                json.dumps(sorted(evidence_ids)),
+                json.dumps(sorted(mention_ids)),
+                version,
+            ),
+        )
+    case = CoreferenceCoordinator(database).freeze_cases()[0]
+
+    coordinator = CoreferenceCoordinator(database)
+    assert coordinator._deterministic_relation(case) == (None, None)
+    assert coordinator.resolve_deterministic(case) == (None, None)
+    with closing(database.connect()) as connection:
+        assert [
+            row[0]
+            for row in connection.execute(
+                "SELECT concept_id FROM mentions ORDER BY id"
+            )
+        ] == [left_id, right_id]
+        assert connection.execute(
+            "SELECT COUNT(*) FROM coreference_decisions"
+        ).fetchone()[0] == 1
+        assert connection.execute(
+            """SELECT COUNT(*) FROM audit_calls
+               WHERE purpose='deterministic_coreference'"""
+        ).fetchone()[0] == 0
+
+
+def test_deterministic_validates_frozen_mention_identity_before_replay(tmp_path):
+    database, lexeme_id, _, evidence_ids, _ = _coreference_case(tmp_path)
+    _set_evidence_payload(
+        database,
+        evidence_ids,
+        {"start_offset": 0, "end_offset": 5},
+    )
+    coordinator = CoreferenceCoordinator(database)
+    case = coordinator.freeze_cases()[0]
+    assert coordinator.resolve_deterministic(case) == ("same", "same_span")
+    forged = replace(
+        case,
+        mentions=(
+            replace(case.mentions[0], evidence_id=evidence_ids[1]),
+            case.mentions[1],
+        ),
+    )
+
+    with pytest.raises(CoreferenceProtocolError, match="mention.*evidence"):
+        coordinator._deterministic_relation(forged)
+    with pytest.raises(CoreferenceProtocolError, match="mention.*evidence"):
+        coordinator.resolve_deterministic(forged)
+    assert case.mentions[0].lexeme_id == lexeme_id
+    assert (case.mentions[0].start_offset, case.mentions[0].end_offset) == (0, 5)
+    with closing(database.connect()) as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM coreference_decisions"
+        ).fetchone()[0] == 1
+        assert connection.execute(
+            """SELECT COUNT(*) FROM audit_calls
+               WHERE purpose='deterministic_coreference'"""
+        ).fetchone()[0] == 1
+
+
+def test_deterministic_anchor_selection_ignores_case_mention_order(tmp_path):
+    database, lexeme_id, mention_ids, evidence_ids, case = _coreference_case(tmp_path)
+    _set_evidence_payload(
+        database,
+        evidence_ids,
+        {"evidence_hash": "order-independent-anchor"},
+    )
+    case = CoreferenceCoordinator(database).freeze_cases()[0]
+    reversed_case = replace(case, mentions=tuple(reversed(case.mentions)))
+
+    assert CoreferenceCoordinator(database).resolve_deterministic(
+        reversed_case
+    ) == ("same", "same_evidence_hash_retry")
+    expected = stable_id("concept", f"{lexeme_id}:{mention_ids[0]}")
+    with closing(database.connect()) as connection:
+        assert [
+            row[0]
+            for row in connection.execute(
+                "SELECT DISTINCT concept_id FROM mentions ORDER BY concept_id"
+            )
+        ] == [expected]
+        assert connection.execute(
+            "SELECT COUNT(*) FROM coreference_decisions"
+        ).fetchone()[0] == 1
+
+
+def test_deterministic_protected_redirect_identity_blocks_same(tmp_path):
+    database, lexeme_id, mention_ids, evidence_ids, _ = _coreference_case(tmp_path)
+    retired_id = "concept-protected-source"
+    canonical_id = "concept-protected-target"
+    _insert_test_concept(
+        database,
+        lexeme_id,
+        retired_id,
+        anchor_mention_id=mention_ids[0],
+        retired=True,
+    )
+    _insert_test_concept(database, lexeme_id, canonical_id)
+    _bind_test_mention(database, mention_ids[0], retired_id)
+    _insert_test_redirects(database, [(retired_id, canonical_id)])
+    with database.transaction() as connection:
+        version = connection.execute(
+            "SELECT MAX(id) FROM knowledge_versions"
+        ).fetchone()[0]
+        connection.execute(
+            """INSERT INTO coreference_decisions(
+                   id, lexeme_id, left_anchor_type, left_anchor_id,
+                   right_anchor_type, right_anchor_id, relation,
+                   decision_source, confidence, locked, votes_json,
+                   evidence_ids_json, anchor_members_json, payload_hash,
+                   created_version, created_at)
+               VALUES('coref-protected-source-target', ?, 'concept', ?,
+                      'concept', ?, 'different', 'human', 1.0, 1,
+                      '[]', '[]', '[]', 'protected-source-target', ?,
+                      '2000-01-01T00:00:00+00:00')""",
+            (lexeme_id, retired_id, canonical_id, version),
+        )
+    _set_evidence_payload(
+        database,
+        evidence_ids,
+        {"evidence_hash": "protected-redirect-same"},
+    )
+    case = CoreferenceCoordinator(database).freeze_cases()[0]
+    case = replace(
+        case,
+        concept_anchors=(),
+        mentions=tuple(
+            replace(mention, concept_anchor_ids=())
+            for mention in case.mentions
+        ),
+    )
+
+    coordinator = CoreferenceCoordinator(database)
+    assert coordinator.resolve_deterministic(case) == (
+        "different",
+        "locked_decision",
+    )
+    assert database.bind_mentions(canonical_id, mention_ids) == 0
+    with closing(database.connect()) as connection:
+        assert [
+            row[0]
+            for row in connection.execute(
+                "SELECT concept_id FROM mentions ORDER BY id"
+            )
+        ] == [retired_id, None]
+        assert connection.execute(
+            "SELECT COUNT(*) FROM coreference_decisions"
+        ).fetchone()[0] == 1
+        assert connection.execute(
+            """SELECT COUNT(*) FROM audit_calls
+               WHERE purpose='deterministic_coreference'"""
+        ).fetchone()[0] == 0
+
+
+def test_deterministic_cross_lexeme_redirect_is_conservative(tmp_path):
+    database, lexeme_id, mention_ids, evidence_ids, _ = _coreference_case(tmp_path)
+    retired_id = "concept-cross-lexeme-source"
+    _insert_test_concept(
+        database,
+        lexeme_id,
+        retired_id,
+        anchor_mention_id=mention_ids[0],
+        retired=True,
+    )
+    _bind_test_mention(database, mention_ids[0], retired_id)
+    foreign_lexeme_id = database.ensure_lexeme("John")
+    foreign_id = "concept-cross-lexeme-target"
+    _insert_test_concept(database, foreign_lexeme_id, foreign_id)
+    _insert_test_redirects(database, [(retired_id, foreign_id)])
+    _set_evidence_payload(
+        database,
+        evidence_ids,
+        {"evidence_hash": "cross-lexeme-redirect"},
+    )
+    coordinator = CoreferenceCoordinator(database)
+    case = coordinator.freeze_cases()[0]
+
+    assert coordinator._deterministic_relation(case) == (None, None)
+    assert coordinator.resolve_deterministic(case) == (None, None)
+    with pytest.raises(ValueError, match="canonical|lexeme"):
+        database.bind_mentions(retired_id, mention_ids)
+    with closing(database.connect()) as connection:
+        assert [
+            row[0]
+            for row in connection.execute(
+                "SELECT concept_id FROM mentions ORDER BY id"
+            )
+        ] == [retired_id, None]
+        assert connection.execute(
+            "SELECT COUNT(*) FROM coreference_decisions"
+        ).fetchone()[0] == 0
+        assert connection.execute(
+            """SELECT COUNT(*) FROM audit_calls
+               WHERE purpose='deterministic_coreference'"""
+        ).fetchone()[0] == 0

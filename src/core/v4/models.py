@@ -251,6 +251,7 @@ class CoreferenceConceptAnchor:
 class CoreferenceMention:
     mention_id: int
     request_id: str
+    lexeme_id: str
     evidence_id: int
     block_id: str
     paragraph_id: str
@@ -261,6 +262,8 @@ class CoreferenceMention:
     discourse_function: str
     context: str
     context_source: str
+    start_offset: int | None
+    end_offset: int | None
     type_observations: tuple[CoreferenceTypeObservation, ...] = ()
     concept_anchor_ids: tuple[str, ...] = ()
 

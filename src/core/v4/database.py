@@ -167,6 +167,8 @@ class V4Database:
     def _active_canonical_concept(
         connection: sqlite3.Connection,
         concept_id: str,
+        *,
+        expected_lexeme_id: str | None = None,
     ) -> tuple[str | None, bool]:
         """Follow retired-concept redirects to one active canonical concept."""
 
@@ -176,12 +178,29 @@ class V4Database:
         while current not in visited:
             visited.add(current)
             concept = connection.execute(
-                "SELECT retired_version FROM concepts WHERE id=?",
+                """SELECT primary_lexeme_id, retired_version
+                   FROM concepts WHERE id=?""",
                 (current,),
             ).fetchone()
             if concept is None:
                 return (None, redirected)
             if concept["retired_version"] is None:
+                if expected_lexeme_id is not None:
+                    primary_ids = {
+                        str(row["lexeme_id"])
+                        for row in connection.execute(
+                            """SELECT lexeme_id FROM concept_lexemes
+                               WHERE concept_id=? AND role='primary'
+                                     AND retired_version IS NULL""",
+                            (current,),
+                        ).fetchall()
+                    }
+                    if (
+                        str(concept["primary_lexeme_id"] or "")
+                        != expected_lexeme_id
+                        or primary_ids != {expected_lexeme_id}
+                    ):
+                        return (None, redirected)
                 return (current, redirected)
             redirect = connection.execute(
                 """SELECT canonical_concept_id FROM concept_redirects
@@ -540,13 +559,19 @@ class V4Database:
                     connection=owned_connection,
                 )
 
+        requested_concept_id = concept_id
         requested_target = connection.execute(
-            "SELECT 1 FROM concepts WHERE id=?",
+            "SELECT primary_lexeme_id FROM concepts WHERE id=?",
             (concept_id,),
         ).fetchone()
         if requested_target is None:
             raise KeyError(f"concept does not exist: {concept_id}")
-        canonical_id, _ = self._active_canonical_concept(connection, concept_id)
+        expected_lexeme_id = str(requested_target["primary_lexeme_id"] or "")
+        canonical_id, _ = self._active_canonical_concept(
+            connection,
+            concept_id,
+            expected_lexeme_id=expected_lexeme_id,
+        )
         if canonical_id is None:
             raise ValueError(
                 f"concept redirect has no active canonical target: {concept_id}"
@@ -640,15 +665,38 @@ class V4Database:
             anchors: set[str] = set()
             for side in ("left", "right"):
                 anchor_id = str(row[f"{side}_anchor_id"])
+                anchors.add(anchor_id)
                 if row[f"{side}_anchor_type"] == "concept":
                     canonical, _ = self._active_canonical_concept(
-                        connection, anchor_id
+                        connection,
+                        anchor_id,
+                        expected_lexeme_id=lexeme_id,
                     )
-                    anchor_id = canonical or anchor_id
-                anchors.add(anchor_id)
+                    if canonical is not None:
+                        anchors.add(canonical)
             protected_members.append(
                 (anchors, member_ids(row["anchor_members_json"]))
             )
+        requested_identities = {requested_concept_id, concept_id}
+        for row in rows:
+            if row["concept_id"] is None:
+                continue
+            current_id = str(row["concept_id"])
+            requested_identities.add(current_id)
+            current_canonical, _ = self._active_canonical_concept(
+                connection,
+                current_id,
+                expected_lexeme_id=lexeme_id,
+            )
+            if current_canonical is not None:
+                requested_identities.add(current_canonical)
+        if any(
+            requested_mention_set_id in anchors
+            or bool(set(ordered_ids) & members)
+            or bool(requested_identities & anchors)
+            for anchors, members in protected_members
+        ):
+            return 0
         bindable: list[int] = []
         for row in rows:
             mention_id = int(row["id"])
@@ -660,7 +708,9 @@ class V4Database:
             current_canonical = current_id
             if current_id is not None:
                 resolved_current, _ = self._active_canonical_concept(
-                    connection, current_id
+                    connection,
+                    current_id,
+                    expected_lexeme_id=lexeme_id,
                 )
                 current_canonical = resolved_current or current_id
             if current_id == concept_id:
@@ -693,7 +743,9 @@ class V4Database:
                         continue
                 else:
                     current_canonical, _ = self._active_canonical_concept(
-                        connection, current_id
+                        connection,
+                        current_id,
+                        expected_lexeme_id=lexeme_id,
                     )
                     if current_canonical != concept_id:
                         continue

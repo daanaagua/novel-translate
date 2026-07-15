@@ -122,6 +122,8 @@ def _mention_payload(mention: CoreferenceMention) -> dict[str, Any]:
             mention.discourse_function, MAX_KIND_CHARS
         ),
         "evidence_id": mention.evidence_id,
+        "end_offset": mention.end_offset,
+        "lexeme_id": mention.lexeme_id,
         "mention_id": mention.mention_id,
         "paragraph_id": mention.paragraph_id,
         "request_id": mention.request_id,
@@ -130,6 +132,7 @@ def _mention_payload(mention: CoreferenceMention) -> dict[str, Any]:
             mention.source_form, MAX_FREE_TEXT_CHARS
         ),
         "source_hash": mention.source_hash,
+        "start_offset": mention.start_offset,
         "type_observations": [
             _observation_payload(item) for item in mention.type_observations
         ],
@@ -490,9 +493,10 @@ class CoreferenceCoordinator:
 
             mention_rows = connection.execute(
                 f"""SELECT m.id AS mention_id, m.evidence_id, m.block_id,
-                          m.paragraph_id, m.source_form, m.discourse_function,
+                          m.paragraph_id, m.source_form, m.normalized_form,
+                          m.discourse_function,
                           m.lexeme_id, m.concept_id,
-                          e.evidence_quote,
+                          e.evidence_quote, e.payload_json,
                           b.block_type AS block_kind, b.source_hash,
                           b.source_text, b.global_index,
                           se.normalized_sha256 AS source_edition_hash,
@@ -559,6 +563,16 @@ class CoreferenceCoordinator:
                    ORDER BY m.lexeme_id, c.id""",
                 selected_lexeme_ids,
             ).fetchall()
+            mention_spans: dict[int, tuple[int | None, int | None]] = {}
+            for row in mention_rows:
+                span = self._candidate_span(
+                    connection,
+                    row,
+                    _decoded_mapping(row["payload_json"]),
+                )
+                mention_spans[int(row["mention_id"])] = (
+                    (span[2], span[3]) if span is not None else (None, None)
+                )
             connection.rollback()
 
         rows_by_lexeme: dict[str, list[dict[str, Any]]] = defaultdict(list)
@@ -708,6 +722,7 @@ class CoreferenceCoordinator:
                     CoreferenceMention(
                         mention_id=mention_id,
                         request_id=f"M{mention_index:03d}",
+                        lexeme_id=str(row["lexeme_id"]),
                         evidence_id=int(row["evidence_id"]),
                         block_id=str(row["block_id"]),
                         paragraph_id=str(row["paragraph_id"]),
@@ -718,6 +733,8 @@ class CoreferenceCoordinator:
                         discourse_function=str(row["discourse_function"]),
                         context=context,
                         context_source=context_source,
+                        start_offset=mention_spans[mention_id][0],
+                        end_offset=mention_spans[mention_id][1],
                         type_observations=mention_observations,
                         concept_anchor_ids=tuple(sorted(anchor_ids)),
                     )
@@ -746,8 +763,13 @@ class CoreferenceCoordinator:
     def _redirect_target(
         connection: sqlite3.Connection,
         concept_id: str,
+        expected_lexeme_id: str,
     ) -> tuple[str | None, bool]:
-        return V4Database._active_canonical_concept(connection, concept_id)
+        return V4Database._active_canonical_concept(
+            connection,
+            concept_id,
+            expected_lexeme_id=expected_lexeme_id,
+        )
 
     @staticmethod
     def _validate_case_anchors(
@@ -870,6 +892,54 @@ class CoreferenceCoordinator:
                         f"{anchor_id}"
                     )
 
+    def _validate_case_mentions(
+        self,
+        case: CoreferenceCase,
+        rows: Sequence[Mapping[str, Any]],
+        payload_by_id: Mapping[int, Mapping[str, Any]],
+        connection: sqlite3.Connection,
+    ) -> None:
+        persisted_by_id = {
+            int(row["mention_id"]): row
+            for row in rows
+        }
+        for mention in case.mentions:
+            row = persisted_by_id.get(mention.mention_id)
+            if row is None:
+                raise CoreferenceProtocolError(
+                    f"coreference mention is not persisted: {mention.mention_id}"
+                )
+            context, context_source = _bounded_context(row)
+            span = self._candidate_span(
+                connection,
+                row,
+                payload_by_id[mention.mention_id],
+            )
+            start_offset, end_offset = (
+                (span[2], span[3]) if span is not None else (None, None)
+            )
+            expected = {
+                "lexeme_id": str(row["lexeme_id"]),
+                "evidence_id": int(row["evidence_id"]),
+                "block_id": str(row["block_id"]),
+                "paragraph_id": str(row["paragraph_id"]),
+                "block_kind": str(row["block_type"]),
+                "source_hash": str(row["source_hash"]),
+                "source_edition_hash": str(row["source_edition_hash"]),
+                "source_form": str(row["source_form"]),
+                "discourse_function": str(row["discourse_function"]),
+                "context": context,
+                "context_source": context_source,
+                "start_offset": start_offset,
+                "end_offset": end_offset,
+            }
+            for field, value in expected.items():
+                if getattr(mention, field) != value:
+                    raise CoreferenceProtocolError(
+                        f"coreference mention {mention.mention_id} {field} "
+                        "does not match persisted data"
+                    )
+
     @staticmethod
     def _candidate_span(
         connection: sqlite3.Connection,
@@ -957,7 +1027,8 @@ class CoreferenceCoordinator:
         rows = connection.execute(
             f"""SELECT m.id AS mention_id, m.evidence_id, m.block_id,
                        m.paragraph_id, m.source_form, m.normalized_form,
-                       m.lexeme_id, m.concept_id, e.kind AS evidence_kind,
+                       m.discourse_function, m.lexeme_id, m.concept_id,
+                       e.kind AS evidence_kind,
                        e.evidence_quote, e.payload_json,
                        b.block_type, b.source_text, b.source_hash,
                        se.normalized_sha256 AS source_edition_hash
@@ -985,6 +1056,9 @@ class CoreferenceCoordinator:
             int(row["mention_id"]): _decoded_mapping(row["payload_json"])
             for row in rows
         }
+        self._validate_case_mentions(
+            case, rows, payload_by_id, connection
+        )
         self._validate_case_anchors(case, rows, connection)
 
         raw_anchor_ids = {
@@ -1003,7 +1077,9 @@ class CoreferenceCoordinator:
         canonical_by_anchor: dict[str, str | None] = {}
         redirected_any = False
         for anchor_id in sorted(raw_anchor_ids):
-            canonical, redirected = self._redirect_target(connection, anchor_id)
+            canonical, redirected = self._redirect_target(
+                connection, anchor_id, case.lexeme_id
+            )
             canonical_by_anchor[anchor_id] = canonical
             redirected_any = redirected_any or redirected
         canonical_anchor_ids = {
@@ -1033,7 +1109,8 @@ class CoreferenceCoordinator:
 
         locked_relations: list[str] = []
         for decision in connection.execute(
-            """SELECT relation, left_anchor_id, right_anchor_id,
+            """SELECT relation, left_anchor_type, left_anchor_id,
+                      right_anchor_type, right_anchor_id,
                       anchor_members_json
                FROM coreference_decisions
                WHERE lexeme_id=? AND retired_version IS NULL
@@ -1048,13 +1125,30 @@ class CoreferenceCoordinator:
                 str(decision["left_anchor_id"]),
                 str(decision["right_anchor_id"]),
             }
+            decision_identities = set(decision_anchors)
+            for side in ("left", "right"):
+                if decision[f"{side}_anchor_type"] != "concept":
+                    continue
+                canonical, _ = self._redirect_target(
+                    connection,
+                    str(decision[f"{side}_anchor_id"]),
+                    case.lexeme_id,
+                )
+                if canonical is not None:
+                    decision_identities.add(canonical)
+            case_identities = raw_anchor_ids | canonical_anchor_ids
+            explicit_conflict = str(decision["relation"]) in {
+                "different",
+                "non_entity",
+            } and bool(
+                (set(mention_ids) & members)
+                or (case_identities & decision_identities)
+            )
             if (
-                str(decision["relation"]) in {"different", "non_entity"}
-                and bool(set(mention_ids) & members)
-            ) or set(mention_ids) <= members or (
-                len(raw_anchor_ids & decision_anchors) >= 2
-            ) or (
-                case.mention_set_id in decision_anchors
+                explicit_conflict
+                or set(mention_ids) <= members
+                or len(case_identities & decision_identities) >= 2
+                or case.mention_set_id in decision_anchors
             ):
                 locked_relations.append(str(decision["relation"]))
         if locked_relations:
@@ -1093,7 +1187,9 @@ class CoreferenceCoordinator:
                 if decision[f"{side}_anchor_type"] != "concept":
                     continue
                 canonical, _ = self._redirect_target(
-                    connection, str(decision[f"{side}_anchor_id"])
+                    connection,
+                    str(decision[f"{side}_anchor_id"]),
+                    case.lexeme_id,
                 )
                 if canonical is None:
                     duplicate_has_invalid_target = True
@@ -1103,16 +1199,6 @@ class CoreferenceCoordinator:
         if any(value is None for value in canonical_by_anchor.values()):
             return {"relation": None, "rule": None, "target": None}
         if len(canonical_anchor_ids) > 1:
-            if (
-                duplicate_subset
-                and not duplicate_has_invalid_target
-                and len(duplicate_targets) == 1
-            ):
-                return {
-                    "relation": "same",
-                    "rule": "same_anchor_or_duplicate_subset",
-                    "target": next(iter(duplicate_targets)),
-                }
             return {"relation": None, "rule": None, "target": None}
 
         replay_candidates: set[tuple[str, str, str | None]] = set()
@@ -1159,7 +1245,9 @@ class CoreferenceCoordinator:
                 if decision[f"{side}_anchor_type"] != "concept":
                     continue
                 canonical, _ = self._redirect_target(
-                    connection, str(decision[f"{side}_anchor_id"])
+                    connection,
+                    str(decision[f"{side}_anchor_id"]),
+                    case.lexeme_id,
                 )
                 if canonical is not None:
                     replay_targets.add(canonical)
@@ -1290,7 +1378,9 @@ class CoreferenceCoordinator:
             return {"relation": None, "rule": None, "target": None}
         if common_anchors or duplicate_subset:
             common_canonical = {
-                self._redirect_target(connection, value)[0]
+                self._redirect_target(
+                    connection, value, case.lexeme_id
+                )[0]
                 for value in common_anchors
             } - {None}
             return {
@@ -1322,6 +1412,19 @@ class CoreferenceCoordinator:
         if canonical_anchor_ids:
             return min(canonical_anchor_ids)
         return None
+
+    @staticmethod
+    def _stable_anchor_mention_id(case: CoreferenceCase) -> int:
+        def key(mention: CoreferenceMention) -> tuple[Any, ...]:
+            span_key = (
+                (0, mention.start_offset, mention.end_offset)
+                if mention.start_offset is not None
+                and mention.end_offset is not None
+                else (1, 0, 0)
+            )
+            return (mention.block_id, *span_key, mention.mention_id)
+
+        return min(case.mentions, key=key).mention_id
 
     def _deterministic_relation(
         self,
@@ -1386,7 +1489,7 @@ class CoreferenceCoordinator:
                     prefix="deterministic_same",
                 ):
                     if target_concept_id is None:
-                        anchor_mention_id = case.mentions[0].mention_id
+                        anchor_mention_id = self._stable_anchor_mention_id(case)
                         target_concept_id = (
                             self.database.ensure_concept_for_anchor(
                                 case.lexeme_id,
