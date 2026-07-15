@@ -5036,6 +5036,8 @@ def test_human_alias_merge_follows_retired_alias_to_explicit_canonical(tmp_path)
         source: stable_id("concept", normalize_english_form(source))
         for source in ("scape", "landscape", "scapes")
     }
+    for source in ("scape", "landscape", "scapes"):
+        database.lock_concept_translation(source, "拟境")
 
     first = database.merge_concept_forms("landscape", ["scapes"])
     with closing(database.connect()) as connection:
@@ -5147,5 +5149,54 @@ def test_human_retired_alias_locked_identity_conflict_rolls_back(tmp_path):
         }
         assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
     assert after == before
+    assert database.resolve_concept_id(ids["scapes"]) == ids["landscape"]
+    assert database.resolve_concept_id(ids["landscape"]) == ids["landscape"]
+
+
+def test_human_retired_alias_locked_target_conflict_rolls_back(tmp_path):
+    database = _db(tmp_path, source_text="Scapes crossed a landscape and a scape.")
+    database.import_legacy_concept("scape", "A", "concept", "explicit target")
+    database.import_legacy_concept("landscape", "C", "concept", "alias target")
+    database.import_legacy_concept("scapes", "C", "concept", "plural alias")
+    ids = {
+        source: stable_id("concept", normalize_english_form(source))
+        for source in ("scape", "landscape", "scapes")
+    }
+    database.merge_concept_forms("landscape", ["scapes"])
+    database.lock_concept_translation("scape", "A")
+    database.lock_concept_translation("landscape", "C")
+    with closing(database.connect()) as connection:
+        before = {
+            table: connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+            for table in (
+                "knowledge_versions",
+                "audit_calls",
+                "knowledge_changes",
+                "concept_redirects",
+                "concept_lexemes",
+                "lexemes",
+                "source_forms",
+            )
+        }
+
+    with pytest.raises(
+        ConceptMergeConflictError,
+        match="locked concepts have conflicting translations",
+    ):
+        database.merge_concept_forms("scape", ["scapes"])
+
+    with closing(database.connect()) as connection:
+        after = {
+            table: connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+            for table in before
+        }
+        statuses = connection.execute(
+            """SELECT id, retired_version FROM concepts
+               WHERE id IN (?, ?) ORDER BY id""",
+            (ids["scape"], ids["landscape"]),
+        ).fetchall()
+        assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
+    assert after == before
+    assert all(row["retired_version"] is None for row in statuses)
     assert database.resolve_concept_id(ids["scapes"]) == ids["landscape"]
     assert database.resolve_concept_id(ids["landscape"]) == ids["landscape"]

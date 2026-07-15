@@ -572,12 +572,9 @@ class V4Database:
             )
         return decision
 
-    def _reject_protected_merge_conflicts(
-        self,
-        connection: sqlite3.Connection,
+    @staticmethod
+    def _reject_locked_concept_conflicts(
         rows: Sequence[sqlite3.Row],
-        concept_ids: set[str],
-        lexeme_id: str,
     ) -> None:
         locked_rows = [row for row in rows if bool(row["locked"])]
         locked_targets = {
@@ -603,6 +600,15 @@ class V4Database:
             raise ConceptMergeConflictError(
                 "locked concepts have conflicting kinds"
             )
+
+    def _reject_protected_merge_conflicts(
+        self,
+        connection: sqlite3.Connection,
+        rows: Sequence[sqlite3.Row],
+        concept_ids: set[str],
+        lexeme_id: str,
+    ) -> None:
+        self._reject_locked_concept_conflicts(rows)
         protected = connection.execute(
             """SELECT * FROM coreference_decisions
                WHERE lexeme_id=? AND retired_version IS NULL
@@ -834,13 +840,7 @@ class V4Database:
                     "rule_conflicts": 0,
                 }
             if human_authorized_cross_lexeme:
-                locked_kinds = {
-                    str(row["kind"]) for row in rows if bool(row["locked"])
-                }
-                if len(locked_kinds) > 1:
-                    raise ConceptMergeConflictError(
-                        "locked concepts have conflicting kinds"
-                    )
+                self._reject_locked_concept_conflicts(rows)
             else:
                 self._reject_protected_merge_conflicts(
                     connection,
