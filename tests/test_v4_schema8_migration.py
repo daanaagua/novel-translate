@@ -59,6 +59,8 @@ def seed_incomplete_schema8(tmp_path, corruption):
             create_schema8(connection)
             if corruption == "table":
                 connection.execute("DROP TABLE lexemes")
+            elif corruption == "concepts_table":
+                connection.execute("DROP TABLE concepts")
             elif corruption == "column":
                 connection.executescript(
                     """
@@ -68,6 +70,38 @@ def seed_incomplete_schema8(tmp_path, corruption):
                 )
             elif corruption == "index":
                 connection.execute("DROP INDEX uq_active_lexeme")
+            elif corruption == "lexeme_index_and_false":
+                connection.executescript(
+                    """
+                    DROP INDEX uq_active_lexeme;
+                    CREATE UNIQUE INDEX uq_active_lexeme
+                    ON lexemes(language, normalized_form)
+                    WHERE retired_version IS NULL AND 0;
+                    """
+                )
+            elif corruption == "concept_lexeme_index_and_false":
+                connection.executescript(
+                    """
+                    DROP INDEX uq_active_concept_lexeme_role;
+                    CREATE UNIQUE INDEX uq_active_concept_lexeme_role
+                    ON concept_lexemes(concept_id, lexeme_id, role)
+                    WHERE retired_version IS NULL AND 0;
+                    """
+                )
+            elif corruption == "legacy_dependencies":
+                connection.executescript(
+                    """
+                    DROP TABLE dependencies;
+                    CREATE TABLE dependencies (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        translation_id INTEGER NOT NULL,
+                        dependency_type TEXT NOT NULL,
+                        dependency_id TEXT NOT NULL,
+                        knowledge_version INTEGER NOT NULL,
+                        UNIQUE(translation_id, dependency_type, dependency_id)
+                    );
+                    """
+                )
             elif corruption == "rendering_check":
                 connection.executescript(
                     """
@@ -127,8 +161,12 @@ def test_schema7_requires_explicit_preview_and_confirm(tmp_path):
     (
         "sentinel",
         "table",
+        "concepts_table",
         "column",
         "index",
+        "lexeme_index_and_false",
+        "concept_lexeme_index_and_false",
+        "legacy_dependencies",
         "rendering_check",
         "translation_check",
         "revalidation_check",
