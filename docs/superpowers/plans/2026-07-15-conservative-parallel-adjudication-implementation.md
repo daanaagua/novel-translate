@@ -379,12 +379,12 @@ git commit -m "feat: configure parallel candidate adjudication"
 - [ ] **步骤 1：运行全部自动化验证**
 
 ```powershell
-.\.venv\Scripts\python.exe -m pytest tests -q
+.\.venv\Scripts\python.exe -m pytest tests --ignore=tests/test_foila_logic.py -q
 .\.venv\Scripts\python.exe -m compileall -q src main.py
 git diff --check
 ```
 
-预期：204 个以上测试全部通过，既有子测试全部通过；编译和 diff 检查无输出。若根目录两个环境依赖型测试不属于 `tests/`，不把它们混入本次结论。
+预期：204 个以上测试全部通过，既有子测试全部通过；编译和 diff 检查无输出。`tests/test_foila_logic.py` 在收集阶段强制要求与本项目无关的 `ARK_API_KEY`，明确排除且单独报告；根目录的 `test_thinking_stream.py` 也不混入本次结论。
 
 - [ ] **步骤 2：核对并备份活动数据库**
 
@@ -436,7 +436,7 @@ Severian 仍只有一个有效工作译名“塞万里安”
 - [ ] **步骤 7：最终验证与 Commit**
 
 ```powershell
-.\.venv\Scripts\python.exe -m pytest tests -q
+.\.venv\Scripts\python.exe -m pytest tests --ignore=tests/test_foila_logic.py -q
 .\.venv\Scripts\python.exe -m compileall -q src main.py
 git diff --check
 git status --short
