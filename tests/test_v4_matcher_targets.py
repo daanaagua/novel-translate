@@ -443,6 +443,141 @@ def test_locked_usage_decision_is_frozen_as_exact_highest_layer_rule(tmp_path):
     assert contextual.dependency_fingerprint != ordinary.dependency_fingerprint
 
 
+@pytest.mark.parametrize(
+    ("scope", "expected"),
+    [
+        ("occurrence", ["USAGE_TARGET", "ORDINARY", "ORDINARY"]),
+        ("speaker", ["USAGE_TARGET", "USAGE_TARGET", "ORDINARY"]),
+        ("thread", ["USAGE_TARGET", "USAGE_TARGET", "ORDINARY"]),
+    ],
+)
+def test_usage_scope_controls_cross_block_context_without_origin_narrowing(
+    tmp_path, scope, expected
+):
+    db = _db(tmp_path, ["Archon spoke.", "Archon waited.", "Archon left."])
+    concept_id = db.import_legacy_concept("Archon", "", "title", "office")
+    version = db.current_knowledge_version()
+    with db.transaction() as connection:
+        lexeme_id = connection.execute(
+            "SELECT primary_lexeme_id FROM concepts WHERE id=?", (concept_id,)
+        ).fetchone()[0]
+        connection.execute(
+            """UPDATE concepts SET verified_target='ORDINARY', status='verified'
+                 WHERE id=?""",
+            (concept_id,),
+        )
+        connection.execute(
+            """UPDATE concept_lexemes SET status='verified', confidence=1.0
+                 WHERE concept_id=? AND lexeme_id=?""",
+            (concept_id, lexeme_id),
+        )
+        mention_ids = []
+        for index in range(3):
+            payload = {
+                "speaker_id": "sev" if index < 2 else "other",
+                "thread_id": "court" if index < 2 else "other-thread",
+                "start_offset": 0,
+                "end_offset": 6,
+            }
+            evidence_id = connection.execute(
+                """INSERT INTO evidence(
+                       block_id, paragraph_id, kind, source_form, evidence_quote,
+                       payload_json, confidence, extractor, run_id, created_at)
+                   VALUES(?, 'P000', 'test', 'Archon', 'Archon', ?, 1.0,
+                          'test', NULL, 'now')""",
+                (f"block_{index}", json.dumps(payload)),
+            ).lastrowid
+            mention_id = connection.execute(
+                """INSERT INTO mentions(
+                       block_id, paragraph_id, source_form, normalized_form,
+                       discourse_function, lexeme_id, concept_id, evidence_id)
+                   VALUES(?, 'P000', 'Archon', 'archon', 'referential', ?, ?, ?)""",
+                (f"block_{index}", lexeme_id, concept_id, evidence_id),
+            ).lastrowid
+            mention_ids.append(mention_id)
+            connection.execute(
+                """INSERT INTO form_occurrences(
+                       lexeme_id, block_id, start_offset, end_offset,
+                       source_form, source_hash, created_at)
+                   VALUES(?, ?, 0, 6, 'Archon', ?, 'now')""",
+                (lexeme_id, f"block_{index}", f"hash-{index}"),
+            )
+        usage_id = connection.execute(
+            """INSERT INTO usage_decisions(
+                   mention_id, rendering, status, scope, locked,
+                   created_version, created_at)
+               VALUES(?, 'USAGE_TARGET', 'verified', ?, 1, ?, 'now')""",
+            (mention_ids[0], scope, version),
+        ).lastrowid
+
+    _, frozen, _ = db.freeze_translation_knowledge()
+    contexts = db.rendering_contexts_for_blocks(
+        [f"block_{index}" for index in range(3)]
+    )
+    matches = [
+        frozen.matched_renderings(
+            "Archon",
+            block_id=f"block_{index}",
+            occurrence_contexts=contexts[f"block_{index}"],
+        )[0]
+        for index in range(3)
+    ]
+
+    assert [match.rendered_target for match in matches] == expected
+    assert matches[0].applied_rule_ids == (f"usage:{usage_id}",)
+    if scope in {"speaker", "thread"}:
+        assert matches[1].applied_rule_ids == (f"usage:{usage_id}",)
+        assert (
+            matches[0].dependency_fingerprint
+            == matches[1].dependency_fingerprint
+        )
+    else:
+        assert matches[1].applied_rule_ids == ()
+    assert matches[2].applied_rule_ids == ()
+
+
+@pytest.mark.parametrize("scope", ["speaker", "thread"])
+def test_usage_scope_without_required_persisted_context_is_not_compiled(
+    tmp_path, scope
+):
+    db = _db(tmp_path, ["Archon spoke."])
+    concept_id = db.import_legacy_concept("Archon", "", "title", "office")
+    version = db.current_knowledge_version()
+    with db.transaction() as connection:
+        lexeme_id = connection.execute(
+            "SELECT primary_lexeme_id FROM concepts WHERE id=?", (concept_id,)
+        ).fetchone()[0]
+        evidence_id = connection.execute(
+            """INSERT INTO evidence(
+                   block_id, paragraph_id, kind, source_form, evidence_quote,
+                   payload_json, confidence, extractor, run_id, created_at)
+               VALUES('block_0', 'P000', 'test', 'Archon', 'Archon', '{}',
+                      1.0, 'test', NULL, 'now')"""
+        ).lastrowid
+        mention_id = connection.execute(
+            """INSERT INTO mentions(
+                   block_id, paragraph_id, source_form, normalized_form,
+                   discourse_function, lexeme_id, concept_id, evidence_id)
+               VALUES('block_0', 'P000', 'Archon', 'archon', 'referential',
+                      ?, ?, ?)""",
+            (lexeme_id, concept_id, evidence_id),
+        ).lastrowid
+        connection.execute(
+            """INSERT INTO usage_decisions(
+                   mention_id, rendering, status, scope, locked,
+                   created_version, created_at)
+               VALUES(?, 'MUST_NOT_APPLY', 'verified', ?, 1, ?, 'now')""",
+            (mention_id, scope, version),
+        )
+
+    snapshot = db.render_snapshot()
+    assert all(
+        not str(rule.get("id") or "").startswith("usage:")
+        for lexeme in snapshot
+        for rule in lexeme.get("lexeme_rules", [])
+    )
+
+
 def test_lexeme_winner_fingerprint_ignores_nonwinning_selected_concept():
     snapshot = _render_snapshot(
         concept_verified="", concept_working="", lexeme_verified="LEXEME"

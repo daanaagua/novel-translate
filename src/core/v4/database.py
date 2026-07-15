@@ -7970,8 +7970,7 @@ class V4Database:
                WHERE ud.retired_version IS NULL
                  AND l.retired_version IS NULL
                  AND ud.locked=1
-                 AND (ud.scope IN ('occurrence','speaker','thread')
-                      OR ud.status='verified')
+                 AND ud.scope IN ('occurrence','speaker','thread')
                ORDER BY ud.id, fo.start_offset, fo.end_offset"""
         ).fetchall()
         usage_groups: Dict[int, List[sqlite3.Row]] = {}
@@ -8011,28 +8010,30 @@ class V4Database:
             except (TypeError, ValueError):
                 payload_span = None
             span = payload_span or (spans[0] if len(spans) == 1 else None)
-            if str(row["scope"]) == "occurrence" and span is None:
+            scope = str(row["scope"])
+            if scope == "occurrence":
+                if span is None:
+                    continue
+                condition: Dict[str, Any] = {
+                    "mention_id": int(row["mention_id"]),
+                    "block_id": str(row["block_id"]),
+                    "paragraph_id": str(row["paragraph_id"]),
+                    "discourse_function": str(row["discourse_function"]),
+                    "start_offset": span[0],
+                    "end_offset": span[1],
+                }
+            elif scope == "speaker":
+                speaker_id = str(payload.get("speaker_id") or "").strip()
+                if not speaker_id:
+                    continue
+                condition = {"speaker_id": speaker_id}
+            elif scope == "thread":
+                thread_id = str(payload.get("thread_id") or "").strip()
+                if not thread_id:
+                    continue
+                condition = {"thread_id": thread_id}
+            else:
                 continue
-            condition: Dict[str, Any] = {
-                "mention_id": int(row["mention_id"]),
-                "block_id": str(row["block_id"]),
-                "paragraph_id": str(row["paragraph_id"]),
-                "discourse_function": str(row["discourse_function"]),
-            }
-            if span is not None:
-                condition["start_offset"], condition["end_offset"] = span
-            raw_concept_id = str(row["concept_id"] or "")
-            if raw_concept_id:
-                canonical_id = raw_concept_id
-                visited: set[str] = set()
-                while canonical_id in redirects and canonical_id not in visited:
-                    visited.add(canonical_id)
-                    canonical_id = redirects[canonical_id]
-                if canonical_id in concepts_by_id:
-                    condition["concept_id"] = canonical_id
-            for key in ("speaker", "speaker_id", "thread", "thread_id"):
-                if payload.get(key) not in (None, ""):
-                    condition[key] = payload[key]
             rule = {
                 "id": f"usage:{usage_id}",
                 "condition": condition,
