@@ -1,12 +1,15 @@
+import hashlib
 import sqlite3
 from contextlib import closing
 
 import pytest
 
 from src.core.v4.database import V4Database
+from src.core.v4.models import ScanOutcome, ScanResponse
 from src.core.v4.schema_v8 import (
     SCHEMA_VERSION,
     SchemaUpgradeRequired,
+    create_schema8,
 )
 
 
@@ -32,11 +35,136 @@ def read_schema_version(path):
         )
 
 
+def filesystem_snapshot(root):
+    return {
+        str(path.relative_to(root)): hashlib.sha256(path.read_bytes()).hexdigest()
+        for path in sorted(root.rglob("*"))
+        if path.is_file()
+    }
+
+
+def seed_incomplete_schema8(tmp_path, corruption):
+    path = tmp_path / "artifacts" / "parallel_v4" / "book.db"
+    path.parent.mkdir(parents=True)
+    with closing(sqlite3.connect(path)) as connection:
+        if corruption == "sentinel":
+            connection.executescript(
+                """
+                CREATE TABLE schema_meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);
+                INSERT INTO schema_meta VALUES('schema_version', '8');
+                CREATE TABLE sentinel(value TEXT);
+                """
+            )
+        else:
+            create_schema8(connection)
+            if corruption == "table":
+                connection.execute("DROP TABLE lexemes")
+            elif corruption == "column":
+                connection.executescript(
+                    """
+                    DROP TABLE candidate_resolutions;
+                    CREATE TABLE candidate_resolutions(id TEXT PRIMARY KEY);
+                    """
+                )
+            elif corruption == "index":
+                connection.execute("DROP INDEX uq_active_lexeme")
+            elif corruption == "rendering_check":
+                connection.executescript(
+                    """
+                    ALTER TABLE rendering_rules RENAME TO old_rendering_rules;
+                    CREATE TABLE rendering_rules (
+                        id TEXT PRIMARY KEY,
+                        lexeme_id TEXT,
+                        concept_id TEXT,
+                        condition_json TEXT NOT NULL,
+                        target TEXT NOT NULL,
+                        created_version INTEGER NOT NULL,
+                        created_at TEXT NOT NULL
+                    );
+                    DROP TABLE old_rendering_rules;
+                    """
+                )
+            elif corruption == "translation_check":
+                connection.executescript(
+                    """
+                    ALTER TABLE translation_versions RENAME TO old_translation_versions;
+                    CREATE TABLE translation_versions (
+                        id INTEGER PRIMARY KEY,
+                        block_id TEXT NOT NULL,
+                        pipeline TEXT NOT NULL,
+                        status TEXT NOT NULL,
+                        validation_status TEXT NOT NULL,
+                        created_at TEXT NOT NULL
+                    );
+                    DROP TABLE old_translation_versions;
+                    """
+                )
+            elif corruption == "revalidation_check":
+                connection.executescript(
+                    """
+                    DROP TABLE revalidation_tasks;
+                    CREATE TABLE revalidation_tasks (
+                        id TEXT PRIMARY KEY,
+                        status TEXT NOT NULL
+                    );
+                    """
+                )
+            else:
+                raise AssertionError(f"unknown corruption: {corruption}")
+            connection.commit()
+    return path
+
+
 def test_schema7_requires_explicit_preview_and_confirm(tmp_path):
     path = seed_schema7_database(tmp_path)
     with pytest.raises(SchemaUpgradeRequired, match="migrate-v4 --preview"):
         V4Database(tmp_path)
     assert read_schema_version(path) == 7
+
+
+@pytest.mark.parametrize(
+    "corruption",
+    (
+        "sentinel",
+        "table",
+        "column",
+        "index",
+        "rendering_check",
+        "translation_check",
+        "revalidation_check",
+    ),
+)
+def test_incomplete_schema8_is_rejected_without_writes(tmp_path, corruption):
+    path = seed_incomplete_schema8(tmp_path, corruption)
+    before = filesystem_snapshot(tmp_path)
+
+    with pytest.raises(
+        SchemaUpgradeRequired,
+        match=r"(?:incomplete|corrupt).*migrate-v4 --preview",
+    ):
+        V4Database(tmp_path)
+
+    assert filesystem_snapshot(tmp_path) == before
+    assert hashlib.sha256(path.read_bytes()).hexdigest() == before[
+        str(path.relative_to(tmp_path))
+    ]
+
+
+def test_create_schema8_two_phase_state_can_finish_initialization(tmp_path):
+    path = tmp_path / "artifacts" / "parallel_v4" / "book.db"
+    path.parent.mkdir(parents=True)
+    with closing(sqlite3.connect(path)) as connection:
+        create_schema8(connection)
+
+    database = V4Database(tmp_path)
+
+    with closing(database.connect()) as connection:
+        assert connection.execute(
+            "SELECT value FROM schema_meta WHERE key='schema_version'"
+        ).fetchone()[0] == "8"
+        assert connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='blocks'"
+        ).fetchone() is not None
 
 
 def test_empty_directory_creates_schema8_with_required_tables(tmp_path):
@@ -191,6 +319,88 @@ def test_legacy_concept_import_populates_lexeme_ownership(tmp_path):
     assert tuple(lexeme) == ("en", "drotte", "Drotte")
     assert association["role"] == "primary"
     assert tuple(source_form) == (concept["primary_lexeme_id"], "Drotte", "drotte")
+
+
+@pytest.mark.parametrize(
+    "operations",
+    (("import", "lock"), ("lock", "import")),
+)
+def test_ownership_helper_never_copies_concept_target_state(tmp_path, operations):
+    database = V4Database(tmp_path)
+    for operation in operations:
+        if operation == "import":
+            database.import_legacy_concept(
+                "Drotte", "", "person", "a companion"
+            )
+        else:
+            database.lock_concept_translation("Drotte", "德罗特", kind="person")
+
+    with closing(database.connect()) as connection:
+        lexeme = connection.execute(
+            """SELECT default_target, working_target, verified_target,
+                      status, locked
+               FROM lexemes WHERE normalized_form='drotte'"""
+        ).fetchone()
+
+    assert tuple(lexeme) == ("", "", "", "provisional", 0)
+
+
+def test_reconcile_reuses_canonical_mention_lexeme(tmp_path):
+    database = V4Database(tmp_path)
+    edition = database.ensure_source_edition(
+        "raw", "normalized", "test", "source.txt"
+    )
+    database.upsert_blocks(
+        edition,
+        [
+            {
+                "id": "block-1",
+                "chapter_id": "chapter-1",
+                "chapter_title": "One",
+                "chapter_index": 0,
+                "block_index": 0,
+                "global_index": 0,
+                "block_type": "prose",
+                "source_text": "Wolves gathered.",
+                "source_hash": "hash",
+            }
+        ],
+    )
+    block = database.list_blocks()[0]
+    response = ScanResponse.model_validate(
+        {
+            "mentions": [
+                {
+                    "paragraph_id": "P000",
+                    "source_form": "Wolves",
+                    "canonical_form": "Wolf",
+                    "category": "species",
+                    "evidence_quote": "Wolves",
+                }
+            ]
+        }
+    )
+    database.start_run("scan-run", "scan", {})
+    database.commit_scan_batch(
+        "scan-run", [ScanOutcome(block=block, response=response)], "fake"
+    )
+
+    database.reconcile_exact_forms()
+
+    with closing(database.connect()) as connection:
+        mention = connection.execute(
+            "SELECT lexeme_id, concept_id FROM mentions"
+        ).fetchone()
+        concept = connection.execute(
+            "SELECT primary_lexeme_id FROM concepts WHERE id=?",
+            (mention["concept_id"],),
+        ).fetchone()
+        lexemes = connection.execute(
+            "SELECT id, normalized_form FROM lexemes ORDER BY normalized_form"
+        ).fetchall()
+
+    assert [row["normalized_form"] for row in lexemes] == ["wolf"]
+    assert concept["primary_lexeme_id"] == mention["lexeme_id"] == lexemes[0]["id"]
 
 
 def test_rendering_rule_requires_exactly_one_subject(tmp_path):

@@ -164,6 +164,46 @@ class V4Database:
             self._active_database_bytes(connection)
         )
 
+    @staticmethod
+    def _associate_schema8_lexeme(
+        connection: sqlite3.Connection,
+        lexeme_id: str,
+        concept_id: str,
+        *,
+        knowledge_version: int | None = None,
+        created_at: str | None = None,
+    ) -> None:
+        """Associate an existing lexeme without deriving it from a surface form."""
+
+        concept = connection.execute(
+            """SELECT created_version, primary_lexeme_id
+               FROM concepts WHERE id=?""",
+            (concept_id,),
+        ).fetchone()
+        if concept is None:
+            raise KeyError(f"concept does not exist: {concept_id}")
+        if knowledge_version is None:
+            knowledge_version = int(concept["created_version"])
+        now = created_at or utc_now()
+        connection.execute(
+            """UPDATE concepts
+               SET primary_lexeme_id=COALESCE(primary_lexeme_id, ?)
+               WHERE id=?""",
+            (lexeme_id, concept_id),
+        )
+        primary_lexeme_id = connection.execute(
+            "SELECT primary_lexeme_id FROM concepts WHERE id=?",
+            (concept_id,),
+        ).fetchone()[0]
+        role = "primary" if primary_lexeme_id == lexeme_id else "alias"
+        connection.execute(
+            """INSERT OR IGNORE INTO concept_lexemes(
+                   concept_id, lexeme_id, role, confidence, status,
+                   created_version, created_at)
+               VALUES(?, ?, ?, 1.0, 'provisional', ?, ?)""",
+            (concept_id, lexeme_id, role, knowledge_version, now),
+        )
+
     def _ensure_schema8_lexeme(
         self,
         connection: sqlite3.Connection,
@@ -174,78 +214,37 @@ class V4Database:
         knowledge_version: int | None = None,
         created_at: str | None = None,
     ) -> str:
-        """Backfill the schema-8 lexeme link for legacy concept-oriented paths."""
+        """Create neutral schema-8 ownership for legacy write paths."""
 
         normalized = normalized_form or normalize_english_form(source_form)
         lexeme_id = stable_id("lexeme", f"en:{normalized}")
-        concept = None
-        if concept_id is not None:
-            concept = connection.execute(
-                """SELECT canonical_source, default_target, working_target,
-                          verified_target, status, locked, created_version,
-                          primary_lexeme_id
-                   FROM concepts WHERE id=?""",
-                (concept_id,),
-            ).fetchone()
-            if concept is None:
-                raise KeyError(f"concept does not exist: {concept_id}")
         if knowledge_version is None:
-            knowledge_version = (
-                int(concept["created_version"])
-                if concept is not None
-                else int(
-                    connection.execute(
-                        "SELECT MAX(id) FROM knowledge_versions"
-                    ).fetchone()[0]
-                )
+            knowledge_version = int(
+                connection.execute(
+                    "SELECT MAX(id) FROM knowledge_versions"
+                ).fetchone()[0]
             )
         now = created_at or utc_now()
         connection.execute(
             """INSERT OR IGNORE INTO lexemes(
                    id, language, normalized_form, canonical_form,
-                   default_target, working_target, verified_target,
-                   status, locked, created_version, created_at)
-               VALUES(?, 'en', ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                   created_version, created_at)
+               VALUES(?, 'en', ?, ?, ?, ?)""",
             (
                 lexeme_id,
                 normalized,
                 source_form,
-                str(concept["default_target"] or "") if concept is not None else "",
-                str(concept["working_target"] or "") if concept is not None else "",
-                str(concept["verified_target"] or "") if concept is not None else "",
-                str(concept["status"] or "provisional")
-                if concept is not None
-                else "provisional",
-                int(bool(concept["locked"])) if concept is not None else 0,
                 knowledge_version,
                 now,
             ),
         )
         if concept_id is not None:
-            connection.execute(
-                """UPDATE concepts
-                   SET primary_lexeme_id=COALESCE(primary_lexeme_id, ?)
-                   WHERE id=?""",
-                (lexeme_id, concept_id),
-            )
-            primary_lexeme_id = connection.execute(
-                "SELECT primary_lexeme_id FROM concepts WHERE id=?",
-                (concept_id,),
-            ).fetchone()[0]
-            role = "primary" if primary_lexeme_id == lexeme_id else "alias"
-            connection.execute(
-                """INSERT OR IGNORE INTO concept_lexemes(
-                       concept_id, lexeme_id, role, confidence, status,
-                       created_version, created_at)
-                   VALUES(?, ?, ?, 1.0, ?, ?, ?)""",
-                (
-                    concept_id,
-                    lexeme_id,
-                    role,
-                    str(concept["status"] or "provisional"),
-                    knowledge_version,
-                    now,
-                ),
+            self._associate_schema8_lexeme(
+                connection,
+                lexeme_id,
+                concept_id,
+                knowledge_version=knowledge_version,
+                created_at=now,
             )
         return lexeme_id
 
@@ -3961,7 +3960,8 @@ class V4Database:
         with self.transaction() as connection:
             rows = connection.execute(
                 """SELECT m.id mention_id, m.source_form, m.normalized_form,
-                          m.discourse_function, e.payload_json, e.confidence
+                          m.discourse_function, m.lexeme_id,
+                          e.payload_json, e.confidence
                    FROM mentions m JOIN evidence e ON e.id=m.evidence_id
                    WHERE m.concept_id IS NULL
                    ORDER BY m.normalized_form, m.id"""
@@ -3986,11 +3986,11 @@ class V4Database:
                         version, utc_now(),
                     ),
                 )
-                lexeme_id = self._ensure_schema8_lexeme(
+                lexeme_id = str(row["lexeme_id"])
+                self._associate_schema8_lexeme(
                     connection,
-                    row["source_form"],
-                    normalized_form=normalize_english_form(row["source_form"]),
-                    concept_id=concept_id,
+                    lexeme_id,
+                    concept_id,
                     knowledge_version=version,
                 )
                 connection.execute(

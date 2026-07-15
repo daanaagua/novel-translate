@@ -14,13 +14,18 @@ class SchemaUpgradeRequired(RuntimeError):
     """An existing database must be migrated by the explicit migration command."""
 
 
+def _connect_readonly(path: Path) -> sqlite3.Connection:
+    uri = f"{path.resolve().as_uri()}?mode=ro"
+    return sqlite3.connect(uri, uri=True)
+
+
 def inspect_schema(path: Path) -> int | None:
     """Return the persisted schema version, or ``None`` for an empty database."""
 
     path = Path(path)
     if not path.exists() or path.stat().st_size == 0:
         return None
-    with closing(sqlite3.connect(path)) as connection:
+    with closing(_connect_readonly(path)) as connection:
         table = connection.execute(
             """SELECT 1 FROM sqlite_master
                WHERE type='table' AND name='schema_meta'"""
@@ -39,6 +44,144 @@ def inspect_schema(path: Path) -> int | None:
             "parallel_v4 database has an invalid schema version; "
             "run migrate-v4 --preview before opening it"
         ) from exc
+
+
+def _schema8_feature_errors(connection: sqlite3.Connection) -> list[str]:
+    required_tables = {
+        "lexemes",
+        "concept_lexemes",
+        "concept_type_observations",
+        "coreference_decisions",
+        "concept_redirects",
+        "form_occurrences",
+        "knowledge_changes",
+        "revalidation_tasks",
+        "source_forms",
+        "mentions",
+        "rendering_rules",
+        "candidate_resolutions",
+        "translation_versions",
+        "dependencies",
+    }
+    table_sql = {
+        str(row[0]): str(row[1] or "")
+        for row in connection.execute(
+            """SELECT name, sql FROM sqlite_master
+               WHERE type='table' AND name NOT LIKE 'sqlite_%'"""
+        )
+    }
+    errors = [
+        f"missing table {name}" for name in sorted(required_tables - table_sql.keys())
+    ]
+
+    required_columns = {
+        "source_forms": {"lexeme_id", "form", "normalized_form"},
+        "mentions": {"lexeme_id", "concept_id", "evidence_id"},
+        "rendering_rules": {"lexeme_id", "concept_id"},
+        "candidate_resolutions": {"lexeme_id", "concept_id"},
+        "translation_versions": {
+            "validation_status",
+            "validated_knowledge_version",
+            "validation_fingerprint",
+        },
+        "revalidation_tasks": {"status"},
+    }
+    column_info: dict[str, dict[str, tuple[object, ...]]] = {}
+    for table, expected in required_columns.items():
+        if table not in table_sql:
+            continue
+        info = {
+            str(row[1]): tuple(row)
+            for row in connection.execute(f"PRAGMA table_info('{table}')")
+        }
+        column_info[table] = info
+        for column in sorted(expected - info.keys()):
+            errors.append(f"missing column {table}.{column}")
+    for table in ("source_forms", "mentions"):
+        lexeme = column_info.get(table, {}).get("lexeme_id")
+        if lexeme is not None and int(lexeme[3]) != 1:
+            errors.append(f"nullable column {table}.lexeme_id")
+    if "concept_id" in column_info.get("source_forms", {}):
+        errors.append("unexpected column source_forms.concept_id")
+
+    index_requirements = {
+        "uq_active_lexeme": (
+            "lexemes",
+            ("language", "normalized_form"),
+            "whereretired_versionisnull",
+        ),
+        "uq_active_concept_lexeme_role": (
+            "concept_lexemes",
+            ("concept_id", "lexeme_id", "role"),
+            "whereretired_versionisnull",
+        ),
+    }
+    for index_name, (table, expected_columns, expected_predicate) in (
+        index_requirements.items()
+    ):
+        if table not in table_sql:
+            continue
+        indexes = {
+            str(row[1]): tuple(row)
+            for row in connection.execute(f"PRAGMA index_list('{table}')")
+        }
+        index = indexes.get(index_name)
+        if index is None or int(index[2]) != 1 or int(index[4]) != 1:
+            errors.append(f"missing partial unique index {index_name}")
+            continue
+        actual_columns = tuple(
+            str(row[2])
+            for row in connection.execute(f"PRAGMA index_info('{index_name}')")
+        )
+        if actual_columns != expected_columns:
+            errors.append(f"invalid columns for index {index_name}")
+        index_sql_row = connection.execute(
+            """SELECT sql FROM sqlite_master
+               WHERE type='index' AND name=?""",
+            (index_name,),
+        ).fetchone()
+        index_sql = (
+            ""
+            if index_sql_row is None
+            else "".join(str(index_sql_row[0] or "").lower().split())
+        )
+        if expected_predicate not in index_sql:
+            errors.append(f"invalid predicate for index {index_name}")
+
+    compact_sql = {
+        table: "".join(sql.lower().split()) for table, sql in table_sql.items()
+    }
+    rendering_sql = compact_sql.get("rendering_rules", "")
+    if "check((lexeme_idisnull)!=(concept_idisnull))" not in rendering_sql:
+        errors.append("missing rendering_rules subject CHECK")
+
+    translation_sql = compact_sql.get("translation_versions", "")
+    validation_check = (
+        "check(validation_statusin"
+        "('clean','pending','validating','warning_stale'))"
+    )
+    if validation_check not in translation_sql:
+        errors.append("missing translation_versions validation_status CHECK")
+
+    revalidation_sql = compact_sql.get("revalidation_tasks", "")
+    revalidation_check = (
+        "check(statusin('pending','validating','resolved_noop','resolved_patch',"
+        "'resolved_retranslate','completed_with_warning'))"
+    )
+    if revalidation_check not in revalidation_sql:
+        errors.append("missing revalidation_tasks status CHECK")
+    return errors
+
+
+def _assert_schema8_features(path: Path) -> None:
+    with closing(_connect_readonly(path)) as connection:
+        errors = _schema8_feature_errors(connection)
+    if errors:
+        detail = "; ".join(errors[:4])
+        raise SchemaUpgradeRequired(
+            f"parallel_v4 schema 8 is incomplete or corrupt ({detail}); "
+            "run migrate-v4 --preview before opening it"
+        )
 
 
 def create_schema8(connection: sqlite3.Connection) -> None:
@@ -361,6 +504,7 @@ def assert_schema8_or_empty(path: Path) -> None:
     path = Path(path)
     version = inspect_schema(path)
     if version == SCHEMA_VERSION:
+        _assert_schema8_features(path)
         return
     if version is not None:
         raise SchemaUpgradeRequired(
@@ -369,7 +513,7 @@ def assert_schema8_or_empty(path: Path) -> None:
         )
 
     if path.exists() and path.stat().st_size:
-        with closing(sqlite3.connect(path)) as connection:
+        with closing(_connect_readonly(path)) as connection:
             user_tables = connection.execute(
                 """SELECT name FROM sqlite_master
                    WHERE type='table' AND name NOT LIKE 'sqlite_%'"""
