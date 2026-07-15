@@ -47,6 +47,8 @@ MAX_KIND_CHARS = 80
 MAX_RAW_RESPONSE_CHARS = 64 * 1024
 MAX_AUDIT_ERROR_CHARS = 2_000
 MAX_DECISION_VOTES_BYTES = 64 * 1024
+MAX_AUTHORIZED_CONCEPT_IDS = MAX_CASE_MENTIONS + MAX_CONCEPT_ANCHORS
+MAX_AUTHORIZED_CONCEPT_ID_CHARS = 256
 # The capped request contains at most 20,320 free-text characters.  JSON may
 # escape each as six bytes; 192 KiB leaves a fixed envelope for keys and IDs.
 MAX_CASE_PAYLOAD_BYTES = 192 * 1024
@@ -2264,6 +2266,7 @@ class CoreferenceCoordinator:
                     "models",
                     "protocol_version",
                     "frozen_payload_hash",
+                    "authorized_concept_ids",
                     "effect",
                     "selected",
                     "selected_sha256",
@@ -2450,6 +2453,24 @@ class CoreferenceCoordinator:
                         target_concept_id,
                         bindings_changed,
                     ) = self._safe_model_same_binding(case, connection)
+                if relation == "same":
+                    authorized_concept_ids = set(related_before)
+                    if target_concept_id is not None:
+                        authorized_concept_ids.add(target_concept_id)
+                    if len(authorized_concept_ids) > MAX_AUTHORIZED_CONCEPT_IDS:
+                        raise RuntimeError(
+                            "dual-model same authorization snapshot exceeds bound"
+                        )
+                    if any(
+                        len(concept_id) > MAX_AUTHORIZED_CONCEPT_ID_CHARS
+                        for concept_id in authorized_concept_ids
+                    ):
+                        raise RuntimeError(
+                            "dual-model same authorization concept ID exceeds bound"
+                        )
+                    resolution_vote["authorized_concept_ids"] = sorted(
+                        authorized_concept_ids
+                    )
                 resolution_vote["effect"] = {
                     "bindings_changed": bindings_changed,
                     "unified_identity": target_concept_id is not None,

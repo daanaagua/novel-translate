@@ -3969,12 +3969,16 @@ def test_dual_model_same_merges_multiple_active_anchors_through_redirect(tmp_pat
     assert len(redirects) == 1
     canonical_id = redirects[0]["canonical_concept_id"]
     assert {row[0] for row in bindings} == {canonical_id}
-    effect = next(
-        vote["effect"]
+    dual_vote = next(
+        vote
         for vote in json.loads(decision["votes_json"])
         if vote.get("source") == "dual_model"
     )
-    assert effect == {"bindings_changed": 1, "unified_identity": True}
+    assert dual_vote["authorized_concept_ids"] == sorted(concept_ids)
+    assert dual_vote["effect"] == {
+        "bindings_changed": 1,
+        "unified_identity": True,
+    }
     assert database.resolve_concept_id(redirects[0]["retired_concept_id"]) == canonical_id
 
 
@@ -4455,6 +4459,18 @@ def test_dual_model_cached_same_compensates_a_previously_unfinished_redirect_mer
     monkeypatch.setattr(database, "merge_concepts", protected_once)
     assert first.resolve_dual_model(case) == ("same", "model_agreement")
     monkeypatch.setattr(database, "merge_concepts", merge_concepts)
+    with database.transaction() as connection:
+        row = connection.execute(
+            "SELECT id, votes_json FROM coreference_decisions"
+        ).fetchone()
+        legacy_votes = json.loads(row["votes_json"])
+        for vote in legacy_votes:
+            if vote.get("source") == "dual_model":
+                vote.pop("authorized_concept_ids", None)
+        connection.execute(
+            "UPDATE coreference_decisions SET votes_json=? WHERE id=?",
+            (json.dumps(legacy_votes, sort_keys=True), row["id"]),
+        )
     cached_a = []
     cached_b = []
     cached = CoreferenceCoordinator(
@@ -4953,3 +4969,183 @@ def test_human_alias_preparation_rolls_back_with_later_concept_merge_failure(
             (canonical_id, variant_lexeme_id),
         ).fetchone()[0] == 0
     assert after == before
+
+
+def test_merge_authorization_does_not_follow_mutable_member_bindings(tmp_path):
+    database, lexeme_id, mention_ids, _, _ = _coreference_case(tmp_path)
+    concept_ids = ("concept-frozen-a", "concept-frozen-b", "concept-rebound-c")
+    for concept_id in concept_ids:
+        _insert_test_concept(database, lexeme_id, concept_id)
+    _bind_test_mention(database, mention_ids[0], concept_ids[0])
+    _bind_test_mention(database, mention_ids[1], concept_ids[1])
+    decision_id = _insert_same_coreference_decision(
+        database,
+        lexeme_id,
+        mention_ids,
+        concept_ids[:2],
+        decision_id="coref-frozen-member-authorization",
+    )
+    _bind_test_mention(database, mention_ids[1], concept_ids[2])
+    with closing(database.connect()) as connection:
+        before_versions = connection.execute(
+            "SELECT COUNT(*) FROM knowledge_versions"
+        ).fetchone()[0]
+
+    with pytest.raises(
+        ConceptMergeConflictError,
+        match="does not authorize every merge concept",
+    ):
+        database.merge_concepts(
+            [concept_ids[0], concept_ids[2]],
+            reason="must not trust mutable member bindings",
+            decision_id=decision_id,
+        )
+
+    with closing(database.connect()) as connection:
+        statuses = connection.execute(
+            """SELECT id, retired_version FROM concepts
+               WHERE id IN (?, ?, ?) ORDER BY id""",
+            concept_ids,
+        ).fetchall()
+        bindings = connection.execute(
+            "SELECT concept_id FROM mentions ORDER BY id"
+        ).fetchall()
+        assert connection.execute(
+            "SELECT COUNT(*) FROM concept_redirects"
+        ).fetchone()[0] == 0
+        assert connection.execute(
+            "SELECT COUNT(*) FROM knowledge_versions"
+        ).fetchone()[0] == before_versions
+    assert all(row["retired_version"] is None for row in statuses)
+    assert [row["concept_id"] for row in bindings] == [
+        concept_ids[0],
+        concept_ids[2],
+    ]
+
+
+def test_human_alias_merge_follows_retired_alias_to_explicit_canonical(tmp_path):
+    database = _db(tmp_path, source_text="Scapes crossed a landscape and a scape.")
+    for source in ("scape", "landscape", "scapes"):
+        database.import_legacy_concept(
+            source,
+            "拟境",
+            "concept",
+            f"legacy {source}",
+        )
+    ids = {
+        source: stable_id("concept", normalize_english_form(source))
+        for source in ("scape", "landscape", "scapes")
+    }
+
+    first = database.merge_concept_forms("landscape", ["scapes"])
+    with closing(database.connect()) as connection:
+        before_second = {
+            "versions": connection.execute(
+                "SELECT COUNT(*) FROM knowledge_versions"
+            ).fetchone()[0],
+            "audits": connection.execute(
+                "SELECT COUNT(*) FROM audit_calls"
+            ).fetchone()[0],
+            "redirects": connection.execute(
+                "SELECT COUNT(*) FROM concept_redirects"
+            ).fetchone()[0],
+        }
+
+    second = database.merge_concept_forms("scape", ["scapes"])
+
+    assert first["changed"] is True
+    assert second["changed"] is True
+    assert second["canonical_id"] == ids["scape"]
+    assert second["merged_concept_ids"] == [ids["landscape"]]
+    assert isinstance(second["authorization_audit_id"], int)
+    assert second["knowledge_version"] > first["knowledge_version"]
+    assert database.resolve_concept_id(ids["scapes"]) == ids["scape"]
+    assert database.resolve_concept_id(ids["landscape"]) == ids["scape"]
+    with closing(database.connect()) as connection:
+        redirects = connection.execute(
+            """SELECT retired_concept_id, canonical_concept_id, reason
+               FROM concept_redirects ORDER BY retired_concept_id"""
+        ).fetchall()
+        after_second = {
+            "versions": connection.execute(
+                "SELECT COUNT(*) FROM knowledge_versions"
+            ).fetchone()[0],
+            "audits": connection.execute(
+                "SELECT COUNT(*) FROM audit_calls"
+            ).fetchone()[0],
+            "redirects": len(redirects),
+        }
+        assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
+    assert {
+        (row["retired_concept_id"], row["canonical_concept_id"])
+        for row in redirects
+    } == {
+        (ids["scapes"], ids["landscape"]),
+        (ids["landscape"], ids["scape"]),
+    }
+    assert all(
+        "human concept-form merge authorization audit:" in row["reason"]
+        for row in redirects
+    )
+    assert after_second == {
+        "versions": before_second["versions"] + 1,
+        "audits": before_second["audits"] + 2,
+        "redirects": before_second["redirects"] + 1,
+    }
+
+    replay = database.merge_concept_forms("scape", ["scapes"])
+
+    assert replay["changed"] is False
+    with closing(database.connect()) as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM knowledge_versions"
+        ).fetchone()[0] == after_second["versions"]
+        assert connection.execute(
+            "SELECT COUNT(*) FROM audit_calls"
+        ).fetchone()[0] == after_second["audits"]
+        assert connection.execute(
+            "SELECT COUNT(*) FROM concept_redirects"
+        ).fetchone()[0] == after_second["redirects"]
+
+
+def test_human_retired_alias_locked_identity_conflict_rolls_back(tmp_path):
+    database = _db(tmp_path, source_text="Scapes crossed a landscape and a scape.")
+    for source in ("scape", "landscape", "scapes"):
+        database.import_legacy_concept(source, "拟境", "concept", source)
+    ids = {
+        source: stable_id("concept", normalize_english_form(source))
+        for source in ("scape", "landscape", "scapes")
+    }
+    database.merge_concept_forms("landscape", ["scapes"])
+    with database.transaction() as connection:
+        connection.execute(
+            "UPDATE concepts SET kind='place', locked=1 WHERE id=?",
+            (ids["scape"],),
+        )
+        connection.execute(
+            "UPDATE concepts SET kind='person', locked=1 WHERE id=?",
+            (ids["landscape"],),
+        )
+    with closing(database.connect()) as connection:
+        before = {
+            table: connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+            for table in (
+                "knowledge_versions",
+                "audit_calls",
+                "knowledge_changes",
+                "concept_redirects",
+            )
+        }
+
+    with pytest.raises(ConceptMergeConflictError, match="locked.*kinds"):
+        database.merge_concept_forms("scape", ["scapes"])
+
+    with closing(database.connect()) as connection:
+        after = {
+            table: connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+            for table in before
+        }
+        assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
+    assert after == before
+    assert database.resolve_concept_id(ids["scapes"]) == ids["landscape"]
+    assert database.resolve_concept_id(ids["landscape"]) == ids["landscape"]

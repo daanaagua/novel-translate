@@ -102,6 +102,8 @@ MAX_MERGE_AUDIT_IDS = 64
 MAX_RULE_CONFLICT_IDS = 64
 MAX_RULE_CONFLICT_TARGETS = 32
 MAX_RULE_CONFLICT_CONDITION_CHARS = 2_048
+MAX_AUTHORIZED_CONCEPT_IDS = 16
+MAX_AUTHORIZED_CONCEPT_ID_CHARS = 256
 HUMAN_CONCEPT_FORM_REDIRECT_PREFIX = (
     "human concept-form merge authorization audit:"
 )
@@ -494,6 +496,44 @@ class V4Database:
                 )
             except (KeyError, ValueError):
                 continue
+        try:
+            votes = self._decoded_json_array(
+                decision["votes_json"], field="coreference decision votes_json"
+            )
+        except ValueError as exc:
+            raise ConceptMergeConflictError(
+                "merge decision has invalid frozen authorization votes"
+            ) from exc
+        frozen_ids: set[str] = set()
+        for vote in votes:
+            if not isinstance(vote, dict) or "authorized_concept_ids" not in vote:
+                continue
+            snapshot = vote["authorized_concept_ids"]
+            if not isinstance(snapshot, list) or len(snapshot) > MAX_AUTHORIZED_CONCEPT_IDS:
+                raise ConceptMergeConflictError(
+                    "merge decision frozen authorization is invalid or unbounded"
+                )
+            for value in snapshot:
+                if (
+                    not isinstance(value, str)
+                    or not value.strip()
+                    or len(value.strip()) > MAX_AUTHORIZED_CONCEPT_ID_CHARS
+                ):
+                    raise ConceptMergeConflictError(
+                        "merge decision frozen authorization contains an invalid concept ID"
+                    )
+                frozen_ids.add(value.strip())
+        if len(frozen_ids) > MAX_AUTHORIZED_CONCEPT_IDS:
+            raise ConceptMergeConflictError(
+                "merge decision frozen authorization is unbounded"
+            )
+        for frozen_id in sorted(frozen_ids):
+            try:
+                authorized.add(
+                    self.resolve_concept_id(frozen_id, connection=connection)
+                )
+            except (KeyError, ValueError):
+                continue
         members = self._decoded_json_array(
             decision["anchor_members_json"],
             field="anchor_members_json",
@@ -508,22 +548,6 @@ class V4Database:
         )
         if member_ids:
             placeholders = ",".join("?" for _ in member_ids)
-            rows = connection.execute(
-                f"""SELECT DISTINCT concept_id FROM mentions
-                     WHERE id IN ({placeholders}) AND lexeme_id=?
-                       AND concept_id IS NOT NULL""",
-                (*member_ids, lexeme_id),
-            ).fetchall()
-            for row in rows:
-                try:
-                    authorized.add(
-                        self.resolve_concept_id(
-                            str(row["concept_id"]),
-                            connection=connection,
-                        )
-                    )
-                except (KeyError, ValueError):
-                    continue
             anchor_rows = connection.execute(
                 f"""SELECT id FROM concepts
                      WHERE anchor_mention_id IN ({placeholders})
@@ -809,7 +833,15 @@ class V4Database:
                     },
                     "rule_conflicts": 0,
                 }
-            if not human_authorized_cross_lexeme:
+            if human_authorized_cross_lexeme:
+                locked_kinds = {
+                    str(row["kind"]) for row in rows if bool(row["locked"])
+                }
+                if len(locked_kinds) > 1:
+                    raise ConceptMergeConflictError(
+                        "locked concepts have conflicting kinds"
+                    )
+            else:
                 self._reject_protected_merge_conflicts(
                     connection,
                     rows,
@@ -6699,11 +6731,17 @@ class V4Database:
                     (alias_id,),
                 ).fetchone()
                 if alias_row is not None:
-                    if (
-                        alias_row["retired_version"] is None
-                        and alias_id != canonical_id
-                    ):
-                        active_ids.append(alias_id)
+                    try:
+                        active_alias_id = self.resolve_concept_id(
+                            alias_id,
+                            connection=connection,
+                        )
+                    except (KeyError, ValueError) as exc:
+                        raise ConceptMergeConflictError(
+                            "human concept-form alias cannot resolve to an active identity"
+                        ) from exc
+                    if active_alias_id != canonical_id:
+                        active_ids.append(active_alias_id)
                     needs_link = False
                 else:
                     needs_link = connection.execute(
