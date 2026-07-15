@@ -1,5 +1,6 @@
 import json
 import hashlib
+import time
 from contextlib import closing
 
 import pytest
@@ -653,6 +654,20 @@ def test_aho_matcher_preserves_word_boundaries_case_and_nfkc():
     assert matcher.match("Archoness XArchon Archon_2") == ()
 
 
+def test_nfkc_grapheme_matching_preserves_original_cluster_spans():
+    matcher = AhoConceptMatcher(
+        {
+            "Å": ["ring"],
+            "A": ["plain"],
+            "ffi": ["ligature"],
+            "f": ["partial"],
+        }
+    )
+
+    assert matcher.iter_matches("A\u030A") == (("ring", "A\u030A", 0, 2),)
+    assert matcher.iter_matches("\ufb03") == (("ligature", "\ufb03", 0, 1),)
+
+
 def test_matcher_cache_builds_once_for_one_signature():
     ConceptMatcherCache.clear()
     snapshot = [
@@ -666,6 +681,197 @@ def test_matcher_cache_builds_once_for_one_signature():
     assert first is second
     assert ConceptMatcherCache.build_count() == 1
     assert first.match("Name1999 and Name1") == ("c1", "c1999")
+
+
+def test_compiled_rule_buckets_avoid_scanning_all_contextual_rules(monkeypatch):
+    snapshot = _render_snapshot(
+        concept_verified="", concept_working="", lexeme_verified=""
+    )
+    snapshot[0]["lexeme_rules"] = [
+        {
+            "id": f"speaker-{index}",
+            "subject_type": "lexeme",
+            "condition": {"speaker_id": f"speaker-{index}"},
+            "target": f"TARGET-{index}",
+            "priority": index,
+            "status": "verified",
+            "locked": True,
+            "created_version": 1,
+        }
+        for index in range(500)
+    ]
+    index = _compile_render(snapshot)
+    checks = {"count": 0}
+    original = matcher_module.FrozenRenderIndex._condition_matches
+
+    def counted(condition, context):
+        checks["count"] += 1
+        return original(condition, context)
+
+    monkeypatch.setattr(
+        matcher_module.FrozenRenderIndex,
+        "_condition_matches",
+        staticmethod(counted),
+    )
+
+    matched = index.matched_renderings("Archon", speaker_id="speaker-321")[0]
+
+    assert matched.rendered_target == "TARGET-321"
+    assert checks["count"] < 20
+
+    checks["count"] = 0
+    source = " ".join("Archon" for _ in range(1000))
+    started = time.perf_counter()
+    repeated = index.matched_renderings(source, speaker_id="speaker-321")
+    elapsed = time.perf_counter() - started
+
+    assert len(repeated) == 1000
+    assert checks["count"] <= 1000
+    assert elapsed < 2.0
+
+
+def test_fingerprint_ignores_nonsemantic_rule_rebuild_metadata():
+    snapshot = _render_snapshot()
+    first = _compile_render(snapshot).matched_renderings(
+        "Archon",
+        block_id="b-vocative",
+        speaker="Severian",
+        thread_id="court",
+    )[0]
+    rebuilt = json.loads(json.dumps(snapshot, ensure_ascii=False))
+    rebuilt_rule = rebuilt[0]["concepts"][0]["rules"][0]
+    rebuilt_rule["created_version"] = 999
+    rebuilt_rule["status"] = "provisional"
+    second = _compile_render(rebuilt).matched_renderings(
+        "Archon",
+        block_id="b-vocative",
+        speaker="Severian",
+        thread_id="court",
+    )[0]
+    changed = json.loads(json.dumps(rebuilt, ensure_ascii=False))
+    changed[0]["concepts"][0]["rules"][0]["priority"] = 101
+    third = _compile_render(changed).matched_renderings(
+        "Archon",
+        block_id="b-vocative",
+        speaker="Severian",
+        thread_id="court",
+    )[0]
+
+    assert first.dependency_fingerprint == second.dependency_fingerprint
+    assert third.dependency_fingerprint != second.dependency_fingerprint
+
+
+def test_freeze_render_bundle_keeps_snapshot_and_contexts_at_one_k0(tmp_path):
+    db = _db(tmp_path, ["Archon spoke."])
+    first_id = db.import_legacy_concept("Archon", "", "title", "first")
+    version = db.current_knowledge_version()
+    second_id = "concept-second"
+    with db.transaction() as connection:
+        lexeme_id = connection.execute(
+            "SELECT primary_lexeme_id FROM concepts WHERE id=?", (first_id,)
+        ).fetchone()[0]
+        connection.execute(
+            """UPDATE concepts SET verified_target='FIRST', status='verified'
+                 WHERE id=?""",
+            (first_id,),
+        )
+        connection.execute(
+            """UPDATE concept_lexemes SET status='verified', confidence=1.0
+                 WHERE concept_id=?""",
+            (first_id,),
+        )
+        connection.execute(
+            """INSERT INTO concepts(
+                   id, kind, canonical_source, verified_target, description,
+                   status, scope, locked, primary_lexeme_id,
+                   created_version, created_at)
+               VALUES(?, 'title', 'Archon', 'SECOND', 'second', 'verified',
+                      'book', 0, ?, ?, 'now')""",
+            (second_id, lexeme_id, version),
+        )
+        connection.execute(
+            """INSERT INTO concept_lexemes(
+                   concept_id, lexeme_id, role, confidence, status,
+                   created_version, created_at)
+               VALUES(?, ?, 'alias', 1.0, 'verified', ?, 'now')""",
+            (second_id, lexeme_id, version),
+        )
+        evidence_id = connection.execute(
+            """INSERT INTO evidence(
+                   block_id, paragraph_id, kind, source_form, evidence_quote,
+                   payload_json, confidence, extractor, run_id, created_at)
+               VALUES('block_0', 'P000', 'test', 'Archon', 'Archon',
+                      '{"speaker_id":"sev"}', 1.0, 'test', NULL, 'now')"""
+        ).lastrowid
+        mention_id = connection.execute(
+            """INSERT INTO mentions(
+                   block_id, paragraph_id, source_form, normalized_form,
+                   discourse_function, lexeme_id, concept_id, evidence_id)
+               VALUES('block_0', 'P000', 'Archon', 'archon', 'referential',
+                      ?, ?, ?)""",
+            (lexeme_id, first_id, evidence_id),
+        ).lastrowid
+        connection.execute(
+            """INSERT INTO form_occurrences(
+                   lexeme_id, block_id, start_offset, end_offset,
+                   source_form, source_hash, created_at)
+               VALUES(?, 'block_0', 0, 6, 'Archon', 'hash-0', 'now')""",
+            (lexeme_id,),
+        )
+
+    frozen = db.freeze_render_bundle(["block_0"])
+    with db.transaction() as connection:
+        connection.execute(
+            "UPDATE mentions SET concept_id=? WHERE id=?", (second_id, mention_id)
+        )
+    next_bundle = db.freeze_render_bundle(["block_0"])
+    frozen_match = frozen.index.matched_renderings(
+        "Archon",
+        block_id="block_0",
+        occurrence_contexts=frozen.contexts_by_block["block_0"],
+    )[0]
+    next_match = next_bundle.index.matched_renderings(
+        "Archon",
+        block_id="block_0",
+        occurrence_contexts=next_bundle.contexts_by_block["block_0"],
+    )[0]
+
+    assert frozen_match.rendered_target == "FIRST"
+    assert next_match.rendered_target == "SECOND"
+    assert frozen.signature != next_bundle.signature
+    assert frozen.contexts_by_block["block_0"][0]["evidence_id"] == evidence_id
+    with pytest.raises(TypeError):
+        frozen.contexts_by_block["block_0"] = ()
+
+
+@pytest.mark.parametrize(
+    "condition_json",
+    [
+        "[]",
+        '{"value":NaN}',
+        json.dumps({"value": "x" * 513}),
+        "[" * 2000 + "]" * 2000,
+    ],
+)
+def test_snapshot_rejects_unsafe_condition_json_with_typed_error(
+    tmp_path, condition_json
+):
+    db = _db(tmp_path, ["Archon spoke."])
+    concept_id = db.import_legacy_concept("Archon", "", "title", "office")
+    version = db.current_knowledge_version()
+    with db.transaction() as connection:
+        connection.execute(
+            """INSERT INTO rendering_rules(
+                   id, concept_id, condition_json, target, priority, status,
+                   scope, locked, created_version, created_at)
+               VALUES('unsafe-condition', ?, ?, 'TARGET', 1, 'verified',
+                      'book', 1, ?, 'now')""",
+            (concept_id, condition_json, version),
+        )
+
+    with pytest.raises(KnowledgeSnapshotError, match="unsafe-condition") as error:
+        db.freeze_translation_knowledge()
+    assert len(str(error.value)) < 300
 
 
 def test_concepts_for_text_deepcopies_nested_rules_and_reuses_matcher(tmp_path):

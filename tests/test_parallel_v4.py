@@ -353,14 +353,14 @@ class ParallelV4Tests(unittest.TestCase):
 
     def test_island_prefetches_rendering_contexts_once(self):
         self.add_blocks([f"Block {index}." for index in range(5)], status="ready")
-        original = self.database.rendering_contexts_for_blocks
+        original = self.database.freeze_render_bundle
         calls = []
 
         def counted(block_ids):
             calls.append(tuple(block_ids))
             return original(block_ids)
 
-        self.database.rendering_contexts_for_blocks = counted
+        self.database.freeze_render_bundle = counted
         pipeline = V4TranslationPipeline(
             self.database,
             lambda: FakeTranslationLLM(),
@@ -378,6 +378,47 @@ class ParallelV4Tests(unittest.TestCase):
         self.assertEqual(result["status"], "completed")
         self.assertEqual(len(calls), 1)
         self.assertEqual(len(calls[0]), 5)
+
+    def test_glossary_items_and_visible_characters_are_hard_bounded(self):
+        source = " ".join(f"Name{index}" for index in range(200))
+        block = self.add_blocks([source], status="ready")[0]
+        version = self.database.current_knowledge_version()
+        with self.database.transaction() as connection:
+            for index in range(200):
+                lexeme_id = f"lex-limit-{index:03d}"
+                form = f"Name{index}"
+                connection.execute(
+                    """INSERT INTO lexemes(
+                           id, language, normalized_form, canonical_form,
+                           working_target, created_version, created_at)
+                       VALUES(?, 'en', lower(?), ?, ?, ?, 'now')""",
+                    (lexeme_id, form, form, f"TARGET-{index}", version),
+                )
+                connection.execute(
+                    """INSERT INTO source_forms(
+                           lexeme_id, form, normalized_form, grammar_json)
+                       VALUES(?, ?, lower(?), '{}')""",
+                    (lexeme_id, form, form),
+                )
+        _, frozen, _ = self.database.freeze_translation_knowledge()
+        pipeline = V4TranslationPipeline(
+            self.database,
+            lambda: None,
+            config=V4PipelineConfig(max_context_chars=1024),
+        )
+
+        manager = pipeline._glossary_for([block], concept_snapshot=frozen)
+        visible = manager.find_terms_in_text(
+            block.source_text, status_filter=list(TermStatus)
+        )
+        rendered = "\n".join(
+            TranslationEngine._render_glossary_term(item) for item in visible
+        )
+
+        self.assertLessEqual(len(visible), 128)
+        self.assertLessEqual(len(rendered), 1024)
+        self.assertGreater(manager.render_limit_metadata["omitted"], 0)
+        self.assertTrue(manager.render_warnings)
 
     def test_local_scan_indexes_candidates_and_legacy_reconcile_is_conservative(self):
         blocks = self.add_blocks(["Archon spoke.", "archon waited.", "Archons gathered."])

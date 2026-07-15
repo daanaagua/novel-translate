@@ -1015,11 +1015,11 @@ def test_all_islands_keep_one_frozen_target_snapshot_and_version(tmp_path, monke
     )
     bumps = {"count": 0}
     freezes = {"count": 0}
-    original_freeze = database.freeze_translation_knowledge
+    original_freeze = database.freeze_render_bundle
 
-    def counted_freeze():
+    def counted_freeze(block_ids):
         freezes["count"] += 1
-        return original_freeze()
+        return original_freeze(block_ids)
 
     def unrelated_version(*_args, **_kwargs):
         bumps["count"] += 1
@@ -1028,7 +1028,7 @@ def test_all_islands_keep_one_frozen_target_snapshot_and_version(tmp_path, monke
         return None
 
     monkeypatch.setattr(database, "commit_translation_proposals", unrelated_version)
-    monkeypatch.setattr(database, "freeze_translation_knowledge", counted_freeze)
+    monkeypatch.setattr(database, "freeze_render_bundle", counted_freeze)
     pipeline = RecordingPipeline(
         database,
         lambda: None,
@@ -1211,8 +1211,8 @@ def test_invalid_snapshot_fails_safely_and_enqueues_one_blocking_review(
     error = KnowledgeSnapshotError("broken-rule", "invalid json")
     monkeypatch.setattr(
         database,
-        "freeze_translation_knowledge",
-        lambda: (_ for _ in ()).throw(error),
+        "freeze_render_bundle",
+        lambda _block_ids: (_ for _ in ()).throw(error),
     )
     pipeline = V4TranslationPipeline(database, lambda: (_ for _ in ()).throw(
         AssertionError("LLM must not run with an invalid knowledge snapshot")

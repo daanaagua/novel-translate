@@ -4,17 +4,19 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import re
 import sqlite3
 import unicodedata
 import uuid
 from copy import deepcopy
 from contextlib import closing, contextmanager
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from threading import RLock
-from typing import Any, Dict, Iterable, Iterator, List, Optional, Sequence
+from types import MappingProxyType
+from typing import Any, Dict, Iterable, Iterator, List, Mapping, Optional, Sequence
 
 from .audit_archive import (
     AuditArchive,
@@ -84,6 +86,75 @@ class KnowledgeSnapshotError(RuntimeError):
         self.rule_id = rule_id
         self.detail = detail
         super().__init__(f"invalid rendering rule {rule_id}: {detail}")
+
+
+@dataclass(frozen=True)
+class FrozenRenderBundle:
+    knowledge_version: int
+    index: FrozenRenderIndex
+    contexts_by_block: Mapping[str, tuple[Mapping[str, Any], ...]]
+    signature: str
+    render_signature: str
+    block_ids: tuple[str, ...]
+
+
+def _immutable_render_value(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        return MappingProxyType(
+            {str(key): _immutable_render_value(item) for key, item in value.items()}
+        )
+    if isinstance(value, list):
+        return tuple(_immutable_render_value(item) for item in value)
+    if isinstance(value, tuple):
+        return tuple(_immutable_render_value(item) for item in value)
+    return value
+
+
+def _safe_rule_condition(raw: Any, rule_id: str) -> Dict[str, Any]:
+    text = str(raw or "{}")
+    try:
+        if len(text.encode("utf-8")) > 16 * 1024:
+            raise ValueError("condition JSON exceeds 16 KiB")
+
+        def reject_constant(_value: str) -> None:
+            raise ValueError("non-finite JSON number")
+
+        value = json.loads(text, parse_constant=reject_constant)
+    except (json.JSONDecodeError, RecursionError, MemoryError, OverflowError, ValueError) as exc:
+        raise KnowledgeSnapshotError(rule_id, str(exc)[:160]) from exc
+    if not isinstance(value, dict):
+        raise KnowledgeSnapshotError(rule_id, "condition JSON root must be an object")
+    nodes = 0
+    stack: list[tuple[Any, int]] = [(value, 1)]
+    while stack:
+        current, depth = stack.pop()
+        nodes += 1
+        if nodes > 256:
+            raise KnowledgeSnapshotError(rule_id, "condition JSON exceeds 256 nodes")
+        if depth > 16:
+            raise KnowledgeSnapshotError(rule_id, "condition JSON exceeds depth 16")
+        if isinstance(current, dict):
+            if len(current) > 128:
+                raise KnowledgeSnapshotError(rule_id, "condition object is too large")
+            for key, item in current.items():
+                if not isinstance(key, str) or len(key) > 512:
+                    raise KnowledgeSnapshotError(rule_id, "condition key is too long")
+                stack.append((item, depth + 1))
+        elif isinstance(current, list):
+            if len(current) > 128:
+                raise KnowledgeSnapshotError(rule_id, "condition list is too large")
+            stack.extend((item, depth + 1) for item in current)
+        elif isinstance(current, str):
+            if len(current) > 512:
+                raise KnowledgeSnapshotError(rule_id, "condition string is too long")
+        elif isinstance(current, float):
+            if not math.isfinite(current):
+                raise KnowledgeSnapshotError(rule_id, "condition number is not finite")
+        elif current is None or isinstance(current, (bool, int)):
+            continue
+        else:
+            raise KnowledgeSnapshotError(rule_id, "condition contains unsupported data")
+    return value
 
 
 class ConceptAnchorConflictError(RuntimeError, ValueError):
@@ -7696,14 +7767,7 @@ class V4Database:
             if not target:
                 continue
             rule_id = str(row["id"])
-            try:
-                condition = json.loads(row["condition_json"])
-            except (json.JSONDecodeError, TypeError) as exc:
-                raise KnowledgeSnapshotError(rule_id, str(exc)) from exc
-            if not isinstance(condition, dict):
-                raise KnowledgeSnapshotError(
-                    rule_id, "condition_json must decode to an object"
-                )
+            condition = _safe_rule_condition(row["condition_json"], rule_id)
             concepts[str(row["concept_id"])]["rules"].append(
                 {
                     "id": rule_id,
@@ -7916,14 +7980,7 @@ class V4Database:
         ).fetchall()
         for row in rule_rows:
             rule_id = str(row["id"])
-            try:
-                condition = json.loads(str(row["condition_json"] or "{}"))
-            except (json.JSONDecodeError, TypeError) as exc:
-                raise KnowledgeSnapshotError(rule_id, str(exc)) from exc
-            if not isinstance(condition, dict):
-                raise KnowledgeSnapshotError(
-                    rule_id, "condition_json must decode to an object"
-                )
+            condition = _safe_rule_condition(row["condition_json"], rule_id)
             rule = {
                 "id": rule_id,
                 "condition": condition,
@@ -8114,15 +8171,26 @@ class V4Database:
         """Batch-load immutable rendering contexts with one bounded SQL query."""
 
         ordered_ids = list(dict.fromkeys(str(value) for value in block_ids))
+        with closing(self.connect()) as connection:
+            return self._rendering_contexts_for_blocks_from_connection(
+                connection, ordered_ids
+            )
+
+    def _rendering_contexts_for_blocks_from_connection(
+        self,
+        connection: sqlite3.Connection,
+        block_ids: Sequence[str],
+    ) -> Dict[str, List[Dict[str, Any]]]:
+        ordered_ids = list(dict.fromkeys(str(value) for value in block_ids))
         grouped: Dict[str, List[Dict[str, Any]]] = {
             block_id: [] for block_id in ordered_ids
         }
         if not ordered_ids:
             return grouped
         placeholders = ",".join("?" for _ in ordered_ids)
-        with closing(self.connect()) as connection:
-            rows = connection.execute(
-                f"""SELECT m.id mention_id, m.block_id, m.lexeme_id, m.concept_id,
+        rows = connection.execute(
+            f"""SELECT m.id mention_id, m.block_id, m.lexeme_id, m.concept_id,
+                       m.evidence_id,
                            m.paragraph_id, m.source_form, m.discourse_function,
                            e.confidence, e.payload_json,
                            fo.start_offset, fo.end_offset
@@ -8133,9 +8201,11 @@ class V4Database:
                      AND fo.lexeme_id=m.lexeme_id
                      AND fo.source_form=m.source_form
                     WHERE m.block_id IN ({placeholders})
+                      AND e.kind!='translation_term'
+                      AND e.extractor!='translate_v4'
                     ORDER BY m.block_id, m.id, fo.start_offset, fo.end_offset""",
-                ordered_ids,
-            ).fetchall()
+            ordered_ids,
+        ).fetchall()
         seen: Dict[str, set[str]] = {block_id: set() for block_id in ordered_ids}
         for row in rows:
             block_id = str(row["block_id"])
@@ -8174,6 +8244,7 @@ class V4Database:
                 "lexeme_id": str(row["lexeme_id"]),
                 "source_form": str(row["source_form"]),
                 "mention_id": int(row["mention_id"]),
+                "evidence_id": int(row["evidence_id"]),
                 "paragraph_id": str(row["paragraph_id"]),
                 "paragraph": str(row["paragraph_id"]),
                 "discourse_function": str(row["discourse_function"]),
@@ -8235,6 +8306,92 @@ class V4Database:
             connection.close()
 
     @staticmethod
+    def _render_bundle_signature(
+        knowledge_version: int,
+        render_signature: str,
+        contexts_by_block: Mapping[str, Sequence[Mapping[str, Any]]],
+    ) -> str:
+        payload = {
+            "render_signature": str(render_signature),
+            "contexts": {
+                str(block_id): [dict(context) for context in contexts_by_block[block_id]]
+                for block_id in sorted(contexts_by_block)
+            },
+        }
+        raw = json.dumps(
+            payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+        )
+        return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+    def freeze_render_bundle(
+        self, block_ids: Sequence[str]
+    ) -> FrozenRenderBundle:
+        """Freeze rendering knowledge and source contexts in one SQLite snapshot."""
+
+        ordered_ids = tuple(dict.fromkeys(str(value) for value in block_ids))
+        connection = self.connect()
+        try:
+            connection.execute("BEGIN")
+            version = int(
+                connection.execute(
+                    "SELECT MAX(id) FROM knowledge_versions"
+                ).fetchone()[0]
+            )
+            self._concept_snapshot_from_connection(connection)
+            snapshot = self._render_snapshot_from_connection(connection)
+            index = FrozenRenderIndex.compile(snapshot, self.target_snapshot_signature)
+            contexts = self._rendering_contexts_for_blocks_from_connection(
+                connection, ordered_ids
+            )
+            signature = self._render_bundle_signature(
+                version, index.signature, contexts
+            )
+            immutable_contexts = MappingProxyType(
+                {
+                    block_id: tuple(
+                        _immutable_render_value(context)
+                        for context in contexts.get(block_id, [])
+                    )
+                    for block_id in ordered_ids
+                }
+            )
+            return FrozenRenderBundle(
+                knowledge_version=version,
+                index=index,
+                contexts_by_block=immutable_contexts,
+                signature=signature,
+                render_signature=index.signature,
+                block_ids=ordered_ids,
+            )
+        finally:
+            connection.rollback()
+            connection.close()
+
+    def render_bundle_signature(self, block_ids: Sequence[str]) -> str:
+        """Read the current combined render/context signature atomically."""
+
+        ordered_ids = tuple(dict.fromkeys(str(value) for value in block_ids))
+        connection = self.connect()
+        try:
+            connection.execute("BEGIN")
+            version = int(
+                connection.execute(
+                    "SELECT MAX(id) FROM knowledge_versions"
+                ).fetchone()[0]
+            )
+            snapshot = self._render_snapshot_from_connection(connection)
+            render_signature = self.target_snapshot_signature(snapshot)
+            contexts = self._rendering_contexts_for_blocks_from_connection(
+                connection, ordered_ids
+            )
+            return self._render_bundle_signature(
+                version, render_signature, contexts
+            )
+        finally:
+            connection.rollback()
+            connection.close()
+
+    @staticmethod
     def target_snapshot_signature(snapshot: Sequence[Dict[str, Any]]) -> str:
         payload = sorted(
             (deepcopy(dict(item)) for item in snapshot),
@@ -8267,6 +8424,7 @@ class V4Database:
         desired_status: str,
         error: Optional[str] = None,
         force_revalidate: bool = False,
+        context_block_ids: Optional[Sequence[str]] = None,
     ) -> tuple[str, bool]:
         """Finalize a translation run against knowledge read in the same write txn."""
 
@@ -8274,7 +8432,21 @@ class V4Database:
             # Preserve the historical validation/read hook before rendering.
             self._concept_snapshot_from_connection(connection)
             snapshot = self._render_snapshot_from_connection(connection)
-            current_signature = self.target_snapshot_signature(snapshot)
+            render_signature = self.target_snapshot_signature(snapshot)
+            if context_block_ids is None:
+                current_signature = render_signature
+            else:
+                version = int(
+                    connection.execute(
+                        "SELECT MAX(id) FROM knowledge_versions"
+                    ).fetchone()[0]
+                )
+                contexts = self._rendering_contexts_for_blocks_from_connection(
+                    connection, context_block_ids
+                )
+                current_signature = self._render_bundle_signature(
+                    version, render_signature, contexts
+                )
             stale = force_revalidate or current_signature != expected_signature
             persisted_status = (
                 "completed_with_errors" if stale else desired_status

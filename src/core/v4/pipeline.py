@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 import time
@@ -22,7 +23,7 @@ from ..schemas import (
 )
 from ..translator import TranslationConfig, TranslationEngine
 from .context import ContextBuilder, ContextOverflow
-from .database import KnowledgeSnapshotError, V4Database
+from .database import FrozenRenderBundle, KnowledgeSnapshotError, V4Database
 from .matcher import FrozenRenderIndex
 from .models import Island, TranslationOutcome, V4Block, V4BlockStatus
 from .semantic_mapper import SemanticMapper, SemanticMapperConfig
@@ -171,15 +172,18 @@ class V4TranslationPipeline:
     ) -> GlossaryManager:
         if isinstance(concept_snapshot, FrozenRenderIndex):
             if rendering_contexts_by_block is None:
-                batch_loader = getattr(
-                    self.database, "rendering_contexts_for_blocks", None
-                )
-                rendering_contexts_by_block = (
-                    batch_loader([block.id for block in blocks])
-                    if batch_loader is not None
-                    else {}
-                )
+                active_bundle = getattr(self, "_active_render_bundle", None)
+                if (
+                    isinstance(active_bundle, FrozenRenderBundle)
+                    and active_bundle.index.signature == concept_snapshot.signature
+                ):
+                    rendering_contexts_by_block = active_bundle.contexts_by_block
+                else:
+                    rendering_contexts_by_block = self.database.freeze_render_bundle(
+                        [block.id for block in blocks]
+                    ).contexts_by_block
             items: List[GlossaryItem] = []
+            item_priorities: Dict[str, int] = {}
             pattern_sources: Dict[str, str] = {}
             for block in blocks:
                 occurrence_contexts = list(
@@ -247,6 +251,16 @@ class V4TranslationPipeline:
                             == "verified"
                             for rule_id in matched.applied_rule_ids
                         )
+                        winning_priority = max(
+                            (
+                                int(
+                                    winning_rules.get(rule_id, {}).get("priority")
+                                    or 0
+                                )
+                                for rule_id in matched.applied_rule_ids
+                            ),
+                            default=0,
+                        )
                         verified = rule_verified or target in {
                             str(lexeme.get("verified_target") or "").strip(),
                             str(concept.get("verified_target") or "").strip(),
@@ -262,12 +276,12 @@ class V4TranslationPipeline:
                             for value in (base_description, location_note)
                             if value
                         ) or None
-                        items.append(
-                            GlossaryItem(
-                                id=(
-                                    f"{matched.concept_id or matched.lexeme_id}:"
-                                    f"{block.id}:{offset_label}"
-                                ),
+                        item_id = (
+                            f"{matched.concept_id or matched.lexeme_id}:"
+                            f"{block.id}:{offset_label}"
+                        )
+                        item = GlossaryItem(
+                                id=item_id,
                                 src=source or str(lexeme.get("source") or ""),
                                 default_target=target,
                                 category=self._category(
@@ -276,15 +290,65 @@ class V4TranslationPipeline:
                                 status=status,
                                 description=description,
                                 rules=[],
-                            )
                         )
+                        items.append(item)
+                        item_priorities[item_id] = winning_priority
+            ranked_items = sorted(
+                enumerate(items),
+                key=lambda value: (
+                    -item_priorities.get(str(value[1].id), 0),
+                    value[0],
+                    str(value[1].id),
+                ),
+            )
+            item_limit = 128
+            character_limit = max(0, min(16 * 1024, self.config.max_context_chars))
+            selected_items: List[GlossaryItem] = []
+            omitted_items: List[GlossaryItem] = []
+            visible_characters = 0
+            for _ordinal, item in ranked_items:
+                rendered = TranslationEngine._render_glossary_term(item)
+                added = len(rendered) + (1 if selected_items else 0)
+                if (
+                    len(selected_items) >= item_limit
+                    or visible_characters + added > character_limit
+                ):
+                    omitted_items.append(item)
+                    continue
+                selected_items.append(item)
+                visible_characters += added
+            omitted_digest = hashlib.sha256(
+                "\n".join(str(item.id) for item in omitted_items).encode("utf-8")
+            ).hexdigest()
             manager = GlossaryManager(str(self.database.root / "readonly_glossary"))
-            manager.glossary = Glossary(items=items)
+            manager.glossary = Glossary(items=selected_items)
             manager._build_patterns()
+            selected_sources = {str(item.src) for item in selected_items}
             for annotated_source, matched_form in pattern_sources.items():
+                if annotated_source not in selected_sources:
+                    continue
                 manager._term_patterns[annotated_source] = re.compile(
                     rf"(?<!\w){re.escape(matched_form)}(?!\w)", re.IGNORECASE
                 )
+            manager.render_limit_metadata = {
+                "total": len(items),
+                "included": len(selected_items),
+                "omitted": len(omitted_items),
+                "visible_characters": visible_characters,
+                "character_limit": character_limit,
+                "item_limit": item_limit,
+                "omitted_digest": omitted_digest,
+                "reason": "bounded_translation_glossary",
+            }
+            manager.render_warnings = (
+                [
+                    "translation glossary was deterministically truncated: "
+                    f"{len(omitted_items)} of {len(items)} entries omitted "
+                    f"({omitted_digest[:16]})"
+                ]
+                if omitted_items
+                else []
+            )
             return manager
 
         source = "\n".join(block.source_text for block in blocks)
@@ -382,11 +446,17 @@ class V4TranslationPipeline:
             str, Sequence[Mapping[str, Any]]
         ] = {}
         if isinstance(concept_snapshot, FrozenRenderIndex):
-            rendering_contexts_by_block = (
-                self.database.rendering_contexts_for_blocks(
+            active_bundle = getattr(self, "_active_render_bundle", None)
+            if (
+                isinstance(active_bundle, FrozenRenderBundle)
+                and active_bundle.index.signature == concept_snapshot.signature
+            ):
+                rendering_contexts_by_block = active_bundle.contexts_by_block
+            else:
+                fallback_bundle = self.database.freeze_render_bundle(
                     [block.id for block in island.blocks]
                 )
-            )
+                rendering_contexts_by_block = fallback_bundle.contexts_by_block
         engine = TranslationEngine(
             llm_manager=audited_llm,
             glossary_manager=self._glossary_for(
@@ -632,11 +702,13 @@ class V4TranslationPipeline:
         knowledge_stale = False
         cursor = 0
         try:
-            (
-                knowledge_version,
-                concept_snapshot,
-                target_signature,
-            ) = self.database.freeze_translation_knowledge()
+            render_bundle = self.database.freeze_render_bundle(
+                [block.id for block in candidates]
+            )
+            knowledge_version = render_bundle.knowledge_version
+            concept_snapshot = render_bundle.index
+            target_signature = render_bundle.signature
+            self._active_render_bundle = render_bundle
         except KnowledgeSnapshotError as exc:
             self.database.fail_run_for_invalid_snapshot(
                 run_id, "translate", run_config, exc
@@ -655,6 +727,7 @@ class V4TranslationPipeline:
             }
         run_config["frozen_knowledge_version"] = knowledge_version
         run_config["target_snapshot_signature"] = target_signature
+        run_config["render_context_block_ids"] = list(render_bundle.block_ids)
         self.database.start_run(
             run_id,
             "translate",
@@ -710,8 +783,8 @@ class V4TranslationPipeline:
                 elif workers < self.config.max_workers:
                     workers += 1
                 cursor += len(wave)
-                current_signature = self.database.target_snapshot_signature(
-                    self.database.render_snapshot()
+                current_signature = self.database.render_bundle_signature(
+                    render_bundle.block_ids
                 )
                 if current_signature != target_signature:
                     knowledge_stale = True
@@ -728,6 +801,7 @@ class V4TranslationPipeline:
                     target_signature,
                     desired_status,
                     force_revalidate=knowledge_stale,
+                    context_block_ids=render_bundle.block_ids,
                 )
             )
             knowledge_stale = knowledge_stale or finalized_knowledge_stale

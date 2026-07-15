@@ -20,17 +20,66 @@ def _word_character(value: str) -> bool:
     return value == "_" or value.isalnum()
 
 
+def _is_grapheme_extend(value: str) -> bool:
+    codepoint = ord(value)
+    return (
+        unicodedata.category(value).startswith("M")
+        or 0xFE00 <= codepoint <= 0xFE0F
+        or 0xE0100 <= codepoint <= 0xE01EF
+        or 0x1F3FB <= codepoint <= 0x1F3FF
+    )
+
+
+def _hangul_jamo_class(value: str) -> str:
+    codepoint = ord(value)
+    if 0x1100 <= codepoint <= 0x115F or 0xA960 <= codepoint <= 0xA97C:
+        return "L"
+    if 0x1160 <= codepoint <= 0x11A7 or 0xD7B0 <= codepoint <= 0xD7C6:
+        return "V"
+    if 0x11A8 <= codepoint <= 0x11FF or 0xD7CB <= codepoint <= 0xD7FB:
+        return "T"
+    return ""
+
+
+def _grapheme_clusters(text: str) -> Iterator[tuple[int, int]]:
+    index = 0
+    while index < len(text):
+        start = index
+        previous_hangul = _hangul_jamo_class(text[index])
+        index += 1
+        while index < len(text):
+            value = text[index]
+            current_hangul = _hangul_jamo_class(value)
+            if _is_grapheme_extend(value):
+                index += 1
+                continue
+            if value == "\u200d" and index + 1 < len(text):
+                index += 2
+                previous_hangul = _hangul_jamo_class(text[index - 1])
+                continue
+            if (
+                (previous_hangul == "L" and current_hangul in {"L", "V"})
+                or (previous_hangul == "V" and current_hangul in {"V", "T"})
+                or (previous_hangul == "T" and current_hangul == "T")
+            ):
+                previous_hangul = current_hangul
+                index += 1
+                continue
+            break
+        yield start, index
+
+
 def _normalized_offsets(text: str) -> tuple[str, list[int], list[int]]:
     """Normalize while retaining half-open offsets into the original string."""
 
     parts: list[str] = []
     starts: list[int] = []
     ends: list[int] = []
-    for offset, character in enumerate(text):
-        normalized = _normalized(character)
+    for start, end in _grapheme_clusters(text):
+        normalized = _normalized(text[start:end])
         parts.append(normalized)
-        starts.extend([offset] * len(normalized))
-        ends.extend([offset + 1] * len(normalized))
+        starts.extend([start] * len(normalized))
+        ends.extend([end] * len(normalized))
     return "".join(parts), starts, ends
 
 
@@ -114,6 +163,16 @@ class AhoConceptMatcher:
                 normalized_end = index + 1
                 normalized_start = normalized_end - len(form)
                 if normalized_start < 0 or not starts:
+                    continue
+                if (
+                    normalized_start > 0
+                    and starts[normalized_start] == starts[normalized_start - 1]
+                ):
+                    continue
+                if (
+                    normalized_end < len(starts)
+                    and starts[normalized_end] == starts[normalized_end - 1]
+                ):
                     continue
                 start = starts[normalized_start]
                 end = ends[normalized_end - 1]
@@ -205,6 +264,12 @@ class FrozenRenderIndex(Sequence[Mapping[str, Any]]):
         self.signature = signature
         self._by_id = by_id
         self._matcher = matcher
+        self._rule_buckets: Dict[
+            tuple[str, str], Dict[tuple[str, str, str], tuple[Mapping[str, Any], ...]]
+        ] = {}
+        self._generic_rules: Dict[
+            tuple[str, str], tuple[Mapping[str, Any], ...]
+        ] = {}
         self._redirects: Dict[str, str] = {}
         for lexeme in snapshot:
             for concept in lexeme.get("concepts", []) or []:
@@ -215,6 +280,144 @@ class FrozenRenderIndex(Sequence[Mapping[str, Any]]):
                 for source_id in concept.get("redirect_source_ids", []) or []:
                     if str(source_id):
                         self._redirects[str(source_id)] = concept_id
+        self._compile_rule_buckets(snapshot)
+
+    @staticmethod
+    def _scalar_bucket_value(value: Any) -> str | None:
+        if value is None or isinstance(value, (str, int, float, bool)):
+            return json.dumps(
+                [type(value).__name__, value],
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+        return None
+
+    @classmethod
+    def _condition_bucket_keys(
+        cls, condition: Mapping[str, Any]
+    ) -> tuple[tuple[str, str, str], ...]:
+        preferred = ("mention_id", "speaker_id", "thread_id", "block_id")
+        ordered_keys = list(preferred) + sorted(
+            key for key in condition if key not in preferred
+        )
+        condition_keys = [key for key in ordered_keys if key in condition]
+        for key in condition_keys:
+            expected = condition[key]
+            values = expected if isinstance(expected, list) else [expected]
+            encoded = [cls._scalar_bucket_value(value) for value in values]
+            if encoded and all(value is not None for value in encoded):
+                return tuple(("value", str(key), str(value)) for value in encoded)
+        if condition_keys:
+            return (("present", str(condition_keys[0]), ""),)
+        return ()
+
+    @staticmethod
+    def _rule_layer(rule: Mapping[str, Any], subject_type: str) -> int:
+        condition = rule.get("condition") or {}
+        locked = bool(rule.get("locked"))
+        status = str(rule.get("status") or "")
+        if locked and condition:
+            return 1
+        if subject_type == "concept":
+            return 2 if locked or status == "verified" else 4
+        return 3 if locked or status == "verified" else 5
+
+    @classmethod
+    def _best_unconditional_rules(
+        cls,
+        rules: Sequence[Mapping[str, Any]],
+        subject_type: str,
+    ) -> tuple[Mapping[str, Any], ...]:
+        status_rank = {
+            "verified": 3,
+            "working": 2,
+            "legacy_provisional": 1,
+            "provisional": 1,
+        }
+        best: Dict[int, tuple[tuple[Any, ...], Mapping[str, Any]]] = {}
+        for rule in rules:
+            layer = cls._rule_layer(rule, subject_type)
+            rank = (
+                -int(rule.get("priority") or 0),
+                -int(bool(rule.get("locked"))),
+                -status_rank.get(str(rule.get("status") or ""), 0),
+                -int(rule.get("created_version") or 0),
+                str(rule.get("id") or ""),
+                str(rule.get("target") or ""),
+            )
+            if layer not in best or rank < best[layer][0]:
+                best[layer] = (rank, rule)
+        return tuple(best[layer][1] for layer in sorted(best))
+
+    def _compile_rule_buckets(
+        self, snapshot: Sequence[Mapping[str, Any]]
+    ) -> None:
+        subjects: Dict[tuple[str, str], Sequence[Mapping[str, Any]]] = {}
+        for lexeme in snapshot:
+            lexeme_id = str(lexeme.get("lexeme_id") or lexeme.get("id") or "")
+            if lexeme_id:
+                subjects[("lexeme", lexeme_id)] = list(
+                    lexeme.get("lexeme_rules", lexeme.get("rules", [])) or []
+                )
+            for concept in lexeme.get("concepts", []) or []:
+                concept_id = str(concept.get("id") or "")
+                if concept_id and ("concept", concept_id) not in subjects:
+                    subjects[("concept", concept_id)] = list(
+                        concept.get("rules", []) or []
+                    )
+        for subject_key, rules in subjects.items():
+            buckets: Dict[tuple[str, str, str], list[Mapping[str, Any]]] = {}
+            generic: list[Mapping[str, Any]] = []
+            for rule in rules:
+                condition = rule.get("condition") or {}
+                keys = (
+                    self._condition_bucket_keys(condition)
+                    if isinstance(condition, Mapping) and condition
+                    else ()
+                )
+                if not keys:
+                    generic.append(rule)
+                    continue
+                for key in keys:
+                    buckets.setdefault(key, []).append(rule)
+            self._rule_buckets[subject_key] = {
+                key: tuple(value) for key, value in buckets.items()
+            }
+            self._generic_rules[subject_key] = self._best_unconditional_rules(
+                generic, subject_key[0]
+            )
+
+    def _rules_for_context(
+        self,
+        subject: Mapping[str, Any],
+        subject_type: str,
+        context: Mapping[str, Any],
+    ) -> tuple[Mapping[str, Any], ...]:
+        subject_id = str(
+            subject.get("lexeme_id") or subject.get("id") or ""
+            if subject_type == "lexeme"
+            else subject.get("id") or ""
+        )
+        subject_key = (subject_type, subject_id)
+        selected: list[Mapping[str, Any]] = list(
+            self._generic_rules.get(subject_key, ())
+        )
+        seen = {id(rule) for rule in selected}
+        buckets = self._rule_buckets.get(subject_key, {})
+        for key, value in context.items():
+            for rule in buckets.get(("present", str(key), ""), ()):
+                if id(rule) not in seen:
+                    seen.add(id(rule))
+                    selected.append(rule)
+            encoded = self._scalar_bucket_value(value)
+            if encoded is None:
+                continue
+            for rule in buckets.get(("value", str(key), encoded), ()):
+                if id(rule) not in seen:
+                    seen.add(id(rule))
+                    selected.append(rule)
+        return tuple(selected)
 
     @staticmethod
     def _deep_snapshot(
@@ -351,7 +554,11 @@ class FrozenRenderIndex(Sequence[Mapping[str, Any]]):
     def _target_candidates(
         subject: Mapping[str, Any], subject_type: str
     ) -> list[_Candidate]:
-        subject_id = str(subject.get("id") or subject.get("lexeme_id") or "")
+        subject_id = str(
+            subject.get("lexeme_id") or subject.get("id") or ""
+            if subject_type == "lexeme"
+            else subject.get("id") or ""
+        )
         status = str(subject.get("status") or "")
         locked = bool(subject.get("locked"))
         created_version = int(subject.get("created_version") or 0)
@@ -391,21 +598,19 @@ class FrozenRenderIndex(Sequence[Mapping[str, Any]]):
                 )
         return candidates
 
-    @classmethod
     def _rule_candidates(
-        cls,
+        self,
         subject: Mapping[str, Any],
         subject_type: str,
         context: Mapping[str, Any],
     ) -> list[_Candidate]:
-        subject_id = str(subject.get("id") or subject.get("lexeme_id") or "")
-        candidates: list[_Candidate] = []
-        rules = (
-            subject.get("lexeme_rules", subject.get("rules", []))
+        subject_id = str(
+            subject.get("lexeme_id") or subject.get("id") or ""
             if subject_type == "lexeme"
-            else subject.get("rules", [])
+            else subject.get("id") or ""
         )
-        for rule in rules or []:
+        candidates: list[_Candidate] = []
+        for rule in self._rules_for_context(subject, subject_type, context):
             owner_type = str(rule.get("subject_type") or subject_type)
             if owner_type != subject_type:
                 continue
@@ -413,7 +618,7 @@ class FrozenRenderIndex(Sequence[Mapping[str, Any]]):
             condition = rule.get("condition") or {}
             if not target or not isinstance(condition, Mapping):
                 continue
-            if not cls._condition_matches(condition, context):
+            if not self._condition_matches(condition, context):
                 continue
             locked = bool(rule.get("locked"))
             status = str(rule.get("status") or "")
@@ -456,14 +661,11 @@ class FrozenRenderIndex(Sequence[Mapping[str, Any]]):
             payload["winner"] = {
                 "subject_type": winner.subject_type,
                 "subject_id": winner.subject_id,
-                "source_field": winner.source_field,
                 "target": winner.target,
                 "rule_id": winner.rule_id,
                 "condition": deepcopy(winner.condition or {}),
                 "priority": winner.priority,
-                "status": winner.status,
                 "locked": winner.locked,
-                "created_version": winner.created_version,
             }
         raw = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
         return hashlib.sha256(raw.encode("utf-8")).hexdigest()
