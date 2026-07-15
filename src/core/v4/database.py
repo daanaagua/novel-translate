@@ -6,13 +6,21 @@ import hashlib
 import json
 import sqlite3
 import unicodedata
+from copy import deepcopy
 from contextlib import closing, contextmanager
 from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, Iterator, List, Optional, Sequence
 
-from .models import ScanOutcome, TranslationOutcome, V4Block, V4BlockStatus
+from .models import (
+    ScanOutcome,
+    TranslationOutcome,
+    V4Block,
+    V4BlockStatus,
+    WorkingTargetRule,
+)
+from .matcher import ConceptMatcherCache
 
 
 SCHEMA_VERSION = 7
@@ -55,6 +63,15 @@ class StaleAdjudicationCommit(RuntimeError):
 
 class StaleAdjudicationLease(RuntimeError):
     """The candidate/source snapshot changed after the model lease was claimed."""
+
+
+class KnowledgeSnapshotError(RuntimeError):
+    """Persisted rendering knowledge cannot be decoded safely."""
+
+    def __init__(self, rule_id: str, detail: str):
+        self.rule_id = rule_id
+        self.detail = detail
+        super().__init__(f"invalid rendering rule {rule_id}: {detail}")
 
 
 class V4Database:
@@ -1060,6 +1077,81 @@ class V4Database:
                 "UPDATE runs SET status=?, finished_at=?, error=? WHERE id=?",
                 (status, utc_now(), error, run_id),
             )
+
+    def fail_run_for_invalid_snapshot(
+        self,
+        run_id: str,
+        stage: str,
+        config: Dict[str, Any],
+        error: KnowledgeSnapshotError,
+    ) -> None:
+        """Fail safely and create one blocking review for corrupt persisted knowledge."""
+
+        with self.transaction() as connection:
+            version = int(
+                connection.execute("SELECT MAX(id) FROM knowledge_versions").fetchone()[0]
+            )
+            connection.execute(
+                """INSERT OR IGNORE INTO runs(
+                       id, stage, status, knowledge_version, config_json,
+                       started_at, finished_at, error
+                   ) VALUES(?, ?, 'failed', ?, ?, ?, ?, ?)""",
+                (
+                    run_id,
+                    stage,
+                    version,
+                    json.dumps(config, ensure_ascii=False),
+                    utc_now(),
+                    utc_now(),
+                    str(error),
+                ),
+            )
+            connection.execute(
+                "UPDATE runs SET status='failed', finished_at=?, error=? WHERE id=?",
+                (utc_now(), str(error), run_id),
+            )
+            rows = connection.execute(
+                """SELECT id, block_id FROM translation_versions
+                   WHERE run_id=? AND pipeline='parallel_v4' AND active=1""",
+                (run_id,),
+            ).fetchall()
+            for row in rows:
+                connection.execute(
+                    "UPDATE translation_versions SET status=? WHERE id=?",
+                    (V4BlockStatus.NEEDS_REVALIDATE.value, row["id"]),
+                )
+                connection.execute(
+                    "UPDATE blocks SET status=?, updated_at=? WHERE id=?",
+                    (
+                        V4BlockStatus.NEEDS_REVALIDATE.value,
+                        utc_now(),
+                        row["block_id"],
+                    ),
+                )
+            exists = connection.execute(
+                """SELECT 1 FROM human_queue
+                   WHERE kind='knowledge_snapshot_invalid' AND status='open'
+                     AND json_extract(payload_json, '$.rule_id')=?""",
+                (error.rule_id,),
+            ).fetchone()
+            if exists is None:
+                connection.execute(
+                    """INSERT INTO human_queue(
+                           block_id, kind, severity, payload_json, created_at
+                       ) VALUES(NULL, 'knowledge_snapshot_invalid', 'blocking', ?, ?)""",
+                    (
+                        json.dumps(
+                            {
+                                "rule_id": error.rule_id,
+                                "detail": error.detail,
+                                "run_id": run_id,
+                            },
+                            ensure_ascii=False,
+                            sort_keys=True,
+                        ),
+                        utc_now(),
+                    ),
+                )
 
     def record_audit_call(
         self,
@@ -3725,44 +3817,130 @@ class V4Database:
                 required = (identity_kind and repeated) or high_impact
                 if effective or not required:
                     continue
-                context_rows = connection.execute(
-                    """SELECT DISTINCT b.id, b.source_text, b.global_index
-                       FROM mentions m JOIN blocks b ON b.id=m.block_id
-                       WHERE m.concept_id=?
-                       ORDER BY b.global_index, b.id LIMIT 3""",
-                    (row["id"],),
-                ).fetchall()
-                contexts = [
-                    self._representative_paragraph(
-                        str(item["source_text"]), str(row["canonical_source"])
-                    )
-                    for item in context_rows
-                ]
                 candidates.append(
                     {
                         "concept_id": str(row["id"]),
                         "source": str(row["canonical_source"]),
                         "kind": str(row["kind"]),
                         "description": str(row["description"] or ""),
-                        "contexts": contexts[:3],
-                        "context_block_ids": [str(item["id"]) for item in context_rows[:3]],
+                        "contexts": [],
+                        "context_block_ids": [],
                         "affected_blocks": affected_blocks,
                         "high_impact": high_impact,
                     }
                 )
+            if not candidates:
+                return []
 
-        for candidate in candidates:
-            baselines: List[str] = []
-            for block_id in candidate.pop("context_block_ids"):
-                reference = self.comparison_reference_for_block(block_id)
-                if reference and str(reference.get("text") or "").strip():
-                    text = str(reference["text"]).strip()
-                    if text not in baselines:
+            concept_ids = [item["concept_id"] for item in candidates]
+            placeholders = ",".join("?" for _ in concept_ids)
+            context_rows = connection.execute(
+                f"""WITH ranked AS (
+                           SELECT m.concept_id, b.id block_id, b.source_text,
+                                  b.global_index,
+                                  ROW_NUMBER() OVER (
+                                      PARTITION BY m.concept_id
+                                      ORDER BY b.global_index, b.id
+                                  ) occurrence_rank
+                           FROM mentions m JOIN blocks b ON b.id=m.block_id
+                           WHERE m.concept_id IN ({placeholders})
+                           GROUP BY m.concept_id, b.id
+                       )
+                       SELECT concept_id, block_id, source_text, global_index
+                       FROM ranked WHERE occurrence_rank<=3
+                       ORDER BY concept_id, global_index, block_id""",
+                concept_ids,
+            ).fetchall()
+            candidates_by_id = {
+                item["concept_id"]: item for item in candidates
+            }
+            for row in context_rows:
+                candidate = candidates_by_id[str(row["concept_id"])]
+                candidate["context_block_ids"].append(str(row["block_id"]))
+                candidate["contexts"].append(
+                    self._representative_paragraph(
+                        str(row["source_text"]), candidate["source"]
+                    )
+                )
+
+            block_ids = list(
+                dict.fromkeys(
+                    block_id
+                    for item in candidates
+                    for block_id in item["context_block_ids"]
+                )
+            )
+            references: Dict[str, str] = {}
+            if block_ids:
+                block_placeholders = ",".join("?" for _ in block_ids)
+                baseline_rows = connection.execute(
+                    f"""SELECT l.block_id, d.id document_id, d.name,
+                               d.created_at, p.target_text, l.ordinal,
+                               l.partial_start, l.partial_end, l.alignment_status
+                        FROM block_baseline_links l
+                        JOIN baseline_documents d
+                          ON d.id=l.baseline_document_id AND d.active=1
+                        JOIN baseline_paragraphs p
+                          ON p.baseline_document_id=l.baseline_document_id
+                         AND p.paragraph_index=l.paragraph_index
+                        WHERE l.block_id IN ({block_placeholders})
+                        ORDER BY l.block_id, d.created_at DESC, d.id, l.ordinal""",
+                    block_ids,
+                ).fetchall()
+                documents: Dict[tuple[str, str], Dict[str, Any]] = {}
+                document_order: Dict[str, List[str]] = {}
+                for row in baseline_rows:
+                    block_id = str(row["block_id"])
+                    document_id = str(row["document_id"])
+                    key = (block_id, document_id)
+                    if key not in documents:
+                        documents[key] = {"parts": [], "exact": True}
+                        document_order.setdefault(block_id, []).append(document_id)
+                    documents[key]["parts"].append(str(row["target_text"] or ""))
+                    if (
+                        bool(row["partial_start"])
+                        or bool(row["partial_end"])
+                        or str(row["alignment_status"]) != "exact"
+                    ):
+                        documents[key]["exact"] = False
+                for block_id, ordered_documents in document_order.items():
+                    for document_id in ordered_documents:
+                        document = documents[(block_id, document_id)]
+                        text = "\n\n".join(document["parts"]).strip()
+                        if document["exact"] and text:
+                            references[block_id] = text
+                            break
+
+                missing = [item for item in block_ids if item not in references]
+                if missing:
+                    missing_placeholders = ",".join("?" for _ in missing)
+                    for row in connection.execute(
+                        f"""SELECT block_id, final_translation FROM (
+                                   SELECT block_id, final_translation,
+                                          ROW_NUMBER() OVER (
+                                              PARTITION BY block_id ORDER BY id DESC
+                                          ) version_rank
+                                   FROM translation_versions
+                                   WHERE block_id IN ({missing_placeholders})
+                                     AND pipeline='serial_v3' AND active=1
+                                     AND final_translation!=''
+                               ) WHERE version_rank=1""",
+                        missing,
+                    ).fetchall():
+                        references[str(row["block_id"])] = str(
+                            row["final_translation"]
+                        ).strip()
+
+            for candidate in candidates:
+                baselines: List[str] = []
+                for block_id in candidate.pop("context_block_ids"):
+                    text = references.get(block_id, "").strip()
+                    if text and text not in baselines:
                         baselines.append(text[:1600])
-                if len(baselines) >= 2:
-                    break
-            candidate["baseline_translations"] = baselines
-        return candidates
+                    if len(baselines) >= 2:
+                        break
+                candidate["baseline_translations"] = baselines
+            return candidates
 
     def enqueue_working_target_review(
         self, concept_ids: Sequence[str], error: str
@@ -3880,7 +4058,20 @@ class V4Database:
     ) -> Dict[str, Any]:
         """Atomically install provisional translations without touching human locks."""
 
-        ordered = sorted(decisions, key=lambda item: str(item.get("concept_id") or ""))
+        validated: List[Dict[str, Any]] = []
+        for decision in decisions:
+            raw_rules = list(decision.get("rules") or [])
+            if len(raw_rules) > 6:
+                raise ValueError("working targets allow at most six rendering rules")
+            item = dict(decision)
+            item["rules"] = [
+                WorkingTargetRule.model_validate(rule).model_dump()
+                for rule in raw_rules
+            ]
+            validated.append(item)
+        ordered = sorted(
+            validated, key=lambda item: str(item.get("concept_id") or "")
+        )
         with self.transaction() as connection:
             changed: List[Dict[str, Any]] = []
             processed_ids: List[str] = []
@@ -4002,8 +4193,15 @@ class V4Database:
             """SELECT c.id, c.kind, c.canonical_source, c.default_target,
                       c.working_target, c.verified_target, c.description,
                       c.status, c.locked, sf.form, sf.normalized_form
-               FROM concepts c JOIN source_forms sf ON sf.concept_id=c.id
+               FROM concepts c
+               JOIN source_forms sf ON sf.concept_id=c.id
+               JOIN knowledge_versions kv ON kv.id=c.created_version
                WHERE c.retired_version IS NULL
+                 AND NOT (
+                     kv.reason LIKE 'translation proposals %'
+                     AND c.status='provisional' AND c.locked=0
+                     AND c.working_target='' AND c.verified_target=''
+                 )
                ORDER BY lower(c.canonical_source), c.id, lower(sf.form), sf.id"""
         ).fetchall()
         concepts: Dict[str, Dict[str, Any]] = {}
@@ -4062,10 +4260,19 @@ class V4Database:
             target = str(row["target"] or "").strip()
             if not target:
                 continue
+            rule_id = str(row["id"])
+            try:
+                condition = json.loads(row["condition_json"])
+            except (json.JSONDecodeError, TypeError) as exc:
+                raise KnowledgeSnapshotError(rule_id, str(exc)) from exc
+            if not isinstance(condition, dict):
+                raise KnowledgeSnapshotError(
+                    rule_id, "condition_json must decode to an object"
+                )
             concepts[str(row["concept_id"])]["rules"].append(
                 {
-                    "id": str(row["id"]),
-                    "condition": json.loads(row["condition_json"]),
+                    "id": rule_id,
+                    "condition": condition,
                     "target": target,
                     "priority": int(row["priority"]),
                     "status": str(row["status"]),
@@ -4107,25 +4314,58 @@ class V4Database:
 
     @staticmethod
     def target_snapshot_signature(snapshot: Sequence[Dict[str, Any]]) -> str:
-        payload = []
-        for concept in snapshot:
-            target = str(concept.get("default_target") or "").strip()
-            rules = [
-                {
-                    "condition": rule.get("condition") or {},
-                    "target": str(rule.get("target") or "").strip(),
-                    "locked": bool(rule.get("locked")),
-                }
-                for rule in concept.get("rules", [])
-                if str(rule.get("target") or "").strip()
-            ]
-            if not target and not rules:
-                continue
+        payload: List[Dict[str, Any]] = []
+        for concept in sorted(snapshot, key=lambda item: str(item.get("id") or "")):
+            rules = []
+            for rule in concept.get("rules", []):
+                rules.append(
+                    {
+                        "id": str(rule.get("id") or ""),
+                        "condition": deepcopy(rule.get("condition") or {}),
+                        "target": str(rule.get("target") or "").strip(),
+                        "priority": int(rule.get("priority") or 0),
+                        "status": str(rule.get("status") or ""),
+                        "locked": bool(rule.get("locked")),
+                    }
+                )
+            rules.sort(
+                key=lambda item: (
+                    item["id"],
+                    -item["priority"],
+                    json.dumps(
+                        item["condition"],
+                        ensure_ascii=False,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    ),
+                    item["target"],
+                )
+            )
             payload.append(
                 {
-                    "id": concept["id"],
-                    "target": target,
-                    "strength": concept.get("target_strength") or "unset",
+                    "id": str(concept.get("id") or ""),
+                    "source": str(concept.get("source") or ""),
+                    "forms": sorted(
+                        {
+                            str(form)
+                            for form in concept.get("forms", [])
+                            if str(form)
+                        },
+                        key=lambda value: (value.casefold(), value),
+                    ),
+                    "kind": str(concept.get("kind") or ""),
+                    "description": str(concept.get("description") or ""),
+                    "status": str(concept.get("status") or ""),
+                    "locked": bool(concept.get("locked")),
+                    "working_target": str(concept.get("working_target") or ""),
+                    "verified_target": str(concept.get("verified_target") or ""),
+                    "default_target": str(concept.get("default_target") or ""),
+                    "target_strength": str(
+                        concept.get("target_strength") or "unset"
+                    ),
+                    "verification_pending": bool(
+                        concept.get("verification_pending")
+                    ),
                     "rules": rules,
                 }
             )
@@ -4137,26 +4377,63 @@ class V4Database:
         text: str,
         concept_snapshot: Optional[Sequence[Dict[str, Any]]] = None,
     ) -> List[Dict[str, Any]]:
-        import re
+        snapshot = (
+            list(concept_snapshot)
+            if concept_snapshot is not None
+            else self.concept_snapshot()
+        )
+        signature = self.target_snapshot_signature(snapshot)
+        matcher = ConceptMatcherCache.get(signature, snapshot)
+        by_id = {str(concept.get("id") or ""): concept for concept in snapshot}
+        return [
+            deepcopy(by_id[concept_id])
+            for concept_id in matcher.match(text)
+            if concept_id in by_id
+        ]
 
-        snapshot = list(concept_snapshot) if concept_snapshot is not None else self.concept_snapshot()
-        matched: List[Dict[str, Any]] = []
-        for concept in snapshot:
-            forms = [
-                str(form).strip()
-                for form in concept.get("forms", [])
-                if str(form).strip()
-            ]
-            if not any(
-                re.search(rf"(?<!\w){re.escape(form)}(?!\w)", text, re.I)
-                for form in forms
-            ):
-                continue
-            item = dict(concept)
-            item["forms"] = list(forms)
-            item["rules"] = [dict(rule) for rule in concept.get("rules", [])]
-            matched.append(item)
-        return matched
+    def finish_translation_run_atomically(
+        self,
+        run_id: str,
+        expected_signature: str,
+        desired_status: str,
+        error: Optional[str] = None,
+        force_revalidate: bool = False,
+    ) -> str:
+        """Finalize a translation run against knowledge read in the same write txn."""
+
+        with self.transaction() as connection:
+            snapshot = self._concept_snapshot_from_connection(connection)
+            current_signature = self.target_snapshot_signature(snapshot)
+            stale = force_revalidate or current_signature != expected_signature
+            persisted_status = (
+                "completed_with_errors" if stale else desired_status
+            )
+            persisted_error = error
+            if stale:
+                persisted_error = persisted_error or "frozen knowledge changed during run"
+                rows = connection.execute(
+                    """SELECT id, block_id FROM translation_versions
+                       WHERE run_id=? AND pipeline='parallel_v4' AND active=1""",
+                    (run_id,),
+                ).fetchall()
+                for row in rows:
+                    connection.execute(
+                        "UPDATE translation_versions SET status=? WHERE id=?",
+                        (V4BlockStatus.NEEDS_REVALIDATE.value, row["id"]),
+                    )
+                    connection.execute(
+                        "UPDATE blocks SET status=?, updated_at=? WHERE id=?",
+                        (
+                            V4BlockStatus.NEEDS_REVALIDATE.value,
+                            utc_now(),
+                            row["block_id"],
+                        ),
+                    )
+            connection.execute(
+                "UPDATE runs SET status=?, finished_at=?, error=? WHERE id=?",
+                (persisted_status, utc_now(), persisted_error, run_id),
+            )
+            return persisted_status
 
     def invalidate_translation_run(self, run_id: str) -> int:
         """Mark all output already committed by a stale frozen run for revalidation."""
@@ -4297,13 +4574,12 @@ class V4Database:
                     ),
                 )
                 translation_id = int(cursor.lastrowid)
-                concepts = self.concepts_for_text(outcome.block.source_text)
-                for concept in concepts:
+                for concept_id in sorted(set(outcome.matched_concept_ids)):
                     connection.execute(
                         """INSERT OR IGNORE INTO dependencies(
                                translation_id, dependency_type, dependency_id, knowledge_version
                            ) VALUES(?, 'concept', ?, ?)""",
-                        (translation_id, concept["id"], outcome.knowledge_version),
+                        (translation_id, concept_id, outcome.knowledge_version),
                     )
                 for claim_id in outcome.claim_dependencies:
                     connection.execute(

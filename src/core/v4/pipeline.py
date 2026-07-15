@@ -21,7 +21,7 @@ from ..schemas import (
 )
 from ..translator import TranslationConfig, TranslationEngine
 from .context import ContextBuilder, ContextOverflow
-from .database import V4Database
+from .database import KnowledgeSnapshotError, V4Database
 from .models import Island, TranslationOutcome, V4Block, V4BlockStatus
 from .semantic_mapper import SemanticMapper, SemanticMapperConfig
 
@@ -185,13 +185,20 @@ class V4TranslationPipeline:
             verified = concept.get("target_strength") == "verified" or bool(
                 concept.get("locked")
             )
+            status = (
+                TermStatus.VERIFIED
+                if verified
+                else TermStatus.WORKING
+                if concept.get("target_strength") == "working"
+                else TermStatus.PENDING
+            )
             items.append(
                 GlossaryItem(
                     id=concept["id"],
                     src=src,
                     default_target=target,
                     category=self._category(concept.get("kind") or "concept"),
-                    status=TermStatus.VERIFIED if verified else TermStatus.PENDING,
+                    status=status,
                     description=concept.get("description") or None,
                     rules=rules,
                 )
@@ -263,6 +270,12 @@ class V4TranslationPipeline:
         previous_translation = ""
         local_summary = ""
         for block in island.blocks:
+            frozen_block_concept_ids = [
+                str(concept["id"])
+                for concept in self.database.concepts_for_text(
+                    block.source_text, concept_snapshot=concept_snapshot
+                )
+            ]
             try:
                 packet = self.context_builder.build(
                     block,
@@ -278,6 +291,7 @@ class V4TranslationPipeline:
                         block=block,
                         knowledge_version=knowledge_version,
                         status=V4BlockStatus.INCOMPLETE_REQUIRES_HUMAN.value,
+                        matched_concept_ids=frozen_block_concept_ids,
                         error=str(exc),
                     )
                 )
@@ -301,6 +315,7 @@ class V4TranslationPipeline:
                             block=block,
                             knowledge_version=knowledge_version,
                             status=V4BlockStatus.INCOMPLETE_REQUIRES_HUMAN.value,
+                            matched_concept_ids=list(packet.matched_concept_ids),
                             error=(
                                 f"{block.id} 加入旧译文对照后必需上下文 "
                                 f"{packet.required_chars + len(comparison_reference)} 字符超过预算 "
@@ -335,6 +350,7 @@ class V4TranslationPipeline:
                             block=block,
                             knowledge_version=knowledge_version,
                             status=V4BlockStatus.INCOMPLETE_REQUIRES_HUMAN.value,
+                            matched_concept_ids=list(packet.matched_concept_ids),
                             audit_calls=block_audits,
                             elapsed_ms=int((time.perf_counter() - started) * 1000),
                             error=(
@@ -420,6 +436,7 @@ class V4TranslationPipeline:
                 warnings=list(result.quality_warnings),
                 term_proposals=term_proposals,
                 relation_proposals=relation_proposals,
+                matched_concept_ids=list(packet.matched_concept_ids),
                 claim_dependencies=list(packet.matched_claim_ids),
                 audit_calls=block_audits,
                 attempts=attempts,
@@ -469,11 +486,33 @@ class V4TranslationPipeline:
         islands = self._make_islands(candidates, self.config.island_size)
         run_id = f"translate_{uuid4().hex}"
         run_config = dict(self.config.__dict__)
-        (
-            knowledge_version,
-            concept_snapshot,
-            target_signature,
-        ) = self.database.freeze_translation_knowledge()
+        workers = min(self.config.initial_workers, self.config.max_workers)
+        completed = warnings = failed = manual = 0
+        paused = False
+        knowledge_stale = False
+        cursor = 0
+        try:
+            (
+                knowledge_version,
+                concept_snapshot,
+                target_signature,
+            ) = self.database.freeze_translation_knowledge()
+        except KnowledgeSnapshotError as exc:
+            self.database.fail_run_for_invalid_snapshot(
+                run_id, "translate", run_config, exc
+            )
+            return {
+                "run_id": run_id,
+                "status": "failed",
+                "completed": 0,
+                "completed_with_warnings": 0,
+                "failed_retryable": 0,
+                "incomplete_requires_human": 0,
+                "remaining_islands": len(islands),
+                "final_workers": workers,
+                "knowledge_stale": False,
+                "frozen_knowledge_version": None,
+            }
         run_config["frozen_knowledge_version"] = knowledge_version
         run_config["target_snapshot_signature"] = target_signature
         self.database.start_run(
@@ -482,12 +521,7 @@ class V4TranslationPipeline:
             run_config,
             knowledge_version=knowledge_version,
         )
-        workers = min(self.config.initial_workers, self.config.max_workers)
-        completed = warnings = failed = manual = 0
-        paused = False
-        knowledge_stale = False
         try:
-            cursor = 0
             while cursor < len(islands):
                 wave = islands[cursor : cursor + workers]
                 wave_outcomes: List[TranslationOutcome] = []
@@ -540,26 +574,31 @@ class V4TranslationPipeline:
                     self.database.concept_snapshot()
                 )
                 if current_signature != target_signature:
-                    self.database.invalidate_translation_run(run_id)
                     knowledge_stale = True
                     break
                 if self.config.decision_mode == "interactive" and proposal_version is not None:
                     paused = True
                     break
-            status = "stale_knowledge" if knowledge_stale else "paused_for_review" if paused else (
+            desired_status = "paused_for_review" if paused else (
                 "completed_with_errors" if failed or manual else "completed"
             )
-            self.database.finish_run(run_id, status)
+            status = self.database.finish_translation_run_atomically(
+                run_id,
+                target_signature,
+                desired_status,
+                force_revalidate=knowledge_stale,
+            )
+        except KnowledgeSnapshotError as exc:
+            self.database.fail_run_for_invalid_snapshot(
+                run_id, "translate", run_config, exc
+            )
+            status = "failed"
         except Exception as exc:
             self.database.finish_run(run_id, "failed", str(exc))
             raise
         return {
             "run_id": run_id,
-            "status": (
-                "stale_knowledge"
-                if knowledge_stale
-                else "paused_for_review" if paused else "completed"
-            ),
+            "status": status,
             "completed": completed,
             "completed_with_warnings": warnings,
             "failed_retryable": failed,

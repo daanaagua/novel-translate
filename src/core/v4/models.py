@@ -228,6 +228,7 @@ class TranslationOutcome:
     warnings: List[str] = field(default_factory=list)
     term_proposals: List[Dict[str, Any]] = field(default_factory=list)
     relation_proposals: List[Dict[str, Any]] = field(default_factory=list)
+    matched_concept_ids: List[str] = field(default_factory=list)
     claim_dependencies: List[str] = field(default_factory=list)
     audit_calls: List[Dict[str, Any]] = field(default_factory=list)
     attempts: int = 1

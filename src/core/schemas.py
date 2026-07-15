@@ -39,6 +39,7 @@ class TermCategory(str, Enum):
 class TermStatus(str, Enum):
     """术语状态"""
     VERIFIED = "verified"   # 已确认
+    WORKING = "working"     # 本轮全书工作译名（非人工核验）
     PENDING = "pending"     # 待审核 (AI 生成)
     REJECTED = "rejected"   # 已驳回
 

@@ -618,18 +618,28 @@ class TranslationEngine:
             source_text,
             status_filter=[TermStatus.VERIFIED],
         )
+        working_terms = self.glossary.find_terms_in_text(
+            source_text,
+            status_filter=[TermStatus.WORKING],
+        )
         pending_terms = self.glossary.find_terms_in_text(
             source_text,
             status_filter=[TermStatus.PENDING],
         )
         verified_terms = self._promptable_glossary_terms(verified_terms)
+        working_terms = self._promptable_glossary_terms(working_terms)
         pending_terms = self._promptable_glossary_terms(pending_terms)
-        glossary_terms = verified_terms + pending_terms
+        glossary_terms = verified_terms + working_terms + pending_terms
         glossary_parts = []
         if verified_terms:
             glossary_parts.append(
-                "【硬性术语】\n"
+                "【人工核验硬约束】\n"
                 + "\n".join(self._render_glossary_term(term) for term in verified_terms)
+            )
+        if working_terms:
+            glossary_parts.append(
+                "【本轮全书工作译名，必须统一使用，仅明确rendering rule可覆盖；不代表人工核验】\n"
+                + "\n".join(self._render_glossary_term(term) for term in working_terms)
             )
         if pending_terms:
             glossary_parts.append(
@@ -710,17 +720,27 @@ class TranslationEngine:
             source_text,
             status_filter=[TermStatus.VERIFIED],
         )
+        working_terms = self.glossary.find_terms_in_text(
+            source_text,
+            status_filter=[TermStatus.WORKING],
+        )
         pending_terms = self.glossary.find_terms_in_text(
             source_text,
             status_filter=[TermStatus.PENDING],
         )
         verified_terms = self._promptable_glossary_terms(verified_terms)
+        working_terms = self._promptable_glossary_terms(working_terms)
         pending_terms = self._promptable_glossary_terms(pending_terms)
         glossary_parts = []
         if verified_terms:
             glossary_parts.append(
-                "【硬性术语】\n"
+                "【人工核验硬约束】\n"
                 + "\n".join(self._render_glossary_term(term) for term in verified_terms)
+            )
+        if working_terms:
+            glossary_parts.append(
+                "【本轮全书工作译名，必须统一使用，仅明确rendering rule可覆盖；不代表人工核验】\n"
+                + "\n".join(self._render_glossary_term(term) for term in working_terms)
             )
         if pending_terms:
             glossary_parts.append(

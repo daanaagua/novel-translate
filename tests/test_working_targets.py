@@ -8,7 +8,7 @@ from src.agents.glossary_manager import GlossaryManager
 from src.core.schemas import Glossary, GlossaryItem, GlossaryRule, TermCategory, TermStatus
 from src.core.translator import TranslationConfig, TranslationEngine
 from src.core.v4.context import ContextBuilder
-from src.core.v4.database import V4Database
+from src.core.v4.database import KnowledgeSnapshotError, V4Database
 from src.core.v4.models import (
     TranslationOutcome,
     V4BlockStatus,
@@ -448,6 +448,7 @@ def test_rules_render_cleanly_and_working_apply_is_idempotent(tmp_path):
         database.list_blocks()[:1]
     )
     assert glossary.glossary.items[0].default_target == "执政官"
+    assert glossary.glossary.items[0].status == TermStatus.WORKING
     assert glossary.glossary.items[0].rules[0].target == "阁下"
 
 
@@ -569,6 +570,20 @@ def test_serial_translator_filters_empty_glossary_arrows_and_rules(tmp_path):
                     GlossaryRule(condition="direct address", target="阁下"),
                 ],
             ),
+            GlossaryItem(
+                id="working",
+                src="Severian",
+                default_target="塞万里安",
+                category=TermCategory.PERSON,
+                status=TermStatus.WORKING,
+            ),
+            GlossaryItem(
+                id="verified",
+                src="Thecla",
+                default_target="泰克拉",
+                category=TermCategory.PERSON,
+                status=TermStatus.VERIFIED,
+            ),
         ]
     )
     manager._build_patterns()
@@ -579,8 +594,10 @@ def test_serial_translator_filters_empty_glossary_arrows_and_rules(tmp_path):
         config=TranslationConfig(enable_polish=True),
     )
 
-    engine._draft_translate("Archon spoke.")
-    engine._polish_translate("Archon spoke.", "执政官发言。")
+    engine._draft_translate("Archon spoke to Severian and Thecla.")
+    engine._polish_translate(
+        "Archon spoke to Severian and Thecla.", "执政官向塞万里安与泰克拉发言。"
+    )
 
     prompts = "\n".join(call["messages"][0]["content"] for call in llm.calls)
     assert "Archon -> 执政官" in prompts
@@ -588,6 +605,9 @@ def test_serial_translator_filters_empty_glossary_arrows_and_rules(tmp_path):
     assert "vocative" not in prompts
     assert "-> \n" not in prompts
     assert "-  ->" not in prompts
+    assert "人工核验硬约束" in prompts
+    assert "本轮全书工作译名，必须统一使用，仅明确rendering rule可覆盖；不代表人工核验" in prompts
+    assert "Severian -> 塞万里安" in prompts
 
 
 class RecordingPipeline(V4TranslationPipeline):
@@ -724,7 +744,7 @@ def test_midrun_target_change_stops_before_mixing_and_revalidates_run(tmp_path):
 
     result = pipeline.run()
 
-    assert result["status"] == "stale_knowledge"
+    assert result["status"] == "completed_with_errors"
     assert result["knowledge_stale"] is True
     assert len(pipeline.seen) == 1
     assert pipeline.seen[0][1] == ["塞万里安"]
@@ -734,3 +754,72 @@ def test_midrun_target_change_stops_before_mixing_and_revalidates_run(tmp_path):
     )
     assert set(database.active_translations()) == {"block_000"}
     assert database.active_translations()["block_000"]["status"] == "needs_revalidate"
+    with closing(database.connect()) as connection:
+        assert connection.execute(
+            "SELECT status FROM runs WHERE id=?", (result["run_id"],)
+        ).fetchone()[0] == result["status"]
+
+
+def test_working_target_candidates_use_one_connection_for_contexts_and_baselines(
+    tmp_path, monkeypatch
+):
+    database = _database(
+        tmp_path, ["Severian waited.", "Severian returned.", "Severian spoke."]
+    )
+    _seed_concept(database, "Severian")
+    original_connect = database.connect
+    calls = {"count": 0}
+
+    def counted_connect():
+        calls["count"] += 1
+        return original_connect()
+
+    monkeypatch.setattr(database, "connect", counted_connect)
+
+    assert database.working_target_candidates()
+    assert calls["count"] == 1
+
+
+def test_invalid_working_rule_is_rejected_before_any_write(tmp_path):
+    database = _database(tmp_path, ["Archon spoke."])
+    concept_id = _seed_concept(database, "Archon", kind="title")
+
+    with pytest.raises(ValidationError):
+        database.apply_working_target_decisions(
+            [
+                {
+                    "concept_id": concept_id,
+                    "target": "执政官",
+                    "rules": [
+                        {"condition": {"mode": {"nested": "invalid"}}, "target": "阁下"}
+                    ],
+                }
+            ]
+        )
+
+    assert database.concepts_for_text("Archon")[0]["working_target"] == ""
+
+
+def test_invalid_snapshot_fails_safely_and_enqueues_one_blocking_review(
+    tmp_path, monkeypatch
+):
+    database = _database(tmp_path, ["Archon spoke."])
+    error = KnowledgeSnapshotError("broken-rule", "invalid json")
+    monkeypatch.setattr(
+        database,
+        "freeze_translation_knowledge",
+        lambda: (_ for _ in ()).throw(error),
+    )
+    pipeline = V4TranslationPipeline(database, lambda: (_ for _ in ()).throw(
+        AssertionError("LLM must not run with an invalid knowledge snapshot")
+    ))
+
+    first = pipeline.run()
+    second = pipeline.run()
+
+    assert first["status"] == second["status"] == "failed"
+    queued = database.list_human_queue()
+    invalid = [item for item in queued if item["kind"] == "knowledge_snapshot_invalid"]
+    assert len(invalid) == 1
+    assert invalid[0]["severity"] == "blocking"
+    assert json.loads(invalid[0]["payload_json"])["rule_id"] == "broken-rule"
