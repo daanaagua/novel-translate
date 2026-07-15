@@ -248,6 +248,26 @@ def _load_project_or_error(book_id):
         return None
 
 
+def _non_negative_int(value):
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError) as exc:
+        raise argparse.ArgumentTypeError("must be a non-negative integer") from exc
+    if parsed < 0:
+        raise argparse.ArgumentTypeError("must be a non-negative integer")
+    return parsed
+
+
+def _positive_int(value):
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError) as exc:
+        raise argparse.ArgumentTypeError("must be a positive integer") from exc
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError("must be a positive integer")
+    return parsed
+
+
 def cmd_migrate_v4(args):
     project = _load_project_or_error(args.book_id)
     if not project:
@@ -752,8 +772,8 @@ def main(argv=None):
     p_scan_v4.add_argument("book_id", help="项目ID")
     p_scan_v4.add_argument("--initial-workers", type=int, default=2)
     p_scan_v4.add_argument("--max-workers", type=int, default=4)
-    p_scan_v4.add_argument("--max-attempts", type=int, default=3)
-    p_scan_v4.add_argument("--max-blocks", type=int)
+    p_scan_v4.add_argument("--max-attempts", type=_positive_int, default=3)
+    p_scan_v4.add_argument("--max-blocks", type=_non_negative_int)
     p_scan_v4.add_argument(
         "--audit-mode", choices=["full", "response", "minimal"]
     )
@@ -763,8 +783,8 @@ def main(argv=None):
         "adjudicate-v4", help="对本地候选簇执行严格双重裁决"
     )
     p_adjudicate_v4.add_argument("book_id", help="项目ID")
-    p_adjudicate_v4.add_argument("--max-clusters", type=int)
-    p_adjudicate_v4.add_argument("--max-attempts", type=int, default=2)
+    p_adjudicate_v4.add_argument("--max-clusters", type=_non_negative_int)
+    p_adjudicate_v4.add_argument("--max-attempts", type=_positive_int, default=2)
     p_adjudicate_v4.add_argument(
         "--audit-mode", choices=["full", "response", "minimal"]
     )
@@ -774,8 +794,8 @@ def main(argv=None):
         "resolve-targets-v4", help="为已裁决概念生成全书工作译名"
     )
     p_resolve_targets_v4.add_argument("book_id", help="项目ID")
-    p_resolve_targets_v4.add_argument("--max-concepts", type=int)
-    p_resolve_targets_v4.add_argument("--max-attempts", type=int, default=2)
+    p_resolve_targets_v4.add_argument("--max-concepts", type=_non_negative_int)
+    p_resolve_targets_v4.add_argument("--max-attempts", type=_positive_int, default=2)
     p_resolve_targets_v4.add_argument(
         "--audit-mode", choices=["full", "response", "minimal"]
     )
@@ -785,9 +805,9 @@ def main(argv=None):
         "prepare-v4", help="依次执行本地索引、候选裁决和工作译名解析"
     )
     p_prepare_v4.add_argument("book_id", help="项目ID")
-    p_prepare_v4.add_argument("--max-blocks", type=int)
-    p_prepare_v4.add_argument("--max-clusters", type=int)
-    p_prepare_v4.add_argument("--max-attempts", type=int, default=2)
+    p_prepare_v4.add_argument("--max-blocks", type=_non_negative_int)
+    p_prepare_v4.add_argument("--max-clusters", type=_non_negative_int)
+    p_prepare_v4.add_argument("--max-attempts", type=_positive_int, default=2)
     p_prepare_v4.add_argument(
         "--audit-mode", choices=["full", "response", "minimal"]
     )
@@ -809,7 +829,7 @@ def main(argv=None):
     p_verify_v4 = subparsers.add_parser("verify-v4", help="对高影响知识执行两个独立核验")
     p_verify_v4.add_argument("book_id", help="项目ID")
     p_verify_v4.add_argument("--max-tasks", type=int)
-    p_verify_v4.add_argument("--max-attempts", type=int, default=2)
+    p_verify_v4.add_argument("--max-attempts", type=_positive_int, default=2)
     p_verify_v4.set_defaults(func=cmd_verify_v4)
 
     p_translate_v4 = subparsers.add_parser("translate-v4", help="执行带屏障的并行两层翻译")
@@ -817,8 +837,8 @@ def main(argv=None):
     p_translate_v4.add_argument("--island-size", type=int)
     p_translate_v4.add_argument("--initial-workers", type=int)
     p_translate_v4.add_argument("--max-workers", type=int)
-    p_translate_v4.add_argument("--max-attempts", type=int, default=2)
-    p_translate_v4.add_argument("--max-blocks", type=int)
+    p_translate_v4.add_argument("--max-attempts", type=_positive_int, default=2)
+    p_translate_v4.add_argument("--max-blocks", type=_non_negative_int)
     p_translate_v4.add_argument(
         "--block",
         action="append",
@@ -895,7 +915,7 @@ def main(argv=None):
     p_repair_v4.add_argument("--block", help="指定文本块；省略时处理开放修复队列")
     p_repair_v4.add_argument("--issue", action="append", help="指定需要修复的问题，可重复")
     p_repair_v4.add_argument("--max-tasks", type=int)
-    p_repair_v4.add_argument("--max-attempts", type=int, default=2)
+    p_repair_v4.add_argument("--max-attempts", type=_positive_int, default=2)
     p_repair_v4.set_defaults(func=cmd_repair_v4)
 
     p_validate_v4 = subparsers.add_parser("validate-v4", help="执行确定性完整性校验")
@@ -912,7 +932,7 @@ def main(argv=None):
     p_compare_v4 = subparsers.add_parser("compare-v4", help="生成串行基线与parallel_v4人工对照")
     p_compare_v4.add_argument("book_id", help="项目ID")
     p_compare_v4.add_argument("--output")
-    p_compare_v4.add_argument("--max-blocks", type=int)
+    p_compare_v4.add_argument("--max-blocks", type=_non_negative_int)
     p_compare_v4.add_argument("--baseline", help="指定外部基线名称")
     p_compare_v4.set_defaults(func=cmd_compare_v4)
     

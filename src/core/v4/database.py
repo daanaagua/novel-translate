@@ -3289,8 +3289,10 @@ class V4Database:
                    'scan', 'candidate_adjudication', 'adjudicate', 'working_target'
                )""",
             """CREATE TEMP TABLE reset_scan_blocks AS
-               SELECT id FROM blocks
-               WHERE status!='pending' OR last_error IS NOT NULL""",
+               SELECT b.id FROM blocks b
+               WHERE (b.status!='pending' OR b.last_error IS NOT NULL)
+                 AND NOT EXISTS(
+                     SELECT 1 FROM translation_versions t WHERE t.block_id=b.id)""",
             """CREATE TEMP TABLE reset_protected_mentions AS
                SELECT DISTINCT m.id FROM mentions m
                JOIN usage_decisions ud ON ud.mention_id=m.id

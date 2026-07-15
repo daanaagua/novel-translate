@@ -3,7 +3,7 @@ import io
 import tempfile
 import unittest
 from contextlib import closing
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import ANY, patch
@@ -885,6 +885,32 @@ class ParallelV4CliTests(unittest.TestCase):
             constructed,
         )
         self.assertIn(("resolve-run", 3), constructed)
+
+    def test_preparation_cli_rejects_unsafe_negative_limits_before_loading_project(self):
+        import main as cli_main
+
+        invalid_commands = (
+            ("scan-v4", "book", "--max-blocks", "-1"),
+            ("prepare-v4", "book", "--max-blocks", "-1"),
+            ("adjudicate-v4", "book", "--max-clusters", "-1"),
+            ("prepare-v4", "book", "--max-clusters", "-1"),
+            ("scan-v4", "book", "--max-attempts", "0"),
+            ("adjudicate-v4", "book", "--max-attempts", "0"),
+            ("resolve-targets-v4", "book", "--max-attempts", "0"),
+            ("prepare-v4", "book", "--max-attempts", "0"),
+        )
+        for arguments in invalid_commands:
+            with self.subTest(arguments=arguments):
+                stderr = io.StringIO()
+                with (
+                    patch.object(cli_main.project_manager, "load_project") as load,
+                    redirect_stderr(stderr),
+                    self.assertRaises(SystemExit) as raised,
+                ):
+                    cli_main.main(list(arguments))
+                self.assertNotEqual(raised.exception.code, 0)
+                load.assert_not_called()
+                self.assertIn("must be", stderr.getvalue())
 
     def test_reset_scan_v4_requires_current_preview_token_and_prints_clean_json(self):
         database = V4Database(self.root)

@@ -1227,6 +1227,45 @@ def test_reset_token_tracks_exact_block_status_rows(tmp_path):
     assert tuple(pending_after) == ("pending", None, pending_before)
 
 
+def test_reset_preserves_block_status_when_any_translation_version_exists(tmp_path):
+    db, _, block, _ = _seed_database(tmp_path)
+    db.start_run("translate-run", "translate", {})
+    with db.transaction() as connection:
+        version = connection.execute(
+            "SELECT MAX(id) FROM knowledge_versions"
+        ).fetchone()[0]
+        connection.execute(
+            """INSERT INTO translation_versions(
+                   block_id, pipeline, run_id, knowledge_version, status,
+                   draft_translation, final_translation, active, created_at
+               ) VALUES(?, 'parallel_v4', 'translate-run', ?, 'completed',
+                        '译稿', '定稿', 1, 'now')""",
+            (block.id, version),
+        )
+        connection.execute(
+            """UPDATE blocks SET status='completed', last_error=NULL,
+                   updated_at='translated' WHERE id=?""",
+            (block.id,),
+        )
+
+    preview = db.preview_scan_reset()
+    assert preview["blocks_reset"] == 0
+    db.reset_scan_derivatives(preview["token"])
+
+    with closing(db.connect()) as connection:
+        block_row = connection.execute(
+            "SELECT status,last_error,updated_at FROM blocks WHERE id=?",
+            (block.id,),
+        ).fetchone()
+        translation_row = connection.execute(
+            """SELECT status,active,draft_translation,final_translation
+               FROM translation_versions WHERE block_id=?""",
+            (block.id,),
+        ).fetchone()
+    assert tuple(block_row) == ("completed", None, "translated")
+    assert tuple(translation_row) == ("completed", 1, "译稿", "定稿")
+
+
 def test_moderate_candidate_storage_scale_keeps_integrity(tmp_path):
     names = tuple(f"Name{index:03d}" for index in range(240))
     db, _, _, candidates = _seed_database(tmp_path, names=names)
