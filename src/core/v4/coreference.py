@@ -13,7 +13,7 @@ import json
 import re
 from typing import Any, Iterable, Mapping, Sequence
 
-from pydantic import ValidationError
+from pydantic import BaseModel, ValidationError
 
 from .database import V4Database, stable_id
 from .models import (
@@ -26,12 +26,36 @@ from .models import (
 
 
 COREFERENCE_PROTOCOL_VERSION = "coreference-v1"
+MAX_PROTOCOL_CASES = 999
 MAX_CASE_MENTIONS = 8
 MAX_CONTEXT_CHARS = 400
+MAX_LEXEME_TYPE_OBSERVATIONS = 8
+MAX_MENTION_TYPE_OBSERVATIONS = 4
+MAX_CONCEPT_ANCHORS = 8
+MAX_FREE_TEXT_CHARS = 200
+MAX_OBSERVATION_SOURCE_CHARS = 160
+MAX_KIND_CHARS = 80
+# The capped request contains at most 20,320 free-text characters.  JSON may
+# escape each as six bytes; 192 KiB leaves a fixed envelope for keys and IDs.
+MAX_CASE_PAYLOAD_BYTES = 192 * 1024
 
 
 class CoreferenceProtocolError(ValueError):
     """A model response does not conform to its frozen request cases."""
+
+
+def _pure_validation_data(value: Any) -> Any:
+    """Remove Pydantic instances so nested objects cannot skip revalidation."""
+
+    if isinstance(value, BaseModel):
+        return _pure_validation_data(value.model_dump(warnings=False))
+    if isinstance(value, Mapping):
+        return {
+            key: _pure_validation_data(item) for key, item in value.items()
+        }
+    if isinstance(value, (list, tuple)):
+        return [_pure_validation_data(item) for item in value]
+    return value
 
 
 def _canonical_json_bytes(value: Mapping[str, Any]) -> bytes:
@@ -43,6 +67,12 @@ def _canonical_json_bytes(value: Mapping[str, Any]) -> bytes:
     ).encode("utf-8")
 
 
+def _bounded_text(value: str, limit: int) -> str:
+    if len(value) <= limit:
+        return value
+    return value[: limit - 1] + "…"
+
+
 def _observation_payload(
     observation: CoreferenceTypeObservation,
 ) -> dict[str, Any]:
@@ -51,39 +81,49 @@ def _observation_payload(
         "concept_id": observation.concept_id,
         "confidence": observation.confidence,
         "evidence_id": observation.evidence_id,
-        "kind": observation.kind,
+        "kind": _bounded_text(observation.kind, MAX_KIND_CHARS),
         "mention_id": observation.mention_id,
         "observation_id": observation.observation_id,
-        "source": observation.source,
+        "source": _bounded_text(
+            observation.source, MAX_OBSERVATION_SOURCE_CHARS
+        ),
     }
 
 
 def _anchor_payload(anchor: CoreferenceConceptAnchor) -> dict[str, Any]:
     return {
         "anchor_mention_id": anchor.anchor_mention_id,
-        "canonical_source": anchor.canonical_source,
+        "canonical_source": _bounded_text(
+            anchor.canonical_source, MAX_FREE_TEXT_CHARS
+        ),
         "concept_id": anchor.concept_id,
         "evidence_id": anchor.evidence_id,
-        "kind": anchor.kind,
-        "role": anchor.role,
-        "status": anchor.status,
+        "kind": _bounded_text(anchor.kind, MAX_KIND_CHARS),
+        "role": _bounded_text(anchor.role, MAX_KIND_CHARS),
+        "status": _bounded_text(anchor.status, MAX_KIND_CHARS),
     }
 
 
 def _mention_payload(mention: CoreferenceMention) -> dict[str, Any]:
     return {
         "block_id": mention.block_id,
-        "block_kind": mention.block_kind,
+        "block_kind": _bounded_text(mention.block_kind, MAX_KIND_CHARS),
         "concept_anchor_ids": list(mention.concept_anchor_ids),
-        "context": mention.context,
-        "context_source": mention.context_source,
-        "discourse_function": mention.discourse_function,
+        "context": _bounded_text(mention.context, MAX_CONTEXT_CHARS),
+        "context_source": _bounded_text(
+            mention.context_source, MAX_KIND_CHARS
+        ),
+        "discourse_function": _bounded_text(
+            mention.discourse_function, MAX_KIND_CHARS
+        ),
         "evidence_id": mention.evidence_id,
         "mention_id": mention.mention_id,
         "paragraph_id": mention.paragraph_id,
         "request_id": mention.request_id,
         "source_edition_hash": mention.source_edition_hash,
-        "source_form": mention.source_form,
+        "source_form": _bounded_text(
+            mention.source_form, MAX_FREE_TEXT_CHARS
+        ),
         "source_hash": mention.source_hash,
         "type_observations": [
             _observation_payload(item) for item in mention.type_observations
@@ -102,10 +142,14 @@ def payload_dict(case: CoreferenceCase) -> dict[str, Any]:
             ],
             "knowledge_version": case.knowledge_version,
             "lexeme": {
-                "canonical_form": case.canonical_form,
+                "canonical_form": _bounded_text(
+                    case.canonical_form, MAX_FREE_TEXT_CHARS
+                ),
                 "id": case.lexeme_id,
-                "language": case.language,
-                "normalized_form": case.normalized_form,
+                "language": _bounded_text(case.language, MAX_KIND_CHARS),
+                "normalized_form": _bounded_text(
+                    case.normalized_form, MAX_FREE_TEXT_CHARS
+                ),
             },
             "mention_set_id": case.mention_set_id,
             "mentions": [_mention_payload(item) for item in case.mentions],
@@ -120,19 +164,36 @@ def payload_dict(case: CoreferenceCase) -> dict[str, Any]:
 def payload_bytes(case: CoreferenceCase) -> bytes:
     """Serialize a frozen case as canonical UTF-8 JSON."""
 
-    return _canonical_json_bytes(payload_dict(case))
+    frozen = _canonical_json_bytes(payload_dict(case))
+    if len(frozen) > MAX_CASE_PAYLOAD_BYTES:
+        raise CoreferenceProtocolError(
+            "coreference payload exceeds the fixed request budget"
+        )
+    return frozen
 
 
 def payload_hash(case: CoreferenceCase) -> str:
     return hashlib.sha256(payload_bytes(case)).hexdigest()
 
 
+def _validated_model_names(model_names: Sequence[str]) -> tuple[str, str]:
+    if isinstance(model_names, (str, bytes)):
+        raise ValueError("coreference requests require two distinct model names")
+    raw_names = tuple(model_names)
+    if len(raw_names) != 2 or any(
+        not isinstance(name, str) for name in raw_names
+    ):
+        raise ValueError("coreference requests require two distinct model names")
+    names = tuple(name.strip() for name in raw_names)
+    if any(not name for name in names) or len(set(names)) != 2:
+        raise ValueError("coreference requests require two distinct model names")
+    return (names[0], names[1])
+
+
 def cache_key(case: CoreferenceCase, model_names: Sequence[str]) -> str:
     """Build an order-insensitive key for a two-model request set."""
 
-    names = tuple(str(name).strip() for name in model_names)
-    if len(names) != 2 or any(not name for name in names):
-        raise ValueError("coreference cache keys require exactly two model names")
+    names = _validated_model_names(model_names)
     key_material = _canonical_json_bytes(
         {
             "models": sorted(names),
@@ -181,6 +242,40 @@ def _bounded_context(row: Mapping[str, Any]) -> tuple[str, str]:
     if len(value) > MAX_CONTEXT_CHARS:
         value = value[: MAX_CONTEXT_CHARS - 1] + "…"
     return value, source
+
+
+def _select_observations(
+    observations: Iterable[CoreferenceTypeObservation],
+    limit: int,
+) -> tuple[CoreferenceTypeObservation, ...]:
+    """Keep deterministic early representatives without duplicate-kind bias."""
+
+    ordered = sorted(observations, key=lambda item: item.observation_id)
+    if not ordered or limit <= 0:
+        return ()
+    selected: dict[int, CoreferenceTypeObservation] = {}
+
+    def add(observation: CoreferenceTypeObservation) -> None:
+        if len(selected) < limit:
+            selected.setdefault(observation.observation_id, observation)
+
+    add(ordered[0])
+    add(ordered[-1])
+    seen_kinds = {item.kind for item in selected.values()}
+    for observation in ordered:
+        if observation.kind in seen_kinds:
+            continue
+        add(observation)
+        seen_kinds.add(observation.kind)
+        if len(selected) >= limit:
+            break
+    for observation in ordered:
+        add(observation)
+        if len(selected) >= limit:
+            break
+    return tuple(
+        sorted(selected.values(), key=lambda item: item.observation_id)
+    )
 
 
 def _select_mentions(
@@ -289,8 +384,55 @@ class CoreferenceCoordinator:
                 "SELECT MAX(id) AS knowledge_version FROM knowledge_versions"
             ).fetchone()
             knowledge_version = int(version_row["knowledge_version"])
+
+            candidate_sql = """SELECT l.id, l.language, l.normalized_form,
+                                      l.canonical_form
+                               FROM lexemes l
+                               WHERE l.retired_version IS NULL
+                                 AND EXISTS(
+                                     SELECT 1
+                                     FROM mentions active_m
+                                     JOIN blocks active_b
+                                       ON active_b.id=active_m.block_id
+                                     JOIN source_editions active_se
+                                       ON active_se.id=active_b.source_edition_id
+                                      AND active_se.active=1
+                                     WHERE active_m.lexeme_id=l.id)
+                                 AND (
+                                     (SELECT COUNT(*)
+                                      FROM mentions counted_m
+                                      JOIN blocks counted_b
+                                        ON counted_b.id=counted_m.block_id
+                                      JOIN source_editions counted_se
+                                        ON counted_se.id=counted_b.source_edition_id
+                                       AND counted_se.active=1
+                                      WHERE counted_m.lexeme_id=l.id) >= 2
+                                     OR
+                                     (SELECT COUNT(DISTINCT observed.kind)
+                                      FROM concept_type_observations observed
+                                      WHERE observed.lexeme_id=l.id
+                                        AND observed.retired_version IS NULL) >= 2
+                                 )
+                               ORDER BY l.normalized_form, l.id"""
+            candidate_parameters: tuple[Any, ...] = ()
+            if max_cases is not None:
+                candidate_sql += " LIMIT ?"
+                candidate_parameters = (min(max_cases, MAX_PROTOCOL_CASES),)
+            candidate_rows = connection.execute(
+                candidate_sql, candidate_parameters
+            ).fetchall()
+            if max_cases is None and len(candidate_rows) > MAX_PROTOCOL_CASES:
+                candidate_rows = candidate_rows[:MAX_PROTOCOL_CASES]
+            selected_lexeme_ids = tuple(
+                str(row["id"]) for row in candidate_rows
+            )
+            if not selected_lexeme_ids:
+                connection.rollback()
+                return ()
+            placeholders = ",".join("?" for _ in selected_lexeme_ids)
+
             mention_rows = connection.execute(
-                """SELECT m.id AS mention_id, m.evidence_id, m.block_id,
+                f"""SELECT m.id AS mention_id, m.evidence_id, m.block_id,
                           m.paragraph_id, m.source_form, m.discourse_function,
                           m.lexeme_id, m.concept_id,
                           e.evidence_quote,
@@ -305,42 +447,37 @@ class CoreferenceCoordinator:
                      ON se.id=b.source_edition_id AND se.active=1
                    JOIN lexemes l ON l.id=m.lexeme_id
                    WHERE l.retired_version IS NULL
+                     AND m.lexeme_id IN ({placeholders})
                    ORDER BY l.normalized_form, l.id, b.global_index,
-                            m.paragraph_id, m.id"""
+                            m.paragraph_id, m.id""",
+                selected_lexeme_ids,
             ).fetchall()
             observation_rows = connection.execute(
-                """SELECT o.id AS observation_id, o.lexeme_id, o.mention_id,
-                          o.concept_id, o.evidence_id, o.kind, o.confidence,
+                f"""SELECT o.id AS observation_id, o.lexeme_id, o.mention_id,
+                          observed_concept.id AS concept_id, o.evidence_id,
+                          o.kind, o.confidence,
                           o.source, o.adjudication_id
                    FROM concept_type_observations o
                    JOIN lexemes l ON l.id=o.lexeme_id
+                   LEFT JOIN concepts observed_concept
+                     ON observed_concept.id=o.concept_id
+                    AND observed_concept.retired_version IS NULL
                    WHERE o.retired_version IS NULL
                      AND l.retired_version IS NULL
-                     AND EXISTS(
-                         SELECT 1
-                         FROM mentions m
-                         JOIN blocks b ON b.id=m.block_id
-                         JOIN source_editions se
-                           ON se.id=b.source_edition_id AND se.active=1
-                         WHERE m.lexeme_id=o.lexeme_id)
+                     AND o.lexeme_id IN ({placeholders})
                    ORDER BY o.lexeme_id, COALESCE(o.mention_id, -1),
-                            o.kind, o.id"""
+                            o.kind, o.id""",
+                selected_lexeme_ids,
             ).fetchall()
             linked_anchor_rows = connection.execute(
-                """SELECT cl.lexeme_id, c.id AS concept_id, c.kind,
+                f"""SELECT cl.lexeme_id, c.id AS concept_id, c.kind,
                           c.canonical_source, c.status, cl.role,
                           c.anchor_mention_id, cl.evidence_id
                    FROM concept_lexemes cl
                    JOIN concepts c ON c.id=cl.concept_id
                    WHERE cl.retired_version IS NULL
                      AND c.retired_version IS NULL
-                     AND EXISTS(
-                         SELECT 1
-                         FROM mentions m
-                         JOIN blocks b ON b.id=m.block_id
-                         JOIN source_editions se
-                           ON se.id=b.source_edition_id AND se.active=1
-                         WHERE m.lexeme_id=cl.lexeme_id)
+                     AND cl.lexeme_id IN ({placeholders})
                    ORDER BY cl.lexeme_id, c.id,
                             CASE cl.role
                                 WHEN 'primary' THEN 0
@@ -348,10 +485,11 @@ class CoreferenceCoordinator:
                                 WHEN 'alias' THEN 2
                                 ELSE 3
                             END,
-                            COALESCE(cl.evidence_id, -1)"""
+                            COALESCE(cl.evidence_id, -1)""",
+                selected_lexeme_ids,
             ).fetchall()
             direct_anchor_rows = connection.execute(
-                """SELECT DISTINCT m.lexeme_id, c.id AS concept_id, c.kind,
+                f"""SELECT DISTINCT m.lexeme_id, c.id AS concept_id, c.kind,
                           c.canonical_source, c.status, 'mention' AS role,
                           c.anchor_mention_id, NULL AS evidence_id
                    FROM mentions m
@@ -360,7 +498,9 @@ class CoreferenceCoordinator:
                      ON se.id=b.source_edition_id AND se.active=1
                    JOIN concepts c ON c.id=m.concept_id
                    WHERE c.retired_version IS NULL
-                   ORDER BY m.lexeme_id, c.id"""
+                     AND m.lexeme_id IN ({placeholders})
+                   ORDER BY m.lexeme_id, c.id""",
+                selected_lexeme_ids,
             ).fetchall()
             connection.rollback()
 
@@ -431,35 +571,49 @@ class CoreferenceCoordinator:
                 )
             )
 
-        pending: list[tuple[str, list[dict[str, Any]]]] = []
-        for lexeme_id, rows in rows_by_lexeme.items():
-            kinds = {item.kind for item in observations_by_lexeme[lexeme_id]}
-            if len(rows) >= 2 or len(kinds) >= 2:
-                pending.append((lexeme_id, rows))
-        pending.sort(
-            key=lambda item: (
-                str(item[1][0]["normalized_form"]),
-                item[0],
-            )
-        )
-        if max_cases is not None:
-            pending = pending[:max_cases]
-        if len(pending) > 999:
-            pending = pending[:999]
+        pending = [
+            (lexeme_id, rows_by_lexeme[lexeme_id])
+            for lexeme_id in selected_lexeme_ids
+        ]
 
         cases: list[CoreferenceCase] = []
         for case_index, (lexeme_id, rows) in enumerate(pending, start=1):
             observations = tuple(observations_by_lexeme[lexeme_id])
             selected = _select_mentions(rows, observations)
             selected_ids = {int(row["mention_id"]) for row in selected}
-            payload_observations = tuple(
-                item
-                for item in observations
-                if item.mention_id is None or item.mention_id in selected_ids
+            selected_concept_ids = {
+                str(row["concept_id"])
+                for row in selected
+                if row["concept_id"] is not None
+            }
+            payload_observations = _select_observations(
+                (item for item in observations if item.mention_id is None),
+                MAX_LEXEME_TYPE_OBSERVATIONS,
+            )
+            anchor_role_order = {
+                "primary": 0,
+                "title": 1,
+                "alias": 2,
+                "uncertain": 3,
+                "mention": 4,
+            }
+            prioritized_anchors = sorted(
+                anchors_by_lexeme[lexeme_id],
+                key=lambda item: (
+                    0
+                    if (
+                        item.anchor_mention_id in selected_ids
+                        or item.concept_id in selected_concept_ids
+                    )
+                    else 1,
+                    anchor_role_order.get(item.role, 5),
+                    item.concept_id,
+                    item.evidence_id if item.evidence_id is not None else -1,
+                ),
             )
             anchors = tuple(
                 sorted(
-                    anchors_by_lexeme[lexeme_id],
+                    prioritized_anchors[:MAX_CONCEPT_ANCHORS],
                     key=lambda item: (
                         item.concept_id,
                         item.role,
@@ -471,8 +625,13 @@ class CoreferenceCoordinator:
             built_mentions: list[CoreferenceMention] = []
             for mention_index, row in enumerate(selected, start=1):
                 mention_id = int(row["mention_id"])
-                mention_observations = tuple(
-                    item for item in observations if item.mention_id == mention_id
+                mention_observations = _select_observations(
+                    (
+                        item
+                        for item in observations
+                        if item.mention_id == mention_id
+                    ),
+                    MAX_MENTION_TYPE_OBSERVATIONS,
                 )
                 anchor_ids = {
                     item.concept_id
@@ -539,9 +698,7 @@ class CoreferenceCoordinator:
     def model_payloads(
         case: CoreferenceCase, model_names: Sequence[str]
     ) -> tuple[bytes, bytes]:
-        names = tuple(model_names)
-        if len(names) != 2:
-            raise ValueError("coreference requests require exactly two models")
+        _validated_model_names(model_names)
         frozen = payload_bytes(case)
         return (frozen, frozen)
 
@@ -555,14 +712,12 @@ class CoreferenceCoordinator:
         if len(by_id) != len(frozen_cases):
             raise CoreferenceProtocolError("frozen cases contain duplicate case ids")
         try:
-            if isinstance(raw_response, CoreferenceResponse):
-                response = CoreferenceResponse.model_validate(
-                    raw_response.model_dump()
-                )
-            elif isinstance(raw_response, (str, bytes)):
+            if isinstance(raw_response, (str, bytes)):
                 response = CoreferenceResponse.model_validate_json(raw_response)
             else:
-                response = CoreferenceResponse.model_validate(raw_response)
+                response = CoreferenceResponse.model_validate(
+                    _pure_validation_data(raw_response)
+                )
         except (ValidationError, ValueError, TypeError) as exc:
             raise CoreferenceProtocolError(
                 f"invalid coreference response: {exc}"

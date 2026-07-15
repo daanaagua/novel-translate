@@ -523,23 +523,30 @@ def _insert_coreference_mention(
     paragraph_id,
     evidence_quote,
     kind=None,
+    source_form="Briah",
 ):
     with database.transaction() as connection:
         cursor = connection.execute(
             """INSERT INTO evidence(
                    block_id, paragraph_id, kind, source_form, evidence_quote,
                    payload_json, confidence, extractor, created_at)
-               VALUES('block-1', ?, 'scan', 'Briah', ?, '{}', 0.9,
+               VALUES('block-1', ?, 'scan', ?, ?, '{}', 0.9,
                       'test', '2000-01-01T00:00:00+00:00')""",
-            (paragraph_id, evidence_quote),
+            (paragraph_id, source_form, evidence_quote),
         )
         evidence_id = int(cursor.lastrowid)
         cursor = connection.execute(
             """INSERT INTO mentions(
                    block_id, paragraph_id, source_form, normalized_form,
                    discourse_function, lexeme_id, evidence_id)
-               VALUES('block-1', ?, 'Briah', 'briah', 'referential', ?, ?)""",
-            (paragraph_id, lexeme_id, evidence_id),
+               VALUES('block-1', ?, ?, ?, 'referential', ?, ?)""",
+            (
+                paragraph_id,
+                source_form,
+                normalize_english_form(source_form),
+                lexeme_id,
+                evidence_id,
+            ),
         )
         mention_id = int(cursor.lastrowid)
         if kind is not None:
@@ -660,6 +667,24 @@ def test_coreference_protocol_revalidates_an_existing_response_instance(tmp_path
         coordinator.parse_response(response, [case])
 
 
+def test_coreference_protocol_revalidates_nested_vote_instances(tmp_path):
+    database, _, _, _, case = _coreference_case(tmp_path)
+    coordinator = CoreferenceCoordinator(database)
+    vote = v4_models.CoreferenceVote.model_validate(
+        {
+            "case_id": case.case_id,
+            "relation": "same",
+            "mention_ids": [mention.request_id for mention in case.mentions],
+            "confidence": 0.8,
+            "rationale": "bounded rationale",
+        }
+    )
+    object.__setattr__(vote, "relation", "maybe")
+
+    with pytest.raises(CoreferenceProtocolError):
+        coordinator.parse_response({"votes": [vote]}, [case])
+
+
 def test_frozen_coreference_payload_is_identical_for_both_models_and_runtime_free(
     tmp_path,
 ):
@@ -698,6 +723,70 @@ def test_coreference_high_frequency_selection_is_bounded_and_stable(tmp_path):
     } <= set(selected_ids)
 
 
+def test_coreference_max_cases_only_materializes_selected_lexeme_details(
+    tmp_path, monkeypatch
+):
+    database = _db(tmp_path)
+    alpha_id = database.ensure_lexeme("Alpha")
+    zulu_id = database.ensure_lexeme("Zulu")
+    for lexeme_id, source_form in ((alpha_id, "Alpha"), (zulu_id, "Zulu")):
+        for index in range(2):
+            _insert_coreference_mention(
+                database,
+                lexeme_id,
+                paragraph_id=f"P{index + 1:03d}",
+                evidence_quote=f"{source_form} context {index}",
+                kind="person",
+                source_form=source_form,
+            )
+
+    statements = []
+    real_connect = database.connect
+
+    def traced_connect():
+        connection = real_connect()
+        connection.set_trace_callback(statements.append)
+        return connection
+
+    monkeypatch.setattr(database, "connect", traced_connect)
+    cases = CoreferenceCoordinator(database).freeze_cases(max_cases=1)
+
+    assert [case.lexeme_id for case in cases] == [alpha_id]
+    detail_queries = [
+        statement
+        for statement in statements
+        if "SELECT m.id AS mention_id" in statement
+    ]
+    assert len(detail_queries) == 1
+    assert alpha_id in detail_queries[0]
+    assert zulu_id not in detail_queries[0]
+    assert all(
+        zulu_id not in statement
+        for statement in statements
+        if "SELECT o.id AS observation_id" in statement
+        or "SELECT cl.lexeme_id" in statement
+        or "SELECT DISTINCT m.lexeme_id" in statement
+    )
+
+
+def test_coreference_zero_max_cases_skips_snapshot_detail_queries(
+    tmp_path, monkeypatch
+):
+    database = _db(tmp_path)
+    connect_calls = 0
+    real_connect = database.connect
+
+    def counted_connect():
+        nonlocal connect_calls
+        connect_calls += 1
+        return real_connect()
+
+    monkeypatch.setattr(database, "connect", counted_connect)
+
+    assert CoreferenceCoordinator(database).freeze_cases(max_cases=0) == ()
+    assert connect_calls == 0
+
+
 def test_frozen_payload_keeps_real_ids_hashes_types_anchors_and_bounded_context(
     tmp_path,
 ):
@@ -717,12 +806,181 @@ def test_frozen_payload_keeps_real_ids_hashes_types_anchors_and_bounded_context(
     assert all(item["block_id"] == "block-1" for item in payload["mentions"])
     assert all(item["source_hash"] == "hash-1" for item in payload["mentions"])
     assert all(item["request_id"].startswith("M") for item in payload["mentions"])
-    assert {item["kind"] for item in payload["type_observations"]} == {
+    all_kinds = {
+        item["kind"]
+        for item in payload["type_observations"]
+    } | {
+        item["kind"]
+        for mention in payload["mentions"]
+        for item in mention["type_observations"]
+    }
+    assert all_kinds == {
         "person",
         "place",
     }
     assert sum(len(item["context"]) for item in payload["mentions"]) <= 3_200
     assert all(len(item["context"]) <= 400 for item in payload["mentions"])
+
+
+def test_coreference_payload_has_a_fixed_budget_for_large_metadata(tmp_path):
+    database, lexeme_id, mention_ids, evidence_ids, _ = _coreference_case(
+        tmp_path, count=8
+    )
+    with database.transaction() as connection:
+        version = connection.execute(
+            "SELECT MAX(id) FROM knowledge_versions"
+        ).fetchone()[0]
+        for index in range(20):
+            suffix = f"{index:03d}"
+            for mention_id, evidence_id in zip(mention_ids, evidence_ids):
+                database.record_type_observation(
+                    lexeme_id,
+                    f"kind-{suffix}-" + ("🧪" * 5_000),
+                    confidence=0.6,
+                    source=f"mention-source-{suffix}-" + ("🧪" * 5_000),
+                    mention_id=mention_id,
+                    evidence_id=evidence_id,
+                    connection=connection,
+                )
+            database.record_type_observation(
+                lexeme_id,
+                f"lexeme-kind-{suffix}-" + ("🧪" * 5_000),
+                confidence=0.5,
+                source=f"lexeme-source-{suffix}-" + ("🧪" * 5_000),
+                connection=connection,
+            )
+            concept_id = f"concept-budget-{suffix}"
+            connection.execute(
+                """INSERT INTO concepts(
+                       id, kind, canonical_source, primary_lexeme_id,
+                       created_version, created_at)
+                   VALUES(?, ?, ?, ?, ?, '2000-01-01T00:00:00+00:00')""",
+                (
+                    concept_id,
+                    f"anchor-kind-{suffix}-" + ("🧪" * 5_000),
+                    f"anchor-source-{suffix}-" + ("🧪" * 5_000),
+                    lexeme_id,
+                    version,
+                ),
+            )
+            connection.execute(
+                """INSERT INTO concept_lexemes(
+                       concept_id, lexeme_id, role, confidence, status,
+                       created_version, created_at)
+                   VALUES(?, ?, 'primary', 1.0, 'provisional', ?,
+                          '2000-01-01T00:00:00+00:00')""",
+                (concept_id, lexeme_id, version),
+            )
+
+    coordinator = CoreferenceCoordinator(database)
+    first_case = coordinator.freeze_cases()[0]
+    second_case = coordinator.freeze_cases()[0]
+    frozen = coordinator.payload_bytes(first_case)
+    payload = json.loads(frozen)["case"]
+
+    assert first_case == second_case
+    assert len(frozen) <= coreference_module.MAX_CASE_PAYLOAD_BYTES
+    assert len(payload["type_observations"]) <= (
+        coreference_module.MAX_LEXEME_TYPE_OBSERVATIONS
+    )
+    assert all(
+        len(mention["type_observations"])
+        <= coreference_module.MAX_MENTION_TYPE_OBSERVATIONS
+        for mention in payload["mentions"]
+    )
+    assert len(payload["concept_anchors"]) <= (
+        coreference_module.MAX_CONCEPT_ANCHORS
+    )
+    assert all(
+        len(item["source"])
+        <= coreference_module.MAX_OBSERVATION_SOURCE_CHARS
+        for item in payload["type_observations"]
+    )
+    assert all(
+        len(item["source"])
+        <= coreference_module.MAX_OBSERVATION_SOURCE_CHARS
+        for mention in payload["mentions"]
+        for item in mention["type_observations"]
+    )
+    assert all(
+        len(item["canonical_source"])
+        <= coreference_module.MAX_FREE_TEXT_CHARS
+        for item in payload["concept_anchors"]
+    )
+    assert [item["mention_id"] for item in payload["mentions"]] == list(
+        mention_ids
+    )
+    nested_kinds = {
+        item["kind"]
+        for mention in payload["mentions"]
+        for item in mention["type_observations"]
+    }
+    assert {"person", "place"} <= nested_kinds
+    assert any(kind.startswith("kind-019-") for kind in nested_kinds)
+
+
+def test_coreference_payload_budget_accepts_worst_case_multibyte_text(tmp_path):
+    _, _, _, _, case = _coreference_case(tmp_path, count=8)
+    marker = "🧪" * 5_000
+    observation_id = 10_000
+    mentions = []
+    for mention in case.mentions:
+        observations = []
+        for _ in range(coreference_module.MAX_MENTION_TYPE_OBSERVATIONS):
+            observation_id += 1
+            observations.append(
+                v4_models.CoreferenceTypeObservation(
+                    observation_id=observation_id,
+                    kind=marker,
+                    confidence=0.5,
+                    source=marker,
+                    mention_id=mention.mention_id,
+                    evidence_id=mention.evidence_id,
+                )
+            )
+        mentions.append(
+            replace(
+                mention,
+                block_kind=marker,
+                source_form=marker,
+                discourse_function=marker,
+                context=marker,
+                context_source=marker,
+                type_observations=tuple(observations),
+            )
+        )
+    lexeme_observations = tuple(
+        v4_models.CoreferenceTypeObservation(
+            observation_id=20_000 + index,
+            kind=marker,
+            confidence=0.5,
+            source=marker,
+        )
+        for index in range(coreference_module.MAX_LEXEME_TYPE_OBSERVATIONS)
+    )
+    anchors = tuple(
+        v4_models.CoreferenceConceptAnchor(
+            concept_id=f"concept-multibyte-{index}",
+            kind=marker,
+            canonical_source=marker,
+            status=marker,
+            role="primary",
+        )
+        for index in range(coreference_module.MAX_CONCEPT_ANCHORS)
+    )
+    worst_case = replace(
+        case,
+        language=marker,
+        normalized_form=marker,
+        canonical_form=marker,
+        mentions=tuple(mentions),
+        type_observations=lexeme_observations,
+        concept_anchors=anchors,
+    )
+
+    frozen = CoreferenceCoordinator.payload_bytes(worst_case)
+
+    assert len(frozen) <= coreference_module.MAX_CASE_PAYLOAD_BYTES
 
 
 def test_coreference_payload_carries_each_existing_concept_anchor_once(tmp_path):
@@ -762,6 +1020,54 @@ def test_coreference_payload_carries_each_existing_concept_anchor_once(tmp_path)
     assert payload["mentions"][0]["concept_anchor_ids"] == ["concept-briah"]
 
 
+def test_coreference_anchor_budget_prioritizes_selected_mention_binding(tmp_path):
+    database, lexeme_id, mention_ids, _, _ = _coreference_case(tmp_path)
+    with database.transaction() as connection:
+        version = connection.execute(
+            "SELECT MAX(id) FROM knowledge_versions"
+        ).fetchone()[0]
+        for index in range(coreference_module.MAX_CONCEPT_ANCHORS):
+            concept_id = f"concept-a-{index:03d}"
+            connection.execute(
+                """INSERT INTO concepts(
+                       id, kind, canonical_source, primary_lexeme_id,
+                       created_version, created_at)
+                   VALUES(?, 'person', ?, ?, ?,
+                          '2000-01-01T00:00:00+00:00')""",
+                (concept_id, concept_id, lexeme_id, version),
+            )
+            connection.execute(
+                """INSERT INTO concept_lexemes(
+                       concept_id, lexeme_id, role, confidence, status,
+                       created_version, created_at)
+                   VALUES(?, ?, 'primary', 1.0, 'provisional', ?,
+                          '2000-01-01T00:00:00+00:00')""",
+                (concept_id, lexeme_id, version),
+            )
+        connection.execute(
+            """INSERT INTO concepts(
+                   id, kind, canonical_source, primary_lexeme_id,
+                   created_version, created_at)
+               VALUES('concept-z-direct', 'person', 'direct', ?, ?,
+                      '2000-01-01T00:00:00+00:00')""",
+            (lexeme_id, version),
+        )
+        connection.execute(
+            "UPDATE mentions SET concept_id='concept-z-direct' WHERE id=?",
+            (mention_ids[0],),
+        )
+
+    case = CoreferenceCoordinator(database).freeze_cases()[0]
+    payload = json.loads(CoreferenceCoordinator.payload_bytes(case))["case"]
+
+    assert "concept-z-direct" in {
+        item["concept_id"] for item in payload["concept_anchors"]
+    }
+    assert payload["mentions"][0]["concept_anchor_ids"] == [
+        "concept-z-direct"
+    ]
+
+
 def test_coreference_payload_does_not_emit_dangling_retired_anchor_ids(tmp_path):
     database, lexeme_id, mention_ids, _, _ = _coreference_case(tmp_path)
     with database.transaction() as connection:
@@ -795,6 +1101,53 @@ def test_coreference_payload_does_not_emit_dangling_retired_anchor_ids(tmp_path)
     assert payload["mentions"][0]["concept_anchor_ids"] == []
 
 
+def test_coreference_type_observations_hide_retired_concept_ids(tmp_path):
+    database, lexeme_id, mention_ids, evidence_ids, _ = _coreference_case(tmp_path)
+    with database.transaction() as connection:
+        created_version = connection.execute(
+            "SELECT MAX(id) FROM knowledge_versions"
+        ).fetchone()[0]
+        connection.execute(
+            """INSERT INTO concepts(
+                   id, kind, canonical_source, primary_lexeme_id,
+                   created_version, created_at)
+               VALUES('retired-observation-concept', 'organization', 'Briah',
+                      ?, ?, '2000-01-01T00:00:00+00:00')""",
+            (lexeme_id, created_version),
+        )
+        database.record_type_observation(
+            lexeme_id,
+            "organization",
+            confidence=0.7,
+            source="retired-concept-test",
+            mention_id=mention_ids[0],
+            concept_id="retired-observation-concept",
+            evidence_id=evidence_ids[0],
+            connection=connection,
+        )
+        retired_version = database.create_knowledge_version(
+            "retire observation concept", connection
+        )
+        connection.execute(
+            """UPDATE concepts SET retired_version=?
+               WHERE id='retired-observation-concept'""",
+            (retired_version,),
+        )
+
+    case = CoreferenceCoordinator(database).freeze_cases()[0]
+    payload = json.loads(CoreferenceCoordinator.payload_bytes(case))["case"]
+
+    assert "retired-observation-concept" not in json.dumps(payload)
+    assert all(
+        item["concept_id"] is None for item in payload["type_observations"]
+    )
+    assert all(
+        item["concept_id"] is None
+        for mention in payload["mentions"]
+        for item in mention["type_observations"]
+    )
+
+
 def test_coreference_cache_key_uses_payload_models_and_protocol_not_model_order(
     tmp_path, monkeypatch
 ):
@@ -810,3 +1163,24 @@ def test_coreference_cache_key_uses_payload_models_and_protocol_not_model_order(
 
     monkeypatch.setattr(coreference_module, "COREFERENCE_PROTOCOL_VERSION", "test-v2")
     assert original != coordinator.cache_key(case, ["model-a", "model-b"])
+
+
+@pytest.mark.parametrize(
+    "model_names",
+    [
+        ["", "model-b"],
+        ["   ", "model-b"],
+        ["model-a", "model-a"],
+        [" model-a ", "model-a"],
+    ],
+)
+def test_coreference_dual_model_names_must_be_nonempty_and_distinct(
+    tmp_path, model_names
+):
+    database, _, _, _, case = _coreference_case(tmp_path)
+    coordinator = CoreferenceCoordinator(database)
+
+    with pytest.raises(ValueError):
+        coordinator.cache_key(case, model_names)
+    with pytest.raises(ValueError):
+        coordinator.model_payloads(case, model_names)
