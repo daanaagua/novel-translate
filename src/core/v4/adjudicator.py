@@ -4,8 +4,9 @@ from __future__ import annotations
 
 import json
 import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, replace
-from typing import Any, Dict, Mapping, Optional, Sequence
+from typing import Any, Callable, Dict, Mapping, Optional, Sequence
 from uuid import uuid4
 
 from .candidate_clusters import CandidateCluster, CandidateClusterBatch
@@ -131,6 +132,7 @@ class V4Adjudicator:
         max_tokens: int = 8192,
         database: Optional[Any] = None,
         audit_mode: str = "full",
+        llm_factory: Optional[Callable[[], Any]] = None,
     ):
         if audit_mode not in {"full", "response", "minimal"}:
             raise ValueError("audit_mode must be full, response, or minimal")
@@ -139,6 +141,16 @@ class V4Adjudicator:
         self.max_tokens = max(1, int(max_tokens))
         self.database = database
         self.audit_mode = audit_mode
+        self.llm_factory = llm_factory
+
+    def _new_worker(self) -> "V4Adjudicator":
+        llm = self.llm_factory() if self.llm_factory is not None else self.llm
+        return V4Adjudicator(
+            llm,
+            max_attempts=self.max_attempts,
+            max_tokens=self.max_tokens,
+            audit_mode=self.audit_mode,
+        )
 
     @staticmethod
     def _clean_json(raw: str) -> str:
@@ -662,70 +674,136 @@ class V4Adjudicator:
         database: Optional[Any] = None,
         *,
         max_clusters: Optional[int] = None,
+        initial_workers: int = 1,
+        max_workers: int = 1,
     ) -> Dict[str, Any]:
         """Adjudicate persisted pending clusters as an independent stage."""
         store = database or self.database
         if store is None:
             raise ValueError("V4Adjudicator.run requires a database")
+        initial_workers = int(initial_workers)
+        max_workers = int(max_workers)
+        if initial_workers < 1 or max_workers < 1:
+            raise ValueError("adjudication worker counts must be positive")
+        if initial_workers > max_workers:
+            raise ValueError("initial_workers cannot exceed max_workers")
+        if max_workers > 1 and self.llm_factory is None:
+            raise ValueError("parallel adjudication requires an llm_factory")
         run_id = f"adjudicate_{uuid4().hex}"
         config = {
             "max_clusters": max_clusters,
             "batch_size": 12,
             "max_attempts": self.max_attempts,
+            "initial_workers": initial_workers,
+            "max_workers": max_workers,
         }
         store.start_run(run_id, "adjudicate", config)
         adjudicated = failed = deferred = 0
         concept_ids: set[str] = set()
         knowledge_version = None
         remaining = None if max_clusters is None else max(0, int(max_clusters))
+        workers = initial_workers
+        waves = batches = model_calls = model_elapsed_ms_sum = 0
+        peak_workers = 0
+        started = time.perf_counter()
         try:
             if remaining == 0:
                 store.finalize_adjudication_run(run_id, "completed")
             while remaining is None or remaining > 0:
-                claim_limit = 12 if remaining is None else min(12, remaining)
-                clusters = store.claim_pending_candidate_clusters(
-                    run_id, claim_limit
-                )
-                if not clusters:
+                claimed_batches = []
+                for _slot in range(workers):
+                    claim_limit = 12 if remaining is None else min(12, remaining)
+                    if claim_limit <= 0:
+                        break
+                    claimed = store.claim_pending_candidate_clusters(
+                        run_id, claim_limit
+                    )
+                    if not claimed:
+                        break
+                    claimed_batches.append(tuple(claimed))
+                    if remaining is not None:
+                        remaining -= len(claimed)
+                if not claimed_batches:
                     status = "completed_with_errors" if failed else "completed"
                     store.finalize_adjudication_run(run_id, status)
                     break
-                source_texts = store.source_texts_for_candidate_clusters(clusters)
-                results = self.adjudicate(
-                    clusters,
-                    source_texts,
-                    run_id=run_id,
-                    database=store,
-                    knowledge_version=knowledge_version,
-                )
-                batch_failed = sum(
-                    result.reason == "model_protocol_failure" for result in results
-                )
-                batch_deferred = sum(
-                    result.verdict == "defer" for result in results
-                )
-                next_adjudicated = adjudicated + len(results)
-                next_failed = failed + batch_failed
-                next_deferred = deferred + batch_deferred
-                if remaining is not None:
-                    remaining -= len(results)
-                no_more = remaining == 0 or not store.has_claimable_candidate_clusters()
-                final_status = None
-                if no_more:
-                    final_status = (
-                        "completed_with_errors" if next_failed else "completed"
+                waves += 1
+                batches += len(claimed_batches)
+                peak_workers = max(peak_workers, len(claimed_batches))
+                source_texts = store.source_texts_for_candidate_clusters(
+                    tuple(
+                        cluster
+                        for claimed_batch in claimed_batches
+                        for cluster in claimed_batch
                     )
-                committed = store.commit_adjudications(
-                    run_id,
-                    results,
-                    require_lease=True,
-                    finalize_run_status=final_status,
                 )
-                adjudicated = next_adjudicated
-                failed = next_failed
-                deferred = next_deferred
-                concept_ids.update(committed.get("concept_ids", []))
-                knowledge_version = committed.get("knowledge_version")
+                wave_knowledge_version = (
+                    int(knowledge_version)
+                    if knowledge_version is not None
+                    else int(store.current_knowledge_version())
+                )
+                outcomes: list[AdjudicationBatchOutcome] = []
+                worker_errors: list[Exception] = []
+                with ThreadPoolExecutor(max_workers=len(claimed_batches)) as executor:
+                    futures = []
+                    for batch_index, claimed_batch in enumerate(claimed_batches):
+                        worker = self._new_worker()
+                        futures.append(
+                            executor.submit(
+                                worker._adjudicate_batch_outcome,
+                                batch_index,
+                                claimed_batch,
+                                source_texts,
+                                knowledge_version=wave_knowledge_version,
+                            )
+                        )
+                    for future in futures:
+                        try:
+                            outcomes.append(future.result())
+                        except Exception as exc:
+                            worker_errors.append(exc)
+
+                ordered_outcomes = sorted(
+                    outcomes, key=lambda outcome: outcome.batch_index
+                )
+                no_more = (
+                    remaining == 0
+                    or not store.has_claimable_candidate_clusters()
+                )
+                for outcome_index, outcome in enumerate(ordered_outcomes):
+                    results = outcome.results
+                    batch_failed = sum(
+                        result.reason == "model_protocol_failure"
+                        for result in results
+                    )
+                    batch_deferred = sum(
+                        result.verdict == "defer" for result in results
+                    )
+                    next_adjudicated = adjudicated + len(results)
+                    next_failed = failed + batch_failed
+                    next_deferred = deferred + batch_deferred
+                    is_last_outcome = outcome_index == len(ordered_outcomes) - 1
+                    final_status = None
+                    if no_more and is_last_outcome and not worker_errors:
+                        final_status = (
+                            "completed_with_errors" if next_failed else "completed"
+                        )
+                    committed = store.commit_adjudications(
+                        run_id,
+                        results,
+                        audit_attempts=outcome.audit_attempts,
+                        require_lease=True,
+                        finalize_run_status=final_status,
+                    )
+                    adjudicated = next_adjudicated
+                    failed = next_failed
+                    deferred = next_deferred
+                    model_calls += outcome.model_calls
+                    model_elapsed_ms_sum += outcome.model_elapsed_ms_sum
+                    concept_ids.update(committed.get("concept_ids", []))
+                    knowledge_version = committed.get("knowledge_version")
+                if worker_errors:
+                    raise worker_errors[0]
                 if no_more:
                     break
             return {
@@ -735,6 +813,14 @@ class V4Adjudicator:
                 "failed": failed,
                 "deferred": deferred,
                 "knowledge_version": knowledge_version,
+                "initial_workers": initial_workers,
+                "max_workers": max_workers,
+                "peak_workers": peak_workers,
+                "waves": waves,
+                "batches": batches,
+                "model_calls": model_calls,
+                "model_elapsed_ms_sum": model_elapsed_ms_sum,
+                "elapsed_ms": int((time.perf_counter() - started) * 1000),
             }
         except Exception as exc:
             store.finalize_adjudication_run(run_id, "failed", str(exc))

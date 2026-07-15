@@ -1,4 +1,6 @@
 import json
+import threading
+import time
 from contextlib import closing
 
 import pytest
@@ -79,6 +81,41 @@ class FailSecondBatchLLM(PromotingLLM):
         return super().chat(messages=messages, **kwargs)
 
 
+class ConcurrentPromotingFactory:
+    def __init__(self, expected_concurrency):
+        self.barrier = threading.Barrier(expected_concurrency)
+        self.lock = threading.Lock()
+        self.active = 0
+        self.peak = 0
+        self.call_index = 0
+        self.batch_sizes = []
+
+    def __call__(self):
+        return ConcurrentPromotingLLM(self)
+
+
+class ConcurrentPromotingLLM(PromotingLLM):
+    def __init__(self, tracker):
+        super().__init__()
+        self.tracker = tracker
+
+    def chat(self, *, messages, **kwargs):
+        payload = json.loads(messages[-1]["content"])
+        with self.tracker.lock:
+            index = self.tracker.call_index
+            self.tracker.call_index += 1
+            self.tracker.active += 1
+            self.tracker.peak = max(self.tracker.peak, self.tracker.active)
+            self.tracker.batch_sizes.append(len(payload["clusters"]))
+        try:
+            self.tracker.barrier.wait(timeout=3)
+            time.sleep((4 - index) * 0.01)
+            return super().chat(messages=messages, **kwargs)
+        finally:
+            with self.tracker.lock:
+                self.tracker.active -= 1
+
+
 def make_database(tmp_path, texts):
     db = V4Database(tmp_path / "book")
     edition = db.ensure_source_edition("raw", "normalized", "test", "source.txt")
@@ -102,6 +139,61 @@ def make_database(tmp_path, texts):
             for index, source in enumerate(texts)
         ],
     )
+    return db
+
+
+def make_candidate_cluster_database(tmp_path, count):
+    names = [f"Name{index:03d}" for index in range(count)]
+    source = " ".join(names)
+    db = make_database(tmp_path, [source])
+    block = db.list_blocks()[0]
+    candidates = []
+    cursor = 0
+    for index, name in enumerate(names):
+        start = source.index(name, cursor)
+        end = start + len(name)
+        cursor = end
+        candidates.append(
+            LexicalCandidate(
+                id=f"candidate-{index:03d}",
+                block_id=block.id,
+                paragraph_id="P000",
+                start_offset=start,
+                end_offset=end,
+                original_text=name,
+                normalized_text=name,
+                left_context="",
+                right_context="",
+                extraction_reason="test",
+                book_frequency=1,
+                score=0,
+            )
+        )
+    db.start_run("scan-many", "scan", {})
+    db.commit_candidate_index_batch(
+        "scan-many",
+        [
+            ScanOutcome(
+                block=block,
+                response=ScanResponse(),
+                lexical_candidates=[item.storage_payload() for item in candidates],
+            )
+        ],
+    )
+    db.persist_candidate_clusters(
+        "scan-many",
+        [
+            CandidateCluster(
+                id=f"cluster-{index:03d}",
+                alternatives=(candidate,),
+                contexts=(),
+                risk_flags=(),
+                affected_blocks=1,
+            )
+            for index, candidate in enumerate(candidates)
+        ],
+    )
+    db.finish_run("scan-many", "completed")
     return db
 
 
@@ -517,6 +609,39 @@ def test_adjudicator_run_calls_model_commits_concepts_and_does_not_repeat(databa
     second = V4Adjudicator(llm, database=database).run()
     assert second["adjudicated"] == 0
     assert llm.calls == first_call_count
+
+
+def test_adjudicator_run_executes_four_batches_and_commits_in_order(
+    tmp_path, monkeypatch
+):
+    db = make_candidate_cluster_database(tmp_path, 48)
+    expected_ids = [cluster.id for cluster in db.load_pending_candidate_clusters()]
+    tracker = ConcurrentPromotingFactory(expected_concurrency=4)
+    commit_order = []
+    write_threads = []
+    original_commit = db.commit_adjudications
+
+    def recording_commit(run_id, results, **kwargs):
+        commit_order.append([result.cluster_id for result in results])
+        write_threads.append(threading.get_ident())
+        return original_commit(run_id, results, **kwargs)
+
+    monkeypatch.setattr(db, "commit_adjudications", recording_commit)
+    result = V4Adjudicator(
+        tracker(),
+        database=db,
+        max_attempts=1,
+        llm_factory=tracker,
+    ).run(initial_workers=4, max_workers=4)
+
+    assert result["adjudicated"] == 48
+    assert tracker.peak == 4
+    assert result["peak_workers"] == 4
+    assert tracker.batch_sizes == [12, 12, 12, 12]
+    assert commit_order == [
+        expected_ids[start : start + 12] for start in range(0, 48, 12)
+    ]
+    assert set(write_threads) == {threading.get_ident()}
 
 
 def test_deferred_adjudication_is_active_but_creates_no_concept(database):
