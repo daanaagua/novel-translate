@@ -29,9 +29,11 @@ from .models import (
     WorkingTargetRule,
 )
 from .matcher import ConceptMatcherCache, FrozenConceptIndex
-
-
-SCHEMA_VERSION = 7
+from .schema_v8 import (
+    SCHEMA_VERSION,
+    SchemaUpgradeRequired,
+    assert_schema8_or_empty,
+)
 
 
 def utc_now() -> str:
@@ -90,6 +92,7 @@ class V4Database:
         self.root = self.project_root / "artifacts" / "parallel_v4"
         self.root.mkdir(parents=True, exist_ok=True)
         self.path = self.root / "book.db"
+        assert_schema8_or_empty(self.path)
         self.audit_archive = AuditArchive(self.root / "audit")
         self._audit_transactions: Dict[int, AuditArchiveTransaction] = {}
         self._audit_transactions_lock = RLock()

@@ -17,6 +17,7 @@ from src.core.v4.candidate_clusters import CandidateCluster, CandidateContext
 from src.core.v4.database import SCHEMA_VERSION, V4Database
 from src.core.v4.lexical_index import LexicalCandidate
 from src.core.v4.models import ScanOutcome, TranslationOutcome, V4BlockStatus
+from src.core.v4.schema_v8 import SchemaUpgradeRequired
 
 
 def _candidate(candidate_id, block, start, text, *, risk_flags=()):
@@ -111,7 +112,7 @@ def _seed_database(tmp_path, names=("Drotte", "Roche")):
     return db, edition, block, candidates
 
 
-def test_schema6_migration_backfills_locked_targets_without_overwriting_values(tmp_path):
+def test_schema6_requires_explicit_upgrade_without_mutating_data(tmp_path):
     root = tmp_path / "legacy"
     path = root / "artifacts" / "parallel_v4" / "book.db"
     path.parent.mkdir(parents=True)
@@ -167,53 +168,27 @@ def test_schema6_migration_backfills_locked_targets_without_overwriting_values(t
             """
         )
 
-    db = V4Database(root)
-    with closing(db.connect()) as connection:
-        concept = connection.execute(
-            "SELECT working_target, verified_target FROM concepts WHERE id='locked-old'"
-        ).fetchone()
+    with pytest.raises(SchemaUpgradeRequired, match="migrate-v4 --preview"):
+        V4Database(root)
+    with closing(sqlite3.connect(path)) as connection:
         lexical_columns = {
-            row["name"] for row in connection.execute("PRAGMA table_info(lexical_candidates)")
-        }
-        tables = {
-            row[0]
-            for row in connection.execute(
-                "SELECT name FROM sqlite_master WHERE type='table'"
-            )
+            row[1] for row in connection.execute("PRAGMA table_info(lexical_candidates)")
         }
         version = connection.execute(
             "SELECT value FROM schema_meta WHERE key='schema_version'"
         ).fetchone()[0]
-
-    assert SCHEMA_VERSION == 7
-    assert version == "7"
-    assert concept["working_target"] == "德罗特"
-    assert concept["verified_target"] == "德罗特"
-    assert {"risk_flags_json", "resolution_status"} <= lexical_columns
-    assert {
-        "candidate_clusters",
-        "candidate_cluster_members",
-        "candidate_adjudications",
-        "candidate_resolutions",
-    } <= tables
-
-    with db.transaction() as connection:
-        connection.execute(
-            "UPDATE concepts SET working_target='人工工作译名', verified_target='人工审定译名' "
-            "WHERE id='locked-old'"
-        )
-        connection.execute(
-            "UPDATE schema_meta SET value='6' WHERE key='schema_version'"
-        )
-    V4Database(root)
-    with closing(db.connect()) as connection:
-        preserved = connection.execute(
-            "SELECT working_target, verified_target FROM concepts WHERE id='locked-old'"
+        concept = connection.execute(
+            "SELECT default_target FROM concepts WHERE id='locked-old'"
         ).fetchone()
-    assert tuple(preserved) == ("人工工作译名", "人工审定译名")
+
+    assert SCHEMA_VERSION == 8
+    assert version == "6"
+    assert concept[0] == "德罗特"
+    assert "risk_flags_json" not in lexical_columns
+    assert "resolution_status" not in lexical_columns
 
 
-def test_unreleased_legacy_schema7_adjudication_table_is_migrated_in_place(tmp_path):
+def test_unreleased_legacy_schema7_adjudication_table_is_not_migrated_in_place(tmp_path):
     root = tmp_path / "legacy-schema7"
     path = root / "artifacts" / "parallel_v4" / "book.db"
     path.parent.mkdir(parents=True)
@@ -292,27 +267,31 @@ def test_unreleased_legacy_schema7_adjudication_table_is_migrated_in_place(tmp_p
         )
         connection.commit()
 
-    db = V4Database(root)
-    canonical = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
-    expected_hash = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
-    with closing(db.connect()) as connection:
+    with pytest.raises(SchemaUpgradeRequired, match="migrate-v4 --preview"):
+        V4Database(root)
+    with closing(sqlite3.connect(path)) as connection:
         columns = {
-            row["name"]
+            row[1]
             for row in connection.execute("PRAGMA table_info(candidate_adjudications)")
         }
         row = connection.execute(
-            """SELECT payload_hash, knowledge_version, active, superseded_at
+            """SELECT verdict, payload_json
                FROM candidate_adjudications WHERE id='adjud-old'"""
         ).fetchone()
         table_sql = connection.execute(
             """SELECT sql FROM sqlite_master
                WHERE type='table' AND name='candidate_adjudications'"""
         ).fetchone()[0]
-        assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
         assert connection.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
-    assert {"payload_hash", "knowledge_version", "active", "superseded_at"} <= columns
-    assert tuple(row) == (expected_hash, 1, 1, None)
-    assert "UNIQUE(run_id, cluster_id)" not in table_sql.replace("\n", " ")
+        version = connection.execute(
+            "SELECT value FROM schema_meta WHERE key='schema_version'"
+        ).fetchone()[0]
+    assert {"payload_hash", "knowledge_version", "active", "superseded_at"}.isdisjoint(
+        columns
+    )
+    assert tuple(row) == ("defer", payload_json)
+    assert "UNIQUE(run_id, cluster_id)" in table_sql.replace("\n", " ")
+    assert version == "7"
 
 
 def test_legacy_schema7_migration_recovers_adjudication_version_for_exact_retry(tmp_path):
@@ -1510,7 +1489,7 @@ def test_structured_human_markers_with_common_separators_stay_inline(
     assert json.loads(row["request_json"]) == request_payload
 
 
-def test_existing_schema7_audit_table_gains_archive_locator_columns(tmp_path):
+def test_existing_schema7_audit_table_is_not_mutated_on_open(tmp_path):
     root = tmp_path / "legacy-audit"
     path = root / "artifacts" / "parallel_v4" / "book.db"
     path.parent.mkdir(parents=True)
@@ -1538,7 +1517,8 @@ def test_existing_schema7_audit_table_gains_archive_locator_columns(tmp_path):
             """
         )
 
-    V4Database(root)
+    with pytest.raises(SchemaUpgradeRequired, match="migrate-v4 --preview"):
+        V4Database(root)
 
     with closing(sqlite3.connect(path)) as connection:
         columns = {
@@ -1549,7 +1529,7 @@ def test_existing_schema7_audit_table_gains_archive_locator_columns(tmp_path):
         "archive_offset",
         "archive_compressed_length",
         "archive_sha256",
-    } <= columns
+    }.isdisjoint(columns)
 
 
 def test_storage_budget_formula_and_batch_rollback(tmp_path, monkeypatch):
