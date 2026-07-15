@@ -7,6 +7,7 @@ import json
 import sqlite3
 import unicodedata
 from contextlib import closing, contextmanager
+from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, Iterator, List, Optional, Sequence
@@ -1386,6 +1387,13 @@ class V4Database:
                      AND b.source_edition_id=(
                          SELECT id FROM source_editions WHERE active=1
                      )
+                     AND NOT EXISTS (
+                         SELECT 1
+                         FROM candidate_cluster_members cm
+                         JOIN candidate_adjudications ca
+                           ON ca.cluster_id=cm.cluster_id
+                         WHERE cm.candidate_id=lc.id AND ca.active=1
+                     )
                    ORDER BY b.global_index, lc.start_offset, lc.end_offset, lc.id"""
             ).fetchall()
         return [self._row_to_lexical_candidate(row) for row in rows]
@@ -1530,15 +1538,40 @@ class V4Database:
                        WHERE ca.cluster_id=candidate_clusters.id
                    )"""
             )
-            historical_ids = {
-                row[0]
-                for row in connection.execute(
-                    "SELECT DISTINCT cluster_id FROM candidate_adjudications"
-                ).fetchall()
-            }
-            safe_clusters = [
-                cluster for cluster in clusters if cluster.id not in historical_ids
-            ]
+            latest_history: Dict[str, str] = {}
+            for row in connection.execute(
+                """SELECT cluster_id, id
+                   FROM candidate_adjudications
+                   ORDER BY cluster_id, created_at DESC, id DESC"""
+            ).fetchall():
+                latest_history.setdefault(row["cluster_id"], row["id"])
+            safe_clusters = []
+            for cluster in clusters:
+                reopened_id = cluster.id
+                member_ids = sorted(
+                    member["candidate_id"]
+                    for member in self._candidate_cluster_members(cluster)
+                )
+                seen_ids = set()
+                while reopened_id in latest_history:
+                    if reopened_id in seen_ids:
+                        raise ValueError("candidate cluster generation cycle")
+                    seen_ids.add(reopened_id)
+                    reopened_id = stable_id(
+                        "cluster",
+                        "reopened:"
+                        + reopened_id
+                        + ":"
+                        + latest_history[reopened_id]
+                        + ":"
+                        + "|".join(member_ids),
+                        length=20,
+                    )
+                safe_clusters.append(
+                    cluster
+                    if reopened_id == cluster.id
+                    else replace(cluster, id=reopened_id)
+                )
             return self._persist_candidate_clusters(connection, run_id, safe_clusters)
 
     def load_pending_candidate_clusters(
@@ -1550,7 +1583,7 @@ class V4Database:
         query = """SELECT cc.* FROM candidate_clusters cc
                    WHERE NOT EXISTS (
                        SELECT 1 FROM candidate_adjudications ca
-                       WHERE ca.cluster_id=cc.id AND ca.active=1
+                       WHERE ca.cluster_id=cc.id
                    )
                      AND EXISTS (
                        SELECT 1
@@ -1586,7 +1619,10 @@ class V4Database:
                 for member in members:
                     candidate = self._row_to_lexical_candidate(member)
                     role = member["role"]
-                    if role in {"alternative", "both"}:
+                    if (
+                        role in {"alternative", "both"}
+                        and member["resolution_status"] == "pending"
+                    ):
                         alternatives.append(candidate)
                     if role not in {"context", "both"}:
                         continue

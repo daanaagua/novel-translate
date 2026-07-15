@@ -455,16 +455,25 @@ class V4Adjudicator:
                     "run_id": run_id,
                     "adjudicated": 0,
                     "concepts": 0,
+                    "failed": 0,
+                    "deferred": 0,
                     "knowledge_version": None,
                 }
             source_texts = store.source_texts_for_candidate_clusters(clusters)
             results = self.adjudicate(clusters, source_texts)
             committed = store.commit_adjudications(run_id, results)
-            store.finish_run(run_id, "completed")
+            failed = sum(
+                result.reason == "model_protocol_failure" for result in results
+            )
+            deferred = sum(result.verdict == "defer" for result in results)
+            status = "completed_with_errors" if failed else "completed"
+            store.finish_run(run_id, status)
             return {
                 "run_id": run_id,
                 "adjudicated": len(results),
                 "concepts": len(set(committed.get("concept_ids", []))),
+                "failed": failed,
+                "deferred": deferred,
                 "knowledge_version": committed.get("knowledge_version"),
             }
         except Exception as exc:

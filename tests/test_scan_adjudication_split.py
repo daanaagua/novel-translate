@@ -3,8 +3,11 @@ from contextlib import closing
 
 import pytest
 
-from src.core.v4.adjudicator import V4Adjudicator
+from src.core.v4.adjudicator import AdjudicationResult, V4Adjudicator
+from src.core.v4.candidate_clusters import CandidateCluster
 from src.core.v4.database import V4Database
+from src.core.v4.lexical_index import LexicalCandidate
+from src.core.v4.models import ScanOutcome, ScanResponse
 from src.core.v4.scanner import V4Scanner
 
 
@@ -50,6 +53,40 @@ class PromotingLLM:
                 }
             )
         return json.dumps({"decisions": decisions})
+
+
+class FailSecondBatchLLM(PromotingLLM):
+    def chat(self, *, messages, **kwargs):
+        if self.calls == 1:
+            self.calls += 1
+            return "{}"
+        return super().chat(messages=messages, **kwargs)
+
+
+def make_database(tmp_path, texts):
+    db = V4Database(tmp_path / "book")
+    edition = db.ensure_source_edition("raw", "normalized", "test", "source.txt")
+    db.upsert_blocks(
+        edition,
+        [
+            {
+                "id": f"block-{index}",
+                "legacy_id": f"v01_ch01_{index:03d}",
+                "chapter_id": "ch01",
+                "chapter_title": "I",
+                "chapter_index": 0,
+                "block_index": index,
+                "global_index": index,
+                "block_type": "prose",
+                "source_text": source,
+                "source_hash": f"hash-{index}",
+                "token_count": len(source.split()),
+                "status": "pending",
+            }
+            for index, source in enumerate(texts)
+        ],
+    )
+    return db
 
 
 @pytest.fixture
@@ -257,12 +294,18 @@ def test_deferred_adjudication_is_active_but_creates_no_concept(database):
 
     assert result["adjudicated"] == 1
     assert result["concepts"] == 0
+    assert result["failed"] == 0
+    assert result["deferred"] == 1
     with closing(database.connect()) as connection:
         row = connection.execute(
             "SELECT verdict, active FROM candidate_adjudications WHERE run_id=?",
             (result["run_id"],),
         ).fetchone()
         assert tuple(row) == ("defer", 1)
+        run = connection.execute(
+            "SELECT status FROM runs WHERE id=?", (result["run_id"],)
+        ).fetchone()
+        assert run["status"] == "completed"
         assert connection.execute("SELECT COUNT(*) FROM concepts").fetchone()[0] == 0
 
 
@@ -282,3 +325,179 @@ def test_adjudicator_run_records_failed_stage(database, monkeypatch):
     assert row["stage"] == "adjudicate"
     assert row["status"] == "failed"
     assert "storage failed" in row["error"]
+
+
+def test_active_cluster_context_only_member_is_not_reclustered(tmp_path):
+    db = make_database(tmp_path, ["Severian waited.", "Severian returned."])
+    V4Scanner(db, ExplodingLLM()).scan_project()
+    cluster = next(
+        item for item in db.load_pending_candidate_clusters() if item.affected_blocks == 2
+    )
+    alternative_ids = {item.id for item in cluster.alternatives}
+    context_only_ids = {
+        item.candidate_id for item in cluster.contexts
+    } - alternative_ids
+    assert context_only_ids
+
+    db.start_run("judge-context", "adjudicate", {})
+    db.commit_adjudications(
+        "judge-context",
+        [
+            AdjudicationResult(
+                cluster_id=cluster.id,
+                verdict="promote",
+                selected_candidate_ids=(cluster.alternatives[0].id,),
+                entity_kind="person",
+                confidence=0.99,
+            )
+        ],
+    )
+    db.finish_run("judge-context", "completed")
+    with db.transaction() as connection:
+        connection.execute("UPDATE blocks SET status='pending'")
+
+    V4Scanner(db, ExplodingLLM()).scan_project()
+    pending_ids = {item.id for item in db.load_pending_lexical_candidates()}
+    assert not pending_ids.intersection(alternative_ids | context_only_ids)
+    assert db.load_pending_candidate_clusters() == []
+    with closing(db.connect()) as connection:
+        assert connection.execute("SELECT COUNT(*) FROM candidate_clusters").fetchone()[0] == 1
+
+
+def test_inactive_history_reopens_as_stable_new_generation(tmp_path):
+    db = make_database(tmp_path, ["Severian waited."])
+    V4Scanner(db, ExplodingLLM()).scan_project()
+    historical = db.load_pending_candidate_clusters()[0]
+    db.start_run("judge-old", "adjudicate", {})
+    db.commit_adjudications(
+        "judge-old",
+        [
+            AdjudicationResult(
+                cluster_id=historical.id,
+                verdict="reject",
+                selected_candidate_ids=(),
+                entity_kind="person",
+                confidence=0.99,
+            )
+        ],
+    )
+    db.finish_run("judge-old", "completed")
+    with db.transaction() as connection:
+        connection.execute("UPDATE candidate_adjudications SET active=0")
+        connection.execute(
+            """UPDATE lexical_candidates
+               SET resolution_status='pending', model_status='pending', selected=0"""
+        )
+        connection.execute("UPDATE blocks SET status='pending'")
+
+    assert db.load_pending_candidate_clusters() == []
+    V4Scanner(db, ExplodingLLM()).scan_project()
+    reopened = db.load_pending_candidate_clusters()
+    assert len(reopened) == 1
+    assert reopened[0].id != historical.id
+    first_generation_id = reopened[0].id
+    with db.transaction() as connection:
+        connection.execute("UPDATE blocks SET status='pending'")
+    V4Scanner(db, ExplodingLLM()).scan_project()
+    assert [item.id for item in db.load_pending_candidate_clusters()] == [
+        first_generation_id
+    ]
+    with closing(db.connect()) as connection:
+        assert connection.execute("SELECT COUNT(*) FROM candidate_clusters").fetchone()[0] == 2
+
+
+def test_pending_cluster_loader_never_returns_resolved_alternative(database):
+    V4Scanner(database, ExplodingLLM()).scan_project(max_blocks=2)
+    cluster = next(
+        item
+        for item in database.load_pending_candidate_clusters()
+        if len(item.alternatives) >= 2
+    )
+    rejected_id = cluster.alternatives[-1].id
+    with database.transaction() as connection:
+        connection.execute(
+            """UPDATE lexical_candidates
+               SET resolution_status='rejected', model_status='rejected'
+               WHERE id=?""",
+            (rejected_id,),
+        )
+    loaded = next(
+        item
+        for item in database.load_pending_candidate_clusters()
+        if item.id == cluster.id
+    )
+    assert rejected_id not in {item.id for item in loaded.alternatives}
+
+
+def test_adjudicator_run_marks_second_batch_protocol_failure_completed_with_errors(
+    tmp_path,
+):
+    names = [f"Name{chr(ord('A') + index)}" for index in range(13)]
+    source = " ".join(names)
+    db = make_database(tmp_path, [source])
+    block = db.list_blocks()[0]
+    candidates = []
+    cursor = 0
+    for index, name in enumerate(names):
+        start = source.index(name, cursor)
+        end = start + len(name)
+        cursor = end
+        candidates.append(
+            LexicalCandidate(
+                id=f"candidate-{index:02d}",
+                block_id=block.id,
+                paragraph_id="P000",
+                start_offset=start,
+                end_offset=end,
+                original_text=name,
+                normalized_text=name,
+                left_context="",
+                right_context="",
+                extraction_reason="test",
+                book_frequency=1,
+                score=0,
+            )
+        )
+    db.start_run("scan-thirteen", "scan", {})
+    db.commit_candidate_index_batch(
+        "scan-thirteen",
+        [
+            ScanOutcome(
+                block=block,
+                response=ScanResponse(),
+                lexical_candidates=[item.storage_payload() for item in candidates],
+            )
+        ],
+    )
+    db.persist_candidate_clusters(
+        "scan-thirteen",
+        [
+            CandidateCluster(
+                id=f"cluster-{index:02d}",
+                alternatives=(candidate,),
+                contexts=(),
+                risk_flags=(),
+                affected_blocks=1,
+            )
+            for index, candidate in enumerate(candidates)
+        ],
+    )
+    db.finish_run("scan-thirteen", "completed")
+
+    result = V4Adjudicator(
+        FailSecondBatchLLM(), max_attempts=1, database=db
+    ).run()
+    assert result["adjudicated"] == 13
+    assert result["failed"] == 1
+    assert result["deferred"] == 1
+    with closing(db.connect()) as connection:
+        run = connection.execute(
+            "SELECT status FROM runs WHERE id=?", (result["run_id"],)
+        ).fetchone()
+        failures = connection.execute(
+            """SELECT COUNT(*) FROM candidate_adjudications
+               WHERE run_id=? AND reason='model_protocol_failure' AND active=1""",
+            (result["run_id"],),
+        ).fetchone()[0]
+    assert run["status"] == "completed_with_errors"
+    assert failures == 1
