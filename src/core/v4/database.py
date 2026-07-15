@@ -734,6 +734,24 @@ class V4Database:
                 ).hexdigest()
             knowledge_version = row["knowledge_version"]
             if knowledge_version not in valid_versions:
+                matched_version = connection.execute(
+                    """SELECT id FROM knowledge_versions
+                       WHERE reason=?
+                       ORDER BY
+                           CASE WHEN julianday(created_at) IS NULL
+                                  OR julianday(?) IS NULL THEN 1 ELSE 0 END,
+                           abs(julianday(created_at) - julianday(?)),
+                           id DESC
+                       LIMIT 1""",
+                    (
+                        f"candidate adjudication {row['run_id']}",
+                        row["updated_at"],
+                        row["updated_at"],
+                    ),
+                ).fetchone()
+                if matched_version is not None:
+                    knowledge_version = int(matched_version["id"])
+            if knowledge_version not in valid_versions:
                 knowledge_version = row["run_version"]
             if knowledge_version not in valid_versions:
                 knowledge_version = fallback_version

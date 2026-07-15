@@ -308,6 +308,77 @@ def test_unreleased_legacy_schema7_adjudication_table_is_migrated_in_place(tmp_p
     assert "UNIQUE(run_id, cluster_id)" not in table_sql.replace("\n", " ")
 
 
+def test_legacy_schema7_migration_recovers_adjudication_version_for_exact_retry(tmp_path):
+    db, _, _, candidates = _seed_database(tmp_path)
+    db.persist_candidate_clusters("scan-run", [_cluster("cluster-old", candidates)])
+    result = AdjudicationResult(
+        cluster_id="cluster-old",
+        verdict="defer",
+        selected_candidate_ids=(),
+        entity_kind="concept",
+        confidence=0.4,
+        reason="model_protocol_failure",
+        rounds=1,
+    )
+    first = db.commit_adjudications("judge-run", [result])
+    assert first["knowledge_version"] == 2
+
+    with closing(sqlite3.connect(db.path)) as connection:
+        connection.execute("PRAGMA foreign_keys=OFF")
+        connection.executescript(
+            """
+            CREATE TABLE candidate_adjudications_b7(
+                id TEXT PRIMARY KEY,
+                run_id TEXT NOT NULL,
+                cluster_id TEXT NOT NULL,
+                verdict TEXT NOT NULL,
+                selected_candidate_ids_json TEXT NOT NULL DEFAULT '[]',
+                entity_kind TEXT NOT NULL DEFAULT '',
+                confidence REAL NOT NULL DEFAULT 0.0,
+                reason TEXT NOT NULL DEFAULT '',
+                rounds INTEGER NOT NULL DEFAULT 1,
+                payload_json TEXT NOT NULL DEFAULT '{}',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                UNIQUE(run_id, cluster_id),
+                FOREIGN KEY(cluster_id)
+                    REFERENCES candidate_clusters(id) ON DELETE CASCADE
+            );
+            INSERT INTO candidate_adjudications_b7(
+                id, run_id, cluster_id, verdict, selected_candidate_ids_json,
+                entity_kind, confidence, reason, rounds, payload_json,
+                created_at, updated_at)
+            SELECT id, run_id, cluster_id, verdict, selected_candidate_ids_json,
+                   entity_kind, confidence, reason, rounds, payload_json,
+                   created_at, updated_at
+            FROM candidate_adjudications WHERE active=1;
+            DROP TABLE candidate_adjudications;
+            ALTER TABLE candidate_adjudications_b7
+                RENAME TO candidate_adjudications;
+            """
+        )
+        connection.commit()
+
+    migrated = V4Database(db.project_root)
+    with closing(migrated.connect()) as connection:
+        adjudication_version = connection.execute(
+            "SELECT knowledge_version FROM candidate_adjudications WHERE active=1"
+        ).fetchone()[0]
+        before_versions = connection.execute(
+            "SELECT COUNT(*) FROM knowledge_versions"
+        ).fetchone()[0]
+    retry = migrated.commit_adjudications("judge-run", [result])
+    with closing(migrated.connect()) as connection:
+        after_versions = connection.execute(
+            "SELECT COUNT(*) FROM knowledge_versions"
+        ).fetchone()[0]
+
+    assert adjudication_version == 2
+    assert retry["knowledge_version"] == 2
+    assert retry["changed"] == 0
+    assert after_versions == before_versions == 2
+
+
 def test_cluster_persistence_and_adjudication_promotion_are_atomic(tmp_path):
     db, _, _, candidates = _seed_database(tmp_path)
     item = _cluster("cluster-1", candidates)
