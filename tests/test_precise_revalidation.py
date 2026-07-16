@@ -2806,11 +2806,18 @@ def _task11_response(action):
     )
 
 
-def _task11_task(database, *, impact=1, target="新译名"):
+def _task11_task(
+    database,
+    *,
+    impact=1,
+    target="新译名",
+    block_id="block-0",
+    subject_id="lexeme-task11",
+):
     translation_id = _insert_revalidation_translation(
         database,
-        "block-0",
-        dependency=("lexeme", "lexeme-task11", "old-fingerprint"),
+        block_id,
+        dependency=("lexeme", subject_id, "old-fingerprint"),
     )
     with database.transaction() as connection:
         connection.execute(
@@ -2827,7 +2834,7 @@ def _task11_task(database, *, impact=1, target="新译名"):
         )
     change_id = _insert_revalidation_change(
         database,
-        subject_id="lexeme-task11",
+        subject_id=subject_id,
         impact=impact,
         payload={
             "old": {"working_target": "旧译名", "rules": []},
@@ -2837,6 +2844,151 @@ def _task11_task(database, *, impact=1, target="新译名"):
     )
     assert RevalidationPlanner(database).plan([change_id])["planned"] == 1
     return translation_id
+
+
+class _Task12Translator:
+    def __init__(self, database, failure):
+        self.database = database
+        self.failure = failure
+        self.calls = []
+
+    def __call__(self, block):
+        self.calls.append(block.id)
+        if block.id == "block-0":
+            if isinstance(self.failure, Exception):
+                raise self.failure
+            return TranslationOutcome(
+                block=block,
+                knowledge_version=self.database.current_knowledge_version(),
+                status=self.failure[0],
+                final_translation=self.failure[1],
+                error=self.failure[2],
+                audit_calls=[
+                    {
+                        "purpose": "draft",
+                        "model": "task12-fake",
+                        "request": {"block_id": block.id},
+                        "raw_response": "bad response",
+                        "accepted": False,
+                        "attempts": 1,
+                        "elapsed_ms": 1,
+                        "error": self.failure[2],
+                    }
+                ],
+            )
+        return TranslationOutcome(
+            block=block,
+            knowledge_version=self.database.current_knowledge_version(),
+            status=V4BlockStatus.COMPLETED.value,
+            draft_translation=f"new {block.id}",
+            final_translation=f"new {block.id}",
+            matched_renderings=(
+                RenderingMatchSnapshot(
+                    lexeme_id=f"fresh-{block.id}",
+                    concept_id=None,
+                    matched_form=block.source_text,
+                    start_offset=0,
+                    end_offset=len(block.source_text),
+                    rendered_target=f"new {block.id}",
+                    dependency_fingerprint="fresh-fingerprint",
+                ),
+            ),
+        )
+
+
+@pytest.mark.parametrize(
+    ("expected_category", "failure", "expected_attempts"),
+    [
+        (
+            "protocol",
+            (V4BlockStatus.FAILED_RETRYABLE.value, "", "protocol response invalid"),
+            2,
+        ),
+        (
+            "structure",
+            (V4BlockStatus.COMPLETED.value, "", "translation structure is empty"),
+            2,
+        ),
+        ("external", TimeoutError("translation timeout"), 2),
+        (
+            "budget",
+            (V4BlockStatus.FAILED_RETRYABLE.value, "", "token budget exceeded"),
+            1,
+        ),
+        (
+            "context",
+            (
+                V4BlockStatus.INCOMPLETE_REQUIRES_HUMAN.value,
+                "",
+                "context window exceeded",
+            ),
+            1,
+        ),
+    ],
+    ids=["protocol", "structure", "external", "budget", "context"],
+)
+def test_task12_warning_fallback_keeps_old_translation_and_continues_queue(
+    tmp_path, expected_category, failure, expected_attempts
+):
+    database = _database(tmp_path, ["Alpha", "Beta"])
+    old_ids = [
+        _task11_task(
+            database,
+            impact=3,
+            block_id=f"block-{index}",
+            subject_id=f"lexeme-task12-{index}",
+        )
+        for index in range(2)
+    ]
+    translator = _Task12Translator(database, failure)
+
+    summary = RevalidationRunner(
+        database,
+        translate_block_factory=lambda: translator,
+        max_attempts=2,
+    ).run()
+
+    assert summary["status"] == "completed_with_warnings"
+    assert summary["warnings"] == 1
+    assert summary["retranslate"] == 1
+    assert translator.calls.count("block-0") == expected_attempts
+    assert translator.calls.count("block-1") == 1
+    with closing(database.connect()) as connection:
+        tasks = connection.execute(
+            "SELECT * FROM revalidation_tasks ORDER BY block_id"
+        ).fetchall()
+        failed_result = json.loads(tasks[0]["result_json"])
+        versions = connection.execute(
+            """SELECT id, block_id, status, validation_status, active
+               FROM translation_versions ORDER BY id"""
+        ).fetchall()
+        assert tasks[0]["status"] == "completed_with_warning"
+        assert tasks[0]["action"] == "warning_fallback"
+        assert failed_result["error_category"] == expected_category
+        assert failed_result["attempts"] == expected_attempts
+        assert failed_result["last_audit_call_id"] is not None
+        assert failed_result["stale_change_ids"]
+        assert tasks[1]["status"] == "resolved_retranslate"
+        assert tasks[1]["replacement_translation_id"] is not None
+        assert connection.execute(
+            """SELECT dependency_id FROM dependencies
+               WHERE translation_id=?""",
+            (tasks[1]["replacement_translation_id"],),
+        ).fetchone()[0] == "fresh-block-1"
+        assert [
+            (row["id"], row["validation_status"], row["active"])
+            for row in versions
+            if row["block_id"] == "block-0"
+        ] == [(old_ids[0], "warning_stale", 1)]
+        assert sum(row["active"] for row in versions if row["block_id"] == "block-1") == 1
+        assert len(versions) == 3
+        assert connection.execute(
+            "SELECT COUNT(*) FROM human_queue WHERE severity='blocking'"
+        ).fetchone()[0] == 0
+        run = connection.execute(
+            "SELECT status FROM runs WHERE stage='revalidation'"
+        ).fetchone()
+        assert run["status"] == "completed_with_warnings"
 
 
 def test_task11_validation_matrix_and_independent_frozen_payloads(tmp_path):
@@ -2854,8 +3006,11 @@ def test_task11_validation_matrix_and_independent_frozen_payloads(tmp_path):
         "noop": 1,
         "patched": 0,
         "retranslate": 0,
+        "warnings": 0,
         "protocol_failures": 0,
         "conflicts": 0,
+        "unfinished": 0,
+        "status": "completed",
     }
     assert left.requests[0][1]["content"] == right.requests[0][1]["content"]
     with closing(database.connect()) as connection:
@@ -2876,11 +3031,15 @@ def test_task11_protocol_exhaustion_escalates_without_human_queue(tmp_path):
         validator_factories=(lambda: invalid, lambda: other),
         max_attempts=2,
     ).run()
-    assert summary["retranslate"] == 1
+    assert summary["retranslate"] == 0
+    assert summary["warnings"] == 1
     assert summary["protocol_failures"] == 1
     with closing(database.connect()) as connection:
         task = connection.execute("SELECT status, action FROM revalidation_tasks").fetchone()
-        assert tuple(task) == ("resolved_retranslate", "retranslate")
+        assert tuple(task) == ("completed_with_warning", "warning_fallback")
+        assert connection.execute(
+            "SELECT validation_status FROM translation_versions WHERE active=1"
+        ).fetchone()[0] == "warning_stale"
         assert connection.execute("SELECT COUNT(*) FROM human_queue").fetchone()[0] == 0
 
 

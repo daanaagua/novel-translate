@@ -15,7 +15,12 @@ from typing import Any, Callable, Mapping, Optional
 from pydantic import ValidationError
 
 from .database import V4Database, utc_now
-from .models import RevalidationClaim, RevalidationResponse, V4BlockStatus
+from .models import (
+    RevalidationClaim,
+    RevalidationResponse,
+    TranslationOutcome,
+    V4BlockStatus,
+)
 from .repairer import V4Repairer
 
 
@@ -944,6 +949,7 @@ class RevalidationRunner:
         *,
         validator_factories: Optional[Sequence[Callable[[], Any]]] = None,
         repairer: Optional[V4Repairer] = None,
+        translate_block_factory: Optional[Callable[[], Any]] = None,
         max_attempts: int = 2,
         lease_seconds: int = 300,
         owner: Optional[str] = None,
@@ -957,11 +963,14 @@ class RevalidationRunner:
             factories = (validator_factory,)
         if any(not callable(factory) for factory in factories):
             raise TypeError("validator factories must be callable")
+        if translate_block_factory is not None and not callable(translate_block_factory):
+            raise TypeError("translate_block_factory must be callable")
         if type(max_attempts) is not int or max_attempts < 1:
             raise ValueError("max_attempts must be a positive integer")
         self.database = database
         self.validator_factories = factories
         self.repairer = repairer
+        self.translate_block_factory = translate_block_factory
         self.max_attempts = max_attempts
         self.lease_seconds = lease_seconds
         self.owner = owner or f"revalidation-{uuid.uuid4().hex}"
@@ -1104,18 +1113,194 @@ class RevalidationRunner:
             return self.validator_factories[:2]
         return (self.validator_factories[0], self.validator_factories[0])
 
-    def run(self, max_tasks: Optional[int] = None) -> Dict[str, int]:
+    @staticmethod
+    def _retranslation_category(error: BaseException | str, status: str = "") -> str:
+        message = f"{type(error).__name__} {error}".casefold()
+        if any(
+            marker in message
+            for marker in (
+                "context window",
+                "context limit",
+                "context overflow",
+                "max_context",
+                "上下文",
+            )
+        ):
+            return "context"
+        if any(
+            marker in message
+            for marker in ("budget", "token limit", "token cap", "quota", "预算")
+        ):
+            return "budget"
+        if any(
+            marker in message
+            for marker in ("protocol", "json", "schema", "parse", "协议")
+        ):
+            return "protocol"
+        if any(
+            marker in message
+            for marker in (
+                "structure",
+                "paragraph",
+                "wrapper",
+                "integrity",
+                "empty",
+                "结构",
+                "段落",
+                "空译文",
+            )
+        ):
+            return "structure"
+        if isinstance(error, (TimeoutError, ConnectionError, OSError)) or any(
+            marker in message
+            for marker in ("timeout", "network", "service", "unavailable", "rate limit")
+        ):
+            return "external"
+        if isinstance(error, BaseException):
+            if isinstance(error, (RevalidationProtocolError, ValidationError, ValueError, TypeError)):
+                return "protocol"
+            return "external"
+        if status == V4BlockStatus.INCOMPLETE_REQUIRES_HUMAN.value:
+            return "context"
+        if status not in {
+            V4BlockStatus.COMPLETED.value,
+            V4BlockStatus.COMPLETED_WITH_WARNINGS.value,
+            V4BlockStatus.FAILED_RETRYABLE.value,
+        }:
+            return "protocol"
+        return "external" if status == V4BlockStatus.FAILED_RETRYABLE.value else "structure"
+
+    @staticmethod
+    def _retranslation_audit(
+        claim: RevalidationClaim,
+        block_id: str,
+        attempt: int,
+        error: BaseException | str,
+    ) -> dict[str, Any]:
+        return {
+            "purpose": "retranslate",
+            "model": "translate_block_factory",
+            "request": {
+                "block_id": block_id,
+                "payload_sha256": claim.payload_hash,
+            },
+            "raw_response": "",
+            "parsed": None,
+            "accepted": False,
+            "attempts": attempt,
+            "elapsed_ms": 0,
+            "error": str(error)[:1024],
+        }
+
+    def _retranslate_or_warn(
+        self,
+        claim: RevalidationClaim,
+        *,
+        reason: str,
+        result: Mapping[str, Any],
+        audits: list[dict[str, Any]],
+        run_id: str,
+        summary: dict[str, Any],
+    ) -> None:
+        block = self.database.get_block_by_identifier(
+            str(claim.task_snapshot["block_id"])
+        )
+        final_category = "protocol"
+        final_error = "translate_block_factory is unavailable"
+        attempts = 0
+        for attempt in range(1, self.max_attempts + 1):
+            attempts = attempt
+            outcome: Optional[TranslationOutcome] = None
+            try:
+                if self.translate_block_factory is None:
+                    raise RevalidationProtocolError(final_error)
+                translator = self.translate_block_factory()
+                if callable(translator):
+                    candidate = translator(block)
+                elif callable(getattr(translator, "translate_block", None)):
+                    candidate = translator.translate_block(block)
+                else:
+                    raise RevalidationProtocolError(
+                        "translate_block_factory returned a non-callable translator"
+                    )
+                if not isinstance(candidate, TranslationOutcome):
+                    raise RevalidationProtocolError(
+                        "translator did not return a TranslationOutcome"
+                    )
+                outcome = candidate
+                if outcome.block.id != block.id:
+                    raise RevalidationProtocolError(
+                        "translator returned an outcome for another block"
+                    )
+                if outcome.status in {
+                    V4BlockStatus.COMPLETED.value,
+                    V4BlockStatus.COMPLETED_WITH_WARNINGS.value,
+                } and outcome.final_translation.strip():
+                    self.database.commit_revalidation_resolution(
+                        claim,
+                        status="resolved_retranslate",
+                        action="retranslate",
+                        result={**dict(result), "reason": reason, "attempts": attempt},
+                        outcome=outcome,
+                        audits=audits,
+                        run_id=run_id,
+                    )
+                    summary["retranslate"] += 1
+                    return
+                if outcome.status in {
+                    V4BlockStatus.COMPLETED.value,
+                    V4BlockStatus.COMPLETED_WITH_WARNINGS.value,
+                }:
+                    final_error = str(outcome.error or "translation structure is empty")
+                else:
+                    final_error = str(outcome.error or outcome.status)
+                final_category = self._retranslation_category(
+                    final_error, outcome.status
+                )
+            except Exception as exc:
+                final_error = str(exc)[:1024]
+                final_category = self._retranslation_category(exc)
+            if outcome is not None and outcome.audit_calls:
+                audits.extend(dict(audit) for audit in outcome.audit_calls)
+            else:
+                audits.append(
+                    self._retranslation_audit(
+                        claim, block.id, attempt, final_error
+                    )
+                )
+            if final_category not in {"protocol", "structure", "external"}:
+                break
+        self.database.complete_with_warning(
+            claim,
+            error_category=final_category,
+            attempts=attempts,
+            error=final_error,
+            audits=audits,
+            run_id=run_id,
+        )
+        summary["warnings"] += 1
+
+    def run(self, max_tasks: Optional[int] = None) -> dict[str, Any]:
         if max_tasks is not None and (type(max_tasks) is not int or max_tasks < 0):
             raise ValueError("max_tasks must be a non-negative integer or None")
-        summary = {
+        summary: dict[str, Any] = {
             "claimed": 0,
             "noop": 0,
             "patched": 0,
             "retranslate": 0,
+            "warnings": 0,
             "protocol_failures": 0,
             "conflicts": 0,
         }
         if max_tasks == 0:
+            summary["unfinished"] = self.database.unfinished_revalidation_count()
+            summary["status"] = (
+                "in_progress"
+                if summary["unfinished"]
+                else "completed_with_warnings"
+                if self.database.warning_revalidation_count()
+                else "completed"
+            )
             return summary
         run_id = f"revalidation_{uuid.uuid4().hex}"
         self.database.start_run(
@@ -1142,15 +1327,14 @@ class RevalidationRunner:
                 impact = int(claim.task_snapshot["impact_level"])
                 audits: list[dict[str, Any]] = []
                 if impact >= 3:
-                    self.database.commit_revalidation_resolution(
+                    self._retranslate_or_warn(
                         claim,
-                        status="resolved_retranslate",
-                        action="retranslate",
-                        result={"reason": "impact_level_3"},
+                        reason="impact_level_3",
+                        result={},
                         audits=audits,
                         run_id=run_id,
+                        summary=summary,
                     )
-                    summary["retranslate"] += 1
                     continue
                 frozen_payload = json.loads(claim.payload_bytes.decode("utf-8"))
                 if not bool(frozen_payload.get("coverage_complete", True)):
@@ -1171,24 +1355,28 @@ class RevalidationRunner:
                             ),
                         }
                     )
-                    self.database.fail_revalidation_task(
+                    self._retranslate_or_warn(
                         claim,
-                        "bounded validator payload cannot cover the full task",
+                        reason="validator_payload_incomplete",
+                        result={
+                            "error": "bounded validator payload cannot cover the full task"
+                        },
                         audits=audits,
                         run_id=run_id,
+                        summary=summary,
                     )
-                    summary["retranslate"] += 1
                     continue
                 factories = self._factories_for_impact(impact)
                 if len(factories) < (2 if impact == 2 else 1):
                     summary["protocol_failures"] += 1
-                    self.database.fail_revalidation_task(
+                    self._retranslate_or_warn(
                         claim,
-                        "independent validator factory is unavailable",
+                        reason="validator_unavailable",
+                        result={"error": "independent validator factory is unavailable"},
                         audits=audits,
                         run_id=run_id,
+                        summary=summary,
                     )
-                    summary["retranslate"] += 1
                     continue
                 responses: list[Optional[RevalidationResponse]] = []
                 clients: list[Any] = []
@@ -1203,13 +1391,17 @@ class RevalidationRunner:
                     impact == 2 and len(clients) == 2 and clients[0] is clients[1]
                 ):
                     summary["protocol_failures"] += 1
-                    self.database.fail_revalidation_task(
+                    self._retranslate_or_warn(
                         claim,
-                        factory_error or "impact-2 validators shared one client instance",
+                        reason="validator_unavailable",
+                        result={
+                            "error": factory_error
+                            or "impact-2 validators shared one client instance"
+                        },
                         audits=audits,
                         run_id=run_id,
+                        summary=summary,
                     )
-                    summary["retranslate"] += 1
                     continue
                 for client in clients:
                     response, side_audits = self._validate_side(client, claim)
@@ -1217,13 +1409,14 @@ class RevalidationRunner:
                     audits.extend(side_audits)
                 if any(response is None for response in responses):
                     summary["protocol_failures"] += 1
-                    self.database.fail_revalidation_task(
+                    self._retranslate_or_warn(
                         claim,
-                        "validator protocol attempts exhausted",
+                        reason="validator_protocol_exhausted",
+                        result={"error": "validator protocol attempts exhausted"},
                         audits=audits,
                         run_id=run_id,
+                        summary=summary,
                     )
-                    summary["retranslate"] += 1
                     continue
                 actions = [response.action for response in responses if response]
                 if len(set(actions)) > 1:
@@ -1256,15 +1449,14 @@ class RevalidationRunner:
                     summary["noop"] += 1
                     continue
                 if decision != "patch_required" or self.repairer is None:
-                    self.database.commit_revalidation_resolution(
+                    self._retranslate_or_warn(
                         claim,
-                        status="resolved_retranslate",
-                        action="retranslate",
-                        result={**result, "reason": "validation_matrix"},
+                        reason="validation_matrix",
+                        result=result,
                         audits=audits,
                         run_id=run_id,
+                        summary=summary,
                     )
-                    summary["retranslate"] += 1
                     continue
                 payload = json.loads(claim.payload_bytes.decode("utf-8"))
                 block = self.database.get_block_by_identifier(
@@ -1284,19 +1476,18 @@ class RevalidationRunner:
                     V4BlockStatus.COMPLETED.value,
                     V4BlockStatus.COMPLETED_WITH_WARNINGS.value,
                 }:
-                    self.database.commit_revalidation_resolution(
+                    audits.extend(dict(audit) for audit in outcome.audit_calls)
+                    self._retranslate_or_warn(
                         claim,
-                        status="resolved_retranslate",
-                        action="retranslate",
+                        reason="full_block_repair_failed",
                         result={
                             **result,
-                            "reason": "full_block_repair_failed",
                             "error": str(outcome.error or "")[:1024],
                         },
-                        audits=tuple(audits) + tuple(outcome.audit_calls),
+                        audits=audits,
                         run_id=run_id,
+                        summary=summary,
                     )
-                    summary["retranslate"] += 1
                     continue
                 self.database.commit_revalidation_resolution(
                     claim,
@@ -1308,7 +1499,15 @@ class RevalidationRunner:
                     run_id=run_id,
                 )
                 summary["patched"] += 1
-            self.database.finish_run(run_id, "completed")
+            summary["unfinished"] = self.database.unfinished_revalidation_count()
+            summary["status"] = (
+                "in_progress"
+                if summary["unfinished"]
+                else "completed_with_warnings"
+                if self.database.warning_revalidation_count()
+                else "completed"
+            )
+            self.database.finish_run(run_id, summary["status"])
             return summary
         except Exception as exc:
             self.database.finish_run(run_id, "failed", str(exc)[:1024])

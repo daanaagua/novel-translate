@@ -755,6 +755,25 @@ class V4TranslationPipeline:
             local_summary = outcome.memory_summary
         return outcomes
 
+    def translate_block_factory(self) -> Callable[[V4Block], TranslationOutcome]:
+        """Build the normal frozen-bundle translator used by revalidation."""
+
+        def translate_block(block: V4Block) -> TranslationOutcome:
+            if not isinstance(block, V4Block):
+                raise TypeError("retranslation requires a V4Block")
+            bundle = self.database.freeze_render_bundle([block.id])
+            self._active_render_bundle = bundle
+            outcomes = self._translate_island(
+                Island(id=f"revalidate-{block.id}", blocks=[block]),
+                bundle.knowledge_version,
+                bundle.index,
+            )
+            if len(outcomes) != 1 or outcomes[0].block.id != block.id:
+                raise RuntimeError("retranslation structure did not return one full block")
+            return outcomes[0]
+
+        return translate_block
+
     def run(self) -> Dict[str, Any]:
         eligible_statuses = [
             V4BlockStatus.READY.value,

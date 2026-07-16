@@ -11749,9 +11749,10 @@ class V4Database:
         task: sqlite3.Row,
         run_id: Optional[str],
         audits: Sequence[Mapping[str, Any]],
-    ) -> None:
+    ) -> List[int]:
+        audit_ids: List[int] = []
         for audit in audits:
-            self.record_audit_call(
+            audit_ids.append(self.record_audit_call(
                 run_id=run_id,  # type: ignore[arg-type]
                 block_id=str(task["block_id"]),
                 purpose=str(audit.get("purpose") or "revalidate"),
@@ -11766,7 +11767,8 @@ class V4Database:
                 error=(str(audit.get("error"))[:1024] if audit.get("error") else None),
                 connection=connection,
                 archive_payload=False,
-            )
+            ))
+        return audit_ids
 
     @staticmethod
     def _revalidation_target(summary: Any) -> str:
@@ -11782,6 +11784,209 @@ class V4Database:
                 if isinstance(rule, dict) and str(rule.get("target") or "").strip():
                     return str(rule["target"]).strip()
         return ""
+
+    def _insert_revalidation_retranslation(
+        self,
+        connection: sqlite3.Connection,
+        task: sqlite3.Row,
+        outcome: TranslationOutcome,
+        run_id: Optional[str],
+    ) -> int:
+        frozen = _snapshot_translation_outcome(outcome)
+        current_version = int(
+            connection.execute("SELECT MAX(id) FROM knowledge_versions").fetchone()[0]
+        )
+        if (
+            frozen.block.id != str(task["block_id"])
+            or frozen.knowledge_version != current_version
+            or frozen.knowledge_version < int(task["to_knowledge_version"])
+            or frozen.status
+            not in {
+                V4BlockStatus.COMPLETED.value,
+                V4BlockStatus.COMPLETED_WITH_WARNINGS.value,
+            }
+            or not frozen.final_translation.strip()
+        ):
+            raise ValueError("revalidation retranslation outcome is inconsistent")
+        source = connection.execute(
+            """SELECT b.source_text, b.source_hash
+               FROM blocks b
+               JOIN source_editions edition
+                 ON edition.id=b.source_edition_id AND edition.active=1
+               WHERE b.id=?""",
+            (task["block_id"],),
+        ).fetchone()
+        if source is None:
+            raise ValueError("revalidation retranslation source is inactive")
+        source_text = str(source["source_text"])
+        if (
+            source_text != frozen.block.source_text
+            or str(source["source_hash"]) != frozen.block.source_hash
+        ):
+            raise ValueError("revalidation retranslation source drifted")
+        stored_source_hash = str(source["source_hash"])
+        computed_source_hash = hashlib.sha256(source_text.encode("utf-8")).hexdigest()
+        if re.fullmatch(r"[0-9a-f]{64}", stored_source_hash) and (
+            stored_source_hash != computed_source_hash
+        ):
+            raise ValueError("revalidation retranslation source hash drifted")
+        previous = connection.execute(
+            """SELECT id FROM translation_versions
+               WHERE id=? AND block_id=? AND pipeline='parallel_v4' AND active=1""",
+            (task["translation_id"], task["block_id"]),
+        ).fetchone()
+        if previous is None:
+            raise ValueError("revalidation retranslation active translation changed")
+
+        dependency_groups: Dict[tuple[str, str], List[RenderingMatchSnapshot]] = {}
+        for match in frozen.matched_renderings:
+            lexeme_id = str(match.lexeme_id or "").strip()
+            concept_id = str(match.concept_id or "").strip()
+            start = int(match.start_offset)
+            end = int(match.end_offset)
+            if not lexeme_id or len(lexeme_id) > 256:
+                raise ValueError("retranslation match lexeme_id is invalid")
+            if len(concept_id) > 256 or len(str(match.dependency_fingerprint)) > 256:
+                raise ValueError("retranslation dependency identity is invalid")
+            if not 0 <= start < end <= len(source_text):
+                raise ValueError("retranslation match span is outside the source block")
+            if unicodedata.normalize("NFKC", source_text[start:end]) != unicodedata.normalize(
+                "NFKC", str(match.matched_form)
+            ):
+                raise ValueError("retranslation match source span drifted")
+            raw_rule_ids = match.applied_rule_ids or ()
+            if isinstance(raw_rule_ids, (str, bytes)):
+                raise ValueError("retranslation match rule IDs must be a sequence")
+            rule_ids = tuple(str(value).strip() for value in raw_rule_ids)
+            if (
+                len(rule_ids) > MAX_DEPENDENCY_RULE_IDS
+                or any(not value or len(value) > 256 for value in rule_ids)
+            ):
+                raise ValueError("retranslation match rule IDs are invalid")
+            dependency_groups.setdefault(("lexeme", lexeme_id), []).append(match)
+            if concept_id:
+                dependency_groups.setdefault(("concept", concept_id), []).append(match)
+            for rule_id in sorted(set(rule_ids)):
+                dependency_groups.setdefault(("rule", rule_id), []).append(match)
+
+        cursor = connection.execute(
+            """INSERT INTO translation_versions(
+                   block_id, pipeline, run_id, knowledge_version, status,
+                   draft_translation, final_translation, analysis,
+                   semantic_obligations, memory_summary, warnings_json,
+                   validation_status, validated_knowledge_version, active, created_at)
+               VALUES(?, 'parallel_v4', ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                      'clean', ?, 0, ?)""",
+            (
+                task["block_id"],
+                run_id,
+                frozen.knowledge_version,
+                frozen.status,
+                frozen.draft_translation or frozen.final_translation,
+                frozen.final_translation,
+                frozen.analysis,
+                frozen.semantic_obligations,
+                frozen.memory_summary,
+                json.dumps(_mutable_render_value(frozen.warnings), ensure_ascii=False),
+                frozen.knowledge_version,
+                utc_now(),
+            ),
+        )
+        replacement_id = int(cursor.lastrowid)
+        dependency_rows: List[tuple[Any, ...]] = []
+        for (dependency_type, dependency_id), group in sorted(
+            dependency_groups.items()
+        ):
+            dependency_rows.append(
+                (
+                    replacement_id,
+                    dependency_type,
+                    dependency_id,
+                    frozen.knowledge_version,
+                    *_dependency_row(dependency_type, dependency_id, group),
+                )
+            )
+        if not frozen.matched_renderings:
+            for concept_id in sorted(set(frozen.matched_concept_ids)):
+                concept_id = str(concept_id).strip()
+                if not concept_id or len(concept_id) > 256:
+                    raise ValueError("legacy retranslation concept ID is invalid")
+                fingerprint = hashlib.sha256(
+                    json.dumps(
+                        {
+                            "dependency_type": "concept",
+                            "dependency_id": concept_id,
+                        },
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    ).encode("utf-8")
+                ).hexdigest()
+                dependency_rows.append(
+                    (
+                        replacement_id,
+                        "concept",
+                        concept_id,
+                        frozen.knowledge_version,
+                        fingerprint,
+                        "",
+                        0,
+                        "",
+                        "[]",
+                        "[]",
+                    )
+                )
+        for claim_id, fingerprint in sorted(
+            {
+                (snapshot.claim_id, snapshot.semantic_fingerprint)
+                for snapshot in frozen.claim_dependencies
+            }
+        ):
+            claim_id = str(claim_id).strip()
+            if not claim_id or len(claim_id) > 256:
+                raise ValueError("retranslation claim dependency ID is invalid")
+            if re.fullmatch(r"[0-9a-f]{64}", str(fingerprint)) is None:
+                raise ValueError("retranslation claim dependency fingerprint is invalid")
+            dependency_rows.append(
+                (
+                    replacement_id,
+                    "claim",
+                    claim_id,
+                    frozen.knowledge_version,
+                    str(fingerprint),
+                    "",
+                    0,
+                    "",
+                    "[]",
+                    "[]",
+                )
+            )
+        if dependency_rows:
+            connection.executemany(
+                """INSERT INTO dependencies(
+                       translation_id, dependency_type, dependency_id,
+                       knowledge_version, dependency_fingerprint,
+                       matched_form, occurrence_count, rendered_target,
+                       applied_rule_ids_json, source_spans_json)
+                   VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                dependency_rows,
+            )
+        deactivated = connection.execute(
+            "UPDATE translation_versions SET active=0 WHERE id=? AND active=1",
+            (task["translation_id"],),
+        )
+        if deactivated.rowcount != 1:
+            raise ValueError("revalidation retranslation lost active translation CAS")
+        activated = connection.execute(
+            "UPDATE translation_versions SET active=1 WHERE id=? AND active=0",
+            (replacement_id,),
+        )
+        if activated.rowcount != 1:
+            raise ValueError("revalidation retranslation activation failed")
+        connection.execute(
+            "UPDATE blocks SET status=?, last_error=NULL, updated_at=? WHERE id=?",
+            (frozen.status, utc_now(), task["block_id"]),
+        )
+        return replacement_id
 
     def commit_revalidation_resolution(
         self,
@@ -11802,10 +12007,10 @@ class V4Database:
         }
         if status not in allowed:
             raise ValueError("invalid revalidation terminal status")
-        if status == "resolved_patch" and outcome is None:
-            raise ValueError("resolved_patch requires a full translation outcome")
-        if status != "resolved_patch" and outcome is not None:
-            raise ValueError("only resolved_patch may insert a translation outcome")
+        if status in {"resolved_patch", "resolved_retranslate"} and outcome is None:
+            raise ValueError(f"{status} requires a full translation outcome")
+        if status not in {"resolved_patch", "resolved_retranslate"} and outcome is not None:
+            raise ValueError("this revalidation status may not insert a translation outcome")
         stale_error: Optional[str] = None
         replacement_id: Optional[int] = None
         with self.transaction() as connection:
@@ -11817,13 +12022,17 @@ class V4Database:
                     connection, task, stored
                 )
             else:
-                self._record_revalidation_audits(
+                audit_ids = self._record_revalidation_audits(
                     connection,
                     task,
                     run_id,
                     tuple(audits) + tuple(outcome.audit_calls if outcome else ()),
                 )
-                if outcome is not None:
+                if outcome is not None and status == "resolved_retranslate":
+                    replacement_id = self._insert_revalidation_retranslation(
+                        connection, task, outcome, run_id
+                    )
+                elif outcome is not None:
                     if (
                         outcome.block.id != str(task["block_id"])
                         or outcome.knowledge_version != int(task["to_knowledge_version"])
@@ -12011,9 +12220,31 @@ class V4Database:
                         "UPDATE translation_versions SET active=1 WHERE id=? AND active=0",
                         (replacement_id,),
                     )
+                if status == "completed_with_warning":
+                    warned = connection.execute(
+                        """UPDATE translation_versions
+                           SET validation_status='warning_stale',
+                               validated_knowledge_version=?
+                           WHERE id=? AND block_id=? AND pipeline='parallel_v4'
+                             AND active=1""",
+                        (
+                            task["to_knowledge_version"],
+                            task["translation_id"],
+                            task["block_id"],
+                        ),
+                    )
+                    if warned.rowcount != 1:
+                        raise ValueError("warning fallback lost active translation CAS")
                 final_result = self._revalidation_base_result(task["result_json"])
                 final_result.update(dict(result))
                 final_result["payload_hash"] = claim.payload_hash
+                if status == "completed_with_warning":
+                    final_result["stale_change_ids"] = sorted(
+                        int(value) for value in final_result.get("change_ids", ())
+                    )
+                    final_result["last_audit_call_id"] = (
+                        audit_ids[-1] if audit_ids else None
+                    )
                 cursor = connection.execute(
                     """UPDATE revalidation_tasks
                        SET status=?, action=?, result_json=?,
@@ -12034,6 +12265,60 @@ class V4Database:
             raise ValueError(stale_error)
         return replacement_id
 
+    def complete_with_warning(
+        self,
+        claim: RevalidationClaim,
+        *,
+        error_category: str,
+        attempts: int,
+        error: str,
+        audits: Sequence[Mapping[str, Any]] = (),
+        run_id: Optional[str] = None,
+    ) -> None:
+        if error_category not in {"protocol", "structure", "external", "budget", "context"}:
+            raise ValueError("invalid revalidation warning category")
+        if type(attempts) is not int or attempts < 1:
+            raise ValueError("warning fallback attempts must be a positive integer")
+        stale_change_ids = sorted(
+            {
+                int(case["change_id"])
+                for case in claim.payload.get("cases", ())
+                if isinstance(case, Mapping) and type(case.get("change_id")) is int
+            }
+        )
+        self.commit_revalidation_resolution(
+            claim,
+            status="completed_with_warning",
+            action="warning_fallback",
+            result={
+                "reason": "retranslation_attempts_exhausted",
+                "error_category": error_category,
+                "attempts": attempts,
+                "error": str(error)[:1024],
+                "stale_change_ids": stale_change_ids,
+            },
+            audits=audits,
+            run_id=run_id,
+        )
+
+    def unfinished_revalidation_count(self) -> int:
+        with closing(self.connect()) as connection:
+            return int(
+                connection.execute(
+                    """SELECT COUNT(*) FROM revalidation_tasks
+                       WHERE status IN ('pending', 'validating')"""
+                ).fetchone()[0]
+            )
+
+    def warning_revalidation_count(self) -> int:
+        with closing(self.connect()) as connection:
+            return int(
+                connection.execute(
+                    """SELECT COUNT(*) FROM revalidation_tasks
+                       WHERE status='completed_with_warning'"""
+                ).fetchone()[0]
+            )
+
     def fail_revalidation_task(
         self,
         claim: RevalidationClaim,
@@ -12042,11 +12327,11 @@ class V4Database:
         audits: Sequence[Mapping[str, Any]] = (),
         run_id: Optional[str] = None,
     ) -> None:
-        self.commit_revalidation_resolution(
+        self.complete_with_warning(
             claim,
-            status="resolved_retranslate",
-            action="retranslate",
-            result={"reason": "protocol_exhausted", "error": str(error)[:1024]},
+            error_category="protocol",
+            attempts=1,
+            error=error,
             audits=audits,
             run_id=run_id,
         )
