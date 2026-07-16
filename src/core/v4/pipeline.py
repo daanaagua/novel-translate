@@ -37,6 +37,7 @@ from .models import (
 )
 from .narrative_memory import NarrativeContextOverflow, NarrativeMemoryStore
 from .narrative_models import (
+    DiscourseDelta,
     DiscourseState,
     NarrativePremapResult,
     NarrativeRetrieval,
@@ -1274,6 +1275,22 @@ class V4TranslationPipeline:
                 raise TypeError("retranslation requires a V4Block")
             bundle = self.database.freeze_render_bundle([block.id])
             self._active_render_bundle = bundle
+            active = self.database.active_translations("parallel_v4").get(
+                block.id, {}
+            )
+            if (
+                self.config.enable_narrative_premap
+                or int(active.get("memory_version") or 1) > 1
+                or bool(active.get("snapshot_id"))
+            ):
+                narrative_context = (
+                    self._retranslation_narrative_context(
+                        block, bundle.knowledge_version
+                    )
+                )
+                self._active_narrative_contexts = {
+                    block.id: narrative_context
+                }
             outcomes = self._translate_island(
                 Island(id=f"revalidate-{block.id}", blocks=[block]),
                 bundle.knowledge_version,
@@ -1284,6 +1301,76 @@ class V4TranslationPipeline:
             return outcomes[0]
 
         return translate_block
+
+    def _retranslation_narrative_context(
+        self, block: V4Block, knowledge_version: int
+    ) -> NarrativeBlockContext:
+        active = self.database.active_translations("parallel_v4").get(
+            block.id, {}
+        )
+        previous_snapshot = None
+        if active.get("snapshot_id"):
+            previous_snapshot = self.narrative_store.load_snapshot(
+                str(active["snapshot_id"])
+            )
+        if previous_snapshot is None:
+            previous_snapshot = (
+                self.narrative_store.latest_snapshot_for_block(block.id)
+            )
+        discourse_state = (
+            previous_snapshot.discourse_state
+            if previous_snapshot is not None
+            else DiscourseState()
+        )
+        result = (
+            self.narrative_store.latest_premap_result_for_block(block.id)
+            or NarrativePremapResult(
+                semantic_relations=(),
+                memory_candidates=(),
+                discourse_delta=DiscourseDelta(),
+                validation_warnings=(
+                    "retranslation reused persisted discourse without "
+                    "a cached premap result",
+                ),
+                degraded=True,
+            )
+        )
+        provisional_subjects = self._provisional_subjects(
+            block, discourse_state
+        )
+        matched_subject_ids = tuple(
+            value["id"] for value in provisional_subjects
+        )
+        snapshot = self.narrative_store.build_snapshot(
+            block,
+            knowledge_version=knowledge_version,
+            memory_version=self.narrative_store.current_memory_version(),
+            discourse_state=discourse_state,
+        )
+        semantic_relation_memory_ids = tuple(
+            dict.fromkeys(
+                memory_id
+                for relation in result.semantic_relations
+                for memory_id in relation.related_memory_ids
+            )
+        )
+        retrieval = self.narrative_store.retrieve_for_block(
+            block,
+            snapshot,
+            matched_subject_ids=matched_subject_ids,
+            semantic_relation_memory_ids=semantic_relation_memory_ids,
+            max_chars=self.config.max_narrative_context_chars,
+        )
+        return NarrativeBlockContext(
+            result=result,
+            snapshot=snapshot,
+            retrieval=retrieval,
+            signals=self._narrative_signals(
+                block, result, discourse_state, discourse_state
+            ),
+            matched_subject_ids=matched_subject_ids,
+            source_structure=self._source_structure(block),
+        )
 
     def _run_narrative(
         self, candidates: Sequence[V4Block]

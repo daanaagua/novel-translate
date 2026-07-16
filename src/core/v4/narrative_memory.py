@@ -343,6 +343,37 @@ class NarrativeMemoryStore:
             snapshot_hash=str(row["snapshot_hash"]),
         )
 
+    def latest_snapshot_for_block(
+        self, block_id: str
+    ) -> NarrativeSnapshot | None:
+        with closing(self.database.connect()) as connection:
+            row = connection.execute(
+                """SELECT id FROM narrative_snapshots
+                   WHERE block_id=?
+                   ORDER BY memory_version DESC, knowledge_version DESC,
+                            created_at DESC, id DESC
+                   LIMIT 1""",
+                (block_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        return self.load_snapshot(str(row["id"]))
+
+    def latest_premap_result_for_block(
+        self, block_id: str
+    ) -> NarrativePremapResult | None:
+        with closing(self.database.connect()) as connection:
+            row = connection.execute(
+                """SELECT cache_key FROM premap_results
+                   WHERE block_id=? AND status!='rejected'
+                   ORDER BY created_at DESC, id DESC
+                   LIMIT 1""",
+                (block_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        return self.load_premap_result(str(row["cache_key"]))
+
     def snapshot_for_cache(
         self, cache_key: str
     ) -> NarrativeSnapshot | None:

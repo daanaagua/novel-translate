@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 
 import pytest
 
@@ -217,6 +218,80 @@ def test_memory_change_only_plans_actual_dependents(tmp_path):
     ]
 
 
+def test_memory_planner_does_not_advertise_unsupported_local_patch(tmp_path):
+    database, blocks = _seed_database(tmp_path)
+    store = NarrativeMemoryStore(database)
+    first = store.merge_candidates(
+        blocks[0],
+        [
+            _candidate(
+                "M-address",
+                "The gate is locked.",
+                "The gate is locked",
+            )
+        ],
+    )
+    memory_id = first.memory_ids[0]
+    _insert_translation(
+        database,
+        block_id=blocks[1].id,
+        memory_version=first.memory_version,
+        final_translation="阁下，门锁着。",
+        memory_id=memory_id,
+    )
+    with database.transaction() as connection:
+        version = int(
+            connection.execute(
+                """INSERT INTO memory_versions(
+                       parent_id, reason, source_global_index, created_at)
+                   VALUES(?, 'address update', 1, 'now')""",
+                (first.memory_version,),
+            ).lastrowid
+        )
+        old_fingerprint = str(
+            connection.execute(
+                """SELECT semantic_fingerprint
+                   FROM narrative_memories WHERE id=?""",
+                (memory_id,),
+            ).fetchone()[0]
+        )
+        change_id = int(
+            connection.execute(
+                """INSERT INTO memory_changes(
+                       memory_version, subject_type, subject_id, change_kind,
+                       old_fingerprint, new_fingerprint, impact_level,
+                       payload_json, created_at)
+                   VALUES(?, 'narrative_memory', ?,
+                          'render_only_address', ?, 'new-fingerprint', 1,
+                          ?, 'now')""",
+                (
+                    version,
+                    memory_id,
+                    old_fingerprint,
+                    json.dumps(
+                        {
+                            "exact_unique_render_change": True,
+                            "old_rendered_target": "阁下",
+                            "new_rendered_target": "大人",
+                        }
+                    ),
+                ),
+            ).lastrowid
+        )
+
+    RevalidationPlanner(database).plan_memory([change_id])
+
+    with database.connect() as connection:
+        result = json.loads(
+            str(
+                connection.execute(
+                    "SELECT result_json FROM revalidation_tasks"
+                ).fetchone()[0]
+            )
+        )
+    assert result["recommended_action"] == "retranslate"
+
+
 def test_failed_memory_retranslation_keeps_old_active_translation(tmp_path):
     database, blocks = _seed_database(tmp_path)
     _memory_id, change_id = _retire_memory(database, blocks)
@@ -303,3 +378,63 @@ def test_successful_memory_retranslation_commits_target_memory_snapshot(
             )
         }
     assert {"narrative_snapshot", "discourse_state"} <= dependency_types
+
+
+def test_production_retranslation_factory_rebuilds_current_narrative_context(
+    tmp_path,
+):
+    from src.core.v4.pipeline import V4PipelineConfig, V4TranslationPipeline
+
+    database, blocks = _seed_database(tmp_path)
+    _memory_id, _change_id = _retire_memory(database, blocks)
+    store = NarrativeMemoryStore(database)
+    old_snapshot = store.build_snapshot(
+        blocks[1],
+        knowledge_version=database.current_knowledge_version(),
+        memory_version=2,
+        discourse_state=DiscourseState(
+            scene_location="the-gate",
+        ),
+    )
+    with database.transaction() as connection:
+        connection.execute(
+            """UPDATE translation_versions SET snapshot_id=?
+               WHERE block_id='block-1' AND active=1""",
+            (old_snapshot.id,),
+        )
+    pipeline = V4TranslationPipeline(
+        database,
+        lambda: object(),
+        config=V4PipelineConfig(enable_narrative_premap=True),
+    )
+
+    def fake_translate_island(island, knowledge_version, concept_snapshot):
+        context = pipeline._active_narrative_contexts[blocks[1].id]
+        return [
+            TranslationOutcome(
+                block=blocks[1],
+                knowledge_version=knowledge_version,
+                memory_version=context.snapshot.memory_version,
+                snapshot_id=context.snapshot.id,
+                context_hash=hashlib.sha256(b"context").hexdigest(),
+                discourse_state_hash=hashlib.sha256(
+                    json.dumps(
+                        context.snapshot.discourse_state.to_dict(),
+                        ensure_ascii=False,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    ).encode("utf-8")
+                ).hexdigest(),
+                status=V4BlockStatus.COMPLETED.value,
+                final_translation="重译",
+            )
+        ]
+
+    pipeline._translate_island = fake_translate_island
+    outcome = pipeline.translate_block_factory()(blocks[1])
+
+    assert outcome.memory_version == store.current_memory_version()
+    assert outcome.snapshot_id != old_snapshot.id
+    assert pipeline._active_narrative_contexts[
+        blocks[1].id
+    ].snapshot.discourse_state.scene_location == "the-gate"

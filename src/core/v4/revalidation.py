@@ -805,7 +805,6 @@ class RevalidationPlanner:
         persisted_details = persisted_details or {}
         subjects: set[tuple[str, str]] = set()
         reasons: list[dict[str, Any]] = []
-        safe_patch = True
         for change_id in sorted(change_ids):
             row = change_rows[change_id]
             detail = candidate.changes.get(change_id)
@@ -822,19 +821,6 @@ class RevalidationPlanner:
                 }
                 vias = ["persisted_memory_change"]
             subjects.update(change_subjects)
-            try:
-                payload = json.loads(str(row["payload_json"] or "{}"))
-            except (TypeError, ValueError, json.JSONDecodeError):
-                payload = {}
-            exact_unique = bool(
-                isinstance(payload, dict)
-                and payload.get("exact_unique_render_change")
-            )
-            safe_patch = bool(
-                safe_patch
-                and int(row["impact_level"]) == 1
-                and exact_unique
-            )
             reasons.append(
                 {
                     "change_id": change_id,
@@ -866,9 +852,10 @@ class RevalidationPlanner:
                 "reasons": reasons,
                 "omitted_reasons": 0,
                 "source_hash": candidate.source_hash,
-                "recommended_action": (
-                    "safe_patch" if safe_patch else "retranslate"
-                ),
+                # Narrative changes alter the frozen snapshot/version.  A local
+                # string replacement cannot safely mint the replacement
+                # snapshot, so the bounded automatic action is full retranslation.
+                "recommended_action": "retranslate",
             }
         )
 
