@@ -13,6 +13,7 @@ from src.core.v4.matcher import (
 )
 from src.core.v4 import matcher as matcher_module
 from src.core.v4.models import TranslationOutcome, V4BlockStatus
+from src.core.v4.revalidation import RevalidationPlanner
 
 
 def _db(tmp_path, texts):
@@ -1110,11 +1111,27 @@ def test_atomic_finish_detects_changed_signature_and_rolls_back_on_failure(
         ],
     )
     original = db._concept_snapshot_from_connection
+    change_ids = []
 
     def change_inside_finish(connection):
+        old_state = db._render_state_for_subject(connection, "concept", concept_id)
         connection.execute(
             "UPDATE concepts SET working_target='新译名' WHERE id=?", (concept_id,)
         )
+        changed_version = db.create_knowledge_version(
+            "test changed knowledge during finish", connection
+        )
+        change = db.record_render_change(
+            connection,
+            subject_type="concept",
+            subject_id=concept_id,
+            old_state=old_state,
+            new_state=db._render_state_for_subject(connection, "concept", concept_id),
+            change_kind="target",
+            reason="test changed knowledge during finish",
+            knowledge_version=changed_version,
+        )
+        change_ids.append(change["change_id"])
         return original(connection)
 
     monkeypatch.setattr(db, "_concept_snapshot_from_connection", change_inside_finish)
@@ -1123,7 +1140,12 @@ def test_atomic_finish_detects_changed_signature_and_rolls_back_on_failure(
     )
     assert status == "completed_with_errors"
     assert knowledge_stale is True
-    assert db.active_translations()[block.id]["status"] == "needs_revalidate"
+    assert db.active_translations()[block.id]["status"] == "completed"
+    assert db.get_block_by_identifier(block.id).status == "completed"
+    planned = RevalidationPlanner(db).plan(change_ids)
+    assert planned["planned"] == 1
+    assert db.status_summary()["needs_revalidate"] == 1
+    assert db.active_translations()[block.id]["status"] == "completed"
 
     db.start_run("failure-run", "translate", {})
     monkeypatch.setattr(

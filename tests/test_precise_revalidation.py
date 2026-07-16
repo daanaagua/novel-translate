@@ -10,6 +10,7 @@ import pytest
 from src.core.v4.context import ContextBuilder
 from src.core.v4.database import KnowledgeSnapshotError, V4Database, render_fingerprint
 from src.core.v4.pipeline import V4TranslationPipeline
+from src.core.v4.revalidation import RevalidationPlanner
 import src.core.v4.models as v4_models
 from src.core.v4.coreference import cache_key, semantic_cache_key
 from src.core.v4.models import (
@@ -72,6 +73,86 @@ def _match(
         applied_rule_ids=tuple(rule_ids),
         dependency_fingerprint=fingerprint,
     )
+
+
+def _insert_revalidation_change(
+    database,
+    *,
+    subject_type="lexeme",
+    subject_id="lexeme-test",
+    impact=1,
+    old_fingerprint="old-fingerprint",
+    new_fingerprint="new-fingerprint",
+    change_kind="target",
+    payload=None,
+):
+    with database.transaction() as connection:
+        version = database.create_knowledge_version(
+            f"revalidation test {subject_type}:{subject_id}", connection
+        )
+        return int(
+            connection.execute(
+                """INSERT INTO knowledge_changes(
+                       knowledge_version, subject_type, subject_id, change_kind,
+                       old_fingerprint, new_fingerprint, impact_level,
+                       payload_json, created_at)
+                   VALUES(?, ?, ?, ?, ?, ?, ?, ?, 'now')""",
+                (
+                    version,
+                    subject_type,
+                    subject_id,
+                    change_kind,
+                    old_fingerprint,
+                    new_fingerprint,
+                    impact,
+                    json.dumps(payload or {}, sort_keys=True),
+                ),
+            ).lastrowid
+        )
+
+
+def _insert_revalidation_translation(
+    database,
+    block_id,
+    *,
+    pipeline="parallel_v4",
+    translation_status="completed",
+    block_status="completed",
+    active=1,
+    dependency=None,
+):
+    with database.transaction() as connection:
+        connection.execute(
+            "UPDATE blocks SET status=? WHERE id=?", (block_status, block_id)
+        )
+        version = int(
+            connection.execute("SELECT MAX(id) FROM knowledge_versions").fetchone()[0]
+        )
+        translation_id = int(
+            connection.execute(
+                """INSERT INTO translation_versions(
+                       block_id, pipeline, knowledge_version, status,
+                       final_translation, active, created_at)
+                   VALUES(?, ?, ?, ?, 'translated', ?, 'now')""",
+                (block_id, pipeline, version, translation_status, active),
+            ).lastrowid
+        )
+        if dependency is not None:
+            dependency_type, dependency_id, fingerprint = dependency
+            connection.execute(
+                """INSERT INTO dependencies(
+                       translation_id, dependency_type, dependency_id,
+                       knowledge_version, dependency_fingerprint)
+                   VALUES(?, ?, ?, ?, ?)""",
+                (
+                    translation_id,
+                    dependency_type,
+                    dependency_id,
+                    version,
+                    fingerprint,
+                ),
+            )
+    return translation_id
 
 
 def _coreference_semantic_case():
@@ -1555,3 +1636,439 @@ def test_full_translation_context_is_frozen_at_k0_and_mixed_bundle_is_rejected(
             frozen.knowledge_version,
             mixed_bundle.index,
         )
+
+
+def test_revalidation_planner_enforces_translation_and_block_hard_conditions(tmp_path):
+    database = _database(
+        tmp_path,
+        ["ready", "no active", "serial only", "parallel active"],
+    )
+    change_id = _insert_revalidation_change(
+        database, subject_type="concept", subject_id="concept-hard"
+    )
+    _insert_revalidation_translation(
+        database,
+        "block-0",
+        block_status="ready",
+        dependency=("concept", "concept-hard", "old-fingerprint"),
+    )
+    _insert_revalidation_translation(
+        database,
+        "block-1",
+        active=0,
+        dependency=("concept", "concept-hard", "old-fingerprint"),
+    )
+    _insert_revalidation_translation(
+        database,
+        "block-2",
+        pipeline="serial_v3",
+        dependency=("concept", "concept-hard", "old-fingerprint"),
+    )
+    valid_translation = _insert_revalidation_translation(
+        database,
+        "block-3",
+        dependency=("concept", "concept-hard", "old-fingerprint"),
+    )
+
+    result = RevalidationPlanner(database).plan([change_id])
+
+    assert result["planned"] == 1
+    with closing(database.connect()) as connection:
+        tasks = connection.execute(
+            "SELECT * FROM revalidation_tasks ORDER BY translation_id"
+        ).fetchall()
+        block_statuses = dict(connection.execute("SELECT id, status FROM blocks"))
+    assert [row["translation_id"] for row in tasks] == [valid_translation]
+    assert tasks[0]["status"] == "pending"
+    assert tasks[0]["attempts"] == 0
+    assert tasks[0]["action"] == ""
+    assert block_statuses == {
+        "block-0": "ready",
+        "block-1": "completed",
+        "block-2": "completed",
+        "block-3": "completed",
+    }
+
+
+def test_revalidation_planner_rejects_unknown_and_skips_non_effective_changes(tmp_path):
+    database = _database(tmp_path, ["valid"])
+    translation_id = _insert_revalidation_translation(
+        database,
+        "block-0",
+        dependency=("lexeme", "lexeme-test", "old-fingerprint"),
+    )
+    zero = _insert_revalidation_change(database, impact=0)
+    same = _insert_revalidation_change(
+        database,
+        old_fingerprint="same-fingerprint",
+        new_fingerprint="same-fingerprint",
+    )
+    effective = _insert_revalidation_change(database)
+    planner = RevalidationPlanner(database)
+
+    assert planner.plan([])["planned"] == 0
+    with pytest.raises(KeyError, match="unknown knowledge change"):
+        planner.plan([effective, 999_999])
+    result = planner.plan([str(effective), zero, same, effective])
+
+    assert result["planned"] == 1
+    with closing(database.connect()) as connection:
+        task = connection.execute("SELECT * FROM revalidation_tasks").fetchone()
+    assert task["translation_id"] == translation_id
+    assert json.loads(task["result_json"])["change_ids"] == [effective]
+
+
+def test_revalidation_planner_uses_fresh_occurrences_without_regex_and_filters_stale(
+    tmp_path, monkeypatch
+):
+    database = _database(tmp_path, ["NovelName appeared.", "NovelName vanished."])
+    concept_id = database.import_legacy_concept("NovelName", "", "person", "new")
+    with database.transaction() as connection:
+        lexeme_id = str(
+            connection.execute(
+                "SELECT primary_lexeme_id FROM concepts WHERE id=?", (concept_id,)
+            ).fetchone()[0]
+        )
+        rows = connection.execute(
+            "SELECT id, source_hash FROM blocks ORDER BY global_index"
+        ).fetchall()
+        connection.executemany(
+            """INSERT INTO form_occurrences(
+                   lexeme_id, block_id, start_offset, end_offset,
+                   source_form, source_hash, created_at)
+               VALUES(?, ?, 0, 9, 'NovelName', ?, 'now')""",
+            [
+                (lexeme_id, rows[0]["id"], rows[0]["source_hash"]),
+                (lexeme_id, rows[1]["id"], "stale-source-hash"),
+            ],
+        )
+    valid_translation = _insert_revalidation_translation(database, "block-0")
+    _insert_revalidation_translation(database, "block-1")
+    change_id = _insert_revalidation_change(
+        database,
+        subject_type="lexeme",
+        subject_id=lexeme_id,
+        old_fingerprint="",
+        new_fingerprint="new-lexeme-fingerprint",
+        change_kind="source_form_added",
+    )
+    monkeypatch.setattr(
+        re,
+        "compile",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("planner must not compile whole-book regexes")
+        ),
+    )
+
+    assert RevalidationPlanner(database).plan([change_id])["planned"] == 1
+    with closing(database.connect()) as connection:
+        tasks = connection.execute(
+            "SELECT translation_id, result_json FROM revalidation_tasks"
+        ).fetchall()
+    assert [row["translation_id"] for row in tasks] == [valid_translation]
+    payload = json.loads(tasks[0]["result_json"])
+    assert payload["source_hash"] == hashlib.sha256(
+        "NovelName appeared.".encode("utf-8")
+    ).hexdigest()
+    assert "NovelName appeared." not in tasks[0]["result_json"]
+
+
+def test_revalidation_pending_is_idempotent_and_merges_supersets_canonically(tmp_path):
+    database = _database(tmp_path, ["Alpha"])
+    _insert_revalidation_translation(
+        database,
+        "block-0",
+        dependency=("concept", "concept-merge", "translation-fingerprint"),
+    )
+    first = _insert_revalidation_change(
+        database,
+        subject_type="concept",
+        subject_id="concept-merge",
+        impact=1,
+        new_fingerprint="new-one",
+    )
+    second = _insert_revalidation_change(
+        database,
+        subject_type="concept",
+        subject_id="concept-merge",
+        impact=3,
+        new_fingerprint="new-two",
+    )
+    planner = RevalidationPlanner(database)
+
+    planner.plan([first])
+    with closing(database.connect()) as connection:
+        before = connection.execute("SELECT * FROM revalidation_tasks").fetchone()
+        before_tuple = (before["id"], before["attempts"], before["created_at"])
+    planner.plan([first, first])
+    planner.plan([second, first])
+    planner.plan([first])
+
+    with closing(database.connect()) as connection:
+        tasks = connection.execute("SELECT * FROM revalidation_tasks").fetchall()
+    assert len(tasks) == 1
+    task = tasks[0]
+    assert (task["id"], task["attempts"], task["created_at"]) == before_tuple
+    assert task["impact_level"] == 3
+    assert json.loads(task["result_json"])["change_ids"] == [first, second]
+    expected_hash = hashlib.sha256(
+        json.dumps(
+            {
+                "change_ids": [first, second],
+                "to_knowledge_version": task["to_knowledge_version"],
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+    assert task["change_set_hash"] == expected_hash
+
+
+def test_revalidation_validating_snapshot_is_immutable_with_pending_successor(tmp_path):
+    database = _database(tmp_path, ["Alpha"])
+    _insert_revalidation_translation(
+        database,
+        "block-0",
+        dependency=("concept", "concept-validating", "translation-fingerprint"),
+    )
+    first = _insert_revalidation_change(
+        database, subject_type="concept", subject_id="concept-validating"
+    )
+    second = _insert_revalidation_change(
+        database,
+        subject_type="concept",
+        subject_id="concept-validating",
+        new_fingerprint="newer-fingerprint",
+    )
+    planner = RevalidationPlanner(database)
+    planner.plan([first])
+    with database.transaction() as connection:
+        connection.execute(
+            "UPDATE revalidation_tasks SET status='validating' WHERE status='pending'"
+        )
+    with closing(database.connect()) as connection:
+        validating_before = tuple(
+            connection.execute(
+                "SELECT * FROM revalidation_tasks WHERE status='validating'"
+            ).fetchone()
+        )
+
+    planner.plan([first, second])
+
+    with closing(database.connect()) as connection:
+        validating_after = tuple(
+            connection.execute(
+                "SELECT * FROM revalidation_tasks WHERE status='validating'"
+            ).fetchone()
+        )
+        pending = connection.execute(
+            "SELECT * FROM revalidation_tasks WHERE status='pending'"
+        ).fetchone()
+    assert validating_after == validating_before
+    assert json.loads(pending["result_json"])["change_ids"] == [second]
+
+
+def test_revalidation_retires_inactive_pending_and_plans_replacement(tmp_path):
+    database = _database(tmp_path, ["Alpha"])
+    old_translation = _insert_revalidation_translation(
+        database,
+        "block-0",
+        dependency=("concept", "concept-replacement", "old"),
+    )
+    change_id = _insert_revalidation_change(
+        database, subject_type="concept", subject_id="concept-replacement"
+    )
+    planner = RevalidationPlanner(database)
+    planner.plan([change_id])
+    with database.transaction() as connection:
+        connection.execute(
+            "UPDATE translation_versions SET active=0 WHERE id=?", (old_translation,)
+        )
+        version = int(
+            connection.execute("SELECT MAX(id) FROM knowledge_versions").fetchone()[0]
+        )
+        new_translation = int(
+            connection.execute(
+                """INSERT INTO translation_versions(
+                       block_id, pipeline, knowledge_version, status,
+                       final_translation, active, created_at)
+                   VALUES('block-0', 'parallel_v4', ?, 'completed', 'new', 1, 'new')""",
+                (version,),
+            ).lastrowid
+        )
+        connection.execute(
+            """INSERT INTO dependencies(
+                   translation_id, dependency_type, dependency_id,
+                   knowledge_version, dependency_fingerprint)
+               VALUES(?, 'concept', 'concept-replacement', ?, 'old')""",
+            (new_translation, version),
+        )
+
+    planner.plan([change_id])
+
+    with closing(database.connect()) as connection:
+        rows = connection.execute(
+            "SELECT translation_id, status, result_json FROM revalidation_tasks ORDER BY translation_id"
+        ).fetchall()
+    assert [(row["translation_id"], row["status"]) for row in rows] == [
+        (old_translation, "resolved_noop"),
+        (new_translation, "pending"),
+    ]
+    assert json.loads(rows[0]["result_json"])["reason"] == "translation_inactive"
+
+
+def test_status_summary_derives_revalidation_without_overwriting_block_status(tmp_path):
+    database = _database(tmp_path, ["Alpha", "Beta"])
+    _insert_revalidation_translation(
+        database,
+        "block-0",
+        dependency=("claim", "claim-summary", "old"),
+    )
+    _insert_revalidation_translation(
+        database,
+        "block-1",
+        dependency=("claim", "claim-summary", "old"),
+    )
+    change_id = _insert_revalidation_change(
+        database, subject_type="claim", subject_id="claim-summary"
+    )
+    RevalidationPlanner(database).plan([change_id])
+
+    summary = database.status_summary()
+
+    assert summary["completed"] == 2
+    assert summary["needs_revalidate"] == 2
+    assert summary["needs_revalidate_translations"] == 2
+    assert all(block.status == "completed" for block in database.list_blocks())
+
+
+def test_revalidation_trigger_failure_rolls_back_all_task_changes(tmp_path):
+    database = _database(tmp_path, ["Alpha"])
+    _insert_revalidation_translation(
+        database,
+        "block-0",
+        dependency=("concept", "concept-trigger", "old"),
+    )
+    first = _insert_revalidation_change(
+        database, subject_type="concept", subject_id="concept-trigger"
+    )
+    second = _insert_revalidation_change(
+        database,
+        subject_type="concept",
+        subject_id="concept-trigger",
+        new_fingerprint="new-two",
+    )
+    planner = RevalidationPlanner(database)
+    planner.plan([first])
+    with closing(database.connect()) as connection:
+        before = tuple(connection.execute("SELECT * FROM revalidation_tasks").fetchone())
+    with database.transaction() as connection:
+        connection.execute(
+            """CREATE TRIGGER fail_revalidation_update
+               BEFORE UPDATE ON revalidation_tasks
+               BEGIN SELECT RAISE(ABORT, 'task update failed'); END"""
+        )
+
+    with pytest.raises(sqlite3.IntegrityError, match="task update failed"):
+        planner.plan([second])
+
+    with closing(database.connect()) as connection:
+        after = tuple(connection.execute("SELECT * FROM revalidation_tasks").fetchone())
+    assert after == before
+
+
+def test_revalidation_does_not_trust_arbitrary_payload_subjects(tmp_path):
+    database = _database(tmp_path, ["Alpha"])
+    _insert_revalidation_translation(
+        database,
+        "block-0",
+        dependency=("concept", "forged-concept", "old"),
+    )
+    change_id = _insert_revalidation_change(
+        database,
+        subject_type="lexeme",
+        subject_id="unrelated-lexeme",
+        payload={"subject_type": "concept", "subject_id": "forged-concept"},
+    )
+
+    assert RevalidationPlanner(database).plan([change_id])["planned"] == 0
+    with closing(database.connect()) as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM revalidation_tasks"
+        ).fetchone()[0] == 0
+
+
+def test_revalidation_plans_all_real_translations_but_not_ready_blocks(tmp_path):
+    translated = _database(tmp_path / "translated", [f"Alpha {i}" for i in range(36)])
+    for index in range(36):
+        _insert_revalidation_translation(
+            translated,
+            f"block-{index}",
+            dependency=("concept", "concept-many", "old"),
+        )
+    change_id = _insert_revalidation_change(
+        translated, subject_type="concept", subject_id="concept-many"
+    )
+    assert RevalidationPlanner(translated).plan([change_id])["planned"] == 36
+
+    ready = _database(tmp_path / "ready", [f"Alpha {i}" for i in range(36)])
+    ready_change = _insert_revalidation_change(
+        ready, subject_type="concept", subject_id="concept-many"
+    )
+    assert RevalidationPlanner(ready).plan([ready_change])["planned"] == 0
+    assert all(block.status == "ready" for block in ready.list_blocks())
+
+
+def test_revalidation_planner_is_a_public_v4_entry_point():
+    from src.core.v4 import RevalidationPlanner as PublicRevalidationPlanner
+
+    assert PublicRevalidationPlanner is RevalidationPlanner
+
+
+def test_revalidation_scale_uses_bounded_index_queries_for_ten_thousand_occurrences(
+    tmp_path, monkeypatch
+):
+    texts = [f"Alpha {index}" for index in range(10_000)]
+    database = _database(tmp_path, texts)
+    concept_id = database.import_legacy_concept("Alpha", "", "person", "scale")
+    with database.transaction() as connection:
+        lexeme_id = str(
+            connection.execute(
+                "SELECT primary_lexeme_id FROM concepts WHERE id=?", (concept_id,)
+            ).fetchone()[0]
+        )
+        rows = connection.execute(
+            "SELECT id, source_hash FROM blocks ORDER BY global_index"
+        ).fetchall()
+        connection.executemany(
+            """INSERT INTO form_occurrences(
+                   lexeme_id, block_id, start_offset, end_offset,
+                   source_form, source_hash, created_at)
+               VALUES(?, ?, 0, 5, 'Alpha', ?, 'now')""",
+            [(lexeme_id, row["id"], row["source_hash"]) for row in rows],
+        )
+    change_id = _insert_revalidation_change(
+        database,
+        subject_type="lexeme",
+        subject_id=lexeme_id,
+        old_fingerprint="",
+        new_fingerprint="new-scale-fingerprint",
+        change_kind="source_form_added",
+    )
+    before_size = database.path.stat().st_size
+    statements = []
+    original_connect = database.connect
+
+    def traced_connect():
+        connection = original_connect()
+        connection.set_trace_callback(statements.append)
+        return connection
+
+    monkeypatch.setattr(database, "connect", traced_connect)
+
+    result = RevalidationPlanner(database).plan([change_id])
+
+    assert result["planned"] == 0
+    assert len(statements) < 80
+    assert database.path.stat().st_size <= before_size + 4096
+    assert all(block.status == "ready" for block in database.list_blocks())

@@ -19,6 +19,7 @@ from src.core.v4.exporter import ParallelV4BookExporter
 from src.core.v4.migration import V4Migrator
 from src.core.v4.models import ScanOutcome, ScanResponse
 from src.core.v4.repairer import V4Repairer
+from src.core.v4.revalidation import RevalidationPlanner
 from src.core.v4.verifier import V4Verifier
 from src.core.v4.web_review import create_review_server
 
@@ -262,15 +263,29 @@ class ParallelV4V2Tests(unittest.TestCase):
         result = self.database.lock_concept_translation(
             "Archon", "阁下", kind="title"
         )
-        self.assertEqual(result["affected_translations"], 1)
+        self.assertEqual(result["affected_translations"], 0)
         concept = self.database.concepts_for_text("Archon")[0]
         self.assertEqual(concept["default_target"], "阁下")
         self.assertTrue(concept["locked"])
         active = self.database.active_translations()[block.id]
-        self.assertEqual(active["status"], "needs_revalidate")
+        self.assertEqual(active["status"], "completed")
         self.assertEqual(
             self.database.get_block_by_identifier(block.id).status,
-            "needs_revalidate",
+            "completed",
+        )
+        with closing(self.database.connect()) as connection:
+            change_ids = [
+                row[0]
+                for row in connection.execute(
+                    "SELECT id FROM knowledge_changes WHERE knowledge_version=?",
+                    (result["knowledge_version"],),
+                )
+            ]
+        planned = RevalidationPlanner(self.database).plan(change_ids)
+        self.assertEqual(planned["planned"], 1)
+        self.assertEqual(self.database.status_summary()["needs_revalidate"], 1)
+        self.assertEqual(
+            self.database.active_translations()[block.id]["status"], "completed"
         )
 
     def insert_translations(self):

@@ -18,6 +18,7 @@ from src.core.v4.models import (
 )
 from src.core.v4.pipeline import V4TranslationPipeline
 from src.core.v4.pipeline import V4PipelineConfig
+from src.core.v4.revalidation import RevalidationPlanner
 from src.core.v4.target_resolver import TargetResolver
 
 
@@ -835,7 +836,7 @@ def test_empty_effective_target_is_context_only_and_never_a_glossary_item(tmp_pa
     assert glossary.glossary.items == []
 
 
-def test_target_change_invalidates_dependency_history_and_ready_matches(tmp_path):
+def test_target_change_records_change_then_planner_targets_only_active_translation(tmp_path):
     database = _database(
         tmp_path,
         ["Severian waited.", "Severian returned.", "No name here."],
@@ -864,6 +865,24 @@ def test_target_change_invalidates_dependency_history_and_ready_matches(tmp_path
             (blocks[0].id,),
         )
         connection.execute(
+            """INSERT INTO dependencies(
+                   translation_id, dependency_type, dependency_id, knowledge_version,
+                   dependency_fingerprint)
+               SELECT id, 'concept', ?, 1, 'old-fingerprint'
+               FROM translation_versions
+               WHERE block_id=? AND pipeline='parallel_v4' AND active=1""",
+            (concept_id, blocks[0].id),
+        )
+        connection.execute(
+            """INSERT INTO dependencies(
+                   translation_id, dependency_type, dependency_id, knowledge_version,
+                   dependency_fingerprint)
+               SELECT tv.id, 'lexeme', c.primary_lexeme_id, 1, 'old-fingerprint'
+               FROM translation_versions tv JOIN concepts c ON c.id=?
+               WHERE tv.block_id=? AND tv.pipeline='parallel_v4' AND tv.active=1""",
+            (concept_id, blocks[0].id),
+        )
+        connection.execute(
             "UPDATE blocks SET status='completed' WHERE id=?", (blocks[0].id,)
         )
 
@@ -871,11 +890,22 @@ def test_target_change_invalidates_dependency_history_and_ready_matches(tmp_path
         [{"concept_id": concept_id, "target": "塞万里安", "rules": []}]
     )
 
-    assert result["affected_blocks"] == 2
+    with closing(database.connect()) as connection:
+        change_ids = [
+            row[0]
+            for row in connection.execute(
+                "SELECT id FROM knowledge_changes WHERE knowledge_version=?",
+                (result["knowledge_version"],),
+            )
+        ]
+    planned = RevalidationPlanner(database).plan(change_ids)
+
+    assert result["affected_blocks"] == 0
+    assert planned["planned"] == 1
     active = database.active_translations()
-    assert active[blocks[0].id]["status"] == "needs_revalidate"
-    assert database.get_block_by_identifier(blocks[0].id).status == "needs_revalidate"
-    assert database.get_block_by_identifier(blocks[1].id).status == "needs_revalidate"
+    assert active[blocks[0].id]["status"] == "completed"
+    assert database.get_block_by_identifier(blocks[0].id).status == "completed"
+    assert database.get_block_by_identifier(blocks[1].id).status == "ready"
     assert database.get_block_by_identifier(blocks[2].id).status == "ready"
 
 
@@ -1091,7 +1121,7 @@ def test_freeze_reads_version_and_targets_from_one_sqlite_snapshot(tmp_path, mon
     assert database.concepts_for_text("Severian")[0]["default_target"] == "新译名"
 
 
-def test_midrun_target_change_stops_before_mixing_and_revalidates_run(tmp_path):
+def test_midrun_target_change_stops_before_mixing_without_mutating_block_status(tmp_path):
     database = _database(
         tmp_path, ["Severian waited long enough.", "Severian returned home."]
     )
@@ -1117,12 +1147,9 @@ def test_midrun_target_change_stops_before_mixing_and_revalidates_run(tmp_path):
     assert result["knowledge_stale"] is True
     assert len(pipeline.seen) == 1
     assert pipeline.seen[0][1] == ["塞万里安"]
-    assert all(
-        block.status == V4BlockStatus.NEEDS_REVALIDATE.value
-        for block in database.list_blocks()
-    )
+    assert [block.status for block in database.list_blocks()] == ["completed", "ready"]
     assert set(database.active_translations()) == {"block_000"}
-    assert database.active_translations()["block_000"]["status"] == "needs_revalidate"
+    assert database.active_translations()["block_000"]["status"] == "completed"
     with closing(database.connect()) as connection:
         assert connection.execute(
             "SELECT status FROM runs WHERE id=?", (result["run_id"],)
@@ -1161,7 +1188,8 @@ def test_atomic_finalizer_reports_a_last_moment_knowledge_race(tmp_path, monkeyp
 
     assert result["status"] == "completed_with_errors"
     assert result["knowledge_stale"] is True
-    assert database.active_translations()["block_000"]["status"] == "needs_revalidate"
+    assert database.get_block_by_identifier("block_000").status == "completed"
+    assert database.active_translations()["block_000"]["status"] == "completed"
 
 
 def test_working_target_candidates_use_one_connection_for_contexts_and_baselines(

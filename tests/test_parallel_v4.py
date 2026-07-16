@@ -18,6 +18,7 @@ from src.core.v4.exporter import ParallelV4BookExporter
 from src.core.v4.migration import V4Migrator
 from src.core.v4.models import ScanOutcome, ScanResponse, TranslationOutcome, V4BlockStatus
 from src.core.v4.pipeline import V4PipelineConfig, V4TranslationPipeline
+from src.core.v4.revalidation import RevalidationPlanner
 from src.core.v4.scanner import ScanProtocolError, V4Scanner
 from src.core.v4.semantic_mapper import SemanticMapper
 from src.core.v4.validation import V4Validator
@@ -926,14 +927,51 @@ class ParallelV4Tests(unittest.TestCase):
                 "SELECT COUNT(*) FROM human_queue WHERE kind='translation_proposal'"
             ).fetchone()[0]
         self.assertEqual(queue_count, 1)
+        with self.database.transaction() as connection:
+            dependency = connection.execute(
+                """SELECT tv.id translation_id, tv.knowledge_version, c.id concept_id
+                   FROM translation_versions tv JOIN concepts c
+                     ON c.canonical_source='Archon' AND c.retired_version IS NULL
+                   WHERE tv.pipeline='parallel_v4' AND tv.active=1
+                   ORDER BY tv.id LIMIT 1"""
+            ).fetchone()
+            connection.execute(
+                """INSERT INTO dependencies(
+                       translation_id, dependency_type, dependency_id,
+                       knowledge_version, dependency_fingerprint)
+                   VALUES(?, 'concept', ?, ?, 'pre-accept-fingerprint')""",
+                (
+                    dependency["translation_id"],
+                    dependency["concept_id"],
+                    dependency["knowledge_version"],
+                ),
+            )
         decision = self.database.resolve_human_item(1, "accept")
-        self.assertEqual(decision["affected_translations"], 1)
+        self.assertEqual(decision["affected_translations"], 0)
         with closing(self.database.connect()) as connection:
             concept = connection.execute(
                 "SELECT status, locked FROM concepts WHERE canonical_source='Archon'"
             ).fetchone()
+            change_ids = [
+                row[0]
+                for row in connection.execute(
+                    "SELECT id FROM knowledge_changes WHERE knowledge_version=?",
+                    (decision["knowledge_version"],),
+                )
+            ]
         self.assertEqual(concept["status"], "verified")
         self.assertEqual(concept["locked"], 1)
+        active_before = self.database.active_translations()
+        self.assertEqual(
+            {row["status"] for row in active_before.values()}, {"completed"}
+        )
+        planned = RevalidationPlanner(self.database).plan(change_ids)
+        self.assertEqual(planned["planned"], 1)
+        self.assertEqual(self.database.status_summary()["needs_revalidate"], 1)
+        self.assertEqual(
+            {row["status"] for row in self.database.active_translations().values()},
+            {"completed"},
+        )
 
         second = V4TranslationPipeline(
             self.database,

@@ -4671,24 +4671,6 @@ class V4Database:
                 "UPDATE runs SET status='failed', finished_at=?, error=? WHERE id=?",
                 (utc_now(), str(error), run_id),
             )
-            rows = connection.execute(
-                """SELECT id, block_id FROM translation_versions
-                   WHERE run_id=? AND pipeline='parallel_v4' AND active=1""",
-                (run_id,),
-            ).fetchall()
-            for row in rows:
-                connection.execute(
-                    "UPDATE translation_versions SET status=? WHERE id=?",
-                    (V4BlockStatus.NEEDS_REVALIDATE.value, row["id"]),
-                )
-                connection.execute(
-                    "UPDATE blocks SET status=?, updated_at=? WHERE id=?",
-                    (
-                        V4BlockStatus.NEEDS_REVALIDATE.value,
-                        utc_now(),
-                        row["block_id"],
-                    ),
-                )
             exists = connection.execute(
                 """SELECT 1 FROM human_queue
                    WHERE kind='knowledge_snapshot_invalid' AND status='open'
@@ -7908,29 +7890,12 @@ class V4Database:
                      AND status IN ('open','needs_human')""",
                 (utc_now(), concept_id),
             )
-            affected_rows = connection.execute(
-                """SELECT DISTINCT tv.id translation_id, tv.block_id
-                   FROM dependencies d
-                   JOIN translation_versions tv ON tv.id=d.translation_id
-                   WHERE d.dependency_type='concept' AND d.dependency_id=?
-                     AND tv.active=1 AND tv.pipeline='parallel_v4'""",
-                (concept_id,),
-            ).fetchall()
-            for row in affected_rows:
-                connection.execute(
-                    "UPDATE translation_versions SET status=? WHERE id=?",
-                    (V4BlockStatus.NEEDS_REVALIDATE.value, row["translation_id"]),
-                )
-                connection.execute(
-                    "UPDATE blocks SET status=?, updated_at=? WHERE id=?",
-                    (V4BlockStatus.NEEDS_REVALIDATE.value, utc_now(), row["block_id"]),
-                )
         return {
             "concept_id": concept_id,
             "source": source,
             "target": target,
             "knowledge_version": version,
-            "affected_translations": len(affected_rows),
+            "affected_translations": 0,
         }
 
     def merge_concept_forms(
@@ -8491,67 +8456,10 @@ class V4Database:
         connection: sqlite3.Connection,
         subjects: Sequence[Dict[str, str]],
     ) -> int:
-        import re
+        """Compatibility shim; task planning is explicit in RevalidationPlanner."""
 
-        affected_blocks: set[str] = set()
-        for subject in subjects:
-            subject_type = str(subject["subject_type"])
-            subject_id = str(subject["subject_id"])
-            affected_blocks.update(
-                str(row["block_id"])
-                for row in connection.execute(
-                    """SELECT DISTINCT tv.block_id
-                       FROM dependencies d
-                       JOIN translation_versions tv ON tv.id=d.translation_id
-                       WHERE d.dependency_type=? AND d.dependency_id=?""",
-                    (subject_type, subject_id),
-                ).fetchall()
-            )
-            if subject_type == "lexeme":
-                form_rows = connection.execute(
-                    """SELECT DISTINCT form FROM source_forms
-                       WHERE lexeme_id=?""",
-                    (subject_id,),
-                ).fetchall()
-            else:
-                form_rows = connection.execute(
-                    """SELECT DISTINCT sf.form FROM source_forms sf
-                       JOIN concept_lexemes cl ON cl.lexeme_id=sf.lexeme_id
-                       WHERE cl.concept_id=? AND cl.retired_version IS NULL""",
-                    (subject_id,),
-                ).fetchall()
-            forms = [str(row["form"]) for row in form_rows if str(row["form"] or "").strip()]
-            if not forms:
-                continue
-            patterns = [
-                re.compile(rf"(?<!\w){re.escape(form)}(?!\w)", re.I)
-                for form in forms
-            ]
-            for block in connection.execute(
-                """SELECT id, source_text, status FROM blocks
-                   WHERE source_edition_id=(
-                       SELECT id FROM source_editions WHERE active=1
-                   )"""
-            ).fetchall():
-                if block["status"] not in {
-                    V4BlockStatus.READY.value,
-                    V4BlockStatus.TRANSLATING.value,
-                }:
-                    continue
-                if any(pattern.search(str(block["source_text"])) for pattern in patterns):
-                    affected_blocks.add(str(block["id"]))
-
-        for block_id in sorted(affected_blocks):
-            connection.execute(
-                """UPDATE translation_versions SET status=?
-                   WHERE block_id=? AND pipeline='parallel_v4' AND active=1""",
-                (V4BlockStatus.NEEDS_REVALIDATE.value, block_id),
-            )
-            connection.execute(
-                "UPDATE blocks SET status=?, updated_at=? WHERE id=?",
-                (V4BlockStatus.NEEDS_REVALIDATE.value, utc_now(), block_id),
-            )
-        return len(affected_blocks)
+        self._require_active_transaction(connection)
+        return 0
 
     def apply_working_target_decisions(
         self, decisions: Sequence[Dict[str, Any]]
@@ -10027,24 +9935,6 @@ class V4Database:
             persisted_error = error
             if stale:
                 persisted_error = persisted_error or "frozen knowledge changed during run"
-                rows = connection.execute(
-                    """SELECT id, block_id FROM translation_versions
-                       WHERE run_id=? AND pipeline='parallel_v4' AND active=1""",
-                    (run_id,),
-                ).fetchall()
-                for row in rows:
-                    connection.execute(
-                        "UPDATE translation_versions SET status=? WHERE id=?",
-                        (V4BlockStatus.NEEDS_REVALIDATE.value, row["id"]),
-                    )
-                    connection.execute(
-                        "UPDATE blocks SET status=?, updated_at=? WHERE id=?",
-                        (
-                            V4BlockStatus.NEEDS_REVALIDATE.value,
-                            utc_now(),
-                            row["block_id"],
-                        ),
-                    )
             connection.execute(
                 "UPDATE runs SET status=?, finished_at=?, error=? WHERE id=?",
                 (persisted_status, utc_now(), persisted_error, run_id),
@@ -10052,24 +9942,9 @@ class V4Database:
             return persisted_status, stale
 
     def invalidate_translation_run(self, run_id: str) -> int:
-        """Mark all output already committed by a stale frozen run for revalidation."""
+        """Legacy no-op; revalidation requires explicit knowledge change IDs."""
 
-        with self.transaction() as connection:
-            rows = connection.execute(
-                """SELECT id, block_id FROM translation_versions
-                   WHERE run_id=? AND pipeline='parallel_v4' AND active=1""",
-                (run_id,),
-            ).fetchall()
-            for row in rows:
-                connection.execute(
-                    "UPDATE translation_versions SET status=? WHERE id=?",
-                    (V4BlockStatus.NEEDS_REVALIDATE.value, row["id"]),
-                )
-                connection.execute(
-                    "UPDATE blocks SET status=?, updated_at=? WHERE id=?",
-                    (V4BlockStatus.NEEDS_REVALIDATE.value, utc_now(), row["block_id"]),
-                )
-            return len(rows)
+        return 0
 
     def prior_concept_source_evidence(
         self,
@@ -10534,7 +10409,6 @@ class V4Database:
             changed_concepts: set[str] = set()
             old_render_states: Dict[str, Dict[str, Any]] = {}
             proposed_concepts: set[str] = set()
-            current_block_ids = {outcome.block.id for outcome in outcomes}
             seen_proposal_keys: set[tuple[str, str, str]] = set()
             for outcome, kind, payload in proposals:
                 payload_json = json.dumps(payload, ensure_ascii=False, sort_keys=True)
@@ -10686,41 +10560,6 @@ class V4Database:
                     reason=f"translation proposals {run_id}",
                     knowledge_version=version,
                 )
-            if changed_concepts:
-                import re
-
-                for concept_id in sorted(changed_concepts):
-                    forms = [
-                        row["form"]
-                        for row in connection.execute(
-                            """SELECT DISTINCT sf.form FROM source_forms sf
-                               JOIN concept_lexemes cl
-                                 ON cl.lexeme_id=sf.lexeme_id
-                               WHERE cl.concept_id=?
-                                 AND cl.retired_version IS NULL""",
-                            (concept_id,),
-                        )
-                    ]
-                    if not forms:
-                        continue
-                    rows = connection.execute(
-                        """SELECT b.id, b.source_text, tv.id translation_id
-                           FROM blocks b JOIN translation_versions tv ON tv.block_id=b.id
-                           WHERE b.source_edition_id=(SELECT id FROM source_editions WHERE active=1)
-                             AND tv.pipeline='parallel_v4' AND tv.active=1"""
-                    ).fetchall()
-                    for row in rows:
-                        if row["id"] in current_block_ids:
-                            continue
-                        if any(re.search(rf"\b{re.escape(form)}\b", row["source_text"], re.I) for form in forms):
-                            connection.execute(
-                                "UPDATE translation_versions SET status=? WHERE id=?",
-                                (V4BlockStatus.NEEDS_REVALIDATE.value, row["translation_id"]),
-                            )
-                            connection.execute(
-                                "UPDATE blocks SET status=?, updated_at=? WHERE id=?",
-                                (V4BlockStatus.NEEDS_REVALIDATE.value, utc_now(), row["id"]),
-                            )
             if proposed_concepts:
                 import re
 
@@ -11824,30 +11663,6 @@ class V4Database:
                         reason=f"human {action} high impact item {item_id}",
                         knowledge_version=version,
                     )
-                affected_rows = connection.execute(
-                    """SELECT DISTINCT tv.id translation_id, tv.block_id
-                       FROM dependencies d
-                       JOIN translation_versions tv ON tv.id=d.translation_id
-                       WHERE d.dependency_type=? AND d.dependency_id=?
-                         AND tv.active=1 AND tv.pipeline='parallel_v4'""",
-                    (subject_type, subject_id),
-                ).fetchall()
-                for affected_row in affected_rows:
-                    connection.execute(
-                        "UPDATE translation_versions SET status=? WHERE id=?",
-                        (
-                            V4BlockStatus.NEEDS_REVALIDATE.value,
-                            affected_row["translation_id"],
-                        ),
-                    )
-                    connection.execute(
-                        "UPDATE blocks SET status=?, updated_at=? WHERE id=?",
-                        (
-                            V4BlockStatus.NEEDS_REVALIDATE.value,
-                            utc_now(),
-                            affected_row["block_id"],
-                        ),
-                    )
                 resolved_status = "accepted" if action == "accept" else "rejected"
                 connection.execute(
                     "UPDATE human_queue SET status=?, resolved_at=? WHERE id=?",
@@ -11857,7 +11672,7 @@ class V4Database:
                     "id": item_id,
                     "status": resolved_status,
                     "knowledge_version": version,
-                    "affected_translations": len(affected_rows),
+                    "affected_translations": 0,
                 }
             if row["kind"] != "translation_proposal":
                 raise ValueError("该队列项不是可接受或拒绝的知识建议")
@@ -11865,10 +11680,7 @@ class V4Database:
             proposal_kind = payload.get("proposal_kind")
             proposal = payload.get("payload") or {}
             version: Optional[int] = None
-            affected = 0
             if proposal_kind == "term" and proposal.get("src"):
-                import re
-
                 source = str(proposal["src"]).strip()
                 target = str(proposal.get("tgt") or "").strip()
                 concept_id = stable_id("concept", normalize_english_form(source))
@@ -11963,37 +11775,6 @@ class V4Database:
                         reason=f"human {action} queue item {item_id}",
                         knowledge_version=version,
                     )
-                    rows = connection.execute(
-                        """SELECT b.id, b.source_text, tv.id translation_id
-                           FROM blocks b JOIN translation_versions tv ON tv.block_id=b.id
-                           WHERE b.source_edition_id=(SELECT id FROM source_editions WHERE active=1)
-                             AND tv.pipeline='parallel_v4' AND tv.active=1
-                             AND tv.status IN (?, ?)""",
-                        (
-                            V4BlockStatus.COMPLETED.value,
-                            V4BlockStatus.COMPLETED_WITH_WARNINGS.value,
-                        ),
-                    ).fetchall()
-                    pattern = re.compile(rf"\b{re.escape(source)}\b", re.I)
-                    for translation in rows:
-                        if not pattern.search(translation["source_text"]):
-                            continue
-                        connection.execute(
-                            "UPDATE translation_versions SET status=? WHERE id=?",
-                            (
-                                V4BlockStatus.NEEDS_REVALIDATE.value,
-                                translation["translation_id"],
-                            ),
-                        )
-                        connection.execute(
-                            "UPDATE blocks SET status=?, updated_at=? WHERE id=?",
-                            (
-                                V4BlockStatus.NEEDS_REVALIDATE.value,
-                                utc_now(),
-                                translation["id"],
-                            ),
-                        )
-                        affected += 1
             resolved_status = "accepted" if action == "accept" else "rejected"
             connection.execute(
                 "UPDATE human_queue SET status=?, resolved_at=? WHERE id=?",
@@ -12003,7 +11784,7 @@ class V4Database:
                 "id": item_id,
                 "status": resolved_status,
                 "knowledge_version": version,
-                "affected_translations": affected,
+                "affected_translations": 0,
             }
 
     def amend_human_item(self, item_id: int, replacement: str) -> Dict[str, Any]:
@@ -12058,11 +11839,31 @@ class V4Database:
 
     def status_summary(self) -> Dict[str, int]:
         with closing(self.connect()) as connection:
-            return {
-                row["status"]: int(row["count"])
+            summary = {
+                (
+                    "legacy_needs_revalidate"
+                    if row["status"] == V4BlockStatus.NEEDS_REVALIDATE.value
+                    else row["status"]
+                ): int(row["count"])
                 for row in connection.execute(
                     """SELECT status, COUNT(*) count FROM blocks
                        WHERE source_edition_id=(SELECT id FROM source_editions WHERE active=1)
                        GROUP BY status ORDER BY status"""
                 )
             }
+            derived = connection.execute(
+                """SELECT COUNT(DISTINCT tv.block_id) block_count,
+                          COUNT(DISTINCT task.translation_id) translation_count
+                   FROM revalidation_tasks task
+                   JOIN translation_versions tv
+                     ON tv.id=task.translation_id AND tv.active=1
+                   JOIN blocks b ON b.id=tv.block_id
+                   JOIN source_editions edition
+                     ON edition.id=b.source_edition_id AND edition.active=1
+                   WHERE task.status IN ('pending','validating')"""
+            ).fetchone()
+            summary["needs_revalidate"] = int(derived["block_count"])
+            summary["needs_revalidate_translations"] = int(
+                derived["translation_count"]
+            )
+            return summary

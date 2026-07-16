@@ -6,6 +6,7 @@ from .database import V4Database
 from .exporter import ParallelV4BookExporter
 from .migration import V4Migrator
 from .pipeline import V4PipelineConfig, V4TranslationPipeline
+from .revalidation import RevalidationPlanner
 from .repairer import V4Repairer
 from .scanner import V4Scanner
 from .validation import V4Validator
@@ -14,6 +15,7 @@ from .web_review import create_review_server, serve_review_ui
 
 __all__ = [
     "ParallelV4BookExporter",
+    "RevalidationPlanner",
     "DocxBaselineImporter",
     "V4Database",
     "V4Migrator",
