@@ -13582,7 +13582,24 @@ class V4Database:
             ).fetchall()
             return [dict(row) for row in rows]
 
-    def status_summary(self) -> Dict[str, int]:
+    def inspect_narrative_memory(
+        self,
+        *,
+        block_id: str | None = None,
+        subject_id: str | None = None,
+        memory_type: str | None = None,
+        limit: int = 200,
+    ) -> Dict[str, Any]:
+        from .narrative_memory import NarrativeMemoryStore
+
+        return NarrativeMemoryStore(self).inspect(
+            block_id=block_id,
+            subject_id=subject_id,
+            memory_type=memory_type,
+            limit=limit,
+        )
+
+    def status_summary(self) -> Dict[str, Any]:
         with closing(self.connect()) as connection:
             summary = {
                 (
@@ -13786,6 +13803,110 @@ class V4Database:
             summary["knowledge_version"] = int(
                 connection.execute("SELECT MAX(id) FROM knowledge_versions").fetchone()[0]
             )
+            summary["memory_version"] = int(
+                connection.execute(
+                    "SELECT COALESCE(MAX(id), 1) FROM memory_versions"
+                ).fetchone()[0]
+            )
+            summary["premap_cursor"] = int(
+                connection.execute(
+                    """SELECT COALESCE(MAX(block.global_index), -1)
+                       FROM premap_results premap
+                       JOIN blocks block ON block.id=premap.block_id
+                       JOIN source_editions edition
+                         ON edition.id=block.source_edition_id
+                        AND edition.active=1
+                       WHERE premap.snapshot_id IS NOT NULL"""
+                ).fetchone()[0]
+            )
+            summary["translation_cursor"] = int(
+                connection.execute(
+                    """SELECT COALESCE(MAX(block.global_index), -1)
+                       FROM translation_versions translation
+                       JOIN blocks block ON block.id=translation.block_id
+                       JOIN source_editions edition
+                         ON edition.id=block.source_edition_id
+                        AND edition.active=1
+                       WHERE translation.pipeline='parallel_v4'
+                         AND translation.active=1"""
+                ).fetchone()[0]
+            )
+            premap_calls = int(
+                connection.execute(
+                    """SELECT COUNT(*) FROM audit_calls
+                       WHERE purpose='narrative_premap'"""
+                ).fetchone()[0]
+            )
+            premap_hits = int(
+                connection.execute(
+                    """SELECT COUNT(*) FROM audit_calls
+                       WHERE purpose='narrative_premap_cache_hit'"""
+                ).fetchone()[0]
+            )
+            premap_total = premap_calls + premap_hits
+            summary["premap_cache_hits"] = premap_hits
+            summary["premap_model_calls"] = premap_calls
+            summary["premap_cache_hit_rate"] = (
+                round(premap_hits / premap_total, 6)
+                if premap_total
+                else 0.0
+            )
+            summary["degraded_premap_blocks"] = int(
+                connection.execute(
+                    """SELECT COUNT(DISTINCT block_id) FROM premap_results
+                       WHERE status='degraded'"""
+                ).fetchone()[0]
+            )
+            summary["unresolved_narrative_references"] = int(
+                connection.execute(
+                    """SELECT COALESCE(SUM(
+                           json_array_length(
+                               json_extract(snapshot.discourse_state_json,
+                                            '$.unresolved_references')
+                           )
+                       ), 0)
+                       FROM narrative_snapshots snapshot
+                       WHERE snapshot.id=(
+                           SELECT latest.id FROM narrative_snapshots latest
+                           WHERE latest.block_id=snapshot.block_id
+                           ORDER BY latest.memory_version DESC,
+                                    latest.knowledge_version DESC,
+                                    latest.created_at DESC, latest.id DESC
+                           LIMIT 1
+                       )"""
+                ).fetchone()[0]
+            )
+            summary["disputed_narrative_memories"] = int(
+                connection.execute(
+                    """SELECT COUNT(*) FROM narrative_memories
+                       WHERE status='disputed' OR truth_status='disputed'"""
+                ).fetchone()[0]
+            )
+            summary["memory_revalidation_tasks"] = int(
+                connection.execute(
+                    """SELECT COUNT(*) FROM revalidation_tasks
+                       WHERE change_domain='memory'"""
+                ).fetchone()[0]
+            )
+            volatility_counts = {"low": 0, "medium": 0, "high": 0}
+            for row in connection.execute(
+                """SELECT CAST(json_extract(
+                              validation_json, '$.metrics.volatility'
+                           ) AS INTEGER) volatility
+                   FROM premap_results
+                   WHERE json_type(
+                       validation_json, '$.metrics.volatility'
+                   ) IS NOT NULL"""
+            ):
+                volatility = int(row["volatility"])
+                bucket = (
+                    "high"
+                    if volatility >= 65
+                    else "medium" if volatility >= 35 else "low"
+                )
+                volatility_counts[bucket] += 1
+            for bucket, count in volatility_counts.items():
+                summary[f"narrative_volatility_{bucket}"] = count
             return summary
 
     def review_warning_sections(self) -> Dict[str, List[Dict[str, Any]]]:

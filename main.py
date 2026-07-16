@@ -599,6 +599,29 @@ def cmd_translate_v4(args):
         semantic_temperature=float(settings.get("semantic_temperature", 0.0)),
         semantic_max_tokens=int(settings.get("semantic_max_tokens", 4096)),
         semantic_max_attempts=int(settings.get("semantic_max_attempts", 2)),
+        enable_narrative_premap=(
+            not bool(getattr(args, "no_narrative_premap", False))
+            and bool(settings.get("enable_narrative_premap", True))
+        ),
+        dynamic_scheduling=(
+            not bool(getattr(args, "no_dynamic_scheduling", False))
+            and bool(settings.get("dynamic_scheduling", True))
+        ),
+        premap_ahead_blocks=(
+            getattr(args, "premap_ahead_blocks", None)
+            or int(settings.get("premap_ahead_blocks", 12))
+        ),
+        premap_max_tokens=(
+            getattr(args, "premap_max_tokens", None)
+            or int(settings.get("premap_max_tokens", 6144))
+        ),
+        premap_max_attempts=int(
+            settings.get("premap_max_attempts", args.max_attempts)
+        ),
+        max_narrative_context_chars=(
+            getattr(args, "max_narrative_context_chars", None)
+            or int(settings.get("max_narrative_context_chars", 6000))
+        ),
         draft_temperature=float(draft.get("temperature", 0.1)),
         draft_max_tokens=int(draft.get("max_tokens", 6144)),
         polish_temperature=float(polish.get("temperature", 0.2)),
@@ -615,6 +638,100 @@ def cmd_translate_v4(args):
     ).run()
     print(json.dumps(result, ensure_ascii=False, indent=2))
     return 1 if result["failed_retryable"] or result["incomplete_requires_human"] else 0
+
+
+def _build_narrative_pipeline(project, args):
+    config = config_loader.load_config()
+    settings = config.get("parallel_v4", {})
+    database = V4Database(project.root_dir)
+    return database, V4TranslationPipeline(
+        database=database,
+        llm_factory=lambda: LLMManager(config["llm"]),
+        prompts=config_loader.load_prompts(),
+        config=V4PipelineConfig(
+            enable_narrative_premap=True,
+            dynamic_scheduling=bool(
+                settings.get("dynamic_scheduling", True)
+            ),
+            max_attempts=int(getattr(args, "max_attempts", 2)),
+            premap_max_attempts=int(
+                settings.get(
+                    "premap_max_attempts",
+                    getattr(args, "max_attempts", 2),
+                )
+            ),
+            premap_max_tokens=int(
+                settings.get("premap_max_tokens", 6144)
+            ),
+            max_narrative_context_chars=int(
+                settings.get("max_narrative_context_chars", 6000)
+            ),
+            max_workers=int(settings.get("max_workers", 4)),
+            audit_mode=settings.get("audit_mode", "full"),
+        ),
+    )
+
+
+def cmd_premap_v4(args):
+    project = _load_project_or_error(args.book_id)
+    if not project:
+        return 1
+    try:
+        V4Migrator(project).migrate()
+        database, pipeline = _build_narrative_pipeline(project, args)
+        block_ids = tuple(
+            database.get_block_by_identifier(identifier).id
+            for identifier in (args.block or ())
+        )
+        result = pipeline.premap(
+            block_ids=block_ids,
+            max_blocks=args.max_blocks,
+        )
+    except Exception as exc:
+        _print_stage_error("premap", exc)
+        return 1
+    print(json.dumps(result, ensure_ascii=False, indent=2))
+    return 0
+
+
+def cmd_inspect_memory_v4(args):
+    project = _load_project_or_error(args.book_id)
+    if not project:
+        return 1
+    try:
+        database = V4Database(project.root_dir)
+        block_id = (
+            database.get_block_by_identifier(args.block).id
+            if args.block
+            else None
+        )
+        result = database.inspect_narrative_memory(
+            block_id=block_id,
+            subject_id=args.subject,
+            memory_type=args.memory_type,
+        )
+    except Exception as exc:
+        _print_stage_error("inspect_memory", exc)
+        return 1
+    print(json.dumps(result, ensure_ascii=False, indent=2))
+    return 0
+
+
+def cmd_rebuild_snapshots_v4(args):
+    project = _load_project_or_error(args.book_id)
+    if not project:
+        return 1
+    try:
+        V4Migrator(project).migrate()
+        _database, pipeline = _build_narrative_pipeline(project, args)
+        result = pipeline.rebuild_snapshots(
+            from_index=args.from_index
+        )
+    except Exception as exc:
+        _print_stage_error("rebuild_snapshots", exc)
+        return 1
+    print(json.dumps(result, ensure_ascii=False, indent=2))
+    return 0
 
 
 def cmd_status_v4(args):
@@ -647,6 +764,15 @@ def cmd_revalidate_v4(args):
                 max_context_chars=int(settings.get("max_context_chars", 24000)),
                 enable_polish=bool(settings.get("enable_polish", True)),
                 decision_mode="auto",
+                enable_narrative_premap=bool(
+                    settings.get("enable_narrative_premap", True)
+                ),
+                dynamic_scheduling=bool(
+                    settings.get("dynamic_scheduling", True)
+                ),
+                max_narrative_context_chars=int(
+                    settings.get("max_narrative_context_chars", 6000)
+                ),
             ),
         )
         repairer = V4Repairer(
@@ -1030,9 +1156,77 @@ def main(argv=None):
         "--pause-on-review", action="store_true", default=None
     )
     p_translate_v4.add_argument("--max-knowledge-epochs", type=_positive_int)
+    p_translate_v4.add_argument(
+        "--no-narrative-premap", action="store_true"
+    )
+    p_translate_v4.add_argument(
+        "--no-dynamic-scheduling", action="store_true"
+    )
+    p_translate_v4.add_argument(
+        "--premap-ahead-blocks", type=_positive_int
+    )
+    p_translate_v4.add_argument(
+        "--premap-max-tokens", type=_positive_int
+    )
+    p_translate_v4.add_argument(
+        "--max-narrative-context-chars", type=_positive_int
+    )
     p_translate_v4.add_argument("--no-polish", action="store_true")
     p_translate_v4.add_argument("--force", "-f", action="store_true", help="强制重翻已完成块")
     p_translate_v4.set_defaults(func=cmd_translate_v4)
+
+    p_premap_v4 = subparsers.add_parser(
+        "premap-v4", help="只运行融合叙事预映射，不生成译文"
+    )
+    p_premap_v4.add_argument("book_id", help="项目ID")
+    p_premap_v4.add_argument("--max-blocks", type=_non_negative_int)
+    p_premap_v4.add_argument(
+        "--block",
+        action="append",
+        help="预映射到指定块；可重复使用，系统会保留前序状态",
+    )
+    p_premap_v4.add_argument(
+        "--max-attempts", type=_positive_int, default=2
+    )
+    p_premap_v4.set_defaults(func=cmd_premap_v4)
+
+    p_inspect_memory_v4 = subparsers.add_parser(
+        "inspect-memory-v4", help="查看叙事记忆、证据、关系和快照"
+    )
+    p_inspect_memory_v4.add_argument("book_id", help="项目ID")
+    p_inspect_memory_v4.add_argument("--block")
+    p_inspect_memory_v4.add_argument("--subject")
+    p_inspect_memory_v4.add_argument(
+        "--memory-type",
+        choices=[
+            "explicit_fact",
+            "observation",
+            "hypothesis",
+            "open_question",
+            "contradiction",
+            "character_state",
+            "relationship_state",
+            "timeline_anchor",
+            "location_state",
+            "narrator_state",
+        ],
+    )
+    p_inspect_memory_v4.set_defaults(func=cmd_inspect_memory_v4)
+
+    p_rebuild_snapshots_v4 = subparsers.add_parser(
+        "rebuild-snapshots-v4",
+        help="按已缓存预映射重建位置开放叙事快照",
+    )
+    p_rebuild_snapshots_v4.add_argument("book_id", help="项目ID")
+    p_rebuild_snapshots_v4.add_argument(
+        "--from-index", type=_non_negative_int, default=0
+    )
+    p_rebuild_snapshots_v4.add_argument(
+        "--max-attempts", type=_positive_int, default=2
+    )
+    p_rebuild_snapshots_v4.set_defaults(
+        func=cmd_rebuild_snapshots_v4
+    )
 
     p_status_v4 = subparsers.add_parser("status-v4", help="查看parallel_v4状态")
     p_status_v4.add_argument("book_id", help="项目ID")

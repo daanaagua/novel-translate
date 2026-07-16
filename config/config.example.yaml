@@ -70,6 +70,12 @@ parallel_v4:
   semantic_temperature: 0.0
   semantic_max_tokens: 4096
   semantic_max_attempts: 2
+  enable_narrative_premap: true
+  dynamic_scheduling: true
+  premap_ahead_blocks: 12
+  premap_max_tokens: 6144
+  premap_max_attempts: 2
+  max_narrative_context_chars: 6000
   use_baseline_reference: false
   audit_mode: "full"
 

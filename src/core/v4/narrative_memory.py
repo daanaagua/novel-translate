@@ -237,6 +237,38 @@ class NarrativeMemoryStore:
             )
         return result_id
 
+    def save_source_structure(
+        self,
+        block: V4Block,
+        structure: Mapping[str, Any],
+        *,
+        extractor_version: str = "narrative-structure-v1",
+    ) -> str:
+        structure_json = _canonical_json(dict(structure))
+        structure_hash = hashlib.sha256(
+            structure_json.encode("utf-8")
+        ).hexdigest()
+        with self.database.transaction() as connection:
+            connection.execute(
+                """INSERT INTO source_structure(
+                       block_id, structure_json, structure_hash,
+                       extractor_version, created_at)
+                   VALUES(?, ?, ?, ?, ?)
+                   ON CONFLICT(block_id) DO UPDATE SET
+                       structure_json=excluded.structure_json,
+                       structure_hash=excluded.structure_hash,
+                       extractor_version=excluded.extractor_version,
+                       created_at=excluded.created_at""",
+                (
+                    block.id,
+                    structure_json,
+                    structure_hash,
+                    extractor_version[:128],
+                    utc_now(),
+                ),
+            )
+        return structure_hash
+
     def load_premap_result(
         self, cache_key: str
     ) -> NarrativePremapResult | None:
@@ -302,7 +334,11 @@ class NarrativeMemoryStore:
         )
 
     def link_premap_snapshot(
-        self, cache_key: str, snapshot_id: str
+        self,
+        cache_key: str,
+        snapshot_id: str,
+        *,
+        metrics: Mapping[str, Any] | None = None,
     ) -> None:
         with self.database.transaction() as connection:
             exists = connection.execute(
@@ -311,13 +347,45 @@ class NarrativeMemoryStore:
             ).fetchone()
             if exists is None:
                 raise KeyError(f"narrative snapshot does not exist: {snapshot_id}")
-            updated = connection.execute(
-                """UPDATE premap_results SET snapshot_id=?
+            row = connection.execute(
+                """SELECT validation_json FROM premap_results
                    WHERE cache_key=?""",
-                (snapshot_id, cache_key),
+                (cache_key,),
+            ).fetchone()
+            if row is None:
+                raise KeyError(f"premap cache does not exist: {cache_key}")
+            try:
+                validation = json.loads(
+                    str(row["validation_json"] or "{}")
+                )
+            except (TypeError, ValueError, json.JSONDecodeError):
+                validation = {}
+            if not isinstance(validation, dict):
+                validation = {}
+            if metrics:
+                validation["metrics"] = dict(metrics)
+            updated = connection.execute(
+                """UPDATE premap_results
+                   SET snapshot_id=?, validation_json=?
+                   WHERE cache_key=?""",
+                (
+                    snapshot_id,
+                    _canonical_json(validation),
+                    cache_key,
+                ),
             )
             if updated.rowcount != 1:
                 raise KeyError(f"premap cache does not exist: {cache_key}")
+
+    def latest_premap_cache_key(self, block_id: str) -> str:
+        with closing(self.database.connect()) as connection:
+            row = connection.execute(
+                """SELECT cache_key FROM premap_results
+                   WHERE block_id=? AND status!='rejected'
+                   ORDER BY created_at DESC, id DESC LIMIT 1""",
+                (block_id,),
+            ).fetchone()
+        return str(row["cache_key"]) if row is not None else ""
 
     def load_snapshot(self, snapshot_id: str) -> NarrativeSnapshot | None:
         with closing(self.database.connect()) as connection:
@@ -373,6 +441,293 @@ class NarrativeMemoryStore:
         if row is None:
             return None
         return self.load_premap_result(str(row["cache_key"]))
+
+    def latest_snapshot_before(
+        self, global_index: int
+    ) -> NarrativeSnapshot | None:
+        with closing(self.database.connect()) as connection:
+            row = connection.execute(
+                """SELECT id FROM narrative_snapshots
+                   WHERE global_index<?
+                   ORDER BY global_index DESC, memory_version DESC,
+                            knowledge_version DESC, id DESC
+                   LIMIT 1""",
+                (int(global_index),),
+            ).fetchone()
+        if row is None:
+            return None
+        return self.load_snapshot(str(row["id"]))
+
+    def load_style_snapshot(
+        self, snapshot_id: str
+    ) -> dict[str, Any] | None:
+        with closing(self.database.connect()) as connection:
+            row = connection.execute(
+                "SELECT * FROM style_snapshots WHERE id=?",
+                (snapshot_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        return {
+            "id": str(row["id"]),
+            "block_id": str(row["block_id"]),
+            "global_index": int(row["global_index"]),
+            "previous_snapshot_id": str(
+                row["previous_snapshot_id"] or ""
+            ),
+            "state": json.loads(str(row["state_json"] or "{}")),
+            "state_hash": str(row["state_hash"]),
+        }
+
+    def latest_style_snapshot(self) -> dict[str, Any] | None:
+        with closing(self.database.connect()) as connection:
+            row = connection.execute(
+                """SELECT id FROM style_snapshots
+                   ORDER BY global_index DESC, created_at DESC, id DESC
+                   LIMIT 1"""
+            ).fetchone()
+        if row is None:
+            return None
+        return self.load_style_snapshot(str(row["id"]))
+
+    def latest_style_snapshot_before(
+        self,
+        global_index: int,
+        *,
+        source_edition_id: int | None = None,
+    ) -> dict[str, Any] | None:
+        if type(global_index) is not int:
+            raise TypeError("global_index must be an integer")
+        query = """
+            SELECT style.id
+            FROM style_snapshots AS style
+            JOIN blocks AS block ON block.id=style.block_id
+            WHERE style.global_index<?
+        """
+        parameters: list[Any] = [global_index]
+        if source_edition_id is not None:
+            if type(source_edition_id) is not int or source_edition_id <= 0:
+                raise ValueError("source_edition_id must be a positive integer")
+            query += " AND block.source_edition_id=?"
+            parameters.append(source_edition_id)
+        query += """
+            ORDER BY style.global_index DESC, style.created_at DESC,
+                     style.id DESC
+            LIMIT 1
+        """
+        with closing(self.database.connect()) as connection:
+            row = connection.execute(query, parameters).fetchone()
+        if row is None:
+            return None
+        return self.load_style_snapshot(str(row["id"]))
+
+    def merge_style_delta(
+        self,
+        block: V4Block,
+        delta: Mapping[str, Any],
+        *,
+        previous_snapshot_id: str | None = None,
+    ) -> dict[str, Any] | None:
+        if previous_snapshot_id is None:
+            previous = self.latest_style_snapshot_before(
+                block.global_index,
+                source_edition_id=block.source_edition_id,
+            )
+        elif previous_snapshot_id:
+            previous = self.load_style_snapshot(previous_snapshot_id)
+        else:
+            previous = None
+        state = dict((previous or {}).get("state") or {})
+        if not isinstance(delta, Mapping):
+            raise TypeError("style delta must be a mapping")
+        for raw_key, raw_value in list(delta.items())[:32]:
+            key = str(raw_key).strip()
+            if not key or len(key) > 64:
+                continue
+            if raw_value is None or str(raw_value).strip() == "":
+                continue
+            if not isinstance(raw_value, (str, bool, int, float)):
+                continue
+            value = (
+                str(raw_value).strip()[:512]
+                if isinstance(raw_value, str)
+                else raw_value
+            )
+            state[key] = value
+        if previous is not None and state == previous["state"]:
+            return previous
+        if not state:
+            return None
+        state_json = _canonical_json(state)
+        state_hash = hashlib.sha256(
+            state_json.encode("utf-8")
+        ).hexdigest()
+        previous_id = str((previous or {}).get("id") or "")
+        snapshot_id = stable_id(
+            "style",
+            f"{block.id}:{previous_id}:{state_hash}",
+            32,
+        )
+        with self.database.transaction() as connection:
+            connection.execute(
+                """INSERT OR IGNORE INTO style_snapshots(
+                       id, block_id, global_index, previous_snapshot_id,
+                       state_json, state_hash, created_at)
+                   VALUES(?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    snapshot_id,
+                    block.id,
+                    block.global_index,
+                    previous_id or None,
+                    state_json,
+                    state_hash,
+                    utc_now(),
+                ),
+            )
+        return self.load_style_snapshot(snapshot_id)
+
+    def inspect(
+        self,
+        *,
+        block_id: str | None = None,
+        subject_id: str | None = None,
+        memory_type: str | None = None,
+        limit: int = 200,
+    ) -> dict[str, Any]:
+        if type(limit) is not int or not 1 <= limit <= 1000:
+            raise ValueError("narrative inspection limit must be 1..1000")
+        clauses = ["1=1"]
+        params: list[Any] = []
+        visible_ids: tuple[str, ...] = ()
+        if block_id:
+            latest = self.latest_snapshot_for_block(block_id)
+            if latest is not None:
+                visible_ids = latest.visible_memory_ids
+            if visible_ids:
+                placeholders = ",".join("?" for _ in visible_ids)
+                clauses.append(
+                    f"(memory.source_block_id=? OR memory.id IN ({placeholders}))"
+                )
+                params.extend((block_id, *visible_ids))
+            else:
+                clauses.append("memory.source_block_id=?")
+                params.append(block_id)
+        if subject_id:
+            clauses.append(
+                """EXISTS(
+                    SELECT 1 FROM narrative_memory_subjects filter_subject
+                    WHERE filter_subject.memory_id=memory.id
+                      AND filter_subject.subject_id=?
+                )"""
+            )
+            params.append(subject_id)
+        if memory_type:
+            clauses.append("memory.memory_type=?")
+            params.append(memory_type)
+        with closing(self.database.connect()) as connection:
+            memory_rows = connection.execute(
+                f"""SELECT memory.* FROM narrative_memories memory
+                    WHERE {' AND '.join(clauses)}
+                    ORDER BY memory.reveal_global_index DESC, memory.id
+                    LIMIT ?""",
+                (*params, limit),
+            ).fetchall()
+            memory_ids = tuple(str(row["id"]) for row in memory_rows)
+            evidence: dict[str, list[dict[str, Any]]] = {}
+            subjects: dict[str, list[dict[str, Any]]] = {}
+            links: dict[str, list[dict[str, Any]]] = {}
+            if memory_ids:
+                placeholders = ",".join("?" for _ in memory_ids)
+                for row in connection.execute(
+                    f"""SELECT * FROM narrative_memory_evidence
+                        WHERE memory_id IN ({placeholders})
+                        ORDER BY memory_id, block_id, start_offset""",
+                    memory_ids,
+                ):
+                    evidence.setdefault(str(row["memory_id"]), []).append(
+                        dict(row)
+                    )
+                for row in connection.execute(
+                    f"""SELECT * FROM narrative_memory_subjects
+                        WHERE memory_id IN ({placeholders})
+                        ORDER BY memory_id, subject_type, subject_id, role""",
+                    memory_ids,
+                ):
+                    subjects.setdefault(str(row["memory_id"]), []).append(
+                        dict(row)
+                    )
+                for row in connection.execute(
+                    f"""SELECT * FROM narrative_memory_links
+                        WHERE from_memory_id IN ({placeholders})
+                           OR to_memory_id IN ({placeholders})
+                        ORDER BY created_memory_version, relation,
+                                 from_memory_id, to_memory_id""",
+                    (*memory_ids, *memory_ids),
+                ):
+                    item = dict(row)
+                    for memory_id in {
+                        str(row["from_memory_id"]),
+                        str(row["to_memory_id"]),
+                    } & set(memory_ids):
+                        links.setdefault(memory_id, []).append(item)
+            snapshot_rows = (
+                connection.execute(
+                    """SELECT * FROM narrative_snapshots
+                       WHERE block_id=?
+                       ORDER BY memory_version DESC, knowledge_version DESC,
+                                created_at DESC, id DESC
+                       LIMIT 20""",
+                    (block_id,),
+                ).fetchall()
+                if block_id
+                else []
+            )
+            premap_rows = (
+                connection.execute(
+                    """SELECT id, block_id, status, validation_json,
+                              snapshot_id, model_id, created_at
+                       FROM premap_results WHERE block_id=?
+                       ORDER BY created_at DESC, id DESC LIMIT 20""",
+                    (block_id,),
+                ).fetchall()
+                if block_id
+                else []
+            )
+        memories = []
+        for row in memory_rows:
+            item = dict(row)
+            memory_id = str(row["id"])
+            item["evidence"] = evidence.get(memory_id, [])
+            item["subjects"] = subjects.get(memory_id, [])
+            item["links"] = links.get(memory_id, [])
+            memories.append(item)
+        snapshots = []
+        for row in snapshot_rows:
+            item = dict(row)
+            item["discourse_state"] = json.loads(
+                item.pop("discourse_state_json") or "{}"
+            )
+            item["visible_memory_ids"] = json.loads(
+                item.pop("visible_memory_ids_json") or "[]"
+            )
+            snapshots.append(item)
+        premap = []
+        for row in premap_rows:
+            item = dict(row)
+            item["validation"] = json.loads(
+                item.pop("validation_json") or "{}"
+            )
+            premap.append(item)
+        return {
+            "filters": {
+                "block_id": block_id,
+                "subject_id": subject_id,
+                "memory_type": memory_type,
+            },
+            "memories": memories,
+            "snapshots": snapshots,
+            "premap": premap,
+        }
 
     def snapshot_for_cache(
         self, cache_key: str

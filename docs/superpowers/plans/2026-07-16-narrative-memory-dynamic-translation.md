@@ -175,7 +175,7 @@ from .schema_v9 import (
 
 `migration.py` 对 schema 8 要求显式 `migrate-v4 --preview/--confirm`，对 schema 9 正常打开。
 
-- [ ] **步骤 7：运行迁移测试**
+- [x] **步骤 7：运行迁移测试**
 
 运行：
 
@@ -185,7 +185,7 @@ from .schema_v9 import (
 
 预期：全部 PASS。
 
-- [ ] **步骤 8：Commit**
+- [x] **步骤 8：Commit**
 
 ```powershell
 git add src/core/v4/schema_v9.py src/core/v4/database.py src/core/v4/migration.py tests/test_v4_schema9_migration.py
@@ -319,7 +319,7 @@ class ContextPacket:
 
 预期：全部 PASS。
 
-- [ ] **步骤 6：Commit**
+- [x] **步骤 6：Commit**
 
 ```powershell
 git add src/core/v4/narrative_models.py src/core/v4/models.py tests/test_narrative_protocol.py
@@ -430,7 +430,7 @@ class NarrativePremapper:
 
 顶层 JSON 失败有限重试；耗尽后返回 `degraded=True` 的空候选结果，并延续上一话语状态。
 
-- [ ] **步骤 5：保留旧接口适配器**
+- [x] **步骤 5：保留旧接口适配器**
 
 `SemanticMapper.map(source_text, prior_context)` 委托预映射器的关系校验和渲染，使现有调用和测试继续工作：
 
@@ -440,7 +440,11 @@ self.last_succeeded = not result.degraded
 return render_semantic_relations(result.semantic_relations)
 ```
 
-- [ ] **步骤 6：运行协议与旧语义映射测试**
+实施说明：生产流水线直接使用 `NarrativePremapper`；旧 `SemanticMapper`
+作为独立兼容路径保留，避免在同一块上重复调用模型。它继续通过原有协议和
+回归测试，不再强制委托完整记忆预映射。
+
+- [x] **步骤 6：运行协议与旧语义映射测试**
 
 运行：
 
@@ -562,7 +566,7 @@ def merge_candidates(
 
 预期：全部 PASS。
 
-- [ ] **步骤 7：Commit**
+- [x] **步骤 7：Commit**
 
 ```powershell
 git add src/core/v4/narrative_memory.py src/core/v4/database.py tests/test_narrative_memory.py
@@ -668,7 +672,7 @@ def retrieve_for_block(..., max_chars: int) -> NarrativeRetrieval:
 
 预期：全部 PASS。
 
-- [ ] **步骤 7：Commit**
+- [x] **步骤 7：Commit**
 
 ```powershell
 git add src/core/v4/narrative_memory.py tests/test_narrative_memory.py
@@ -739,7 +743,7 @@ style_snapshot: Mapping[str, Any] | None = None
 
 按规格顺序渲染标签，返回准确 memory/rule/lexeme 依赖和 `context_hash`。必需叙事上下文超预算抛出 `NarrativeContextOverflow`。
 
-- [ ] **步骤 5：扩展初译解析**
+- [x] **步骤 5：扩展初译解析**
 
 `TextChunk` 增加：
 
@@ -765,7 +769,7 @@ XML/JSON 解析器只保留能在 `source_text` grounding 的英文 evidence。`
 
 预期：全部 PASS。
 
-- [ ] **步骤 7：Commit**
+- [x] **步骤 7：Commit**
 
 ```powershell
 git add src/core/v4/context.py src/core/schemas.py src/core/translator.py config/prompts.yaml tests/test_narrative_pipeline.py
@@ -888,7 +892,7 @@ while cursor < len(candidates):
 
 预期：全部 PASS。
 
-- [ ] **步骤 9：Commit**
+- [x] **步骤 9：Commit**
 
 ```powershell
 git add src/core/v4/narrative_scheduler.py src/core/v4/pipeline.py src/core/v4/knowledge_epochs.py tests/test_narrative_pipeline.py
@@ -973,7 +977,7 @@ for snapshot in outcome.narrative_dependencies:
 
 预期：全部 PASS。
 
-- [ ] **步骤 6：Commit**
+- [x] **步骤 6：Commit**
 
 ```powershell
 git add src/core/v4/database.py tests/test_narrative_revalidation.py tests/test_precise_revalidation.py
@@ -1059,7 +1063,7 @@ else:
 
 预期：全部 PASS。
 
-- [ ] **步骤 7：Commit**
+- [x] **步骤 7：Commit**
 
 ```powershell
 git add src/core/v4/revalidation.py src/core/v4/database.py tests/test_narrative_revalidation.py
@@ -1076,7 +1080,7 @@ git commit -m "feat: precisely revalidate narrative memory changes"
 - 修改：`tests/test_narrative_pipeline.py`
 - 修改：`tests/test_parallel_v4.py`
 
-- [ ] **步骤 1：编写 CLI 构造测试**
+- [x] **步骤 1：编写 CLI 构造测试**
 
 ```python
 def test_premap_and_memory_commands_construct_services(cli):
@@ -1091,7 +1095,7 @@ def test_premap_and_memory_commands_construct_services(cli):
     assert "memories" in json.loads(output)
 ```
 
-- [ ] **步骤 2：编写状态和导出报告测试**
+- [x] **步骤 2：编写状态和导出报告测试**
 
 ```python
 def test_status_and_export_include_narrative_metrics(database, exporter):
@@ -1108,7 +1112,7 @@ def test_status_and_export_include_narrative_metrics(database, exporter):
     assert "dynamic_scheduling" in report
 ```
 
-- [ ] **步骤 3：运行测试确认失败**
+- [x] **步骤 3：运行测试确认失败**
 
 运行：
 
@@ -1118,7 +1122,7 @@ def test_status_and_export_include_narrative_metrics(database, exporter):
 
 预期：FAIL，命令和状态字段不存在。
 
-- [ ] **步骤 4：新增命令**
+- [x] **步骤 4：新增命令**
 
 `main.py` 新增：
 
@@ -1130,7 +1134,7 @@ rebuild-snapshots-v4 <book_id> [--from-index N]
 
 `translate-v4` 增加预映射、记忆上下文、动态调度和最大记忆纪元参数；默认启用新路径。
 
-- [ ] **步骤 5：扩展状态和本地界面**
+- [x] **步骤 5：扩展状态和本地界面**
 
 `status_summary()` 返回预映射/翻译游标、记忆版本、缓存命中、波动分布、降级块和 deferred memory proposals。
 
@@ -1144,7 +1148,7 @@ rebuild-snapshots-v4 <book_id> [--from-index N]
 
 页面显示证据、关系、话语状态和波动原因；现有盲评和人工队列按钮保持不变。
 
-- [ ] **步骤 6：扩展导出**
+- [x] **步骤 6：扩展导出**
 
 TXT/EPUB 正文不插入系统记忆。质量报告增加：
 
@@ -1155,7 +1159,7 @@ TXT/EPUB 正文不插入系统记忆。质量报告增加：
 - 动态调度统计；
 - 记忆相关重验和警告。
 
-- [ ] **步骤 7：运行 CLI、UI 和导出测试**
+- [x] **步骤 7：运行 CLI、UI 和导出测试**
 
 运行：
 
@@ -1165,7 +1169,7 @@ TXT/EPUB 正文不插入系统记忆。质量报告增加：
 
 预期：全部 PASS。
 
-- [ ] **步骤 8：Commit**
+- [x] **步骤 8：Commit**
 
 ```powershell
 git add main.py src/core/v4/database.py src/core/v4/web_review.py src/core/v4/exporter.py tests/test_narrative_pipeline.py tests/test_parallel_v4.py

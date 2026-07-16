@@ -469,14 +469,27 @@ class ParallelV4V2Tests(unittest.TestCase):
         self.assertIn('id="warning-uncertain-coreference"', REVIEW_HTML)
         self.assertIn('id="warning-render-conflicts"', REVIEW_HTML)
         self.assertIn('id="warning-stale"', REVIEW_HTML)
+        self.assertIn('id="narrative-memory"', REVIEW_HTML)
+        self.assertIn('id="narrative-snapshot"', REVIEW_HTML)
+        self.assertIn('id="narrative-volatility"', REVIEW_HTML)
         self.assertNotIn("unfinished warning", REVIEW_HTML.casefold())
 
     def test_v4_public_api_exports_unattended_coordinators(self):
-        from src.core.v4 import CoreferenceCoordinator, RevalidationRunner, V4Migrator
+        from src.core.v4 import (
+            CoreferenceCoordinator,
+            NarrativeMemoryStore,
+            NarrativePremapper,
+            RevalidationRunner,
+            V4Migrator,
+            classify_memory_change,
+        )
 
         self.assertTrue(CoreferenceCoordinator)
+        self.assertTrue(NarrativeMemoryStore)
+        self.assertTrue(NarrativePremapper)
         self.assertTrue(RevalidationRunner)
         self.assertTrue(V4Migrator)
+        self.assertEqual(classify_memory_change("timeline_anchor"), 3)
 
     def test_web_server_is_loopback_and_post_requires_token(self):
         docx = self.root / "web-baseline.docx"
@@ -503,6 +516,24 @@ class ParallelV4V2Tests(unittest.TestCase):
             self.assertEqual(
                 detail["candidates"][1]["origin"], "parallel_v4（尚未生成）"
             )
+            narrative_memory = json.loads(
+                urlopen(
+                    f"http://{host}:{port}/api/narrative-memory?block={block.id}"
+                ).read()
+            )
+            narrative_snapshot = json.loads(
+                urlopen(
+                    f"http://{host}:{port}/api/narrative-snapshot?block={block.id}"
+                ).read()
+            )
+            narrative_volatility = json.loads(
+                urlopen(
+                    f"http://{host}:{port}/api/narrative-volatility?block={block.id}"
+                ).read()
+            )
+            self.assertIn("memories", narrative_memory)
+            self.assertIn("snapshots", narrative_snapshot)
+            self.assertIn("premap", narrative_volatility)
             payload = json.dumps(
                 {"block": block.id, "paragraph_index": 0, "body": "测试注释"}
             ).encode()

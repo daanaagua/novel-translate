@@ -1411,6 +1411,8 @@ class ParallelV4CliTests(unittest.TestCase):
         self.assertEqual(captured["config"].decision_mode, "interactive")
         self.assertTrue(captured["config"].pause_on_review)
         self.assertEqual(captured["config"].max_knowledge_epochs, 4)
+        self.assertTrue(captured["config"].enable_narrative_premap)
+        self.assertTrue(captured["config"].dynamic_scheduling)
         self.assertEqual(
             captured["config"].unattended_failure_policy, "finish_with_warnings"
         )
@@ -1430,6 +1432,95 @@ class ParallelV4CliTests(unittest.TestCase):
             )
         self.assertEqual(legacy_code, 0)
         self.assertEqual(captured["config"].decision_mode, "auto")
+
+    def test_narrative_cli_commands_construct_bounded_services(self):
+        import main as cli_main
+
+        calls = []
+
+        class FakeDatabase:
+            def __init__(self, root):
+                self.root = root
+
+            def get_block_by_identifier(self, identifier):
+                return SimpleNamespace(id=f"resolved-{identifier}")
+
+            def inspect_narrative_memory(self, **filters):
+                calls.append(("inspect", filters))
+                return {"memories": [], "snapshots": []}
+
+        class FakePipeline:
+            def __init__(self, **kwargs):
+                calls.append(("pipeline", kwargs["config"]))
+
+            def premap(self, *, block_ids=(), max_blocks=None):
+                calls.append(("premap", tuple(block_ids), max_blocks))
+                return {"premapped": 3}
+
+            def rebuild_snapshots(self, *, from_index=0):
+                calls.append(("rebuild", from_index))
+                return {"rebuilt": 2}
+
+        with (
+            patch.object(cli_main, "V4Migrator"),
+            patch.object(cli_main, "V4Database", FakeDatabase),
+            patch.object(cli_main, "V4TranslationPipeline", FakePipeline),
+            patch.object(cli_main, "LLMManager", return_value=object()),
+            patch.object(
+                cli_main.config_loader,
+                "load_config",
+                return_value={
+                    "llm": {},
+                    "parallel_v4": {},
+                    "translation": {},
+                },
+            ),
+            patch.object(cli_main.config_loader, "load_prompts", return_value={}),
+        ):
+            premap_code, premap_output = self.invoke(
+                "premap-v4",
+                "book",
+                "--max-blocks",
+                "3",
+                "--block",
+                "v01_ch01_000",
+            )
+            inspect_code, inspect_output = self.invoke(
+                "inspect-memory-v4",
+                "book",
+                "--block",
+                "v01_ch01_000",
+                "--subject",
+                "concept-severian",
+            )
+            rebuild_code, rebuild_output = self.invoke(
+                "rebuild-snapshots-v4",
+                "book",
+                "--from-index",
+                "8",
+            )
+
+        self.assertEqual(
+            (premap_code, inspect_code, rebuild_code), (0, 0, 0)
+        )
+        self.assertEqual(json.loads(premap_output)["premapped"], 3)
+        self.assertIn("memories", json.loads(inspect_output))
+        self.assertEqual(json.loads(rebuild_output)["rebuilt"], 2)
+        self.assertIn(
+            ("premap", ("resolved-v01_ch01_000",), 3), calls
+        )
+        self.assertIn(
+            (
+                "inspect",
+                {
+                    "block_id": "resolved-v01_ch01_000",
+                    "subject_id": "concept-severian",
+                    "memory_type": None,
+                },
+            ),
+            calls,
+        )
+        self.assertIn(("rebuild", 8), calls)
 
     def test_migrate_v4_preview_and_confirmation_are_explicit(self):
         import main as cli_main

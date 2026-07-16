@@ -222,6 +222,10 @@ class V4TranslationPipeline:
         self._premap_tail_state = DiscourseState()
         self._premap_cache_hits = 0
         self._premap_model_calls = 0
+        self._style_tail_snapshot: Mapping[str, Any] | None = None
+        self._active_style_snapshots: Mapping[
+            str, Mapping[str, Any]
+        ] = {}
 
     @staticmethod
     def _category(value: str) -> Optional[TermCategory]:
@@ -645,6 +649,9 @@ class V4TranslationPipeline:
         prior_state: DiscourseState,
     ) -> NarrativeBlockContext:
         structure = self._source_structure(block)
+        structure_hash = self.narrative_store.save_source_structure(
+            block, structure
+        )
         provisional_subjects = self._provisional_subjects(
             block, prior_state
         )
@@ -677,13 +684,7 @@ class V4TranslationPipeline:
         )
         cache_key = self.narrative_store.premap_cache_key(
             block=block,
-            structure_hash=hashlib.sha256(
-                json.dumps(
-                    structure,
-                    sort_keys=True,
-                    separators=(",", ":"),
-                ).encode("utf-8")
-            ).hexdigest(),
+            structure_hash=structure_hash,
             prompt_hash=prompt_hash,
             model_id=model_id,
             parameters_hash=parameters_hash,
@@ -692,11 +693,64 @@ class V4TranslationPipeline:
         )
         cached = self.narrative_store.load_premap_result(cache_key)
         cached_snapshot = self.narrative_store.snapshot_for_cache(cache_key)
+        current_memory_version = (
+            self.narrative_store.current_memory_version()
+        )
+        linked_snapshot_is_compatible = bool(
+            cached_snapshot is not None
+            and cached_snapshot.knowledge_version == knowledge_version
+            and cached_snapshot.memory_version == current_memory_version
+        )
         if cached is not None and cached_snapshot is not None:
             self._premap_cache_hits += 1
+            self.database.record_audit_call(
+                run_id=run_id,
+                block_id=block.id,
+                purpose="narrative_premap_cache_hit",
+                model=model_id,
+                knowledge_version=knowledge_version,
+                request={"cache_key": cache_key},
+                raw_response="",
+                parsed={"snapshot_id": cached_snapshot.id},
+                accepted=True,
+                attempts=1,
+                elapsed_ms=0,
+                error=None,
+                archive_payload=False,
+            )
             result = cached
-            snapshot = cached_snapshot
-            current_state = snapshot.discourse_state
+            current_state = apply_discourse_delta(
+                prior_state, result.discourse_delta
+            )
+            refreshed_snapshot = None
+            if (
+                not linked_snapshot_is_compatible
+                and cached_snapshot.knowledge_version == knowledge_version
+            ):
+                refreshed_snapshot = self.narrative_store.build_snapshot(
+                    block,
+                    knowledge_version=knowledge_version,
+                    memory_version=current_memory_version,
+                    discourse_state=current_state,
+                )
+                linked_snapshot_is_compatible = bool(
+                    refreshed_snapshot.visible_memory_ids
+                    == cached_snapshot.visible_memory_ids
+                    and refreshed_snapshot.discourse_state
+                    == cached_snapshot.discourse_state
+                )
+            if linked_snapshot_is_compatible:
+                snapshot = cached_snapshot
+            else:
+                snapshot = (
+                    refreshed_snapshot
+                    or self.narrative_store.build_snapshot(
+                        block,
+                        knowledge_version=knowledge_version,
+                        memory_version=current_memory_version,
+                        discourse_state=current_state,
+                    )
+                )
         else:
             if cached is None:
                 premapper = NarrativePremapper(
@@ -784,8 +838,20 @@ class V4TranslationPipeline:
                 knowledge_version=knowledge_version,
                 discourse_state=current_state,
             )
+        signals = self._narrative_signals(
+            block, result, prior_state, current_state
+        )
+        schedule_plan = self.narrative_scheduler.plan(signals)
+        if cached_snapshot is None or linked_snapshot_is_compatible:
             self.narrative_store.link_premap_snapshot(
-                cache_key, snapshot.id
+                cache_key,
+                snapshot.id,
+                metrics={
+                    "volatility": schedule_plan.volatility,
+                    "reasons": list(schedule_plan.reasons),
+                    "workers": schedule_plan.workers,
+                    "island_size": schedule_plan.island_size,
+                },
             )
         matched_subject_ids = tuple(
             value["id"] for value in provisional_subjects
@@ -813,9 +879,7 @@ class V4TranslationPipeline:
             result=result,
             snapshot=snapshot,
             retrieval=retrieval,
-            signals=self._narrative_signals(
-                block, result, prior_state, current_state
-            ),
+            signals=signals,
             matched_subject_ids=matched_subject_ids,
             source_structure=structure,
             error=error,
@@ -1033,6 +1097,9 @@ class V4TranslationPipeline:
                         narrative_context.source_structure
                         if narrative_context is not None
                         else self._source_structure(block)
+                    ),
+                    style_snapshot=self._active_style_snapshots.get(
+                        block.id
                     ),
                 )
             except ContextOverflow as exc:
@@ -1291,6 +1358,17 @@ class V4TranslationPipeline:
                 self._active_narrative_contexts = {
                     block.id: narrative_context
                 }
+            style_snapshot = (
+                self.narrative_store.latest_style_snapshot_before(
+                    block.global_index,
+                    source_edition_id=block.source_edition_id,
+                )
+            )
+            self._active_style_snapshots = (
+                {block.id: style_snapshot}
+                if style_snapshot is not None
+                else {}
+            )
             outcomes = self._translate_island(
                 Island(id=f"revalidate-{block.id}", blocks=[block]),
                 bundle.knowledge_version,
@@ -1301,6 +1379,120 @@ class V4TranslationPipeline:
             return outcomes[0]
 
         return translate_block
+
+    def premap(
+        self,
+        *,
+        block_ids: Sequence[str] = (),
+        max_blocks: int | None = None,
+    ) -> Dict[str, Any]:
+        """Run the fused narrative premap without translating any prose."""
+
+        if max_blocks is not None and (
+            type(max_blocks) is not int or max_blocks < 0
+        ):
+            raise ValueError("max_blocks must be a non-negative integer")
+        blocks = self.database.list_blocks()
+        requested = set(str(value) for value in block_ids)
+        if requested:
+            positions = [
+                index
+                for index, block in enumerate(blocks)
+                if block.id in requested
+            ]
+            missing = requested - {blocks[index].id for index in positions}
+            if missing:
+                raise KeyError(f"unknown premap block: {sorted(missing)[0]}")
+            blocks = blocks[: max(positions) + 1] if positions else []
+        if max_blocks is not None:
+            blocks = blocks[:max_blocks]
+        self._premap_contexts = {}
+        self._premap_cursor = -1
+        self._premap_tail_snapshot = None
+        self._premap_tail_state = DiscourseState()
+        self._premap_cache_hits = 0
+        self._premap_model_calls = 0
+        run_id = f"premap_{uuid4().hex}"
+        knowledge_version = self.database.current_knowledge_version()
+        self.database.start_run(
+            run_id,
+            "premap",
+            {
+                "max_blocks": max_blocks,
+                "block_ids": sorted(requested),
+                "narrative_premap_mode": True,
+            },
+            knowledge_version=knowledge_version,
+        )
+        try:
+            if blocks:
+                self._ensure_premapped(
+                    blocks,
+                    through_position=len(blocks) - 1,
+                    knowledge_version=knowledge_version,
+                    run_id=run_id,
+                )
+            self.database.finish_run(run_id, "completed")
+        except Exception as exc:
+            self.database.finish_run(run_id, "failed", str(exc)[:1024])
+            raise
+        return {
+            "run_id": run_id,
+            "status": "completed",
+            "premapped": len(blocks),
+            "requested_block_ids": sorted(requested),
+            "premap_cursor": (
+                blocks[self._premap_cursor].global_index
+                if blocks and self._premap_cursor >= 0
+                else -1
+            ),
+            "premap_cache_hits": self._premap_cache_hits,
+            "premap_model_calls": self._premap_model_calls,
+            "memory_version": self.narrative_store.current_memory_version(),
+        }
+
+    def rebuild_snapshots(
+        self, *, from_index: int = 0
+    ) -> Dict[str, Any]:
+        if type(from_index) is not int or from_index < 0:
+            raise ValueError("from_index must be a non-negative integer")
+        blocks = [
+            block
+            for block in self.database.list_blocks()
+            if block.global_index >= from_index
+        ]
+        previous = self.narrative_store.latest_snapshot_before(from_index)
+        state = (
+            previous.discourse_state if previous is not None else DiscourseState()
+        )
+        knowledge_version = self.database.current_knowledge_version()
+        rebuilt = skipped = 0
+        snapshot_ids: list[str] = []
+        for block in blocks:
+            result = self.narrative_store.latest_premap_result_for_block(
+                block.id
+            )
+            if result is None:
+                skipped += 1
+                continue
+            prior_state = state
+            state = apply_discourse_delta(state, result.discourse_delta)
+            snapshot = self.narrative_store.build_snapshot(
+                block,
+                knowledge_version=knowledge_version,
+                memory_version=self.narrative_store.current_memory_version(),
+                discourse_state=state,
+            )
+            rebuilt += 1
+            snapshot_ids.append(snapshot.id)
+        return {
+            "status": "completed",
+            "from_index": from_index,
+            "rebuilt": rebuilt,
+            "skipped": skipped,
+            "snapshot_ids": snapshot_ids,
+            "memory_version": self.narrative_store.current_memory_version(),
+        }
 
     def _retranslation_narrative_context(
         self, block: V4Block, knowledge_version: int
@@ -1502,6 +1694,14 @@ class V4TranslationPipeline:
                     )
                     for block in wave_blocks
                 }
+                self._active_style_snapshots = (
+                    {
+                        block.id: self._style_tail_snapshot
+                        for block in wave_blocks
+                    }
+                    if self._style_tail_snapshot is not None
+                    else {}
+                )
                 wave_outcomes: List[TranslationOutcome] = []
                 final_workers = max(1, len(wave))
                 with ThreadPoolExecutor(
@@ -1523,6 +1723,29 @@ class V4TranslationPipeline:
                     wave_outcomes,
                     audit_mode=self.config.audit_mode,
                 )
+                for outcome in sorted(
+                    wave_outcomes,
+                    key=lambda value: value.block.global_index,
+                ):
+                    if outcome.status not in {
+                        V4BlockStatus.COMPLETED.value,
+                        V4BlockStatus.COMPLETED_WITH_WARNINGS.value,
+                    }:
+                        continue
+                    if outcome.style_delta:
+                        self._style_tail_snapshot = (
+                            self.narrative_store.merge_style_delta(
+                                outcome.block,
+                                outcome.style_delta,
+                                previous_snapshot_id=str(
+                                    (
+                                        self._style_tail_snapshot
+                                        or {}
+                                    ).get("id")
+                                    or ""
+                                ),
+                            )
+                        )
                 epoch_coordinator.stage(run_id, wave_outcomes)
                 checkpoint = epoch_coordinator.checkpoint(run_id)
                 change_ids.update(checkpoint.change_ids)
@@ -1664,6 +1887,15 @@ class V4TranslationPipeline:
         if self.config.max_blocks is not None:
             candidates = candidates[: self.config.max_blocks]
         if self.config.enable_narrative_premap:
+            self._style_tail_snapshot = (
+                self.narrative_store.latest_style_snapshot_before(
+                    candidates[0].global_index,
+                    source_edition_id=candidates[0].source_edition_id,
+                )
+                if candidates
+                else None
+            )
+            self._active_style_snapshots = {}
             return self._run_narrative(candidates)
         islands = self._make_islands(candidates, self.config.island_size)
         run_id = f"translate_{uuid4().hex}"

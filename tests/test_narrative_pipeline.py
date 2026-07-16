@@ -4,6 +4,9 @@ import hashlib
 import json
 import subprocess
 import sys
+from types import SimpleNamespace
+
+import yaml
 
 from src.core.v4.context import ContextBuilder
 from src.core.v4.database import V4Database
@@ -128,6 +131,31 @@ def test_provisional_subjects_include_all_prior_discourse_layers(tmp_path):
         "time-night",
         "layer-dream",
     }
+
+
+def test_status_and_quality_report_include_narrative_metrics(tmp_path):
+    from src.core.v4.exporter import ParallelV4BookExporter
+
+    database = V4Database(tmp_path / "book")
+    status = database.status_summary()
+
+    assert {
+        "premap_cursor",
+        "translation_cursor",
+        "memory_version",
+        "premap_cache_hit_rate",
+        "degraded_premap_blocks",
+        "unresolved_narrative_references",
+        "disputed_narrative_memories",
+        "memory_revalidation_tasks",
+    } <= status.keys()
+    exporter = ParallelV4BookExporter(
+        SimpleNamespace(root_dir=tmp_path / "book"),
+        database=database,
+    )
+    report = exporter.build_quality_report()
+    assert "narrative_memory" in report
+    assert "dynamic_scheduling" in report
 
 
 def test_context_includes_semantics_memory_discourse_and_exact_dependencies(
@@ -293,6 +321,23 @@ def test_xml_parser_reads_supplemental_memory_and_style_delta():
     assert parsed["style_delta"] == {"register": "formal"}
 
 
+def test_draft_prompt_requests_bounded_memory_and_style_outputs():
+    from pathlib import Path
+
+    prompts = yaml.safe_load(
+        (
+            Path(__file__).resolve().parents[1]
+            / "config"
+            / "prompts.yaml"
+        ).read_text(encoding="utf-8")
+    )
+    draft = prompts["draft"]["system"]
+
+    assert "<supplemental_memory>" in draft
+    assert "<style_delta" in draft
+    assert "只允许引用当前英文原文中的证据" in draft
+
+
 def test_translator_imports_in_a_fresh_interpreter_without_package_cycle():
     result = subprocess.run(
         [
@@ -450,6 +495,417 @@ def test_pipeline_premaps_ahead_and_reuses_cached_snapshot_chain(tmp_path):
         "narrative_snapshot",
         "discourse_state",
     } <= dependencies
+
+
+def test_public_premap_and_memory_inspection_reuse_cache(tmp_path):
+    from src.core.v4.pipeline import V4PipelineConfig, V4TranslationPipeline
+
+    class PremapOnlyLLM:
+        def __init__(self):
+            self.calls = 0
+
+        def get_model(self, purpose):
+            return f"fake-{purpose}"
+
+        def chat(self, *, purpose, **_kwargs):
+            assert purpose == "narrative_premap"
+            self.calls += 1
+            return json.dumps(
+                {
+                    "semantic_relations": [],
+                    "memory_candidates": [],
+                    "discourse_delta": {
+                        "scene_location": "the-citadel",
+                        "state_confidence": 0.5,
+                    },
+                }
+            )
+
+    database = V4Database(tmp_path / "book")
+    edition = database.ensure_source_edition(
+        "raw", "normalized", "test", "source.txt"
+    )
+    rows = []
+    for index in range(2):
+        source = f"Premap sentence {index}."
+        rows.append(
+            {
+                "id": f"premap-only-{index}",
+                "legacy_id": f"v01_ch01_{index:03d}",
+                "chapter_id": "ch01",
+                "chapter_title": "I",
+                "chapter_index": 0,
+                "block_index": index,
+                "global_index": index,
+                "block_type": "prose",
+                "source_text": source,
+                "source_hash": hashlib.sha256(source.encode()).hexdigest(),
+                "token_count": 3,
+                "status": "ready",
+            }
+        )
+    database.upsert_blocks(edition, rows)
+    llm = PremapOnlyLLM()
+    config = V4PipelineConfig(enable_narrative_premap=True)
+
+    first = V4TranslationPipeline(
+        database, lambda: llm, config=config
+    ).premap(max_blocks=2)
+    second = V4TranslationPipeline(
+        database, lambda: llm, config=config
+    ).premap(max_blocks=2)
+    inspected = database.inspect_narrative_memory(
+        block_id="premap-only-1",
+        subject_id=None,
+        memory_type=None,
+    )
+
+    assert first["premapped"] == second["premapped"] == 2
+    assert first["premap_model_calls"] == 2
+    assert second["premap_cache_hits"] == 2
+    assert llm.calls == 2
+    assert inspected["snapshots"][0]["block_id"] == "premap-only-1"
+
+
+def test_style_delta_is_persisted_and_available_to_next_wave(tmp_path):
+    from src.core.v4.pipeline import V4PipelineConfig, V4TranslationPipeline
+
+    class StyleLLM:
+        def __init__(self):
+            self.draft_saw_formal = []
+            self.premap_calls = 0
+
+        def get_model(self, purpose):
+            return f"fake-{purpose}"
+
+        def chat(self, *, messages, purpose="draft", stream=False, **_kwargs):
+            if purpose == "narrative_premap":
+                self.premap_calls += 1
+                return json.dumps(
+                    {
+                        "semantic_relations": [],
+                        "memory_candidates": (
+                            [
+                                {
+                                    "candidate_id": "M-style-boundary",
+                                    "memory_type": "contradiction",
+                                    "statement": "The presentation layer changes.",
+                                    "truth_status": "observed",
+                                    "visibility": "reader_visible",
+                                    "confidence": 0.8,
+                                    "evidence_spans": [
+                                        "Style sentence 0."
+                                    ],
+                                    "subjects": [],
+                                    "related_memory_ids": [],
+                                    "state_operation": "append",
+                                    "high_impact": True,
+                                }
+                            ]
+                            if self.premap_calls == 1
+                            else []
+                        ),
+                        "discourse_delta": (
+                            {
+                                "narrator_layer": "narrator-a",
+                                "presentation_layer": "layer-a",
+                                "scene_time": "later",
+                            }
+                            if self.premap_calls == 1
+                            else {}
+                        ),
+                    }
+                )
+            joined = "\n".join(str(item["content"]) for item in messages)
+            self.draft_saw_formal.append("formal" in joined)
+            style = (
+                {"register": "formal"}
+                if len(self.draft_saw_formal) == 1
+                else {}
+            )
+            payload = json.dumps(
+                {
+                    "analysis": "",
+                    "translation": "译文。",
+                    "memory_summary": "",
+                    "new_terms": [],
+                    "relations": [],
+                    "supplemental_memory_candidates": [],
+                    "style_delta": style,
+                }
+            )
+
+            def generator():
+                yield ("content", payload)
+
+            return generator() if stream else payload
+
+    database = V4Database(tmp_path / "book")
+    edition = database.ensure_source_edition(
+        "raw", "normalized", "test", "source.txt"
+    )
+    rows = []
+    for index in range(2):
+        source = f"Style sentence {index}."
+        rows.append(
+            {
+                "id": f"style-block-{index}",
+                "legacy_id": f"v01_ch01_{index:03d}",
+                "chapter_id": "ch01",
+                "chapter_title": "I",
+                "chapter_index": 0,
+                "block_index": index,
+                "global_index": index,
+                "block_type": "prose",
+                "source_text": source,
+                "source_hash": hashlib.sha256(source.encode()).hexdigest(),
+                "token_count": 3,
+                "status": "ready",
+            }
+        )
+    database.upsert_blocks(edition, rows)
+    llm = StyleLLM()
+
+    result = V4TranslationPipeline(
+        database,
+        lambda: llm,
+        config=V4PipelineConfig(
+            enable_narrative_premap=True,
+            enable_polish=False,
+            island_size=1,
+            initial_workers=1,
+            max_workers=1,
+            premap_ahead_blocks=2,
+        ),
+    ).run()
+
+    assert result["completed"] == 2
+    assert llm.draft_saw_formal == [False, True]
+    with database.connect() as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM style_snapshots"
+        ).fetchone()[0] == 1
+        style_snapshot_id = connection.execute(
+            """SELECT style_snapshot_id FROM translation_versions
+               WHERE block_id='style-block-1' AND active=1"""
+        ).fetchone()[0]
+    assert style_snapshot_id
+
+
+def test_rebuild_snapshots_preserves_premap_cache_provenance(tmp_path):
+    from src.core.v4.narrative_memory import NarrativeMemoryStore
+    from src.core.v4.pipeline import V4PipelineConfig, V4TranslationPipeline
+
+    class PremapLLM:
+        def get_model(self, purpose):
+            return f"fake-{purpose}"
+
+        def chat(self, *, purpose="draft", **_kwargs):
+            assert purpose == "narrative_premap"
+            return json.dumps(
+                {
+                    "semantic_relations": [],
+                    "memory_candidates": [],
+                    "discourse_delta": {},
+                }
+            )
+
+    database = V4Database(tmp_path / "book")
+    edition = database.ensure_source_edition(
+        "raw", "normalized", "test", "source.txt"
+    )
+    database.upsert_blocks(
+        edition,
+        [
+            {
+                "id": f"rebuild-block-{index}",
+                "legacy_id": f"v01_ch01_{index:03d}",
+                "chapter_id": "ch01",
+                "chapter_title": "I",
+                "chapter_index": 0,
+                "block_index": index,
+                "global_index": index,
+                "block_type": "prose",
+                "source_text": f"Rebuild sentence {index}.",
+                "source_hash": hashlib.sha256(
+                    f"Rebuild sentence {index}.".encode()
+                ).hexdigest(),
+                "token_count": 3,
+                "status": "ready",
+            }
+            for index in range(2)
+        ],
+    )
+    config = V4PipelineConfig(enable_narrative_premap=True)
+    V4TranslationPipeline(
+        database, PremapLLM, config=config
+    ).premap(max_blocks=2)
+    with database.connect() as connection:
+        before = [
+            tuple(row)
+            for row in connection.execute(
+                """SELECT cache_key, snapshot_id, prior_snapshot_hash
+                   FROM premap_results ORDER BY block_id"""
+            ).fetchall()
+        ]
+
+    store = NarrativeMemoryStore(database)
+    first_block = database.list_blocks()[0]
+    store.merge_candidates(
+        first_block,
+        [
+            NarrativeMemoryCandidate(
+                candidate_id="rebuild-memory",
+                memory_type="explicit_fact",
+                statement="A new visible fact exists.",
+                truth_status="observed",
+                visibility="reader_visible",
+                confidence=0.9,
+                evidence_spans=(first_block.source_text,),
+                subjects=(),
+            )
+        ],
+        source="test",
+    )
+    V4TranslationPipeline(
+        database, PremapLLM, config=config
+    ).rebuild_snapshots(from_index=0)
+
+    with database.connect() as connection:
+        after = [
+            tuple(row)
+            for row in connection.execute(
+                """SELECT cache_key, snapshot_id, prior_snapshot_hash
+                   FROM premap_results ORDER BY block_id"""
+            ).fetchall()
+        ]
+    assert after == before
+    for _, snapshot_id, prior_snapshot_hash in after:
+        snapshot = store.load_snapshot(snapshot_id)
+        assert snapshot is not None
+        previous = (
+            store.load_snapshot(snapshot.previous_snapshot_id)
+            if snapshot.previous_snapshot_id
+            else None
+        )
+        assert prior_snapshot_hash == (
+            previous.snapshot_hash if previous is not None else ""
+        )
+    rerun = V4TranslationPipeline(
+        database, PremapLLM, config=config
+    ).premap(max_blocks=2)
+    assert rerun["premap_cache_hits"] == 1
+    assert rerun["premap_model_calls"] == 1
+
+
+def test_partial_run_does_not_seed_style_from_future_block(tmp_path):
+    from src.core.v4.narrative_memory import NarrativeMemoryStore
+    from src.core.v4.pipeline import V4PipelineConfig, V4TranslationPipeline
+
+    database = V4Database(tmp_path / "book")
+    edition = database.ensure_source_edition(
+        "raw", "normalized", "test", "source.txt"
+    )
+    database.upsert_blocks(
+        edition,
+        [
+            {
+                "id": f"style-future-{index}",
+                "legacy_id": f"v01_ch01_{index:03d}",
+                "chapter_id": "ch01",
+                "chapter_title": "I",
+                "chapter_index": 0,
+                "block_index": index,
+                "global_index": index,
+                "block_type": "prose",
+                "source_text": f"Style future sentence {index}.",
+                "source_hash": hashlib.sha256(
+                    f"Style future sentence {index}.".encode()
+                ).hexdigest(),
+                "token_count": 4,
+                "status": "ready",
+            }
+            for index in range(2)
+        ],
+    )
+    blocks = database.list_blocks()
+    NarrativeMemoryStore(database).merge_style_delta(
+        blocks[1],
+        {"register": "future-formal"},
+        previous_snapshot_id="",
+    )
+    pipeline = V4TranslationPipeline(
+        database,
+        lambda: object(),
+        config=V4PipelineConfig(
+            enable_narrative_premap=True,
+            include_block_ids=(blocks[0].id,),
+        ),
+    )
+    captured = {}
+
+    def capture_run(candidates):
+        captured["tail"] = pipeline._style_tail_snapshot
+        return {"status": "captured", "candidate_count": len(candidates)}
+
+    pipeline._run_narrative = capture_run
+    result = pipeline.run()
+
+    assert result["candidate_count"] == 1
+    assert captured["tail"] is None
+
+
+def test_retranslation_does_not_use_style_from_future_block(tmp_path):
+    from src.core.v4.narrative_memory import NarrativeMemoryStore
+    from src.core.v4.pipeline import V4PipelineConfig, V4TranslationPipeline
+
+    database = V4Database(tmp_path / "book")
+    edition = database.ensure_source_edition(
+        "raw", "normalized", "test", "source.txt"
+    )
+    database.upsert_blocks(
+        edition,
+        [
+            {
+                "id": f"style-retranslate-{index}",
+                "legacy_id": f"v01_ch01_{index:03d}",
+                "chapter_id": "ch01",
+                "chapter_title": "I",
+                "chapter_index": 0,
+                "block_index": index,
+                "global_index": index,
+                "block_type": "prose",
+                "source_text": f"Style retranslate sentence {index}.",
+                "source_hash": hashlib.sha256(
+                    f"Style retranslate sentence {index}.".encode()
+                ).hexdigest(),
+                "token_count": 4,
+                "status": "ready",
+            }
+            for index in range(2)
+        ],
+    )
+    blocks = database.list_blocks()
+    NarrativeMemoryStore(database).merge_style_delta(
+        blocks[1],
+        {"register": "future-formal"},
+        previous_snapshot_id="",
+    )
+    pipeline = V4TranslationPipeline(
+        database,
+        lambda: object(),
+        config=V4PipelineConfig(enable_narrative_premap=False),
+    )
+    captured = {}
+
+    def capture_island(island, *_args, **_kwargs):
+        captured.update(pipeline._active_style_snapshots)
+        return [SimpleNamespace(block=island.blocks[0])]
+
+    pipeline._translate_island = capture_island
+    pipeline.translate_block_factory()(blocks[0])
+
+    assert captured == {}
 
 
 def test_knowledge_checkpoint_merges_supplemental_memory_once(tmp_path):

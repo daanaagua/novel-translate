@@ -37,6 +37,9 @@ main{display:grid;grid-template-columns:minmax(280px,360px) 1fr;min-height:calc(
 <div class="section-title"><h2>译文对照</h2></div><div id="candidates" class="columns"></div>
 <div id="votePanel" class="card" hidden><h3>盲评选择</h3><div class="muted">点击四个评价按钮会立即保存选择和当前理由；修改理由后，可单独点击“保存理由/更新评价”。</div><div class="vote-actions"><button data-vote-choice="A" onclick="submitVote('A')">A更好</button><button data-vote-choice="B" onclick="submitVote('B')">B更好</button><button data-vote-choice="tie" onclick="submitVote('tie')">两者相当</button><button data-vote-choice="neither" onclick="submitVote('neither')">都不合格</button></div><input id="voteNote" oninput="saveVoteDraft()" placeholder="可选：简短说明理由" style="width:100%"><div class="queue-actions"><button onclick="saveCurrentVote()">保存理由/更新评价</button></div><div id="voteStatus" class="vote-status"></div></div>
 <div class="section-title"><h2>证据</h2></div><div id="evidence"></div>
+<div class="section-title"><h2>叙事上下文</h2></div>
+<div class="columns"><div><h3>记忆与关系</h3><div id="narrative-memory" class="prose"></div></div><div><h3>位置快照</h3><div id="narrative-snapshot" class="prose"></div></div></div>
+<div class="section-title"><h2>动态调度</h2></div><div id="narrative-volatility" class="prose"></div>
 <div class="section-title"><h2>注释</h2></div><div id="annotations"></div><div class="card"><input id="annIndex" type="number" min="0" value="0" style="width:90px"><input id="annBody" placeholder="注释正文" style="width:min(560px,70%)"><button onclick="addAnnotation()">添加待审注释</button></div>
 <div class="section-title"><h2>局部修复</h2></div><div class="card"><textarea id="repairIssues" rows="3" style="width:100%" placeholder="每行一个需要修复的问题"></textarea><button onclick="requestRepair()">加入局部修复队列</button></div>
 </div></section></main>
@@ -53,7 +56,8 @@ function renderTasks(verify,repair){const root=document.querySelector('#tasks');
 function renderBlocks(rows){const root=document.querySelector('#blocks');root.innerHTML='';for(const b of rows){const c=document.createElement('div');c.className='card block';c.onclick=()=>loadBlock(b.legacy_id,true);c.innerHTML=`<h3></h3><span class="pill"></span>`;c.querySelector('h3').textContent=`${b.legacy_id} · ${b.chapter_title}`;c.querySelector('.pill').textContent=(b.translation_status||b.status)+(b.comparison_choice?` · 已选${{A:'A',B:'B',tie:'相当',neither:'均不合格'}[b.comparison_choice]}`:'');root.append(c)}}
 async function queueAction(id,action){try{await api(`/api/queue/${id}`,{method:'POST',body:JSON.stringify({action})});await loadState()}catch(e){alert(e.message)}}
 async function editAccept(id){const replacement=prompt('输入替换后的译法或声明：');if(!replacement)return;try{await api(`/api/queue/${id}`,{method:'POST',body:JSON.stringify({action:'accept',replacement})});await loadState()}catch(e){alert(e.message)}}
-async function loadBlock(id,blind=true){currentBlock=id;const d=await api(`/api/block?id=${encodeURIComponent(id)}&blind=${blind?'1':'0'}`);revealed=d.blind_available?!blind:true;document.querySelector('#empty').hidden=true;document.querySelector('#detail').hidden=false;escText(document.querySelector('#blockTitle'),`${d.legacy_id} · ${d.chapter_title}`);const warnings=JSON.parse(d.warnings_json||'[]');escText(document.querySelector('#blockMeta'),`${d.v4_status||d.status} · global_index=${d.global_index}${warnings.length?' · 警告：'+warnings.join('；'):''}`);escText(document.querySelector('#source'),d.source_text);const cr=document.querySelector('#candidates');cr.innerHTML='';for(const x of d.candidates){const box=document.createElement('div');box.innerHTML='<h3></h3><div class="prose"></div>';box.querySelector('h3').textContent=x.label+(x.origin?` · ${x.origin}`:'');box.querySelector('.prose').textContent=x.text||'（无译文）';cr.append(box)}renderVote(d);const er=document.querySelector('#evidence');er.innerHTML='';for(const e of d.evidence){const c=document.createElement('div');c.className='card';c.textContent=`[${e.kind}] ${e.paragraph_id}: ${e.evidence_quote}`;er.append(c)}renderAnnotations(d.annotations);const reveal=document.querySelector('#revealBtn');reveal.hidden=!d.blind_available;reveal.onclick=()=>loadBlock(id,revealed);reveal.textContent=revealed?'恢复盲评':'揭示来源'}
+async function loadBlock(id,blind=true){currentBlock=id;const d=await api(`/api/block?id=${encodeURIComponent(id)}&blind=${blind?'1':'0'}`);revealed=d.blind_available?!blind:true;document.querySelector('#empty').hidden=true;document.querySelector('#detail').hidden=false;escText(document.querySelector('#blockTitle'),`${d.legacy_id} · ${d.chapter_title}`);const warnings=JSON.parse(d.warnings_json||'[]');escText(document.querySelector('#blockMeta'),`${d.v4_status||d.status} · global_index=${d.global_index}${warnings.length?' · 警告：'+warnings.join('；'):''}`);escText(document.querySelector('#source'),d.source_text);const cr=document.querySelector('#candidates');cr.innerHTML='';for(const x of d.candidates){const box=document.createElement('div');box.innerHTML='<h3></h3><div class="prose"></div>';box.querySelector('h3').textContent=x.label+(x.origin?` · ${x.origin}`:'');box.querySelector('.prose').textContent=x.text||'（无译文）';cr.append(box)}renderVote(d);const er=document.querySelector('#evidence');er.innerHTML='';for(const e of d.evidence){const c=document.createElement('div');c.className='card';c.textContent=`[${e.kind}] ${e.paragraph_id}: ${e.evidence_quote}`;er.append(c)}await loadNarrative(id);renderAnnotations(d.annotations);const reveal=document.querySelector('#revealBtn');reveal.hidden=!d.blind_available;reveal.onclick=()=>loadBlock(id,revealed);reveal.textContent=revealed?'恢复盲评':'揭示来源'}
+async function loadNarrative(id){const q=encodeURIComponent(id);const [memory,snapshot,volatility]=await Promise.all([api(`/api/narrative-memory?block=${q}`),api(`/api/narrative-snapshot?block=${q}`),api(`/api/narrative-volatility?block=${q}`)]);escText(document.querySelector('#narrative-memory'),JSON.stringify(memory.memories,null,2));escText(document.querySelector('#narrative-snapshot'),JSON.stringify(snapshot.snapshots,null,2));escText(document.querySelector('#narrative-volatility'),JSON.stringify(volatility.premap,null,2))}
 function renderVote(d){const panel=document.querySelector('#votePanel');panel.hidden=!d.blind_available;if(panel.hidden)return;const labels={A:'A更好',B:'B更好',tie:'两者相当',neither:'都不合格'};currentVoteChoice=d.comparison_vote?.choice||null;currentVoteBlinded=d.comparison_vote?.blinded??null;for(const button of document.querySelectorAll('[data-vote-choice]'))button.classList.toggle('selected',button.dataset.voteChoice===currentVoteChoice);const saved=d.comparison_vote?.note||'';const hasDraft=Object.prototype.hasOwnProperty.call(voteDrafts,currentBlock);document.querySelector('#voteNote').value=hasDraft?voteDrafts[currentBlock]:saved;let status=d.comparison_vote?`已记录：${labels[d.comparison_vote.choice]}${d.comparison_vote.blinded?'（盲评）':'（揭示后选择）'}`:'';if(hasDraft&&voteDrafts[currentBlock]!==saved)status+=(status?' · ':'')+'理由草稿尚未提交';document.querySelector('#voteStatus').textContent=status}
 function saveVoteDraft(){if(!currentBlock)return;voteDrafts[currentBlock]=document.querySelector('#voteNote').value;localStorage.setItem(DRAFT_KEY,JSON.stringify(voteDrafts));const status=document.querySelector('#voteStatus');if(!status.textContent.includes('理由草稿尚未提交'))status.textContent+=(status.textContent?' · ':'')+'理由草稿尚未提交'}
 async function persistVote(choice,blinded){const block=currentBlock;const note=document.querySelector('#voteNote').value;await api('/api/comparison-votes',{method:'POST',body:JSON.stringify({block,choice,blinded,note})});delete voteDrafts[block];localStorage.setItem(DRAFT_KEY,JSON.stringify(voteDrafts));await loadBlock(block,!revealed);const s=await api('/api/state');renderBlocks(s.blocks)}
@@ -215,6 +219,39 @@ def create_review_server(database: V4Database, port: int = 8765):
                     data.pop("v4_translation", None)
                     data.pop("serial_translation", None)
                     self._send_json(data)
+                    return
+                if parsed.path in {
+                    "/api/narrative-memory",
+                    "/api/narrative-snapshot",
+                    "/api/narrative-volatility",
+                }:
+                    query = parse_qs(parsed.query)
+                    identifier = (query.get("block") or [""])[0]
+                    block = database.get_block_by_identifier(identifier)
+                    data = database.inspect_narrative_memory(
+                        block_id=block.id
+                    )
+                    if parsed.path == "/api/narrative-memory":
+                        self._send_json(
+                            {
+                                "block_id": block.id,
+                                "memories": data["memories"],
+                            }
+                        )
+                    elif parsed.path == "/api/narrative-snapshot":
+                        self._send_json(
+                            {
+                                "block_id": block.id,
+                                "snapshots": data["snapshots"],
+                            }
+                        )
+                    else:
+                        self._send_json(
+                            {
+                                "block_id": block.id,
+                                "premap": data["premap"],
+                            }
+                        )
                     return
                 self._send_json({"error": "not found"}, 404)
             except Exception as exc:

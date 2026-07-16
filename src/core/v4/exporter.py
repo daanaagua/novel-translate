@@ -29,6 +29,58 @@ class ParallelV4BookExporter(BookExporter):
         self.database = database or V4Database(project.root_dir)
         self._include_annotations = False
 
+    def build_quality_report(self) -> str:
+        report = V4Validator(self.database).validate()
+        status = self.database.status_summary()
+        narrative_lines = [
+            "",
+            "## narrative_memory",
+            "",
+            f"- memory_version: {status['memory_version']}",
+            f"- premap_cursor: {status['premap_cursor']}",
+            f"- translation_cursor: {status['translation_cursor']}",
+            (
+                "- premap_cache_hit_rate: "
+                f"{status['premap_cache_hit_rate']:.4f}"
+            ),
+            (
+                "- degraded_premap_blocks: "
+                f"{status['degraded_premap_blocks']}"
+            ),
+            (
+                "- unresolved_references: "
+                f"{status['unresolved_narrative_references']}"
+            ),
+            (
+                "- disputed_memories: "
+                f"{status['disputed_narrative_memories']}"
+            ),
+            (
+                "- memory_revalidation_tasks: "
+                f"{status['memory_revalidation_tasks']}"
+            ),
+            "",
+            "## dynamic_scheduling",
+            "",
+            (
+                "- volatility_low: "
+                f"{status['narrative_volatility_low']}"
+            ),
+            (
+                "- volatility_medium: "
+                f"{status['narrative_volatility_medium']}"
+            ),
+            (
+                "- volatility_high: "
+                f"{status['narrative_volatility_high']}"
+            ),
+            f"- deferred_proposals: {status['frozen_proposals']}",
+            f"- warning_stale: {status['warning_stale']}",
+        ]
+        return report.to_markdown().rstrip() + "\n" + "\n".join(
+            narrative_lines
+        ) + "\n"
+
     def _chapters(self) -> List[Chapter]:
         annotations_by_block: Dict[str, List[dict]] = {}
         if self._include_annotations:
@@ -133,7 +185,9 @@ class ParallelV4BookExporter(BookExporter):
         finally:
             self._include_annotations = False
         report_path = target_dir / "quality_report.md"
-        report_path.write_text(report.to_markdown(), encoding="utf-8")
+        report_path.write_text(
+            self.build_quality_report(), encoding="utf-8"
+        )
         return V4ExportResult(
             txt_path=result.txt_path,
             epub_path=result.epub_path,

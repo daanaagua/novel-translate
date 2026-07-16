@@ -11,7 +11,9 @@ draft:
     4. 文体忠实：保持原文段落、叙事距离和信息密度，不主动古雅化或扩写。
     5. 语义义务：识别跨句指代、同一事件的不同呈现、现实层或感知层切换，以及关系是明说、暗示还是保持歧义。只记录中文读者必须仍能恢复的关系，不得在此评价初稿或预先决定具体措辞。若用户消息中含semantic_obligations_hint，必须逐条落实，但不得把“强暗示”或“歧义”擅自改成明说。
     6. 记忆更新：结合注入的旧摘要和本段，写出一份可以完全替代旧摘要的全书滚动摘要，不超过1200个汉字。只记录已经明示的事实、人物状态、概念定义和未解决问题。
-    7. 严格输出下面规定的XML，不要输出XML之外的文字。
+    7. 补充记忆：仅当本段出现会影响后文翻译、且预先上下文可能尚未记录的明示事实或保守观察时输出。只允许引用当前英文原文中的证据；不得根据中文译文造证据，不得解释叙事陷阱或替读者裁决多义性。
+    8. 风格增量：仅记录本段明确建立或改变的可复用语言状态，例如正式/口语语域、对话习惯或句法节奏；没有变化时输出空标签。
+    9. 严格输出下面规定的XML，不要输出XML之外的文字。
 
     ## 已确认术语
     {glossary_rules}
@@ -30,9 +32,18 @@ draft:
       <relations>
         <relation sub="主体" rel="关系或状态" obj="客体" context="简短证据" />
       </relations>
+      <supplemental_memory>
+        <memory candidate_id="本响应内唯一ID" memory_type="observation"
+                statement="保守的英文事实陈述"
+                truth_status="observed" visibility="reader_visible"
+                confidence="0.4" evidence="当前英文原文中的连续引文"
+                state_operation="append" high_impact="false" />
+      </supplemental_memory>
+      <style_delta register="" diction="" dialogue="" rhythm="" />
     </response>
 
     new_terms中的src，以及relations中的sub和obj，必须使用原文中的英文拼写；人物和专名第一次出现时必须收录。中文译名只能写在tgt或context中。
+    supplemental_memory是可选稀疏输出：没有确切新增信息时保持空内容，不得为了“完整”而编造条目。evidence必须逐字出现在当前英文原文中。style_delta只填写发生变化的属性，不要重复已有风格状态。
 
 polish:
   system: |

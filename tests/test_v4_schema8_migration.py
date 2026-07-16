@@ -12,12 +12,16 @@ from src.core.v4.models import ScanOutcome, ScanResponse
 from src.core.v4 import schema_v8
 from src.core.v4.migration import V4Migrator
 from src.core.v4.schema_v8 import (
-    SCHEMA_VERSION,
     SchemaMigrationError,
     SchemaUpgradeRequired,
     confirm_schema8,
     create_schema8,
     preview_schema8,
+)
+from src.core.v4.schema_v9 import (
+    SCHEMA_VERSION,
+    migrate_schema9,
+    preview_schema9,
 )
 
 
@@ -228,6 +232,11 @@ def read_schema_version(path):
         )
 
 
+def upgrade_schema8_fixture_to_schema9(path):
+    preview = preview_schema9(Path(path).resolve())
+    return migrate_schema9(path, preview["confirmation_token"])
+
+
 def filesystem_snapshot(root):
     return {
         str(path.relative_to(root)): hashlib.sha256(path.read_bytes()).hexdigest()
@@ -370,6 +379,7 @@ def test_minimal_schema7_meta_is_rebuilt_canonically(tmp_path):
     preview = preview_schema8(path)
 
     assert confirm_schema8(path, preview["confirm_token"])["status"] == "migrated"
+    upgrade_schema8_fixture_to_schema9(path)
     V4Database(tmp_path)
 
 
@@ -381,7 +391,7 @@ def test_v4_migrator_delays_database_open_until_explicit_schema_check(tmp_path):
 
     assert migrator.database is None
     assert read_schema_version(path) == 7
-    with pytest.raises(SchemaUpgradeRequired, match="explicit upgrade"):
+    with pytest.raises(SchemaUpgradeRequired, match="schema 9 upgrade"):
         migrator.migrate()
     assert migrator.database is None
     assert read_schema_version(path) == 7
@@ -423,6 +433,10 @@ def test_schema7_confirm_backs_up_migrates_and_is_idempotent(tmp_path):
     assert backup_path.parent.parent == path.parent
     assert read_schema_version(backup_path) == 7
     assert read_schema_version(path) == 8
+    second = confirm_schema8(path, preview["confirm_token"])
+    assert second["status"] == "already_schema8"
+    assert second["backup_path"] == result["backup_path"]
+    upgrade_schema8_fixture_to_schema9(path)
     database = V4Database(tmp_path)
     with closing(database.connect()) as connection:
         repaired = connection.execute(
@@ -459,11 +473,6 @@ def test_schema7_confirm_backs_up_migrates_and_is_idempotent(tmp_path):
     assert tuple(rule) == ("c-mal-locked", None, 1)
     assert tuple(lexeme) == ("锁定马", 0)
     assert tuple(locator) == ("audit/locked.jsonl.zst", 7, 11, "archive-hash")
-
-    second = confirm_schema8(path, preview["confirm_token"])
-    assert second["status"] == "already_schema8"
-    assert second["backup_path"] == result["backup_path"]
-
 
 def test_schema7_occurrence_backfill_preserves_matcher_boundaries_and_offsets(
     tmp_path,
@@ -532,6 +541,7 @@ def test_migrated_stale_task_has_claimable_bounded_provenance(tmp_path):
     path = seed_schema7_migration_fixture(tmp_path)
     preview = preview_schema8(path)
     confirm_schema8(path, preview["confirm_token"])
+    upgrade_schema8_fixture_to_schema9(path)
     database = V4Database(tmp_path)
 
     claim = database.claim_revalidation_task("migration-test")
@@ -653,10 +663,10 @@ def test_incomplete_schema8_is_rejected_without_writes(tmp_path, corruption):
     before = filesystem_snapshot(tmp_path)
 
     with pytest.raises(
-        SchemaUpgradeRequired,
-        match=r"(?:incomplete|corrupt).*migrate-v4 --preview",
+        (SchemaMigrationError, SchemaUpgradeRequired),
+        match=r"(?:incomplete|corrupt|canonical|schema 8).*",
     ):
-        V4Database(tmp_path)
+        preview_schema9(path.resolve())
 
     assert filesystem_snapshot(tmp_path) == before
     assert hashlib.sha256(path.read_bytes()).hexdigest() == before[
@@ -670,12 +680,13 @@ def test_create_schema8_two_phase_state_can_finish_initialization(tmp_path):
     with closing(sqlite3.connect(path)) as connection:
         create_schema8(connection)
 
+    upgrade_schema8_fixture_to_schema9(path)
     database = V4Database(tmp_path)
 
     with closing(database.connect()) as connection:
         assert connection.execute(
             "SELECT value FROM schema_meta WHERE key='schema_version'"
-        ).fetchone()[0] == "8"
+        ).fetchone()[0] == "9"
         assert connection.execute(
             "SELECT 1 FROM sqlite_master WHERE type='table' AND name='blocks'"
         ).fetchone() is not None
@@ -719,7 +730,7 @@ def test_empty_directory_creates_schema8_with_required_tables(tmp_path):
             for table in ("source_forms", "mentions")
         }
 
-    assert version == SCHEMA_VERSION == 8
+    assert version == SCHEMA_VERSION == 9
     assert {
         "lexemes",
         "concept_lexemes",
@@ -729,6 +740,9 @@ def test_empty_directory_creates_schema8_with_required_tables(tmp_path):
         "form_occurrences",
         "knowledge_changes",
         "revalidation_tasks",
+        "narrative_memories",
+        "narrative_snapshots",
+        "style_snapshots",
     } <= tables
     assert "lexeme_id" in columns["source_forms"]
     assert "lexeme_id" in columns["mentions"]
@@ -741,6 +755,11 @@ def test_empty_directory_creates_schema8_with_required_tables(tmp_path):
         "validation_status",
         "validated_knowledge_version",
         "validation_fingerprint",
+        "memory_version",
+        "snapshot_id",
+        "context_hash",
+        "style_snapshot_id",
+        "discourse_state_hash",
     } <= columns["translation_versions"]
     assert {
         "dependency_fingerprint",
