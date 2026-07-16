@@ -1527,19 +1527,45 @@ class ParallelV4CliTests(unittest.TestCase):
 
         database_path = self.root / "artifacts" / "parallel_v4" / "book.db"
         with patch.object(
-            cli_main, "preview_schema8", return_value={"status": "ready", "confirm_token": "t"}
+            cli_main,
+            "_preview_v4_migration",
+            return_value={"status": "ready", "confirm_token": "t"},
         ) as preview:
             preview_code, preview_output = self.invoke("migrate-v4", "book", "--preview")
         self.assertEqual(preview_code, 0)
         preview.assert_called_once_with(database_path.resolve())
         self.assertEqual(json.loads(preview_output)["confirm_token"], "t")
 
-        with patch.object(cli_main, "V4Migrator") as migrator:
+        with patch.object(cli_main, "_inspect_v4_schema", return_value=8), patch.object(
+            cli_main, "V4Migrator"
+        ) as migrator:
             migrator.return_value.migrate.return_value = {"status": "migrated"}
             migrate_code, _ = self.invoke("migrate-v4", "book", "--confirm", "token")
         self.assertEqual(migrate_code, 0)
         migrator.assert_called_once_with(self.project, confirm_token="token")
         migrator.return_value.migrate.assert_called_once_with()
+
+    def test_migrate_v4_schema7_confirmation_stops_at_schema8(self):
+        import main as cli_main
+
+        database_path = self.root / "artifacts" / "parallel_v4" / "book.db"
+        with patch.object(
+            cli_main, "_inspect_v4_schema", return_value=7
+        ), patch.object(
+            cli_main,
+            "_confirm_schema7_to8",
+            return_value={"status": "migrated", "schema_version": 8},
+        ) as confirm, patch.object(cli_main, "V4Migrator") as migrator:
+            code, output = self.invoke(
+                "migrate-v4", "book", "--confirm", "schema7-token"
+            )
+
+        self.assertEqual(code, 0)
+        confirm.assert_called_once_with(
+            database_path.resolve(), "schema7-token"
+        )
+        migrator.assert_not_called()
+        self.assertEqual(json.loads(output)["next_schema"], 9)
 
     def test_model_preparation_commands_forward_audit_and_attempt_limits(self):
         import main as cli_main

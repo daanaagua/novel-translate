@@ -530,7 +530,10 @@ class V4TranslationPipeline:
                         or concept.get("canonical_source")
                         or concept_id
                     )[:256],
-                    "kind": str(concept.get("kind") or "concept")[:64],
+                    "subject_type": "concept",
+                    "semantic_kind": str(
+                        concept.get("kind") or "concept"
+                    )[:64],
                 }
             lexeme_id = str(
                 concept.get("primary_lexeme_id") or ""
@@ -539,7 +542,8 @@ class V4TranslationPipeline:
                 subjects[lexeme_id] = {
                     "id": lexeme_id,
                     "label": str(concept.get("source") or lexeme_id)[:256],
-                    "kind": "lexeme",
+                    "subject_type": "lexeme",
+                    "semantic_kind": "lexeme",
                 }
         prior_ids = {
             *prior_state.active_speakers,
@@ -561,7 +565,14 @@ class V4TranslationPipeline:
                 {
                     "id": subject_id,
                     "label": "prior discourse subject",
-                    "kind": "prior",
+                    "subject_type": (
+                        "concept"
+                        if subject_id.startswith("concept_")
+                        else "lexeme"
+                        if subject_id.startswith("lexeme_")
+                        else "thread"
+                    ),
+                    "semantic_kind": "prior",
                 },
             )
         return [subjects[key] for key in sorted(subjects)]
@@ -1461,7 +1472,12 @@ class V4TranslationPipeline:
             for block in self.database.list_blocks()
             if block.global_index >= from_index
         ]
-        previous = self.narrative_store.latest_snapshot_before(from_index)
+        previous = self.narrative_store.latest_snapshot_before(
+            from_index,
+            source_edition_id=(
+                blocks[0].source_edition_id if blocks else None
+            ),
+        )
         state = (
             previous.discourse_state if previous is not None else DiscourseState()
         )
@@ -1565,8 +1581,37 @@ class V4TranslationPipeline:
         )
 
     def _run_narrative(
-        self, candidates: Sequence[V4Block]
+        self,
+        candidates: Sequence[V4Block],
+        *,
+        premap_blocks: Sequence[V4Block] | None = None,
     ) -> Dict[str, Any]:
+        premap_sequence = list(premap_blocks or candidates)
+
+        def ensure_through_candidate(
+            candidate_position: int,
+            *,
+            knowledge_version: int,
+            run_id: str,
+        ) -> None:
+            if not candidates or not premap_sequence:
+                return
+            target_global_index = candidates[
+                min(len(candidates) - 1, candidate_position)
+            ].global_index
+            through_position = -1
+            for index, block in enumerate(premap_sequence):
+                if block.global_index > target_global_index:
+                    break
+                through_position = index
+            if through_position >= 0:
+                self._ensure_premapped(
+                    premap_sequence,
+                    through_position=through_position,
+                    knowledge_version=knowledge_version,
+                    run_id=run_id,
+                )
+
         run_id = f"translate_{uuid4().hex}"
         run_config = dict(self.config.__dict__)
         run_config["knowledge_epoch_mode"] = True
@@ -1632,9 +1677,8 @@ class V4TranslationPipeline:
                     len(candidates) - 1,
                     cursor + self.config.premap_ahead_blocks - 1,
                 )
-                self._ensure_premapped(
-                    candidates,
-                    through_position=through,
+                ensure_through_candidate(
+                    through,
                     knowledge_version=knowledge_version,
                     run_id=run_id,
                 )
@@ -1652,6 +1696,11 @@ class V4TranslationPipeline:
                 )
                 block_limit = max(
                     1, desired_workers * plan.island_size
+                )
+                ensure_through_candidate(
+                    cursor + block_limit - 1,
+                    knowledge_version=knowledge_version,
+                    run_id=run_id,
                 )
                 planned_blocks = list(
                     candidates[cursor : cursor + block_limit]
@@ -1718,35 +1767,46 @@ class V4TranslationPipeline:
                     }
                     for future in as_completed(futures):
                         wave_outcomes.extend(future.result())
-                self.database.commit_translation_batch(
-                    run_id,
-                    wave_outcomes,
-                    audit_mode=self.config.audit_mode,
-                )
-                for outcome in sorted(
-                    wave_outcomes,
-                    key=lambda value: value.block.global_index,
-                ):
-                    if outcome.status not in {
-                        V4BlockStatus.COMPLETED.value,
-                        V4BlockStatus.COMPLETED_WITH_WARNINGS.value,
-                    }:
-                        continue
-                    if outcome.style_delta:
-                        self._style_tail_snapshot = (
-                            self.narrative_store.merge_style_delta(
-                                outcome.block,
-                                outcome.style_delta,
-                                previous_snapshot_id=str(
-                                    (
-                                        self._style_tail_snapshot
-                                        or {}
-                                    ).get("id")
-                                    or ""
-                                ),
+                with self.database.transaction() as connection:
+                    self.database.commit_translation_batch(
+                        run_id,
+                        wave_outcomes,
+                        audit_mode=self.config.audit_mode,
+                        connection=connection,
+                    )
+                    for outcome in sorted(
+                        wave_outcomes,
+                        key=lambda value: value.block.global_index,
+                    ):
+                        if outcome.status not in {
+                            V4BlockStatus.COMPLETED.value,
+                            V4BlockStatus.COMPLETED_WITH_WARNINGS.value,
+                        }:
+                            continue
+                        if outcome.style_delta:
+                            self._style_tail_snapshot = (
+                                self.narrative_store.merge_style_delta(
+                                    outcome.block,
+                                    outcome.style_delta,
+                                    previous_snapshot_id=str(
+                                        (
+                                            self._style_tail_snapshot
+                                            or {}
+                                        ).get("id")
+                                        or ""
+                                    ),
+                                    connection=connection,
+                                )
                             )
-                        )
-                epoch_coordinator.stage(run_id, wave_outcomes)
+                    epoch_coordinator.stage(
+                        run_id,
+                        wave_outcomes,
+                        connection=connection,
+                    )
+                    epoch_coordinator.checkpoint_in_transaction(
+                        run_id,
+                        connection,
+                    )
                 checkpoint = epoch_coordinator.checkpoint(run_id)
                 change_ids.update(checkpoint.change_ids)
                 deferred_proposals = checkpoint.deferred_proposals
@@ -1841,8 +1901,8 @@ class V4TranslationPipeline:
             "deferred_proposals": deferred_proposals,
             "change_ids": sorted(change_ids),
             "premap_cursor": (
-                candidates[self._premap_cursor].global_index
-                if self._premap_cursor >= 0 and candidates
+                self._premap_tail_snapshot.global_index
+                if self._premap_tail_snapshot is not None
                 else -1
             ),
             "translation_cursor": (
@@ -1887,6 +1947,23 @@ class V4TranslationPipeline:
         if self.config.max_blocks is not None:
             candidates = candidates[: self.config.max_blocks]
         if self.config.enable_narrative_premap:
+            self._premap_contexts = {}
+            self._premap_cursor = -1
+            self._premap_tail_snapshot = (
+                self.narrative_store.latest_snapshot_before(
+                    candidates[0].global_index,
+                    source_edition_id=candidates[0].source_edition_id,
+                )
+                if candidates
+                else None
+            )
+            self._premap_tail_state = (
+                self._premap_tail_snapshot.discourse_state
+                if self._premap_tail_snapshot is not None
+                else DiscourseState()
+            )
+            self._premap_cache_hits = 0
+            self._premap_model_calls = 0
             self._style_tail_snapshot = (
                 self.narrative_store.latest_style_snapshot_before(
                     candidates[0].global_index,
@@ -1896,7 +1973,25 @@ class V4TranslationPipeline:
                 else None
             )
             self._active_style_snapshots = {}
-            return self._run_narrative(candidates)
+            seed_global_index = (
+                self._premap_tail_snapshot.global_index
+                if self._premap_tail_snapshot is not None
+                else -1
+            )
+            max_candidate_index = (
+                max(block.global_index for block in candidates)
+                if candidates
+                else -1
+            )
+            premap_blocks = [
+                block
+                for block in self.database.list_blocks()
+                if seed_global_index < block.global_index <= max_candidate_index
+            ]
+            return self._run_narrative(
+                candidates,
+                premap_blocks=premap_blocks,
+            )
         islands = self._make_islands(candidates, self.config.island_size)
         run_id = f"translate_{uuid4().hex}"
         run_config = dict(self.config.__dict__)
@@ -1967,12 +2062,22 @@ class V4TranslationPipeline:
                     }
                     for future in as_completed(futures):
                         wave_outcomes.extend(future.result())
-                self.database.commit_translation_batch(
-                    run_id,
-                    wave_outcomes,
-                    audit_mode=self.config.audit_mode,
-                )
-                epoch_coordinator.stage(run_id, wave_outcomes)
+                with self.database.transaction() as connection:
+                    self.database.commit_translation_batch(
+                        run_id,
+                        wave_outcomes,
+                        audit_mode=self.config.audit_mode,
+                        connection=connection,
+                    )
+                    epoch_coordinator.stage(
+                        run_id,
+                        wave_outcomes,
+                        connection=connection,
+                    )
+                    epoch_coordinator.checkpoint_in_transaction(
+                        run_id,
+                        connection,
+                    )
                 checkpoint = epoch_coordinator.checkpoint(run_id)
                 change_ids.update(checkpoint.change_ids)
                 deferred_proposals = checkpoint.deferred_proposals

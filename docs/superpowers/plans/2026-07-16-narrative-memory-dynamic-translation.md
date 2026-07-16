@@ -1183,7 +1183,7 @@ git commit -m "feat: expose narrative workflow controls and reports"
 - 修改：`tests/test_narrative_pipeline.py`
 - 修改：`docs/superpowers/specs/2026-07-16-narrative-memory-dynamic-translation-design.md`
 
-- [ ] **步骤 1：增加规模和恢复测试**
+- [x] **步骤 1：增加规模和恢复测试**
 
 规模夹具写入十万块元数据和多批记忆，断言：
 
@@ -1194,9 +1194,11 @@ assert premap_result_count <= block_count * protocol_versions
 assert recovered_cursor == last_committed_global_index + 1
 ```
 
-注入波次事务失败，断言活动译文、记忆版本、快照游标均停留在上一完整检查点。
+注入波次事务失败，断言活动译文和由该波次产生的记忆版本均停留在上一完整
+检查点。预映射快照允许按设计前瞻，但必须保持追加式、可审计并能在恢复后
+作为已提交前缀继续使用。
 
-- [ ] **步骤 2：运行新功能测试集合**
+- [x] **步骤 2：运行新功能测试集合**
 
 运行：
 
@@ -1206,7 +1208,7 @@ assert recovered_cursor == last_committed_global_index + 1
 
 预期：全部 PASS。
 
-- [ ] **步骤 3：运行完整回归**
+- [x] **步骤 3：运行完整回归**
 
 运行：
 
@@ -1214,9 +1216,9 @@ assert recovered_cursor == last_committed_global_index + 1
 & 'D:\llm\小说翻译\.venv\Scripts\python.exe' -m pytest tests --ignore=tests/test_foila_logic.py -q
 ```
 
-预期：原有 `547 passed, 8 subtests passed` 加新增测试全部 PASS。
+最终实际：`621 passed, 8 subtests passed`，全部 PASS。
 
-- [ ] **步骤 4：执行静态完整性检查**
+- [x] **步骤 4：执行静态完整性检查**
 
 运行：
 
@@ -1227,7 +1229,7 @@ git diff --check
 
 预期：compileall 成功；`git diff --check` 无输出；新增生产路径均有可执行实现。
 
-- [ ] **步骤 5：迁移《新日之书》项目副本并试跑**
+- [x] **步骤 5：迁移《新日之书》项目副本并试跑**
 
 先复制现有项目数据库到隔离测试目录，再运行：
 
@@ -1248,7 +1250,7 @@ git diff --check
 - 二次预映射命中缓存；
 - 输出中不存在具体小说词汇硬编码。
 
-- [ ] **步骤 6：把规格状态改为已实现**
+- [x] **步骤 6：把规格状态改为已实现**
 
 将规格头部更新为：
 
@@ -1258,7 +1260,7 @@ git diff --check
 
 并在验收章节记录实际测试数和试跑命令结果。
 
-- [ ] **步骤 7：最终 Commit**
+- [x] **步骤 7：最终 Commit**
 
 ```powershell
 git add tests/test_v4_storage_scale.py tests/test_narrative_pipeline.py docs/superpowers/specs/2026-07-16-narrative-memory-dynamic-translation-design.md

@@ -6,6 +6,7 @@ import subprocess
 import sys
 from types import SimpleNamespace
 
+import pytest
 import yaml
 
 from src.core.v4.context import ContextBuilder
@@ -131,6 +132,7 @@ def test_provisional_subjects_include_all_prior_discourse_layers(tmp_path):
         "time-night",
         "layer-dream",
     }
+    assert all(subject["subject_type"] for subject in subjects)
 
 
 def test_status_and_quality_report_include_narrative_metrics(tmp_path):
@@ -512,12 +514,12 @@ def test_public_premap_and_memory_inspection_reuse_cache(tmp_path):
             self.calls += 1
             return json.dumps(
                 {
-                    "semantic_relations": [],
-                    "memory_candidates": [],
-                    "discourse_delta": {
-                        "scene_location": "the-citadel",
-                        "state_confidence": 0.5,
-                    },
+                        "semantic_relations": [],
+                        "memory_candidates": [],
+                        "discourse_delta": {
+                            "narrator_layer": "test-narrator",
+                            "state_confidence": 0.5,
+                        },
                 }
             )
 
@@ -844,7 +846,7 @@ def test_partial_run_does_not_seed_style_from_future_block(tmp_path):
     )
     captured = {}
 
-    def capture_run(candidates):
+    def capture_run(candidates, **_kwargs):
         captured["tail"] = pipeline._style_tail_snapshot
         return {"status": "captured", "candidate_count": len(candidates)}
 
@@ -906,6 +908,294 @@ def test_retranslation_does_not_use_style_from_future_block(tmp_path):
     pipeline.translate_block_factory()(blocks[0])
 
     assert captured == {}
+
+
+def test_resumed_run_seeds_premap_from_last_committed_prefix(tmp_path):
+    from src.core.v4.pipeline import V4PipelineConfig, V4TranslationPipeline
+
+    class PremapLLM:
+        def get_model(self, purpose):
+            return f"fake-{purpose}"
+
+        def chat(self, *, purpose="draft", **_kwargs):
+            assert purpose == "narrative_premap"
+            return json.dumps(
+                {
+                    "semantic_relations": [],
+                    "memory_candidates": [],
+                    "discourse_delta": {
+                        "scene_time": "remembered-prefix",
+                    },
+                }
+            )
+
+    database = V4Database(tmp_path / "book")
+    edition = database.ensure_source_edition(
+        "raw", "normalized", "test", "source.txt"
+    )
+    database.upsert_blocks(
+        edition,
+        [
+            {
+                "id": f"resume-block-{index}",
+                "legacy_id": f"v01_ch01_{index:03d}",
+                "chapter_id": "ch01",
+                "chapter_title": "I",
+                "chapter_index": 0,
+                "block_index": index,
+                "global_index": index,
+                "block_type": "prose",
+                "source_text": f"Resume sentence {index}.",
+                "source_hash": hashlib.sha256(
+                    f"Resume sentence {index}.".encode()
+                ).hexdigest(),
+                "token_count": 3,
+                "status": "ready",
+            }
+            for index in range(3)
+        ],
+    )
+    config = V4PipelineConfig(enable_narrative_premap=True)
+    V4TranslationPipeline(
+        database, PremapLLM, config=config
+    ).premap(max_blocks=2)
+    with database.transaction() as connection:
+        connection.execute(
+            """UPDATE blocks SET status='completed'
+               WHERE global_index<2"""
+        )
+
+    pipeline = V4TranslationPipeline(
+        database, PremapLLM, config=config
+    )
+    captured = {}
+
+    def capture_run(candidates, **_kwargs):
+        captured["snapshot"] = pipeline._premap_tail_snapshot
+        captured["state"] = pipeline._premap_tail_state
+        return {"status": "captured", "candidate_count": len(candidates)}
+
+    pipeline._run_narrative = capture_run
+    result = pipeline.run()
+
+    assert result["candidate_count"] == 1
+    assert captured["snapshot"] is not None
+    assert captured["snapshot"].global_index == 1
+    assert captured["state"].scene_time == "remembered-prefix"
+
+
+def test_fresh_noncontiguous_selection_premaps_the_missing_prefix(tmp_path):
+    from src.core.v4.narrative_memory import NarrativeMemoryStore
+    from src.core.v4.pipeline import V4PipelineConfig, V4TranslationPipeline
+
+    class SelectionLLM:
+        def __init__(self):
+            self.premap_calls = 0
+
+        def get_model(self, purpose):
+            return f"fake-{purpose}"
+
+        def chat(self, *, purpose="draft", stream=False, **_kwargs):
+            if purpose == "narrative_premap":
+                self.premap_calls += 1
+                return json.dumps(
+                    {
+                        "semantic_relations": [],
+                        "memory_candidates": [],
+                        "discourse_delta": {},
+                    }
+                )
+            payload = json.dumps(
+                {
+                    "analysis": "",
+                    "translation": "选中块译文。",
+                    "memory_summary": "",
+                    "new_terms": [],
+                    "relations": [],
+                    "supplemental_memory_candidates": [],
+                    "style_delta": {},
+                },
+                ensure_ascii=False,
+            )
+
+            def generator():
+                yield ("content", payload)
+
+            return generator() if stream else payload
+
+    database = V4Database(tmp_path / "book")
+    edition = database.ensure_source_edition(
+        "raw", "normalized", "test", "source.txt"
+    )
+    database.upsert_blocks(
+        edition,
+        [
+            {
+                "id": f"selected-prefix-{index}",
+                "legacy_id": f"v01_ch01_{index:03d}",
+                "chapter_id": "ch01",
+                "chapter_title": "I",
+                "chapter_index": 0,
+                "block_index": index,
+                "global_index": index,
+                "block_type": "prose",
+                "source_text": f"Selected sentence {index}.",
+                "source_hash": hashlib.sha256(
+                    f"Selected sentence {index}.".encode()
+                ).hexdigest(),
+                "token_count": 3,
+                "status": "ready",
+            }
+            for index in range(3)
+        ],
+    )
+    blocks = database.list_blocks()
+    llm = SelectionLLM()
+    result = V4TranslationPipeline(
+        database,
+        lambda: llm,
+        config=V4PipelineConfig(
+            enable_narrative_premap=True,
+            enable_polish=False,
+            include_block_ids=(blocks[2].id,),
+            initial_workers=1,
+            max_workers=1,
+        ),
+    ).run()
+
+    assert result["completed"] == 1
+    assert llm.premap_calls == 3
+    snapshot = NarrativeMemoryStore(database).latest_snapshot_for_block(
+        blocks[2].id
+    )
+    assert snapshot is not None
+    previous = NarrativeMemoryStore(database).load_snapshot(
+        snapshot.previous_snapshot_id
+    )
+    assert previous is not None
+    assert previous.global_index == 1
+
+
+def test_failed_epoch_checkpoint_rolls_back_entire_translation_wave(
+    tmp_path, monkeypatch
+):
+    from src.core.v4.knowledge_epochs import KnowledgeEpochCoordinator
+    from src.core.v4.pipeline import V4PipelineConfig, V4TranslationPipeline
+
+    class AtomicWaveLLM:
+        def get_model(self, purpose):
+            return f"fake-{purpose}"
+
+        def chat(self, *, purpose="draft", stream=False, **_kwargs):
+            if purpose == "narrative_premap":
+                return json.dumps(
+                    {
+                        "semantic_relations": [],
+                        "memory_candidates": [],
+                        "discourse_delta": {},
+                    }
+                )
+            payload = json.dumps(
+                {
+                    "analysis": "",
+                    "translation": "原子波次译文。",
+                    "memory_summary": "",
+                    "new_terms": [],
+                    "relations": [],
+                    "supplemental_memory_candidates": [
+                        {
+                            "candidate_id": "atomic-memory",
+                            "memory_type": "observation",
+                            "statement": "The atomic sentence exists.",
+                            "truth_status": "observed",
+                            "visibility": "reader_visible",
+                            "confidence": 0.7,
+                            "evidence_spans": ["Atomic source sentence."],
+                            "subjects": [],
+                            "related_memory_ids": [],
+                            "state_operation": "append",
+                            "high_impact": False,
+                        }
+                    ],
+                    "style_delta": {"register": "formal"},
+                },
+                ensure_ascii=False,
+            )
+
+            def generator():
+                yield ("content", payload)
+
+            return generator() if stream else payload
+
+    database = V4Database(tmp_path / "book")
+    edition = database.ensure_source_edition(
+        "raw", "normalized", "test", "source.txt"
+    )
+    source = "Atomic source sentence."
+    database.upsert_blocks(
+        edition,
+        [
+            {
+                "id": "atomic-wave-block",
+                "legacy_id": "v01_ch01_000",
+                "chapter_id": "ch01",
+                "chapter_title": "I",
+                "chapter_index": 0,
+                "block_index": 0,
+                "global_index": 0,
+                "block_type": "prose",
+                "source_text": source,
+                "source_hash": hashlib.sha256(source.encode()).hexdigest(),
+                "token_count": 3,
+                "status": "ready",
+            }
+        ],
+    )
+    initial_memory_version = database.status_summary()["memory_version"]
+    original = KnowledgeEpochCoordinator.checkpoint_in_transaction
+
+    def fail_after_checkpoint(self, run_id, connection):
+        result = original(self, run_id, connection)
+        assert self.narrative_store.current_memory_version(
+            connection
+        ) > initial_memory_version
+        raise RuntimeError("injected checkpoint failure")
+
+    monkeypatch.setattr(
+        KnowledgeEpochCoordinator,
+        "checkpoint_in_transaction",
+        fail_after_checkpoint,
+    )
+
+    with pytest.raises(RuntimeError, match="injected checkpoint failure"):
+        V4TranslationPipeline(
+            database,
+            AtomicWaveLLM,
+            config=V4PipelineConfig(
+                enable_narrative_premap=True,
+                enable_polish=False,
+                initial_workers=1,
+                max_workers=1,
+            ),
+        ).run()
+
+    with database.connect() as connection:
+        assert connection.execute(
+            """SELECT COUNT(*) FROM translation_versions
+               WHERE active=1"""
+        ).fetchone()[0] == 0
+        assert connection.execute(
+            "SELECT COUNT(*) FROM narrative_memories"
+        ).fetchone()[0] == 0
+        assert connection.execute(
+            "SELECT COUNT(*) FROM style_snapshots"
+        ).fetchone()[0] == 0
+        assert connection.execute(
+            "SELECT status FROM blocks WHERE id='atomic-wave-block'"
+        ).fetchone()[0] == "ready"
+    assert database.status_summary()["memory_version"] == (
+        initial_memory_version
+    )
 
 
 def test_knowledge_checkpoint_merges_supplemental_memory_once(tmp_path):

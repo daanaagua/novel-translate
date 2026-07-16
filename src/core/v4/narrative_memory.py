@@ -108,14 +108,27 @@ class NarrativeMemoryStore:
         return int(row[0])
 
     def memory_change_ids_between(
-        self, lower_exclusive: int, upper_inclusive: int
+        self,
+        lower_exclusive: int,
+        upper_inclusive: int,
+        connection: sqlite3.Connection | None = None,
     ) -> list[int]:
         if lower_exclusive >= upper_inclusive:
             return []
-        with closing(self.database.connect()) as connection:
+        if connection is not None:
             return [
                 int(row[0])
                 for row in connection.execute(
+                    """SELECT id FROM memory_changes
+                       WHERE memory_version>? AND memory_version<=?
+                       ORDER BY id""",
+                    (int(lower_exclusive), int(upper_inclusive)),
+                ).fetchall()
+            ]
+        with closing(self.database.connect()) as owned:
+            return [
+                int(row[0])
+                for row in owned.execute(
                     """SELECT id FROM memory_changes
                        WHERE memory_version>? AND memory_version<=?
                        ORDER BY id""",
@@ -148,7 +161,7 @@ class NarrativeMemoryStore:
         parameters_hash: str,
         prior_snapshot_hash: str,
         provisional_subject_hash: str,
-        protocol_version: str = "narrative-premap-v1",
+        protocol_version: str = "narrative-premap-v2",
     ) -> str:
         payload = {
             "protocol_version": protocol_version,
@@ -443,29 +456,53 @@ class NarrativeMemoryStore:
         return self.load_premap_result(str(row["cache_key"]))
 
     def latest_snapshot_before(
-        self, global_index: int
+        self,
+        global_index: int,
+        *,
+        source_edition_id: int | None = None,
     ) -> NarrativeSnapshot | None:
+        query = """
+            SELECT snapshot.id
+            FROM narrative_snapshots AS snapshot
+            JOIN blocks AS block ON block.id=snapshot.block_id
+            WHERE snapshot.global_index<?
+        """
+        parameters: list[Any] = [int(global_index)]
+        if source_edition_id is not None:
+            if type(source_edition_id) is not int or source_edition_id <= 0:
+                raise ValueError("source_edition_id must be a positive integer")
+            query += " AND block.source_edition_id=?"
+            parameters.append(source_edition_id)
+        query += """
+            ORDER BY snapshot.global_index DESC,
+                     snapshot.memory_version DESC,
+                     snapshot.knowledge_version DESC,
+                     snapshot.id DESC
+            LIMIT 1
+        """
         with closing(self.database.connect()) as connection:
-            row = connection.execute(
-                """SELECT id FROM narrative_snapshots
-                   WHERE global_index<?
-                   ORDER BY global_index DESC, memory_version DESC,
-                            knowledge_version DESC, id DESC
-                   LIMIT 1""",
-                (int(global_index),),
-            ).fetchone()
+            row = connection.execute(query, parameters).fetchone()
         if row is None:
             return None
         return self.load_snapshot(str(row["id"]))
 
     def load_style_snapshot(
-        self, snapshot_id: str
+        self,
+        snapshot_id: str,
+        *,
+        connection: sqlite3.Connection | None = None,
     ) -> dict[str, Any] | None:
-        with closing(self.database.connect()) as connection:
+        if connection is not None:
             row = connection.execute(
                 "SELECT * FROM style_snapshots WHERE id=?",
                 (snapshot_id,),
             ).fetchone()
+        else:
+            with closing(self.database.connect()) as owned:
+                row = owned.execute(
+                    "SELECT * FROM style_snapshots WHERE id=?",
+                    (snapshot_id,),
+                ).fetchone()
         if row is None:
             return None
         return {
@@ -527,6 +564,7 @@ class NarrativeMemoryStore:
         delta: Mapping[str, Any],
         *,
         previous_snapshot_id: str | None = None,
+        connection: sqlite3.Connection | None = None,
     ) -> dict[str, Any] | None:
         if previous_snapshot_id is None:
             previous = self.latest_style_snapshot_before(
@@ -534,7 +572,10 @@ class NarrativeMemoryStore:
                 source_edition_id=block.source_edition_id,
             )
         elif previous_snapshot_id:
-            previous = self.load_style_snapshot(previous_snapshot_id)
+            previous = self.load_style_snapshot(
+                previous_snapshot_id,
+                connection=connection,
+            )
         else:
             previous = None
         state = dict((previous or {}).get("state") or {})
@@ -568,8 +609,8 @@ class NarrativeMemoryStore:
             f"{block.id}:{previous_id}:{state_hash}",
             32,
         )
-        with self.database.transaction() as connection:
-            connection.execute(
+        with self._write(connection) as active:
+            active.execute(
                 """INSERT OR IGNORE INTO style_snapshots(
                        id, block_id, global_index, previous_snapshot_id,
                        state_json, state_hash, created_at)
@@ -584,7 +625,14 @@ class NarrativeMemoryStore:
                     utc_now(),
                 ),
             )
-        return self.load_style_snapshot(snapshot_id)
+        return {
+            "id": snapshot_id,
+            "block_id": block.id,
+            "global_index": block.global_index,
+            "previous_snapshot_id": previous_id,
+            "state": state,
+            "state_hash": state_hash,
+        }
 
     def inspect(
         self,
@@ -1109,13 +1157,23 @@ class NarrativeMemoryStore:
             ).fetchall()
             visible_ids = tuple(str(row["id"]) for row in rows)
             previous = connection.execute(
-                """SELECT id FROM narrative_snapshots
-                   WHERE global_index<?
-                     AND knowledge_version<=?
-                     AND memory_version<=?
-                   ORDER BY global_index DESC, memory_version DESC, id DESC
+                """SELECT snapshot.id
+                   FROM narrative_snapshots AS snapshot
+                   JOIN blocks AS previous_block
+                     ON previous_block.id=snapshot.block_id
+                   WHERE snapshot.global_index<?
+                     AND previous_block.source_edition_id=?
+                     AND snapshot.knowledge_version<=?
+                     AND snapshot.memory_version<=?
+                   ORDER BY snapshot.global_index DESC,
+                            snapshot.memory_version DESC, snapshot.id DESC
                    LIMIT 1""",
-                (block.global_index, knowledge_version, version),
+                (
+                    block.global_index,
+                    block.source_edition_id,
+                    knowledge_version,
+                    version,
+                ),
             ).fetchone()
             previous_id = str(previous["id"]) if previous is not None else ""
             state_json = _canonical_json(discourse_state.to_dict())

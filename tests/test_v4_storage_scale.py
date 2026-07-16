@@ -5,6 +5,7 @@ import sqlite3
 import time
 from contextlib import closing
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import replace
 from threading import Barrier
 
 import pytest
@@ -119,6 +120,231 @@ def _seed_database(tmp_path, names=("Drotte", "Roche")):
         "fake",
     )
     return db, edition, block, candidates
+
+
+def test_narrative_schema_scales_to_hundred_thousand_blocks(tmp_path):
+    block_count = 100_000
+    sampled_blocks = 1_000
+    memory_count = 2_000
+    db = V4Database(tmp_path / "large-book")
+    edition = db.ensure_source_edition(
+        "raw-scale",
+        "normalized-scale",
+        "scale-test",
+        "source.txt",
+    )
+    created_at = "2000-01-01T00:00:00+00:00"
+    with db.transaction() as connection:
+        connection.executemany(
+            """INSERT INTO blocks(
+                   id, legacy_id, source_edition_id, chapter_id,
+                   chapter_title, chapter_index, block_index, global_index,
+                   block_type, source_text, source_hash, token_count, status,
+                   updated_at)
+               VALUES(?, ?, ?, ?, ?, ?, ?, ?, 'prose', 'x', 'h', 1,
+                      'ready', ?)""",
+            (
+                (
+                    f"scale-block-{index:06d}",
+                    f"v01_ch{index // 1000:03d}_{index % 1000:03d}",
+                    edition,
+                    f"ch{index // 1000:03d}",
+                    f"Chapter {index // 1000}",
+                    index // 1000,
+                    index % 1000,
+                    index,
+                    created_at,
+                )
+                for index in range(block_count)
+            ),
+        )
+        knowledge_version = int(
+            connection.execute(
+                "SELECT MAX(id) FROM knowledge_versions"
+            ).fetchone()[0]
+        )
+        memory_version = int(
+            connection.execute(
+                "SELECT MAX(id) FROM memory_versions"
+            ).fetchone()[0]
+        )
+        connection.executemany(
+            """INSERT INTO narrative_memories(
+                   id, memory_type, statement, truth_status, visibility,
+                   confidence, reveal_global_index, source_block_id,
+                   source_hash, status, high_impact, semantic_fingerprint,
+                   created_memory_version, created_at)
+               VALUES(?, 'observation', ?, 'observed', 'reader_visible',
+                      0.8, ?, ?, 'h', 'provisional', 0, ?, ?, ?)""",
+            (
+                (
+                    f"scale-memory-{index:06d}",
+                    f"Observed scale fact {index}.",
+                    index,
+                    f"scale-block-{index:06d}",
+                    f"fingerprint-{index:06d}",
+                    memory_version,
+                    created_at,
+                )
+                for index in range(memory_count)
+            ),
+        )
+        connection.executemany(
+            """INSERT INTO narrative_memory_subjects(
+                   memory_id, subject_type, subject_id, role)
+               VALUES(?, 'concept', ?, 'subject')""",
+            (
+                (
+                    f"scale-memory-{index:06d}",
+                    f"concept-{index % 100:03d}",
+                )
+                for index in range(memory_count)
+            ),
+        )
+        connection.executemany(
+            """INSERT INTO narrative_snapshots(
+                   id, block_id, global_index, knowledge_version,
+                   memory_version, previous_snapshot_id,
+                   discourse_state_json, visible_memory_ids_json,
+                   snapshot_hash, created_at)
+               VALUES(?, ?, ?, ?, ?, NULL, '{}', '[]', ?, ?)""",
+            (
+                (
+                    f"scale-snapshot-{index:06d}",
+                    f"scale-block-{index:06d}",
+                    index,
+                    knowledge_version,
+                    memory_version,
+                    f"snapshot-hash-{index:06d}",
+                    created_at,
+                )
+                for index in range(sampled_blocks)
+            ),
+        )
+        connection.executemany(
+            """INSERT INTO premap_results(
+                   id, block_id, cache_key, status, semantic_json,
+                   memory_candidates_json, discourse_delta_json,
+                   validation_json, model_id, prompt_hash,
+                   prior_snapshot_hash, request_hash, response_hash,
+                   snapshot_id, created_at)
+               VALUES(?, ?, ?, 'accepted', '[]', '[]', '{}', '{}',
+                      'scale-model', ?, '', ?, ?, ?, ?)""",
+            (
+                (
+                    f"scale-premap-{protocol}-{index:06d}",
+                    f"scale-block-{index:06d}",
+                    f"scale-cache-{protocol}-{index:06d}",
+                    f"prompt-{protocol}",
+                    f"request-{protocol}-{index:06d}",
+                    f"response-{protocol}-{index:06d}",
+                    f"scale-snapshot-{index:06d}",
+                    created_at,
+                )
+                for protocol in range(2)
+                for index in range(sampled_blocks)
+            ),
+        )
+        plan = connection.execute(
+            """EXPLAIN QUERY PLAN
+               SELECT memory_id
+               FROM narrative_memory_subjects
+               WHERE subject_type='concept' AND subject_id='concept-050'"""
+        ).fetchall()
+        snapshot_rows = int(
+            connection.execute(
+                "SELECT COUNT(*) FROM narrative_snapshots"
+            ).fetchone()[0]
+        )
+        premap_rows = int(
+            connection.execute(
+                "SELECT COUNT(*) FROM premap_results"
+            ).fetchone()[0]
+        )
+
+    assert any(
+        "idx_narrative_subject_lookup" in str(row[-1])
+        for row in plan
+    )
+    assert snapshot_rows <= block_count
+    assert premap_rows <= block_count * 2
+    status = db.status_summary()
+    assert status["premap_cursor"] == sampled_blocks - 1
+    assert status["premap_cursor"] + 1 == sampled_blocks
+
+
+def test_translation_wave_failure_rolls_back_to_previous_checkpoint(tmp_path):
+    db = V4Database(tmp_path / "atomic-book")
+    edition = db.ensure_source_edition(
+        "raw-atomic",
+        "normalized-atomic",
+        "atomic-test",
+        "source.txt",
+    )
+    rows = []
+    for index in range(2):
+        source = f"Atomic sentence {index}."
+        rows.append(
+            {
+                "id": f"atomic-block-{index}",
+                "legacy_id": f"v01_ch01_{index:03d}",
+                "chapter_id": "ch01",
+                "chapter_title": "I",
+                "chapter_index": 0,
+                "block_index": index,
+                "global_index": index,
+                "block_type": "prose",
+                "source_text": source,
+                "source_hash": hashlib.sha256(source.encode()).hexdigest(),
+                "token_count": 3,
+                "status": "ready",
+            }
+        )
+    db.upsert_blocks(edition, rows)
+    blocks = db.list_blocks()
+    knowledge_version = db.current_knowledge_version()
+    memory_version = db.status_summary()["memory_version"]
+    db.start_run(
+        "atomic-wave",
+        "translate",
+        {},
+        knowledge_version=knowledge_version,
+    )
+
+    with pytest.raises(ValueError, match="source drift"):
+        db.commit_translation_batch(
+            "atomic-wave",
+            [
+                TranslationOutcome(
+                    block=blocks[0],
+                    knowledge_version=knowledge_version,
+                    memory_version=memory_version,
+                    status=V4BlockStatus.COMPLETED.value,
+                    final_translation="第一块译文",
+                ),
+                TranslationOutcome(
+                    block=replace(
+                        blocks[1],
+                        source_text="Injected source drift.",
+                    ),
+                    knowledge_version=knowledge_version,
+                    memory_version=memory_version,
+                    status=V4BlockStatus.COMPLETED.value,
+                    final_translation="第二块译文",
+                ),
+            ],
+        )
+
+    with closing(db.connect()) as connection:
+        assert connection.execute(
+            """SELECT COUNT(*) FROM translation_versions
+               WHERE run_id='atomic-wave'"""
+        ).fetchone()[0] == 0
+        assert connection.execute(
+            """SELECT COUNT(*) FROM audit_calls
+               WHERE run_id='atomic-wave'"""
+        ).fetchone()[0] == 0
+    assert db.status_summary()["memory_version"] == memory_version
 
 
 def test_concept_redirect_merge_scales_without_read_n_plus_one_or_unbounded_growth(
@@ -371,7 +597,7 @@ def test_schema6_requires_explicit_upgrade_without_mutating_data(tmp_path):
             "SELECT default_target FROM concepts WHERE id='locked-old'"
         ).fetchone()
 
-    assert SCHEMA_VERSION == 8
+    assert SCHEMA_VERSION == 9
     assert version == "6"
     assert concept[0] == "德罗特"
     assert "risk_flags_json" not in lexical_columns

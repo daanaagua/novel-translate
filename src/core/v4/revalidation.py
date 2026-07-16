@@ -502,20 +502,40 @@ class RevalidationPlanner:
             "retired": 0,
         }
 
-    def plan(self, change_ids: Sequence[int]) -> dict[str, Any]:
+    def plan(
+        self,
+        change_ids: Sequence[int],
+        connection: sqlite3.Connection | None = None,
+    ) -> dict[str, Any]:
         normalized = self._normalize_change_ids(change_ids)
         if not normalized:
             return self._empty_result()
+        if connection is not None:
+            with self.database._method_savepoint(
+                connection, "revalidation_plan"
+            ):
+                return self._plan_in_transaction(connection, normalized)
         with self.database.transaction() as connection:
             with self.database._method_savepoint(connection, "revalidation_plan"):
                 return self._plan_in_transaction(connection, normalized)
 
-    def plan_memory(self, change_ids: Sequence[int]) -> dict[str, Any]:
+    def plan_memory(
+        self,
+        change_ids: Sequence[int],
+        connection: sqlite3.Connection | None = None,
+    ) -> dict[str, Any]:
         """Plan only translations whose frozen narrative context can change."""
 
         normalized = self._normalize_change_ids(change_ids)
         if not normalized:
             return {**self._empty_result(), "planned_block_ids": []}
+        if connection is not None:
+            with self.database._method_savepoint(
+                connection, "memory_revalidation_plan"
+            ):
+                return self._plan_memory_in_transaction(
+                    connection, normalized
+                )
         with self.database.transaction() as connection:
             with self.database._method_savepoint(
                 connection, "memory_revalidation_plan"

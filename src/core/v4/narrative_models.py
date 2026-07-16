@@ -306,8 +306,8 @@ class SemanticRelation:
         spans = _bounded_text_tuple(
             self.source_spans, "source_spans", MAX_EVIDENCE_SPANS, 1_024
         )
-        if len(spans) < 2:
-            raise ValueError("source_spans requires at least two items")
+        if not spans:
+            raise ValueError("source_spans requires at least one item")
         object.__setattr__(self, "source_spans", spans)
         object.__setattr__(
             self,

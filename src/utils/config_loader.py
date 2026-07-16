@@ -88,16 +88,31 @@ class ConfigLoader:
     @staticmethod
     def _load_opencode_api_key(provider: str) -> str:
         """Read a provider key from the local OpenCode config without copying it."""
-        opencode_path = Path.home() / ".config" / "opencode" / "opencode.json"
-        if not opencode_path.exists():
-            raise FileNotFoundError(f"OpenCode 配置不存在: {opencode_path}")
         import json
 
-        data = json.loads(opencode_path.read_text(encoding="utf-8"))
-        try:
-            key = data["provider"][provider]["options"]["apiKey"]
-        except (KeyError, TypeError) as exc:
-            raise KeyError(f"OpenCode 中没有 provider={provider} 的 apiKey") from exc
+        home = Path.home()
+        config_path = home / ".config" / "opencode" / "opencode.json"
+        auth_path = home / ".local" / "share" / "opencode" / "auth.json"
+        key = None
+        if config_path.exists():
+            data = json.loads(config_path.read_text(encoding="utf-8"))
+            try:
+                key = data["provider"][provider]["options"]["apiKey"]
+            except (KeyError, TypeError):
+                key = None
+        if not key and auth_path.exists():
+            auth = json.loads(auth_path.read_text(encoding="utf-8"))
+            try:
+                entry = auth[provider]
+                if entry.get("type") == "api":
+                    key = entry.get("key") or entry.get("apiKey")
+            except (AttributeError, KeyError, TypeError):
+                key = None
+        if not config_path.exists() and not auth_path.exists():
+            raise FileNotFoundError(
+                "OpenCode 配置和认证存储均不存在: "
+                f"{config_path}; {auth_path}"
+            )
         if not key:
             raise ValueError(f"OpenCode 中 provider={provider} 的 apiKey 为空")
         return str(key)

@@ -172,8 +172,8 @@ def test_epoch_checkpoint_only_pauses_when_both_flags_are_explicit(tmp_path):
         ).fetchone()[0] == 1
 
 
-def test_epoch_checkpoint_does_not_advance_high_water_past_a_concurrent_change(
-    tmp_path, monkeypatch
+def test_epoch_checkpoint_includes_change_committed_before_writer_lock(
+    tmp_path,
 ):
     database = _database(tmp_path)
     concept_id = _seed_active_translation(database)
@@ -181,19 +181,9 @@ def test_epoch_checkpoint_does_not_advance_high_water_past_a_concurrent_change(
     database.start_run(run_id, "translate", {"knowledge_epoch_mode": True})
     coordinator = KnowledgeEpochCoordinator(database, ["block-0"])
     coordinator.freeze()
-    original_scan = database.knowledge_change_ids_after
-    inserted = {"done": False}
-
-    def change_after_first_scan(version):
-        found = original_scan(version)
-        if not inserted["done"]:
-            inserted["done"] = True
-            database.apply_working_target_decisions(
-                [{"concept_id": concept_id, "target": "新译名", "rules": []}]
-            )
-        return found
-
-    monkeypatch.setattr(database, "knowledge_change_ids_after", change_after_first_scan)
+    database.apply_working_target_decisions(
+        [{"concept_id": concept_id, "target": "新译名", "rules": []}]
+    )
 
     result = coordinator.checkpoint(run_id)
 

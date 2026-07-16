@@ -35,7 +35,14 @@ from src.core.v4 import (
     write_shadow_comparison,
 )
 from src.core.v4.adjudicator import V4Adjudicator
-from src.core.v4.schema_v9 import preview_schema9
+from src.core.v4.schema_v8 import (
+    confirm_schema8 as _confirm_schema7_to8,
+    preview_schema8 as _preview_schema7_to8,
+)
+from src.core.v4.schema_v9 import (
+    inspect_schema as _inspect_v4_schema,
+    preview_schema9,
+)
 
 # Compatibility seam for existing CLI tests and extensions.  It now previews
 # the current schema-9 migration rather than the retired schema-8 migration.
@@ -283,16 +290,42 @@ def _decision_mode(value):
     return value
 
 
+def _preview_v4_migration(database_path):
+    version = _inspect_v4_schema(database_path)
+    if version == 7:
+        result = dict(_preview_schema7_to8(database_path))
+        result["from_schema"] = 7
+        result["target_schema"] = 8
+        result["next_schema"] = 9
+        return result
+    result = dict(preview_schema9(database_path))
+    result["from_schema"] = version
+    result["target_schema"] = 9
+    return result
+
+
 def cmd_migrate_v4(args):
     project = _load_project_or_error(args.book_id)
     if not project:
         return 1
     try:
+        database_path = (
+            Path(project.root_dir) / "artifacts" / "parallel_v4" / "book.db"
+        ).resolve()
         if getattr(args, "preview", False):
-            database_path = (
-                Path(project.root_dir) / "artifacts" / "parallel_v4" / "book.db"
+            result = _preview_v4_migration(database_path)
+        elif _inspect_v4_schema(database_path) == 7:
+            confirm_token = getattr(args, "confirm", None)
+            if not confirm_token:
+                raise ValueError(
+                    "schema 7 requires migrate-v4 --preview followed by "
+                    "--confirm before schema 9 migration"
+                )
+            result = dict(
+                _confirm_schema7_to8(database_path, confirm_token)
             )
-            result = preview_schema8(database_path.resolve())
+            result["schema_version"] = 8
+            result["next_schema"] = 9
         else:
             result = V4Migrator(
                 project, confirm_token=getattr(args, "confirm", None)

@@ -995,6 +995,20 @@ class V4Database:
                     self._audit_transactions.pop(id(connection), None)
             connection.close()
 
+    @contextmanager
+    def _write(
+        self, connection: sqlite3.Connection | None
+    ) -> Iterator[sqlite3.Connection]:
+        if connection is not None:
+            if not connection.in_transaction:
+                raise ValueError(
+                    "external connection requires an active transaction"
+                )
+            yield connection
+            return
+        with self.transaction() as owned:
+            yield owned
+
     @staticmethod
     @contextmanager
     def _method_savepoint(
@@ -4280,9 +4294,21 @@ class V4Database:
                     f"ALTER TABLE audit_calls ADD COLUMN {name} {declaration}"
                 )
 
-    def current_knowledge_version(self) -> int:
-        with closing(self.connect()) as connection:
-            return int(connection.execute("SELECT MAX(id) FROM knowledge_versions").fetchone()[0])
+    def current_knowledge_version(
+        self, connection: sqlite3.Connection | None = None
+    ) -> int:
+        if connection is not None:
+            return int(
+                connection.execute(
+                    "SELECT MAX(id) FROM knowledge_versions"
+                ).fetchone()[0]
+            )
+        with closing(self.connect()) as owned:
+            return int(
+                owned.execute(
+                    "SELECT MAX(id) FROM knowledge_versions"
+                ).fetchone()[0]
+            )
 
     def active_source_edition_id(self) -> int:
         with closing(self.connect()) as connection:
@@ -4717,11 +4743,21 @@ class V4Database:
                 (status, utc_now(), error, run_id),
             )
 
-    def load_knowledge_epoch_state(self, run_id: str) -> Dict[str, Any]:
-        with closing(self.connect()) as connection:
+    def load_knowledge_epoch_state(
+        self,
+        run_id: str,
+        *,
+        connection: sqlite3.Connection | None = None,
+    ) -> Dict[str, Any]:
+        if connection is not None:
             row = connection.execute(
                 "SELECT config_json FROM runs WHERE id=?", (run_id,)
             ).fetchone()
+        else:
+            with closing(self.connect()) as owned:
+                row = owned.execute(
+                    "SELECT config_json FROM runs WHERE id=?", (run_id,)
+                ).fetchone()
         if row is None:
             raise ValueError(f"unknown translation run: {run_id}")
         try:
@@ -4741,9 +4777,10 @@ class V4Database:
         state: Mapping[str, Any],
         *,
         knowledge_version: Optional[int] = None,
+        connection: sqlite3.Connection | None = None,
     ) -> None:
-        with self.transaction() as connection:
-            row = connection.execute(
+        with self._write(connection) as active:
+            row = active.execute(
                 "SELECT config_json, knowledge_version FROM runs WHERE id=?", (run_id,)
             ).fetchone()
             if row is None:
@@ -4759,12 +4796,12 @@ class V4Database:
                 if knowledge_version is not None
                 else int(row["knowledge_version"])
             )
-            if connection.execute(
+            if active.execute(
                 "SELECT 1 FROM knowledge_versions WHERE id=?", (version,)
             ).fetchone() is None:
                 raise ValueError(f"unknown knowledge version: {version}")
             config["knowledge_epoch_state"] = deepcopy(dict(state))
-            connection.execute(
+            active.execute(
                 "UPDATE runs SET knowledge_version=?, config_json=? WHERE id=?",
                 (
                     version,
@@ -4773,10 +4810,14 @@ class V4Database:
                 ),
             )
 
-    def knowledge_change_ids_after(self, knowledge_version: int) -> List[int]:
+    def knowledge_change_ids_after(
+        self,
+        knowledge_version: int,
+        connection: sqlite3.Connection | None = None,
+    ) -> List[int]:
         if type(knowledge_version) is not int or knowledge_version < 0:
             raise ValueError("knowledge_version must be a non-negative integer")
-        with closing(self.connect()) as connection:
+        if connection is not None:
             return [
                 int(row[0])
                 for row in connection.execute(
@@ -4785,9 +4826,21 @@ class V4Database:
                     (knowledge_version,),
                 )
             ]
+        with closing(self.connect()) as owned:
+            return [
+                int(row[0])
+                for row in owned.execute(
+                    """SELECT id FROM knowledge_changes
+                       WHERE knowledge_version>? ORDER BY knowledge_version, id""",
+                    (knowledge_version,),
+                )
+            ]
 
     def knowledge_change_ids_between(
-        self, after_version: int, through_version: int
+        self,
+        after_version: int,
+        through_version: int,
+        connection: sqlite3.Connection | None = None,
     ) -> List[int]:
         if (
             type(after_version) is not int
@@ -4796,10 +4849,20 @@ class V4Database:
             or through_version < after_version
         ):
             raise ValueError("knowledge change version bounds are invalid")
-        with closing(self.connect()) as connection:
+        if connection is not None:
             return [
                 int(row[0])
                 for row in connection.execute(
+                    """SELECT id FROM knowledge_changes
+                       WHERE knowledge_version>? AND knowledge_version<=?
+                       ORDER BY knowledge_version, id""",
+                    (after_version, through_version),
+                )
+            ]
+        with closing(self.connect()) as owned:
+            return [
+                int(row[0])
+                for row in owned.execute(
                     """SELECT id FROM knowledge_changes
                        WHERE knowledge_version>? AND knowledge_version<=?
                        ORDER BY knowledge_version, id""",
@@ -10207,6 +10270,7 @@ class V4Database:
         outcomes: Sequence[TranslationOutcome],
         pipeline: str = "parallel_v4",
         audit_mode: str = "full",
+        connection: sqlite3.Connection | None = None,
     ) -> None:
         if isinstance(outcomes, (str, bytes)) or not isinstance(outcomes, Sequence):
             raise TypeError("translation outcomes must be a sequence")
@@ -10214,7 +10278,7 @@ class V4Database:
             (_snapshot_translation_outcome(outcome) for outcome in outcomes),
             key=lambda item: item.block.global_index,
         )
-        with self.transaction() as connection:
+        with self._write(connection) as connection:
             versions = sorted({outcome.knowledge_version for outcome in ordered})
             if versions:
                 placeholders = ",".join("?" for _ in versions)
@@ -10702,6 +10766,7 @@ class V4Database:
         outcomes: Sequence[TranslationOutcome],
         enqueue_review: bool = False,
         return_change_ids: bool = False,
+        connection: sqlite3.Connection | None = None,
     ) -> Optional[int] | Dict[str, Any]:
         proposals = [
             (outcome, "term", payload)
@@ -10720,7 +10785,7 @@ class V4Database:
                 else None
             )
         proposals.sort(key=lambda item: (item[0].block.global_index, item[1], json.dumps(item[2], sort_keys=True)))
-        with self.transaction() as connection:
+        with self._write(connection) as connection:
             material_terms: Dict[str, tuple[str, str]] = {}
             for _, kind, payload in proposals:
                 if kind != "term":

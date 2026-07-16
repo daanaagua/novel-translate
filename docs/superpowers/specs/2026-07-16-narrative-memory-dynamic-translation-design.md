@@ -1,7 +1,7 @@
 # 叙事记忆融合与动态并行翻译设计
 
 日期：2026-07-16
-状态：书面规格待审阅
+状态：已实现并通过回归
 目标分支：`feature/narrative-memory-v5`
 数据库目标版本：schema 9
 
@@ -948,7 +948,7 @@ rebuild-snapshots-v4 <book_id>
 
 本版本完成需满足：
 
-1. 现有 547 个测试和 8 个 subtests 全部继续通过；
+1. 现有测试与新增回归测试全部继续通过；
 2. schema 9 新测试全部通过；
 3. 《新日之书》试跑中，预映射与翻译形成至少一个章节前瞻流水线；
 4. 典型词形、人物状态、地点、时间和呈现层能生成带英文证据的记忆；
@@ -962,6 +962,36 @@ rebuild-snapshots-v4 <book_id>
 12. TXT、EPUB、质量报告和审计报告可正常导出；
 13. 迁移预览、确认、回滚和数据库完整性检查全部工作；
 14. 代码中不存在依赖具体小说词汇的硬编码修复。
+
+### 21.1 实施验收记录
+
+2026-07-16 在隔离项目 `new_sun_v5_pilot_clean` 上完成验收：
+
+- 原项目 schema 7 先经显式预览/确认迁移到 schema 8，再经显式
+  预览/确认迁移到 schema 9；原项目数据库未被修改；
+- 12 块融合预映射首次运行完成，随后同一范围重跑为
+  `premap_cache_hits=12`、`premap_model_calls=0`；
+- 预映射生成 37 条叙事记忆、54 条英文证据；SQL 复核
+  `INVALID_EVIDENCE=0`、`FUTURE_LEAKS=0`；
+- 6 块翻译试跑完成，`completed=6`、失败与人工阻塞均为 0；
+  翻译阶段复用 6 个预映射缓存，未重新调用预映射模型；
+- 活动译文写入 73 条 lexeme 依赖、40 条 narrative memory 依赖、
+  6 条 narrative snapshot 依赖和 6 条 discourse state 依赖；
+- 低波动块保持多 worker 计划，高波动块降至单 worker；试跑最终
+  高波动 wave 的 `final_workers=1`；
+- 译文快照的后文记忆泄露计数为 0；
+- 同轮新增词汇知识为 6 个活动译文生成精确 impact-2 重验任务，
+  未产生全书无差别重验；
+- 更新后的严格协议又对前三块实测，首次 3 次模型调用，重跑
+  `premap_cache_hits=3`、`premap_model_calls=0`；
+- 翻译波次的译文、style、知识/记忆 checkpoint 和精确重验任务现由
+  同一 SQLite 写事务提交；在 memory version 已写入后注入 checkpoint
+  异常，活动译文、记忆、style 和块状态全部回滚；
+- 新鲜数据库上的非连续 `--block` 选择会自动预映射缺失前缀，不会把
+  远处目标块错误地当作无前文的第一块；
+- `rg` 检查新增生产路径未发现 Severian、Vodalus、Drotte、
+  Roche、Tecla 或 Gene Wolfe 等小说专名硬编码；
+- 完整回归结果：`621 passed, 8 subtests passed`。
 
 ## 22. 实施边界
 

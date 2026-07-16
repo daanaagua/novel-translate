@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import sqlite3
 from dataclasses import dataclass
 from typing import Any, Mapping, Optional, Sequence
 
@@ -134,8 +135,15 @@ class KnowledgeEpochCoordinator:
             "deferred_proposals": 0,
         }
 
-    def _load_state(self, run_id: str) -> dict[str, Any]:
-        state = self.database.load_knowledge_epoch_state(run_id)
+    def _load_state(
+        self,
+        run_id: str,
+        connection: sqlite3.Connection | None = None,
+    ) -> dict[str, Any]:
+        state = self.database.load_knowledge_epoch_state(
+            run_id,
+            connection=connection,
+        )
         if not state:
             return self._initial_state()
         ordinal = state.get("ordinal")
@@ -155,10 +163,15 @@ class KnowledgeEpochCoordinator:
         self._ordinal = ordinal
         return state
 
-    def stage(self, run_id: str, outcomes: Sequence[TranslationOutcome]) -> int:
+    def stage(
+        self,
+        run_id: str,
+        outcomes: Sequence[TranslationOutcome],
+        connection: sqlite3.Connection | None = None,
+    ) -> int:
         if isinstance(outcomes, (str, bytes)) or not isinstance(outcomes, Sequence):
             raise TypeError("epoch outcomes must be a sequence")
-        state = self._load_state(run_id)
+        state = self._load_state(run_id, connection)
         seen = {str(value) for value in state["seen_entry_hashes"]}
         staged_hashes = {
             str(entry.get("entry_hash") or "")
@@ -179,7 +192,11 @@ class KnowledgeEpochCoordinator:
                 + len(entry["relation_proposals"])
                 + len(entry["supplemental_memory_candidates"])
             )
-        self.database.save_knowledge_epoch_state(run_id, state)
+        self.database.save_knowledge_epoch_state(
+            run_id,
+            state,
+            connection=connection,
+        )
         return added
 
     def _restore_outcomes(
@@ -218,7 +235,9 @@ class KnowledgeEpochCoordinator:
         )
 
     def _ensure_term_forms(
-        self, staged: Sequence[Mapping[str, Any]]
+        self,
+        staged: Sequence[Mapping[str, Any]],
+        connection: sqlite3.Connection | None = None,
     ) -> dict[str, str]:
         forms = sorted(
             {
@@ -232,13 +251,24 @@ class KnowledgeEpochCoordinator:
         )
         if not forms:
             return {}
+        if connection is not None:
+            return {
+                form: self.database.ensure_lexeme(
+                    form, connection=connection
+                )
+                for form in forms
+            }
         with self.database.transaction() as connection:
             return {
                 form: self.database.ensure_lexeme(form, connection=connection)
                 for form in forms
             }
 
-    def backfill_form_occurrences(self, forms: Mapping[str, str]) -> int:
+    def backfill_form_occurrences(
+        self,
+        forms: Mapping[str, str],
+        connection: sqlite3.Connection | None = None,
+    ) -> int:
         """Scan every active source block once and idempotently batch occurrences."""
 
         if not isinstance(forms, Mapping):
@@ -256,7 +286,8 @@ class KnowledgeEpochCoordinator:
         inserted = 0
         batch: list[FormOccurrence] = []
         blocks = self.database.list_blocks()
-        with self.database.transaction() as connection:
+        def write(active: sqlite3.Connection) -> None:
+            nonlocal inserted
             for block in blocks:
                 for lexeme_id, source_form, start, end in matcher.finditer(
                     block.source_text
@@ -273,13 +304,18 @@ class KnowledgeEpochCoordinator:
                     )
                     if len(batch) == OCCURRENCE_BATCH_SIZE:
                         inserted += self.database.record_form_occurrences(
-                            batch, connection=connection
+                            batch, connection=active
                         )
                         batch.clear()
             if batch:
                 inserted += self.database.record_form_occurrences(
-                    batch, connection=connection
+                    batch, connection=active
                 )
+        if connection is not None:
+            write(connection)
+        else:
+            with self.database.transaction() as active:
+                write(active)
         return inserted
 
     def _result_from_state(
@@ -306,16 +342,31 @@ class KnowledgeEpochCoordinator:
             payload_hash=str(raw.get("payload_hash") or ""),
         )
 
-    def checkpoint(self, run_id: str) -> EpochCheckpointResult:
-        state = self._load_state(run_id)
+    def checkpoint_in_transaction(
+        self,
+        run_id: str,
+        connection: sqlite3.Connection,
+    ) -> tuple[dict[str, Any], bool]:
+        if not connection.in_transaction:
+            raise ValueError(
+                "checkpoint connection requires an active transaction"
+            )
+        state = self._load_state(run_id, connection)
         staged = [dict(value) for value in state["staged"]]
         base_version = int(state["base_knowledge_version"])
         base_memory_version = int(state["base_memory_version"])
-        external_change_ids = self.database.knowledge_change_ids_after(base_version)
-        current_memory_version = self.narrative_store.current_memory_version()
+        external_change_ids = self.database.knowledge_change_ids_after(
+            base_version,
+            connection=connection,
+        )
+        current_memory_version = (
+            self.narrative_store.current_memory_version(connection)
+        )
         external_memory_change_ids = (
             self.narrative_store.memory_change_ids_between(
-                base_memory_version, current_memory_version
+                base_memory_version,
+                current_memory_version,
+                connection=connection,
             )
         )
         if (
@@ -326,7 +377,7 @@ class KnowledgeEpochCoordinator:
             state.get("last_result"), Mapping
             )
         ):
-            return self._result_from_state(state["last_result"], reused=True)
+            return dict(state["last_result"]), True
         payload_hash = hashlib.sha256(
             _canonical(
                 {
@@ -340,7 +391,7 @@ class KnowledgeEpochCoordinator:
         checkpoint_key = f"{state['ordinal']}:{payload_hash}"
         prior = state["checkpoints"].get(checkpoint_key)
         if isinstance(prior, Mapping):
-            return self._result_from_state(prior, reused=True)
+            return dict(prior), True
 
         staged_count = self._proposal_count(staged)
         capped = bool(staged and int(state["ordinal"]) >= self.max_knowledge_epochs - 1)
@@ -349,9 +400,15 @@ class KnowledgeEpochCoordinator:
         proposal_version: Optional[int] = None
         applied = False
         if staged and not capped:
-            proposed_forms = self._ensure_term_forms(staged)
+            proposed_forms = self._ensure_term_forms(
+                staged,
+                connection=connection,
+            )
             if proposed_forms:
-                self.backfill_form_occurrences(proposed_forms)
+                self.backfill_form_occurrences(
+                    proposed_forms,
+                    connection=connection,
+                )
             restored = self._restore_outcomes(staged)
             if any(
                 outcome.term_proposals or outcome.relation_proposals
@@ -362,6 +419,7 @@ class KnowledgeEpochCoordinator:
                     restored,
                     enqueue_review=self.decision_mode == "interactive",
                     return_change_ids=True,
+                    connection=connection,
                 )
                 if isinstance(proposal_result, Mapping):
                     if proposal_result.get("knowledge_version") is not None:
@@ -387,21 +445,28 @@ class KnowledgeEpochCoordinator:
                     outcome.block,
                     candidates,
                     source="translation_supplemental",
+                    connection=connection,
                 )
                 memory_change_ids.extend(merged.change_ids)
             applied = bool(proposal_version is not None or memory_change_ids)
 
-        final_high_water = self.database.current_knowledge_version()
+        final_high_water = self.database.current_knowledge_version(
+            connection
+        )
         final_memory_high_water = (
-            self.narrative_store.current_memory_version()
+            self.narrative_store.current_memory_version(connection)
         )
         bounded_change_ids = self.database.knowledge_change_ids_between(
-            base_version, final_high_water
+            base_version,
+            final_high_water,
+            connection=connection,
         )
         change_ids = tuple(sorted(set(bounded_change_ids + proposal_change_ids)))
         bounded_memory_change_ids = (
             self.narrative_store.memory_change_ids_between(
-                base_memory_version, final_memory_high_water
+                base_memory_version,
+                final_memory_high_water,
+                connection=connection,
             )
         )
         memory_change_ids = tuple(
@@ -416,10 +481,18 @@ class KnowledgeEpochCoordinator:
         planned_tasks = 0
         planner = RevalidationPlanner(self.database)
         if change_ids:
-            planned_tasks += int(planner.plan(change_ids)["planned"])
+            planned_tasks += int(
+                planner.plan(
+                    change_ids,
+                    connection=connection,
+                )["planned"]
+            )
         if memory_change_ids:
             planned_tasks += int(
-                planner.plan_memory(memory_change_ids)["planned"]
+                planner.plan_memory(
+                    memory_change_ids,
+                    connection=connection,
+                )["planned"]
             )
         advanced = (
             final_high_water > base_version
@@ -463,6 +536,17 @@ class KnowledgeEpochCoordinator:
         if advanced:
             self._epoch = None
         self.database.save_knowledge_epoch_state(
-            run_id, state, knowledge_version=final_high_water
+            run_id,
+            state,
+            knowledge_version=final_high_water,
+            connection=connection,
         )
-        return self._result_from_state(raw_result, reused=False)
+        return raw_result, False
+
+    def checkpoint(self, run_id: str) -> EpochCheckpointResult:
+        with self.database.transaction() as connection:
+            raw_result, reused = self.checkpoint_in_transaction(
+                run_id,
+                connection,
+            )
+        return self._result_from_state(raw_result, reused=reused)
