@@ -6,13 +6,16 @@ import hashlib
 import json
 import sqlite3
 import unicodedata
+from collections.abc import Sequence
 from dataclasses import dataclass, field
-from typing import Any, Sequence
+from typing import Any
 
 from .database import V4Database, utc_now
 
 
 MAX_CHANGE_IDS = 1024
+MAX_RAW_CHANGE_IDS = MAX_CHANGE_IDS
+MAX_INPUT_BYTES = 16 * 1024
 MAX_RESULT_BYTES = 64 * 1024
 _MAX_PAYLOAD_BYTES = 64 * 1024
 _MAX_PAYLOAD_IDS = 64
@@ -137,10 +140,24 @@ class RevalidationPlanner:
     def _normalize_change_ids(change_ids: Sequence[int]) -> list[int]:
         if isinstance(change_ids, (str, bytes)) or not isinstance(change_ids, Sequence):
             raise TypeError("change_ids must be a sequence of positive integers")
+        raw_length = len(change_ids)
+        if raw_length > MAX_RAW_CHANGE_IDS:
+            raise PlanningBudgetError("raw change_ids exceed planning budget")
         normalized: set[int] = set()
+        raw_count = 0
+        input_bytes = 0
         for value in change_ids:
+            raw_count += 1
+            if raw_count > MAX_RAW_CHANGE_IDS:
+                raise PlanningBudgetError("raw change_ids exceed planning budget")
             if type(value) is not int or value <= 0:
                 raise ValueError("change_ids must contain positive integers")
+            try:
+                input_bytes += len(str(value)) + 1
+            except (ValueError, OverflowError):
+                raise PlanningBudgetError("change_ids exceed input byte budget") from None
+            if input_bytes > MAX_INPUT_BYTES:
+                raise PlanningBudgetError("change_ids exceed input byte budget")
             normalized.add(value)
             if len(normalized) > MAX_CHANGE_IDS:
                 raise PlanningBudgetError("change_ids exceed planning budget")

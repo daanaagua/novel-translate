@@ -2,6 +2,7 @@ import hashlib
 import json
 import re
 import sqlite3
+from collections.abc import Sequence
 from contextlib import closing, contextmanager
 from dataclasses import replace
 from decimal import Decimal
@@ -1759,6 +1760,77 @@ def test_revalidation_planner_rejects_input_over_budget_before_writes(tmp_path):
         assert connection.execute(
             "SELECT COUNT(*) FROM revalidation_tasks"
         ).fetchone()[0] == 0
+
+
+def test_revalidation_rejects_duplicate_raw_flood_before_database_access(
+    tmp_path, monkeypatch
+):
+    database = _database(tmp_path, ["Alpha"])
+    monkeypatch.setattr(
+        database,
+        "transaction",
+        lambda: (_ for _ in ()).throw(
+            AssertionError("input validation must not enter a database transaction")
+        ),
+    )
+
+    with pytest.raises(PlanningBudgetError, match="raw change_ids"):
+        RevalidationPlanner(database).plan([1] * 100_000)
+    with closing(database.connect()) as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM revalidation_tasks"
+        ).fetchone()[0] == 0
+
+
+def test_revalidation_checks_raw_length_before_traversing_sequence(tmp_path):
+    database = _database(tmp_path, ["Alpha"])
+
+    class OversizedSequence(Sequence):
+        def __len__(self):
+            return 100_000
+
+        def __getitem__(self, _index):
+            raise AssertionError("oversized sequence must not be traversed")
+
+    with pytest.raises(PlanningBudgetError, match="raw change_ids"):
+        RevalidationPlanner(database).plan(OversizedSequence())
+
+
+def test_revalidation_counts_duplicate_integer_bytes_before_deduplication(
+    tmp_path, monkeypatch
+):
+    database = _database(tmp_path, ["Alpha"])
+    monkeypatch.setattr(
+        database,
+        "transaction",
+        lambda: (_ for _ in ()).throw(
+            AssertionError("input validation must not enter a database transaction")
+        ),
+    )
+    large_id = 10**100
+
+    with pytest.raises(PlanningBudgetError, match="input byte budget"):
+        RevalidationPlanner(database).plan([large_id] * MAX_CHANGE_IDS)
+
+
+def test_revalidation_accepts_raw_boundary_for_duplicates_and_unique_ids():
+    assert RevalidationPlanner._normalize_change_ids([1] * MAX_CHANGE_IDS) == [1]
+    assert RevalidationPlanner._normalize_change_ids(
+        list(range(1, MAX_CHANGE_IDS + 1))
+    ) == list(range(1, MAX_CHANGE_IDS + 1))
+
+
+def test_revalidation_rejects_iterators_before_consuming_them(tmp_path):
+    database = _database(tmp_path, ["Alpha"])
+    consumed = {"value": False}
+
+    def values():
+        consumed["value"] = True
+        yield 1
+
+    with pytest.raises(TypeError, match="sequence"):
+        RevalidationPlanner(database).plan(values())
+    assert consumed["value"] is False
 
 
 def test_revalidation_only_plans_changes_strictly_newer_than_translation(tmp_path):
