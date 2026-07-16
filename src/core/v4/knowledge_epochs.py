@@ -10,6 +10,8 @@ from typing import Any, Mapping, Optional, Sequence
 from .database import FrozenRenderBundle, V4Database
 from .matcher import MultiFormMatcher
 from .models import FormOccurrence, TranslationOutcome, V4BlockStatus
+from .narrative_memory import NarrativeMemoryStore
+from .narrative_models import NarrativeMemoryCandidate
 from .revalidation import RevalidationPlanner
 
 
@@ -29,6 +31,7 @@ def _canonical(value: Any) -> str:
 class KnowledgeEpoch:
     ordinal: int
     knowledge_version: int
+    memory_version: int
     render_bundle: FrozenRenderBundle
 
     @property
@@ -77,6 +80,7 @@ class KnowledgeEpochCoordinator:
         self.pause_on_review = bool(pause_on_review)
         self._ordinal = 0
         self._epoch: Optional[KnowledgeEpoch] = None
+        self.narrative_store = NarrativeMemoryStore(database)
 
     def freeze(self) -> KnowledgeEpoch:
         if self._epoch is None:
@@ -84,6 +88,7 @@ class KnowledgeEpochCoordinator:
             self._epoch = KnowledgeEpoch(
                 ordinal=self._ordinal,
                 knowledge_version=bundle.knowledge_version,
+                memory_version=self.narrative_store.current_memory_version(),
                 render_bundle=bundle,
             )
         return self._epoch
@@ -92,13 +97,17 @@ class KnowledgeEpochCoordinator:
     def _entry(outcome: TranslationOutcome) -> Optional[dict[str, Any]]:
         terms = [dict(value) for value in outcome.term_proposals]
         relations = [dict(value) for value in outcome.relation_proposals]
-        if not terms and not relations:
+        supplemental_memory = [
+            dict(value) for value in outcome.supplemental_memory_candidates
+        ]
+        if not terms and not relations and not supplemental_memory:
             return None
         payload = {
             "block_id": outcome.block.id,
             "knowledge_version": int(outcome.knowledge_version),
             "term_proposals": terms,
             "relation_proposals": relations,
+            "supplemental_memory_candidates": supplemental_memory,
         }
         payload["entry_hash"] = hashlib.sha256(
             _canonical(
@@ -106,6 +115,7 @@ class KnowledgeEpochCoordinator:
                     "block_id": payload["block_id"],
                     "term_proposals": terms,
                     "relation_proposals": relations,
+                    "supplemental_memory_candidates": supplemental_memory,
                 }
             ).encode("utf-8")
         ).hexdigest()
@@ -116,6 +126,7 @@ class KnowledgeEpochCoordinator:
         return {
             "ordinal": epoch.ordinal,
             "base_knowledge_version": epoch.knowledge_version,
+            "base_memory_version": epoch.memory_version,
             "staged": [],
             "seen_entry_hashes": [],
             "checkpoints": {},
@@ -128,10 +139,13 @@ class KnowledgeEpochCoordinator:
             return self._initial_state()
         ordinal = state.get("ordinal")
         base_version = state.get("base_knowledge_version")
+        base_memory_version = state.get("base_memory_version")
         if type(ordinal) is not int or ordinal < 0:
             raise ValueError("knowledge epoch ordinal is invalid")
         if type(base_version) is not int or base_version < 1:
             raise ValueError("knowledge epoch base version is invalid")
+        if type(base_memory_version) is not int or base_memory_version < 1:
+            raise ValueError("knowledge epoch base memory version is invalid")
         for key in ("staged", "seen_entry_hashes"):
             if not isinstance(state.get(key), list):
                 raise ValueError(f"knowledge epoch {key} is invalid")
@@ -159,7 +173,11 @@ class KnowledgeEpochCoordinator:
                 continue
             state["staged"].append(entry)
             staged_hashes.add(entry["entry_hash"])
-            added += len(entry["term_proposals"]) + len(entry["relation_proposals"])
+            added += (
+                len(entry["term_proposals"])
+                + len(entry["relation_proposals"])
+                + len(entry["supplemental_memory_candidates"])
+            )
         self.database.save_knowledge_epoch_state(run_id, state)
         return added
 
@@ -178,6 +196,13 @@ class KnowledgeEpochCoordinator:
                     relation_proposals=[
                         dict(value) for value in entry["relation_proposals"]
                     ],
+                    supplemental_memory_candidates=[
+                        dict(value)
+                        for value in entry.get(
+                            "supplemental_memory_candidates"
+                        )
+                        or ()
+                    ],
                 )
             )
         return restored
@@ -187,6 +212,7 @@ class KnowledgeEpochCoordinator:
         return sum(
             len(entry.get("term_proposals") or ())
             + len(entry.get("relation_proposals") or ())
+            + len(entry.get("supplemental_memory_candidates") or ())
             for entry in staged
         )
 
@@ -279,6 +305,7 @@ class KnowledgeEpochCoordinator:
         state = self._load_state(run_id)
         staged = [dict(value) for value in state["staged"]]
         base_version = int(state["base_knowledge_version"])
+        base_memory_version = int(state["base_memory_version"])
         external_change_ids = self.database.knowledge_change_ids_after(base_version)
         if not staged and not external_change_ids and isinstance(
             state.get("last_result"), Mapping
@@ -301,29 +328,56 @@ class KnowledgeEpochCoordinator:
         staged_count = self._proposal_count(staged)
         capped = bool(staged and int(state["ordinal"]) >= self.max_knowledge_epochs - 1)
         proposal_change_ids: list[int] = []
+        memory_change_ids: list[int] = []
         proposal_version: Optional[int] = None
         applied = False
         if staged and not capped:
             proposed_forms = self._ensure_term_forms(staged)
             if proposed_forms:
                 self.backfill_form_occurrences(proposed_forms)
-            proposal_result = self.database.commit_translation_proposals(
-                run_id,
-                self._restore_outcomes(staged),
-                enqueue_review=self.decision_mode == "interactive",
-                return_change_ids=True,
-            )
-            if isinstance(proposal_result, Mapping):
-                if proposal_result.get("knowledge_version") is not None:
-                    proposal_version = int(proposal_result["knowledge_version"])
-                proposal_change_ids = [
-                    int(value) for value in proposal_result.get("change_ids") or ()
+            restored = self._restore_outcomes(staged)
+            if any(
+                outcome.term_proposals or outcome.relation_proposals
+                for outcome in restored
+            ):
+                proposal_result = self.database.commit_translation_proposals(
+                    run_id,
+                    restored,
+                    enqueue_review=self.decision_mode == "interactive",
+                    return_change_ids=True,
+                )
+                if isinstance(proposal_result, Mapping):
+                    if proposal_result.get("knowledge_version") is not None:
+                        proposal_version = int(
+                            proposal_result["knowledge_version"]
+                        )
+                    proposal_change_ids = [
+                        int(value)
+                        for value in proposal_result.get("change_ids") or ()
+                    ]
+                elif proposal_result is not None:
+                    proposal_version = int(proposal_result)
+            for outcome in sorted(
+                restored, key=lambda value: value.block.global_index
+            ):
+                candidates = [
+                    NarrativeMemoryCandidate.from_mapping(value)
+                    for value in outcome.supplemental_memory_candidates
                 ]
-            elif proposal_result is not None:
-                proposal_version = int(proposal_result)
-            applied = proposal_version is not None
+                if not candidates:
+                    continue
+                merged = self.narrative_store.merge_candidates(
+                    outcome.block,
+                    candidates,
+                    source="translation_supplemental",
+                )
+                memory_change_ids.extend(merged.change_ids)
+            applied = bool(proposal_version is not None or memory_change_ids)
 
         final_high_water = self.database.current_knowledge_version()
+        final_memory_high_water = (
+            self.narrative_store.current_memory_version()
+        )
         bounded_change_ids = self.database.knowledge_change_ids_between(
             base_version, final_high_water
         )
@@ -331,12 +385,16 @@ class KnowledgeEpochCoordinator:
         planned_tasks = 0
         if change_ids:
             planned_tasks = int(RevalidationPlanner(self.database).plan(change_ids)["planned"])
-        advanced = final_high_water > base_version
+        advanced = (
+            final_high_water > base_version
+            or final_memory_high_water > base_memory_version
+        )
         if advanced:
             state["ordinal"] = min(
                 self.max_knowledge_epochs - 1, int(state["ordinal"]) + 1
             )
         state["base_knowledge_version"] = final_high_water
+        state["base_memory_version"] = final_memory_high_water
         if not capped:
             state["seen_entry_hashes"] = sorted(
                 set(str(value) for value in state["seen_entry_hashes"])

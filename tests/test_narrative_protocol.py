@@ -192,3 +192,30 @@ def test_premapper_accepts_strict_json_response():
     assert result.degraded is False
     assert result.semantic_relations[0].relation_type == "referential_link"
     assert result.memory_candidates[0].candidate_id == "M1"
+
+
+def test_discourse_delta_preserves_omitted_fields_and_can_clear_speakers():
+    from src.core.v4.narrative_models import (
+        DiscourseDelta,
+        DiscourseState,
+        apply_discourse_delta,
+    )
+
+    prior = DiscourseState(
+        viewpoint_holder="C1",
+        active_speakers=("C1",),
+        scene_location="L1",
+        state_confidence=0.8,
+    )
+    delta = DiscourseDelta(
+        active_speakers=(),
+        scene_location="L2",
+        state_confidence=0.9,
+    )
+
+    merged = apply_discourse_delta(prior, delta)
+
+    assert merged.viewpoint_holder == "C1"
+    assert merged.active_speakers == ()
+    assert merged.scene_location == "L2"
+    assert merged.state_confidence == 0.9

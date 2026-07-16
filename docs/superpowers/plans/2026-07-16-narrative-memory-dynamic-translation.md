@@ -684,7 +684,7 @@ git commit -m "feat: add position-gated narrative snapshots"
 - 修改：`config/prompts.yaml`
 - 创建：`tests/test_narrative_pipeline.py`
 
-- [ ] **步骤 1：编写上下文顺序和依赖测试**
+- [x] **步骤 1：编写上下文顺序和依赖测试**
 
 ```python
 def test_context_includes_memory_and_discourse_after_semantic_constraints(...):
@@ -704,7 +704,7 @@ def test_context_includes_memory_and_discourse_after_semantic_constraints(...):
     assert packet.context_hash
 ```
 
-- [ ] **步骤 2：编写补充记忆只接受英文证据测试**
+- [x] **步骤 2：编写补充记忆只接受英文证据测试**
 
 ```python
 def test_translation_supplemental_memory_requires_english_evidence():
@@ -716,7 +716,7 @@ def test_translation_supplemental_memory_requires_english_evidence():
     assert parsed["supplemental_memory_candidates"] == []
 ```
 
-- [ ] **步骤 3：运行测试确认失败**
+- [x] **步骤 3：运行测试确认失败**
 
 运行：
 
@@ -726,7 +726,7 @@ def test_translation_supplemental_memory_requires_english_evidence():
 
 预期：FAIL，新上下文参数或输出字段不存在。
 
-- [ ] **步骤 4：扩展 `ContextBuilder`**
+- [x] **步骤 4：扩展 `ContextBuilder`**
 
 增加参数：
 
@@ -755,7 +755,7 @@ XML/JSON 解析器只保留能在 `source_text` grounding 的英文 evidence。`
 - 润色不能返回知识或记忆变化；
 - `memory_summary` 仅用于审计。
 
-- [ ] **步骤 6：运行上下文和翻译器测试**
+- [x] **步骤 6：运行上下文和翻译器测试**
 
 运行：
 
@@ -780,7 +780,7 @@ git commit -m "feat: inject narrative context into translation"
 - 修改：`src/core/v4/knowledge_epochs.py`
 - 修改：`tests/test_narrative_pipeline.py`
 
-- [ ] **步骤 1：编写波动分档和边界测试**
+- [x] **步骤 1：编写波动分档和边界测试**
 
 ```python
 def test_high_volatility_forces_single_worker_and_small_island():
@@ -795,7 +795,7 @@ def test_island_never_crosses_reveal_boundary():
     assert all(not ({1, 2} <= {b.global_index for b in i.blocks}) for i in islands)
 ```
 
-- [ ] **步骤 2：编写前瞻缓存流水线测试**
+- [x] **步骤 2：编写前瞻缓存流水线测试**
 
 ```python
 def test_translation_premaps_ahead_and_reuses_cache(fake_llm, pipeline):
@@ -806,7 +806,7 @@ def test_translation_premaps_ahead_and_reuses_cache(fake_llm, pipeline):
     assert fake_llm.count("narrative_premap") == first_calls
 ```
 
-- [ ] **步骤 3：运行测试确认失败**
+- [x] **步骤 3：运行测试确认失败**
 
 运行：
 
@@ -816,7 +816,7 @@ def test_translation_premaps_ahead_and_reuses_cache(fake_llm, pipeline):
 
 预期：FAIL，动态计划和预映射游标不存在。
 
-- [ ] **步骤 4：实现波动评分**
+- [x] **步骤 4：实现波动评分**
 
 `NarrativeScheduler.score()` 按规格信号产生 0–100 分和原因列表；`plan()` 返回：
 
@@ -833,7 +833,7 @@ class DynamicWavePlan:
 
 同样输入产生完全相同计划。
 
-- [ ] **步骤 5：实现前瞻协调器**
+- [x] **步骤 5：实现前瞻协调器**
 
 `pipeline.py` 增加：
 
@@ -850,7 +850,7 @@ def _ensure_premapped_through(self, target_global_index: int) -> PremapWindow:
 
 正常翻译前确保目标块已有快照；缓存命中不调用模型。映射失败写降级结果并继续。
 
-- [ ] **步骤 6：把动态计划接入 wave**
+- [x] **步骤 6：把动态计划接入 wave**
 
 替换固定 `islands = _make_islands(..., island_size)` 和单一 `workers`：
 
@@ -865,7 +865,7 @@ while cursor < len(candidates):
 
 速率限制和失败只能降低动态计划的并发上限；成功后逐步恢复。
 
-- [ ] **步骤 7：扩展知识纪元提交补充记忆**
+- [x] **步骤 7：扩展知识纪元提交补充记忆**
 
 `KnowledgeEpochCoordinator` 的 staged entry 加入：
 
@@ -878,7 +878,7 @@ while cursor < len(candidates):
 
 在 checkpoint 中按块顺序调用 `NarrativeMemoryStore.merge_candidates()`，并记录 `memory_version`、deferred memory 数量和记忆变化 ID。
 
-- [ ] **步骤 8：运行流水线测试**
+- [x] **步骤 8：运行流水线测试**
 
 运行：
 
@@ -902,7 +902,7 @@ git commit -m "feat: add narrative-aware dynamic translation waves"
 - 创建：`tests/test_narrative_revalidation.py`
 - 修改：`tests/test_precise_revalidation.py`
 
-- [ ] **步骤 1：编写译文依赖提交测试**
+- [x] **步骤 1：编写译文依赖提交测试**
 
 ```python
 def test_translation_commit_records_memory_snapshot_and_discourse_dependencies(...):
@@ -921,7 +921,7 @@ def test_translation_commit_records_memory_snapshot_and_discourse_dependencies(.
     assert ("narrative_snapshot", "snap-7") in dependencies
 ```
 
-- [ ] **步骤 2：运行测试确认失败**
+- [x] **步骤 2：运行测试确认失败**
 
 运行：
 
@@ -931,7 +931,7 @@ def test_translation_commit_records_memory_snapshot_and_discourse_dependencies(.
 
 预期：FAIL，译文表或提交快照缺少新字段。
 
-- [ ] **步骤 3：扩展不可变提交快照**
+- [x] **步骤 3：扩展不可变提交快照**
 
 `database.py` 的 `_TranslationCommitSnapshot` 和 `_snapshot_translation_outcome()` 必须复制并校验：
 
@@ -946,7 +946,7 @@ narrative_dependencies
 
 worker 提供的任一记忆依赖必须在冻结快照中可见且指纹匹配，否则整个 batch 回滚。
 
-- [ ] **步骤 4：扩展译文写入和依赖行**
+- [x] **步骤 4：扩展译文写入和依赖行**
 
 所有创建译文版本的路径，包括正常提交、重译、局部修补和旧译文导入，均写入新列。正常提交增加：
 
@@ -963,7 +963,7 @@ for snapshot in outcome.narrative_dependencies:
 
 快照、话语和样式使用各自哈希作为 dependency fingerprint。
 
-- [ ] **步骤 5：运行提交和旧精确依赖测试**
+- [x] **步骤 5：运行提交和旧精确依赖测试**
 
 运行：
 

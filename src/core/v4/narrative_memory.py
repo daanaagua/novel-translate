@@ -13,6 +13,7 @@ from typing import Any, Iterator, Mapping, Sequence
 from .database import V4Database, stable_id, utc_now
 from .models import V4Block
 from .narrative_models import (
+    DiscourseDelta,
     DiscourseState,
     NarrativeMemoryCandidate,
     NarrativeMemoryRecord,
@@ -21,6 +22,7 @@ from .narrative_models import (
     NarrativeSnapshot,
     NarrativeSubject,
     SemanticRelation,
+    render_narrative_memory,
 )
 
 
@@ -188,8 +190,8 @@ class NarrativeMemoryStore:
                        memory_candidates_json, discourse_delta_json,
                        validation_json, model_id, prompt_hash,
                        prior_snapshot_hash, request_hash, response_hash,
-                       audit_call_id, created_at)
-                   VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                       audit_call_id, snapshot_id, created_at)
+                   VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?)""",
                 (
                     result_id,
                     block.id,
@@ -276,12 +278,105 @@ class NarrativeMemoryStore:
         return NarrativePremapResult(
             semantic_relations=tuple(relations),
             memory_candidates=tuple(candidates),
-            discourse_delta=DiscourseState.from_mapping(
+            discourse_delta=DiscourseDelta.from_mapping(
                 json.loads(row["discourse_delta_json"] or "{}")
             ),
             validation_warnings=tuple(validation.get("warnings") or ()),
             degraded=bool(validation.get("degraded")),
         )
+
+    def link_premap_snapshot(
+        self, cache_key: str, snapshot_id: str
+    ) -> None:
+        with self.database.transaction() as connection:
+            exists = connection.execute(
+                "SELECT 1 FROM narrative_snapshots WHERE id=?",
+                (snapshot_id,),
+            ).fetchone()
+            if exists is None:
+                raise KeyError(f"narrative snapshot does not exist: {snapshot_id}")
+            updated = connection.execute(
+                """UPDATE premap_results SET snapshot_id=?
+                   WHERE cache_key=?""",
+                (snapshot_id, cache_key),
+            )
+            if updated.rowcount != 1:
+                raise KeyError(f"premap cache does not exist: {cache_key}")
+
+    def load_snapshot(self, snapshot_id: str) -> NarrativeSnapshot | None:
+        with closing(self.database.connect()) as connection:
+            row = connection.execute(
+                "SELECT * FROM narrative_snapshots WHERE id=?",
+                (snapshot_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        return NarrativeSnapshot(
+            id=str(row["id"]),
+            block_id=str(row["block_id"]),
+            global_index=int(row["global_index"]),
+            knowledge_version=int(row["knowledge_version"]),
+            memory_version=int(row["memory_version"]),
+            previous_snapshot_id=str(row["previous_snapshot_id"] or ""),
+            discourse_state=DiscourseState.from_mapping(
+                json.loads(row["discourse_state_json"] or "{}")
+            ),
+            visible_memory_ids=tuple(
+                json.loads(row["visible_memory_ids_json"] or "[]")
+            ),
+            snapshot_hash=str(row["snapshot_hash"]),
+        )
+
+    def snapshot_for_cache(
+        self, cache_key: str
+    ) -> NarrativeSnapshot | None:
+        with closing(self.database.connect()) as connection:
+            row = connection.execute(
+                """SELECT snapshot_id FROM premap_results
+                   WHERE cache_key=?""",
+                (cache_key,),
+            ).fetchone()
+        if row is None or not row["snapshot_id"]:
+            return None
+        return self.load_snapshot(str(row["snapshot_id"]))
+
+    def snapshot_payload(
+        self, snapshot: NarrativeSnapshot, *, max_memories: int = 64
+    ) -> dict[str, Any]:
+        selected_ids = snapshot.visible_memory_ids[:max_memories]
+        if not selected_ids:
+            memories: list[dict[str, Any]] = []
+        else:
+            placeholders = ",".join("?" for _ in selected_ids)
+            with closing(self.database.connect()) as connection:
+                rows = connection.execute(
+                    f"""SELECT id, memory_type, statement, truth_status,
+                               visibility, confidence, status
+                        FROM narrative_memories
+                        WHERE id IN ({placeholders})""",
+                    selected_ids,
+                ).fetchall()
+            by_id = {str(row["id"]): row for row in rows}
+            memories = [
+                {
+                    "id": memory_id,
+                    "memory_type": str(by_id[memory_id]["memory_type"]),
+                    "statement": str(by_id[memory_id]["statement"]),
+                    "truth_status": str(by_id[memory_id]["truth_status"]),
+                    "visibility": str(by_id[memory_id]["visibility"]),
+                    "confidence": float(by_id[memory_id]["confidence"]),
+                    "status": str(by_id[memory_id]["status"]),
+                }
+                for memory_id in selected_ids
+                if memory_id in by_id
+            ]
+        return {
+            "id": snapshot.id,
+            "snapshot_hash": snapshot.snapshot_hash,
+            "global_index": snapshot.global_index,
+            "memory_version": snapshot.memory_version,
+            "visible_memories": memories,
+        }
 
     @staticmethod
     def _evidence_offsets(
@@ -340,7 +435,15 @@ class NarrativeMemoryStore:
         source: str = "premap",
         connection: sqlite3.Connection | None = None,
     ) -> MemoryMergeResult:
-        prepared = []
+        prepared_by_id: dict[
+            str,
+            tuple[
+                NarrativeMemoryCandidate,
+                tuple[tuple[int, int, str], ...],
+                str,
+                str,
+            ],
+        ] = {}
         for candidate in candidates:
             if not isinstance(candidate, NarrativeMemoryCandidate):
                 raise TypeError(
@@ -353,7 +456,11 @@ class NarrativeMemoryStore:
                 [(start, end) for start, end, _ in evidence],
             )
             memory_id = stable_id("memory", fingerprint, 32)
-            prepared.append((candidate, evidence, fingerprint, memory_id))
+            prepared_by_id.setdefault(
+                memory_id,
+                (candidate, evidence, fingerprint, memory_id),
+            )
+        prepared = list(prepared_by_id.values())
         if not prepared:
             return MemoryMergeResult(self.current_memory_version(), ())
 
@@ -483,6 +590,38 @@ class NarrativeMemoryStore:
                        VALUES(?, ?, ?, ?, ?)""",
                     (from_id, to_id, relation, confidence, version),
                 )
+                if relation in {"answers", "supersedes"}:
+                    prior = active.execute(
+                        """SELECT semantic_fingerprint FROM narrative_memories
+                           WHERE id=? AND retired_memory_version IS NULL""",
+                        (to_id,),
+                    ).fetchone()
+                    if prior is not None:
+                        active.execute(
+                            """UPDATE narrative_memories
+                               SET status='superseded',
+                                   retired_memory_version=?
+                               WHERE id=? AND retired_memory_version IS NULL""",
+                            (version, to_id),
+                        )
+                        cursor = active.execute(
+                            """INSERT INTO memory_changes(
+                                   memory_version, subject_type, subject_id,
+                                   change_kind, old_fingerprint,
+                                   new_fingerprint, impact_level,
+                                   payload_json, created_at)
+                               VALUES(?, 'narrative_memory', ?, ?, ?, '', 2,
+                                      ?, ?)""",
+                            (
+                                version,
+                                to_id,
+                                relation,
+                                str(prior["semantic_fingerprint"]),
+                                _canonical_json({"replacement": from_id}),
+                                utc_now(),
+                            ),
+                        )
+                        change_ids.append(int(cursor.lastrowid))
             return MemoryMergeResult(
                 version,
                 tuple(value[3] for value in prepared),
@@ -515,26 +654,63 @@ class NarrativeMemoryStore:
         memory_version: int | None = None,
     ) -> NarrativeSnapshot:
         version = memory_version or self.current_memory_version()
+        priority_subject_ids = {
+            value
+            for value in (
+                *discourse_state.active_speakers,
+                *discourse_state.addressed_parties,
+                *discourse_state.unresolved_references,
+                discourse_state.viewpoint_holder,
+                discourse_state.scene_location,
+            )
+            if value
+        }
         with self.database.transaction() as connection:
+            if priority_subject_ids:
+                subject_placeholders = ",".join(
+                    "?" for _ in priority_subject_ids
+                )
+                priority_sql = f"""EXISTS(
+                    SELECT 1 FROM narrative_memory_subjects nms
+                    WHERE nms.memory_id=nm.id
+                      AND nms.subject_id IN ({subject_placeholders})
+                )"""
+                priority_args = tuple(sorted(priority_subject_ids))
+            else:
+                priority_sql = "0"
+                priority_args = ()
             rows = connection.execute(
-                """SELECT id FROM narrative_memories
-                   WHERE reveal_global_index<=?
-                     AND visibility!='system_private'
-                     AND status!='rejected'
-                     AND created_memory_version<=?
-                     AND (retired_memory_version IS NULL
-                          OR retired_memory_version>?)
-                   ORDER BY high_impact DESC, reveal_global_index DESC, id
-                   LIMIT ?""",
-                (block.global_index, version, version, MAX_VISIBLE_MEMORIES),
+                f"""SELECT nm.id, {priority_sql} priority_match
+                    FROM narrative_memories nm
+                    JOIN blocks source_block
+                      ON source_block.id=nm.source_block_id
+                     AND source_block.source_hash=nm.source_hash
+                    WHERE nm.reveal_global_index<=?
+                      AND nm.visibility!='system_private'
+                      AND nm.status!='rejected'
+                      AND nm.created_memory_version<=?
+                      AND (nm.retired_memory_version IS NULL
+                           OR nm.retired_memory_version>?)
+                    ORDER BY priority_match DESC, nm.high_impact DESC,
+                             nm.reveal_global_index DESC, nm.id
+                    LIMIT ?""",
+                priority_args
+                + (
+                    block.global_index,
+                    version,
+                    version,
+                    MAX_VISIBLE_MEMORIES,
+                ),
             ).fetchall()
             visible_ids = tuple(str(row["id"]) for row in rows)
             previous = connection.execute(
                 """SELECT id FROM narrative_snapshots
                    WHERE global_index<?
+                     AND knowledge_version<=?
+                     AND memory_version<=?
                    ORDER BY global_index DESC, memory_version DESC, id DESC
                    LIMIT 1""",
-                (block.global_index,),
+                (block.global_index, knowledge_version, version),
             ).fetchone()
             previous_id = str(previous["id"]) if previous is not None else ""
             state_json = _canonical_json(discourse_state.to_dict())
@@ -640,8 +816,11 @@ class NarrativeMemoryStore:
         matched = {str(value) for value in matched_subject_ids}
         discourse = set(snapshot.discourse_state.active_speakers)
         discourse.update(snapshot.discourse_state.addressed_parties)
+        discourse.update(snapshot.discourse_state.unresolved_references)
         if snapshot.discourse_state.viewpoint_holder:
             discourse.add(snapshot.discourse_state.viewpoint_holder)
+        if snapshot.discourse_state.scene_location:
+            discourse.add(snapshot.discourse_state.scene_location)
         ranked = []
         for row in rows:
             memory_subjects = subjects_by_memory.get(str(row["id"]), [])
@@ -673,7 +852,9 @@ class NarrativeMemoryStore:
                     and direct
                 )
             )
-            rendered_size = len(record.id) + len(record.statement) + 32
+            rendered_size = len(
+                render_narrative_memory(record, required=required)
+            ) + 1
             ranked.append(
                 (
                     required,

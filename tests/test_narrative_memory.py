@@ -285,3 +285,251 @@ def test_required_memory_over_budget_returns_manual_boundary(tmp_path):
             matched_subject_ids=("concept-tecla",),
             max_chars=50,
         )
+
+
+def test_same_response_duplicate_candidates_are_idempotent(tmp_path):
+    from src.core.v4.narrative_memory import NarrativeMemoryStore
+
+    database, blocks = _seed_database(tmp_path)
+    store = NarrativeMemoryStore(database)
+    candidate = _fact()
+
+    result = store.merge_candidates(blocks[0], [candidate, candidate])
+
+    assert len(set(result.memory_ids)) == 1
+    with database.connect() as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM narrative_memories"
+        ).fetchone()[0] == 1
+
+
+def test_source_hash_change_excludes_stale_memory_from_new_snapshot(tmp_path):
+    from src.core.v4.narrative_memory import NarrativeMemoryStore
+
+    database, blocks = _seed_database(tmp_path)
+    store = NarrativeMemoryStore(database)
+    memory_id = store.merge_candidates(blocks[0], [_fact()]).memory_ids[0]
+    edition = blocks[0].source_edition_id
+    database.upsert_blocks(
+        edition,
+        [
+            {
+                "id": blocks[0].id,
+                "legacy_id": blocks[0].legacy_id,
+                "chapter_id": blocks[0].chapter_id,
+                "chapter_title": "I",
+                "chapter_index": blocks[0].chapter_index,
+                "block_index": blocks[0].block_index,
+                "global_index": blocks[0].global_index,
+                "block_type": blocks[0].block_type,
+                "source_text": "The gate is open.",
+                "source_hash": "changed-source-hash",
+                "token_count": 4,
+                "status": "ready",
+            }
+        ],
+    )
+    refreshed = database.get_block_by_identifier(blocks[0].id)
+
+    snapshot = store.build_snapshot(
+        refreshed,
+        knowledge_version=database.current_knowledge_version(),
+        discourse_state=DiscourseState(),
+    )
+
+    assert memory_id not in snapshot.visible_memory_ids
+
+
+def test_snapshot_prioritizes_old_active_speaker_before_recent_noise(tmp_path):
+    from src.core.v4.narrative_memory import NarrativeMemoryStore
+
+    database, blocks = _seed_database(tmp_path, count=514)
+    store = NarrativeMemoryStore(database)
+    with database.transaction() as connection:
+        for index in range(513):
+            memory_id = f"memory-{index:04d}"
+            connection.execute(
+                """INSERT INTO narrative_memories(
+                       id, memory_type, statement, truth_status, visibility,
+                       confidence, reveal_global_index, source_block_id,
+                       source_hash, status, high_impact, semantic_fingerprint,
+                       created_memory_version, retired_memory_version, created_at)
+                   VALUES(?, 'observation', ?, 'observed', 'reader_visible',
+                          0.5, ?, ?, ?, 'provisional', 0, ?, 1, NULL, ?)""",
+                (
+                    memory_id,
+                    f"Noise {index}",
+                    index,
+                    blocks[index].id,
+                    blocks[index].source_hash,
+                    f"fingerprint-{index}",
+                    "2026-07-16T00:00:00+00:00",
+                ),
+            )
+        connection.execute(
+            """INSERT INTO narrative_memory_subjects(
+                   memory_id, subject_type, subject_id, role)
+               VALUES('memory-0000', 'concept', 'concept-old-speaker', 'speaker')"""
+        )
+
+    snapshot = store.build_snapshot(
+        blocks[513],
+        knowledge_version=database.current_knowledge_version(),
+        discourse_state=DiscourseState(
+            active_speakers=("concept-old-speaker",),
+            state_confidence=0.8,
+        ),
+    )
+
+    assert len(snapshot.visible_memory_ids) == 512
+    assert "memory-0000" in snapshot.visible_memory_ids
+
+
+def test_retrieval_budget_counts_full_subject_rendering(tmp_path):
+    from src.core.v4.narrative_memory import (
+        NarrativeContextOverflow,
+        NarrativeMemoryStore,
+    )
+
+    database, blocks = _seed_database(tmp_path)
+    store = NarrativeMemoryStore(database)
+    subjects = tuple(
+        NarrativeSubject(
+            "concept",
+            f"concept-{'x' * 200}-{index}",
+            "participant",
+        )
+        for index in range(16)
+    )
+    store.merge_candidates(
+        blocks[1],
+        [
+            _fact(
+                candidate_id="M-many-subjects",
+                statement="Tecla speaks.",
+                evidence="Tecla speaks",
+                subjects=subjects,
+                high_impact=True,
+            )
+        ],
+    )
+    snapshot = store.build_snapshot(
+        blocks[3],
+        knowledge_version=database.current_knowledge_version(),
+        discourse_state=DiscourseState(
+            active_speakers=(subjects[0].subject_id,),
+        ),
+    )
+
+    with pytest.raises(NarrativeContextOverflow, match="required narrative"):
+        store.retrieve_for_block(
+            blocks[3],
+            snapshot,
+            matched_subject_ids=(subjects[0].subject_id,),
+            max_chars=200,
+        )
+
+
+def test_close_question_retires_old_question_from_later_snapshot(tmp_path):
+    from src.core.v4.narrative_memory import NarrativeMemoryStore
+
+    database, blocks = _seed_database(tmp_path)
+    store = NarrativeMemoryStore(database)
+    question_id = store.merge_candidates(
+        blocks[0],
+        [
+            _fact(
+                candidate_id="M-question",
+                statement="Is the gate locked?",
+                memory_type="open_question",
+            )
+        ],
+    ).memory_ids[0]
+    store.merge_candidates(
+        blocks[1],
+        [
+            _fact(
+                candidate_id="M-answer",
+                statement="The question is answered.",
+                evidence="Tecla speaks",
+                memory_type="explicit_fact",
+                related=(question_id,),
+                operation="close_question",
+            )
+        ],
+    )
+
+    snapshot = store.build_snapshot(
+        blocks[3],
+        knowledge_version=database.current_knowledge_version(),
+        discourse_state=DiscourseState(),
+    )
+
+    assert question_id not in snapshot.visible_memory_ids
+    with database.connect() as connection:
+        status, retired = connection.execute(
+            """SELECT status, retired_memory_version
+               FROM narrative_memories WHERE id=?""",
+            (question_id,),
+        ).fetchone()
+    assert status == "superseded"
+    assert retired is not None
+
+
+def test_unresolved_reference_outweighs_recent_unrelated_memory(tmp_path):
+    from src.core.v4.narrative_memory import NarrativeMemoryStore
+    from src.core.v4.narrative_models import render_narrative_memory
+
+    database, blocks = _seed_database(tmp_path)
+    store = NarrativeMemoryStore(database)
+    alice_id = store.merge_candidates(
+        blocks[0],
+        [
+            _fact(
+                candidate_id="M-alice",
+                statement="Alice is waiting.",
+                subjects=(
+                    NarrativeSubject(
+                        "concept", "concept-alice", "character"
+                    ),
+                ),
+            )
+        ],
+    ).memory_ids[0]
+    bell_id = store.merge_candidates(
+        blocks[1],
+        [
+            _fact(
+                candidate_id="M-bell",
+                statement="A bell is ringing.",
+                evidence="Tecla speaks",
+            )
+        ],
+    ).memory_ids[0]
+    snapshot = store.build_snapshot(
+        blocks[3],
+        knowledge_version=database.current_knowledge_version(),
+        discourse_state=DiscourseState(
+            unresolved_references=("concept-alice",),
+        ),
+    )
+    full = store.retrieve_for_block(
+        blocks[3],
+        snapshot,
+        matched_subject_ids=(),
+        max_chars=4_000,
+    )
+    alice = next(memory for memory in full.memories if memory.id == alice_id)
+    one_item_budget = len(
+        render_narrative_memory(alice, required=False)
+    ) + 1
+
+    selected = store.retrieve_for_block(
+        blocks[3],
+        snapshot,
+        matched_subject_ids=(),
+        max_chars=one_item_budget,
+    )
+
+    assert [memory.id for memory in selected.memories] == [alice_id]
+    assert bell_id not in {memory.id for memory in selected.memories}

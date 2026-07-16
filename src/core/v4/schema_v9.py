@@ -6,14 +6,15 @@ import hashlib
 import hmac
 import os
 import sqlite3
-import uuid
 from contextlib import closing
+from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
 from .schema_v8 import (
     SchemaMigrationError,
     SchemaUpgradeRequired,
+    assert_schema8_or_empty,
     create_schema8,
     inspect_schema,
 )
@@ -152,6 +153,7 @@ CREATE TABLE IF NOT EXISTS premap_results (
     request_hash TEXT NOT NULL,
     response_hash TEXT NOT NULL,
     audit_call_id INTEGER REFERENCES audit_calls(id),
+    snapshot_id TEXT REFERENCES narrative_snapshots(id),
     created_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_premap_results_block
@@ -270,47 +272,129 @@ def create_schema9(connection: sqlite3.Connection) -> None:
         connection.commit()
 
 
-def _sha256_file(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
+def _extension_signature(
+    connection: sqlite3.Connection,
+) -> dict[tuple[str, str], str]:
+    names = tuple(sorted(REQUIRED_TABLES))
+    placeholders = ",".join("?" for _ in names)
+    return {
+        (str(row[0]), str(row[1])): str(row[3] or "").strip()
+        for row in connection.execute(
+            f"""SELECT type, name, tbl_name, sql FROM sqlite_master
+                WHERE sql IS NOT NULL
+                  AND (name IN ({placeholders})
+                       OR tbl_name IN ({placeholders}))
+                ORDER BY type, name""",
+            names + names,
+        )
+    }
+
+
+@lru_cache(maxsize=1)
+def _expected_schema9_features() -> tuple[
+    dict[tuple[str, str], str],
+    dict[str, tuple[Any, ...]],
+    set[tuple[str, str, str]],
+]:
+    with closing(sqlite3.connect(":memory:")) as connection:
+        connection.row_factory = sqlite3.Row
+        create_schema9(connection)
+        signature = _extension_signature(connection)
+        columns = {
+            str(row["name"]): (
+                str(row["type"]),
+                int(row["notnull"]),
+                row["dflt_value"],
+                int(row["pk"]),
+            )
+            for row in connection.execute(
+                "PRAGMA table_info(translation_versions)"
+            )
+            if str(row["name"]) in TRANSLATION_COLUMNS
+        }
+        foreign_keys = {
+            (str(row["from"]), str(row["table"]), str(row["to"]))
+            for row in connection.execute(
+                "PRAGMA foreign_key_list(translation_versions)"
+            )
+            if str(row["from"]) in TRANSLATION_COLUMNS
+        }
+    return signature, columns, foreign_keys
+
+
+def _schema9_errors(connection: sqlite3.Connection) -> list[str]:
+    expected_signature, expected_columns, expected_foreign_keys = (
+        _expected_schema9_features()
+    )
+    actual_signature = _extension_signature(connection)
+    errors: list[str] = []
+    for key, expected_sql in expected_signature.items():
+        actual_sql = actual_signature.get(key)
+        if actual_sql is None:
+            errors.append(f"missing {key[0]} {key[1]}")
+        elif actual_sql != expected_sql:
+            errors.append(f"noncanonical {key[0]} {key[1]}")
+    actual_columns = {
+        str(row["name"]): (
+            str(row["type"]),
+            int(row["notnull"]),
+            row["dflt_value"],
+            int(row["pk"]),
+        )
+        for row in connection.execute(
+            "PRAGMA table_info(translation_versions)"
+        )
+        if str(row["name"]) in TRANSLATION_COLUMNS
+    }
+    if actual_columns != expected_columns:
+        errors.append("translation narrative columns are noncanonical")
+    actual_foreign_keys = {
+        (str(row["from"]), str(row["table"]), str(row["to"]))
+        for row in connection.execute(
+            "PRAGMA foreign_key_list(translation_versions)"
+        )
+        if str(row["from"]) in TRANSLATION_COLUMNS
+    }
+    if actual_foreign_keys != expected_foreign_keys:
+        errors.append("translation narrative foreign keys are noncanonical")
+    version = connection.execute(
+        "SELECT value FROM schema_meta WHERE key='schema_version'"
+    ).fetchone()
+    if version is None or str(version[0]) != "9":
+        errors.append("schema_meta is not version 9")
+    try:
+        foreign_key_errors = connection.execute(
+            "PRAGMA foreign_key_check"
+        ).fetchall()
+    except sqlite3.DatabaseError as exc:
+        errors.append(f"foreign key schema is invalid: {exc}")
+    else:
+        if foreign_key_errors:
+            errors.append("foreign key check failed")
+    duplicate = connection.execute(
+        """SELECT block_id, pipeline, COUNT(*) duplicate_count
+           FROM translation_versions
+           WHERE active=1
+           GROUP BY block_id, pipeline
+           HAVING COUNT(*)>1
+           LIMIT 1"""
+    ).fetchone()
+    if duplicate is not None:
+        errors.append(
+            "duplicate active translation "
+            f"{duplicate['block_id']}:{duplicate['pipeline']}"
+        )
+    return errors
 
 
 def _assert_schema9_features(path: Path) -> None:
     with closing(sqlite3.connect(path)) as connection:
-        tables = {
-            str(row[0])
-            for row in connection.execute(
-                "SELECT name FROM sqlite_master WHERE type='table'"
-            )
-        }
-        missing_tables = sorted(REQUIRED_TABLES.difference(tables))
-        columns = {
-            str(row[1])
-            for row in connection.execute(
-                "PRAGMA table_info(translation_versions)"
-            ).fetchall()
-        }
-        missing_columns = sorted(set(TRANSLATION_COLUMNS).difference(columns))
-        version = connection.execute(
-            "SELECT value FROM schema_meta WHERE key='schema_version'"
-        ).fetchone()
-        foreign_key_errors = connection.execute("PRAGMA foreign_key_check").fetchall()
-    errors = []
-    if missing_tables:
-        errors.append(f"missing tables {', '.join(missing_tables[:4])}")
-    if missing_columns:
-        errors.append(f"missing columns {', '.join(missing_columns)}")
-    if version is None or str(version[0]) != "9":
-        errors.append("schema_meta is not version 9")
-    if foreign_key_errors:
-        errors.append("foreign key check failed")
+        connection.row_factory = sqlite3.Row
+        errors = _schema9_errors(connection)
     if errors:
         raise SchemaUpgradeRequired(
             "parallel_v4 schema 9 is incomplete or corrupt "
-            f"({'; '.join(errors)}); run migrate-v4 --preview"
+            f"({'; '.join(errors[:6])}); run migrate-v4 --preview"
         )
 
 
@@ -344,11 +428,18 @@ def assert_schema9_or_empty(path: Path) -> None:
         create_schema9(connection)
 
 
-def _confirmation_token(path: Path, source_sha256: str) -> str:
+def _confirmation_token(
+    path: Path, source_sha256: str, source_bytes: int
+) -> str:
     material = (
-        f"schema9:{path.resolve()}:{path.stat().st_size}:{source_sha256}"
+        f"schema9:{path.resolve()}:{source_bytes}:{source_sha256}"
     ).encode("utf-8")
     return hashlib.sha256(material).hexdigest()[:32]
+
+
+def _serialized_snapshot(path: Path) -> bytes:
+    with closing(sqlite3.connect(path, timeout=30)) as connection:
+        return bytes(connection.serialize())
 
 
 def preview_schema9(path: str | Path) -> dict[str, Any]:
@@ -369,7 +460,10 @@ def preview_schema9(path: str | Path) -> dict[str, Any]:
         raise SchemaMigrationError(
             f"only schema 8 can be migrated to schema 9 (found {version!r})"
         )
-    source_sha256 = _sha256_file(source)
+    assert_schema8_or_empty(source)
+    serialized = _serialized_snapshot(source)
+    source_sha256 = hashlib.sha256(serialized).hexdigest()
+    source_bytes = len(serialized)
     backup = source.with_name(
         f"{source.name}.schema8-{source_sha256[:12]}.bak"
     )
@@ -396,26 +490,19 @@ def preview_schema9(path: str | Path) -> dict[str, Any]:
         "to_version": 9,
         "database": str(source),
         "source_sha256": source_sha256,
-        "source_bytes": source.stat().st_size,
-        "estimated_added_bytes": max(64 * 1024, source.stat().st_size // 50),
+        "source_bytes": source_bytes,
+        "estimated_added_bytes": max(64 * 1024, source_bytes // 50),
         "active_translations": active_translations,
         "unfinished_tasks": unfinished_tasks,
         "backup_path": str(backup),
-        "confirmation_token": _confirmation_token(source, source_sha256),
+        "confirmation_token": _confirmation_token(
+            source, source_sha256, source_bytes
+        ),
     }
 
 
-def _sqlite_backup(source: Path, destination: Path) -> None:
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    destination.unlink(missing_ok=True)
-    with closing(sqlite3.connect(source)) as source_connection, closing(
-        sqlite3.connect(destination)
-    ) as destination_connection:
-        source_connection.backup(destination_connection)
-
-
 def migrate_schema9(path: str | Path, confirm_token: str) -> dict[str, Any]:
-    """Install schema 9 through a validated staging database and atomic replace."""
+    """Install schema 9 using exclusive, transactional in-place DDL."""
 
     source = Path(path).resolve()
     preview = preview_schema9(source)
@@ -428,51 +515,95 @@ def migrate_schema9(path: str | Path, confirm_token: str) -> dict[str, Any]:
         raise SchemaMigrationError(
             "schema 9 migration token is invalid; run preview again"
         )
-    if _sha256_file(source) != str(preview["source_sha256"]):
-        raise SchemaMigrationError(
-            "schema 8 database changed after preview; run preview again"
-        )
 
     backup = Path(str(preview["backup_path"]))
-    if not backup.exists():
-        _sqlite_backup(source, backup)
-    elif _sha256_file(backup) != str(preview["source_sha256"]):
-        backup.unlink()
-        _sqlite_backup(source, backup)
-
-    staging = source.parent / f".{source.name}.{uuid.uuid4().hex}.schema9"
-    try:
-        _sqlite_backup(backup, staging)
-        with closing(sqlite3.connect(staging)) as connection:
-            connection.execute("PRAGMA foreign_keys = ON")
-            connection.execute("BEGIN IMMEDIATE")
-            _install_schema9_extensions(connection)
-            foreign_key_errors = connection.execute(
-                "PRAGMA foreign_key_check"
-            ).fetchall()
-            if foreign_key_errors:
+    with closing(sqlite3.connect(source, timeout=30)) as connection:
+        connection.row_factory = sqlite3.Row
+        connection.execute("PRAGMA foreign_keys = ON")
+        connection.execute("BEGIN EXCLUSIVE")
+        try:
+            serialized = bytes(connection.serialize())
+            serialized_hash = hashlib.sha256(serialized).hexdigest()
+            if serialized_hash != str(preview["source_sha256"]):
                 raise SchemaMigrationError(
-                    "schema 9 staged database failed foreign key validation"
+                    "schema 8 database changed after preview; run preview again"
+                )
+            if backup.exists():
+                backup_hash = hashlib.sha256(backup.read_bytes()).hexdigest()
+                if backup_hash != serialized_hash:
+                    raise SchemaMigrationError(
+                        "schema 9 backup path contains a different database"
+                    )
+            else:
+                backup.parent.mkdir(parents=True, exist_ok=True)
+                temporary_backup = backup.with_suffix(backup.suffix + ".tmp")
+                temporary_backup.write_bytes(serialized)
+                os.replace(temporary_backup, backup)
+
+            requested_tables = (
+                "blocks",
+                "concepts",
+                "lexemes",
+                "claims",
+                "translation_versions",
+                "dependencies",
+            )
+            existing_tables = {
+                str(row[0])
+                for row in connection.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table'"
+                )
+            }
+            tracked_tables = tuple(
+                table
+                for table in requested_tables
+                if table in existing_tables
+            )
+            before_counts = {
+                table: int(
+                    connection.execute(
+                        f"SELECT COUNT(*) FROM {table}"
+                    ).fetchone()[0]
+                )
+                for table in tracked_tables
+            }
+            duplicate = connection.execute(
+                """SELECT block_id, pipeline FROM translation_versions
+                   WHERE active=1
+                   GROUP BY block_id, pipeline
+                   HAVING COUNT(*)>1
+                   LIMIT 1"""
+            ).fetchone()
+            if duplicate is not None:
+                raise SchemaMigrationError(
+                    "schema 8 has duplicate active translation "
+                    f"{duplicate['block_id']}:{duplicate['pipeline']}"
+                )
+            _install_schema9_extensions(connection)
+            errors = _schema9_errors(connection)
+            if errors:
+                raise SchemaMigrationError(
+                    "schema 9 validation failed: " + "; ".join(errors[:6])
+                )
+            after_counts = {
+                table: int(
+                    connection.execute(
+                        f"SELECT COUNT(*) FROM {table}"
+                    ).fetchone()[0]
+                )
+                for table in tracked_tables
+            }
+            if after_counts != before_counts:
+                raise SchemaMigrationError(
+                    "schema 9 migration changed existing table row counts"
                 )
             connection.commit()
-        if inspect_schema(staging) != SCHEMA_VERSION:
-            raise SchemaMigrationError("staged database did not reach schema 9")
-        _assert_schema9_features(staging)
-        for database_path in (source, staging):
-            for suffix in ("-wal", "-shm"):
-                Path(f"{database_path}{suffix}").unlink(missing_ok=True)
-        retired = source.parent / f".{source.name}.{uuid.uuid4().hex}.schema8"
-        os.replace(source, retired)
-        try:
-            os.replace(staging, source)
         except Exception:
-            os.replace(retired, source)
+            connection.rollback()
             raise
-        retired.unlink(missing_ok=True)
-    finally:
-        staging.unlink(missing_ok=True)
-        Path(f"{staging}-wal").unlink(missing_ok=True)
-        Path(f"{staging}-shm").unlink(missing_ok=True)
+    if inspect_schema(source) != SCHEMA_VERSION:
+        raise SchemaMigrationError("database did not reach schema 9")
+    _assert_schema9_features(source)
     return {
         **preview,
         "status": "migrated",

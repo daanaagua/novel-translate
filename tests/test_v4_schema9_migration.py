@@ -140,3 +140,107 @@ def test_schema9_migration_rejects_wrong_token(tmp_path):
 
     with pytest.raises(SchemaMigrationError, match="token"):
         migrate_schema9(path, "wrong-token")
+
+
+def test_schema9_migration_rejects_database_changed_after_preview(tmp_path):
+    from src.core.v4.schema_v9 import (
+        SchemaMigrationError,
+        inspect_schema,
+        migrate_schema9,
+        preview_schema9,
+    )
+
+    path = tmp_path / "book.db"
+    _schema8_database(path)
+    preview = preview_schema9(path)
+    with closing(sqlite3.connect(path)) as connection:
+        connection.execute(
+            """INSERT INTO translation_versions(
+                   block_id, pipeline, knowledge_version, status,
+                   final_translation, active, created_at)
+               VALUES('block-1', 'parallel_v4', 1, 'completed',
+                      'concurrent write', 1, '2026-07-16T00:00:01+00:00')"""
+        )
+        connection.commit()
+
+    with pytest.raises(SchemaMigrationError, match="token|changed"):
+        migrate_schema9(path, preview["confirmation_token"])
+
+    assert inspect_schema(path) == 8
+    with closing(sqlite3.connect(path)) as connection:
+        assert connection.execute(
+            "SELECT final_translation FROM translation_versions"
+        ).fetchone()[0] == "concurrent write"
+
+
+def test_schema9_migration_failure_rolls_back_in_place(tmp_path, monkeypatch):
+    import src.core.v4.schema_v9 as schema_v9
+
+    path = tmp_path / "book.db"
+    _schema8_database(path)
+    preview = schema_v9.preview_schema9(path)
+    original = schema_v9._install_schema9_extensions
+
+    def fail_after_install(connection):
+        original(connection)
+        raise RuntimeError("injected migration failure")
+
+    monkeypatch.setattr(schema_v9, "_install_schema9_extensions", fail_after_install)
+
+    with pytest.raises(RuntimeError, match="injected"):
+        schema_v9.migrate_schema9(path, preview["confirmation_token"])
+
+    assert schema_v9.inspect_schema(path) == 8
+    with closing(sqlite3.connect(path)) as connection:
+        tables = {
+            row[0]
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            )
+        }
+    assert "narrative_memories" not in tables
+
+
+def test_corrupt_schema9_narrative_table_is_rejected(tmp_path):
+    from src.core.v4.schema_v9 import SchemaUpgradeRequired
+
+    database = V4Database(tmp_path)
+    path = database.path
+    with closing(sqlite3.connect(path)) as connection:
+        connection.execute("PRAGMA foreign_keys = OFF")
+        connection.execute("DROP TABLE narrative_memories")
+        connection.execute("CREATE TABLE narrative_memories(id TEXT PRIMARY KEY)")
+        connection.commit()
+
+    with pytest.raises(SchemaUpgradeRequired, match="incomplete|corrupt"):
+        V4Database(tmp_path)
+
+
+def test_schema9_migration_rejects_duplicate_active_translations(tmp_path):
+    from src.core.v4.schema_v9 import (
+        SchemaMigrationError,
+        inspect_schema,
+        migrate_schema9,
+        preview_schema9,
+    )
+
+    path = tmp_path / "book.db"
+    _schema8_database(path)
+    with closing(sqlite3.connect(path)) as connection:
+        connection.executemany(
+            """INSERT INTO translation_versions(
+                   block_id, pipeline, knowledge_version, status,
+                   final_translation, active, created_at)
+               VALUES('block-1', 'parallel_v4', 1, 'completed', ?, 1, ?)""",
+            [
+                ("first", "2026-07-16T00:00:01+00:00"),
+                ("second", "2026-07-16T00:00:02+00:00"),
+            ],
+        )
+        connection.commit()
+    preview = preview_schema9(path)
+
+    with pytest.raises(SchemaMigrationError, match="active translation"):
+        migrate_schema9(path, preview["confirmation_token"])
+
+    assert inspect_schema(path) == 8

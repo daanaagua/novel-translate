@@ -59,7 +59,9 @@ class TranslationEngine:
             "translation": "",
             "memory_summary": "",
             "new_terms": [],
-            "relations": []
+            "relations": [],
+            "supplemental_memory_candidates": [],
+            "style_delta": {},
         }
         
         # Helper to extract tag content
@@ -103,8 +105,100 @@ class TranslationEngine:
                     "obj": attrs.get("obj"),
                     "context": attrs.get("context")
                 })
+
+        for match in re.finditer(
+            r'<memory\s+(.*?)/>', text, re.DOTALL | re.IGNORECASE
+        ):
+            attrs = extract_attributes(match.group(1))
+            evidence = attrs.get("evidence") or ""
+            result["supplemental_memory_candidates"].append(
+                {
+                    "candidate_id": attrs.get("candidate_id") or "",
+                    "memory_type": attrs.get("memory_type") or "",
+                    "statement": attrs.get("statement") or "",
+                    "truth_status": attrs.get("truth_status") or "inferred",
+                    "visibility": attrs.get("visibility") or "reader_visible",
+                    "confidence": attrs.get("confidence") or "0.4",
+                    "evidence_spans": [
+                        value.strip()
+                        for value in evidence.split("|")
+                        if value.strip()
+                    ],
+                    "subjects": [],
+                    "related_memory_ids": [],
+                    "state_operation": attrs.get("state_operation") or "append",
+                    "high_impact": (
+                        str(attrs.get("high_impact") or "").casefold()
+                        in {"1", "true", "yes"}
+                    ),
+                }
+            )
+
+        style_match = re.search(
+            r'<style_delta\s+(.*?)/>',
+            text,
+            re.DOTALL | re.IGNORECASE,
+        )
+        if style_match:
+            result["style_delta"] = extract_attributes(style_match.group(1))
             
         return result
+
+    @staticmethod
+    def _validated_supplemental_memory(
+        values: Any, source_text: str
+    ) -> List[Dict[str, Any]]:
+        """Keep only bounded candidates whose evidence occurs in current English."""
+
+        import re
+        from .v4.narrative_models import (
+            NarrativeMemoryCandidate,
+            NarrativeSubject,
+        )
+
+        if not isinstance(values, list):
+            return []
+        normalized_source = re.sub(r"\s+", " ", source_text).strip()
+        accepted: List[Dict[str, Any]] = []
+        for raw in values[:32]:
+            try:
+                if not isinstance(raw, dict):
+                    continue
+                subjects = tuple(
+                    NarrativeSubject(
+                        subject_type=str(subject.get("subject_type") or ""),
+                        subject_id=str(subject.get("subject_id") or ""),
+                        role=str(subject.get("role") or "subject"),
+                    )
+                    for subject in raw.get("subjects") or ()
+                    if isinstance(subject, dict)
+                )
+                candidate = NarrativeMemoryCandidate(
+                    candidate_id=str(raw.get("candidate_id") or ""),
+                    memory_type=str(raw.get("memory_type") or ""),
+                    statement=str(raw.get("statement") or ""),
+                    truth_status=str(raw.get("truth_status") or ""),
+                    visibility=str(raw.get("visibility") or ""),
+                    confidence=float(raw.get("confidence")),
+                    evidence_spans=tuple(raw.get("evidence_spans") or ()),
+                    subjects=subjects,
+                    related_memory_ids=tuple(
+                        raw.get("related_memory_ids") or ()
+                    ),
+                    state_operation=str(
+                        raw.get("state_operation") or "append"
+                    ),
+                    high_impact=bool(raw.get("high_impact")),
+                )
+                if not all(
+                    re.sub(r"\s+", " ", span).strip() in normalized_source
+                    for span in candidate.evidence_spans
+                ):
+                    continue
+                accepted.append(candidate.to_dict())
+            except (TypeError, ValueError):
+                continue
+        return accepted
 
     def _sanitize_json(self, raw_json: str) -> str:
         """
@@ -227,6 +321,24 @@ class TranslationEngine:
                 chunk.semantic_obligations = "\n".join(dict.fromkeys(obligations))
                 chunk.draft_translation = response_data.get("translation", "")
                 chunk.memory_summary = response_data.get("memory_summary", "")
+                chunk.supplemental_memory_candidates = (
+                    self._validated_supplemental_memory(
+                        response_data.get(
+                            "supplemental_memory_candidates",
+                            response_data.get("supplemental_memory", []),
+                        ),
+                        chunk.source_text,
+                    )
+                )
+                style_delta = response_data.get("style_delta") or {}
+                chunk.style_delta = (
+                    {
+                        str(key)[:64]: str(value)[:256]
+                        for key, value in style_delta.items()
+                    }
+                    if isinstance(style_delta, dict)
+                    else {}
+                )
                 
                 # 处理新术语
                 new_terms = response_data.get("new_terms", [])

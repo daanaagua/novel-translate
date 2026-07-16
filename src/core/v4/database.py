@@ -29,6 +29,7 @@ from .audit_archive import (
 from .models import (
     ClaimDependencySnapshot,
     FormOccurrence,
+    NarrativeDependencySnapshot,
     RenderingMatchSnapshot,
     RevalidationClaim,
     ScanOutcome,
@@ -629,6 +630,11 @@ class FrozenRenderBundle:
 class _TranslationCommitSnapshot:
     block: V4Block
     knowledge_version: int
+    memory_version: int
+    snapshot_id: str
+    context_hash: str
+    style_snapshot_id: str
+    discourse_state_hash: str
     status: str
     draft_translation: str
     final_translation: str
@@ -639,6 +645,7 @@ class _TranslationCommitSnapshot:
     matched_concept_ids: tuple[str, ...]
     matched_renderings: tuple[RenderingMatchSnapshot, ...]
     claim_dependencies: tuple[ClaimDependencySnapshot, ...]
+    narrative_dependencies: tuple[NarrativeDependencySnapshot, ...]
     audit_calls: tuple[Mapping[str, Any], ...]
     error: str | None
 
@@ -752,6 +759,28 @@ def _snapshot_claim_dependency(value: Any) -> ClaimDependencySnapshot:
     )
 
 
+def _snapshot_narrative_dependency(
+    value: Any,
+) -> NarrativeDependencySnapshot:
+    if type(value) is NarrativeDependencySnapshot:
+        return value
+    if not isinstance(value, Mapping):
+        raise ValueError(
+            "narrative dependencies must be NarrativeDependencySnapshot "
+            "or strict mapping"
+        )
+    raw = _strict_snapshot_mapping(
+        value,
+        allowed={"memory_id", "semantic_fingerprint"},
+        required={"memory_id", "semantic_fingerprint"},
+        label="NarrativeDependencySnapshot",
+    )
+    return NarrativeDependencySnapshot(
+        memory_id=str(raw["memory_id"]),
+        semantic_fingerprint=str(raw["semantic_fingerprint"]),
+    )
+
+
 def _snapshot_translation_outcome(value: Any) -> _TranslationCommitSnapshot:
     if not isinstance(value, TranslationOutcome):
         raise TypeError("translation batch entries must be TranslationOutcome")
@@ -771,6 +800,33 @@ def _snapshot_translation_outcome(value: Any) -> _TranslationCommitSnapshot:
     raw_claims = value.claim_dependencies
     if not isinstance(raw_claims, (list, tuple)) or len(raw_claims) > MAX_FROZEN_CLAIMS:
         raise ValueError("claim dependency snapshot is not a bounded sequence")
+    raw_narrative = value.narrative_dependencies
+    if (
+        not isinstance(raw_narrative, (list, tuple))
+        or len(raw_narrative) > MAX_FROZEN_CLAIMS
+    ):
+        raise ValueError(
+            "narrative dependency snapshot is not a bounded sequence"
+        )
+    memory_version = value.memory_version
+    if isinstance(memory_version, bool) or not isinstance(memory_version, int):
+        raise ValueError("translation memory version must be an integer")
+    if memory_version < 1:
+        raise ValueError("translation memory version must be positive")
+    snapshot_id = str(value.snapshot_id or "")
+    context_hash = str(value.context_hash or "")
+    style_snapshot_id = str(value.style_snapshot_id or "")
+    discourse_state_hash = str(value.discourse_state_hash or "")
+    for label, raw_value, allow_empty in (
+        ("snapshot_id", snapshot_id, True),
+        ("context_hash", context_hash, True),
+        ("style_snapshot_id", style_snapshot_id, True),
+        ("discourse_state_hash", discourse_state_hash, True),
+    ):
+        if len(raw_value) > 256:
+            raise ValueError(f"translation {label} is too long")
+        if not allow_empty and not raw_value:
+            raise ValueError(f"translation {label} cannot be empty")
     raw_concepts = value.matched_concept_ids
     if not isinstance(raw_concepts, (list, tuple)) or len(raw_concepts) > 4096:
         raise ValueError("matched concept IDs are not a bounded sequence")
@@ -795,6 +851,11 @@ def _snapshot_translation_outcome(value: Any) -> _TranslationCommitSnapshot:
     return _TranslationCommitSnapshot(
         block=block,
         knowledge_version=knowledge_version,
+        memory_version=memory_version,
+        snapshot_id=snapshot_id,
+        context_hash=context_hash,
+        style_snapshot_id=style_snapshot_id,
+        discourse_state_hash=discourse_state_hash,
         status=str(value.status),
         draft_translation=str(value.draft_translation),
         final_translation=str(value.final_translation),
@@ -806,6 +867,10 @@ def _snapshot_translation_outcome(value: Any) -> _TranslationCommitSnapshot:
         matched_renderings=tuple(_snapshot_render_match(item) for item in raw_matches),
         claim_dependencies=tuple(
             _snapshot_claim_dependency(item) for item in raw_claims
+        ),
+        narrative_dependencies=tuple(
+            _snapshot_narrative_dependency(item)
+            for item in raw_narrative
         ),
         audit_calls=tuple(audits),
         error=str(value.error) if value.error is not None else None,
@@ -10316,6 +10381,88 @@ class V4Database:
                         dependency_groups.setdefault(("concept", concept_id), []).append(match)
                     for rule_id in sorted(set(rule_ids)):
                         dependency_groups.setdefault(("rule", rule_id), []).append(match)
+                narrative_dependency_rows: List[tuple[str, str]] = []
+                if outcome.snapshot_id:
+                    snapshot_row = connection.execute(
+                        """SELECT * FROM narrative_snapshots WHERE id=?""",
+                        (outcome.snapshot_id,),
+                    ).fetchone()
+                    if snapshot_row is None:
+                        raise ValueError(
+                            "translation narrative snapshot does not exist"
+                        )
+                    if (
+                        str(snapshot_row["block_id"]) != outcome.block.id
+                        or int(snapshot_row["knowledge_version"])
+                        != outcome.knowledge_version
+                        or int(snapshot_row["memory_version"])
+                        != outcome.memory_version
+                    ):
+                        raise ValueError(
+                            "translation narrative snapshot version mismatch"
+                        )
+                    visible_memory_ids = {
+                        str(value)
+                        for value in json.loads(
+                            snapshot_row["visible_memory_ids_json"] or "[]"
+                        )
+                    }
+                    expected_discourse_hash = hashlib.sha256(
+                        str(snapshot_row["discourse_state_json"]).encode(
+                            "utf-8"
+                        )
+                    ).hexdigest()
+                    if (
+                        outcome.discourse_state_hash
+                        != expected_discourse_hash
+                    ):
+                        raise ValueError(
+                            "translation discourse state hash mismatch"
+                        )
+                    if re.fullmatch(
+                        r"[0-9a-f]{64}", outcome.context_hash
+                    ) is None:
+                        raise ValueError(
+                            "translation context hash is invalid"
+                        )
+                    for dependency in outcome.narrative_dependencies:
+                        memory_id = str(dependency.memory_id).strip()
+                        fingerprint = str(
+                            dependency.semantic_fingerprint
+                        ).strip()
+                        if memory_id not in visible_memory_ids:
+                            raise ValueError(
+                                "translation narrative dependency is not visible"
+                            )
+                        row = connection.execute(
+                            """SELECT semantic_fingerprint
+                               FROM narrative_memories WHERE id=?""",
+                            (memory_id,),
+                        ).fetchone()
+                        if (
+                            row is None
+                            or str(row["semantic_fingerprint"])
+                            != fingerprint
+                        ):
+                            raise ValueError(
+                                "translation narrative dependency fingerprint mismatch"
+                            )
+                        narrative_dependency_rows.append(
+                            (memory_id, fingerprint)
+                        )
+                elif outcome.narrative_dependencies:
+                    raise ValueError(
+                        "translation narrative dependencies require a snapshot"
+                    )
+                if outcome.style_snapshot_id:
+                    style_exists = connection.execute(
+                        "SELECT 1 FROM style_snapshots WHERE id=?",
+                        (outcome.style_snapshot_id,),
+                    ).fetchone()
+                    if style_exists is None:
+                        raise ValueError(
+                            "translation style snapshot does not exist"
+                        )
                 if pipeline == "parallel_v4":
                     previous_vote = connection.execute(
                         "SELECT * FROM comparison_votes WHERE block_id=?",
@@ -10334,8 +10481,11 @@ class V4Database:
                            block_id, pipeline, run_id, knowledge_version, status,
                            draft_translation, final_translation, analysis,
                            semantic_obligations, memory_summary, warnings_json,
+                           memory_version, snapshot_id, context_hash,
+                           style_snapshot_id, discourse_state_hash,
                            active, created_at
-                       ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?)""",
+                       ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                                ?, 1, ?)""",
                     (
                         outcome.block.id, pipeline, run_id, outcome.knowledge_version,
                         outcome.status, outcome.draft_translation, outcome.final_translation,
@@ -10345,6 +10495,11 @@ class V4Database:
                             _mutable_render_value(outcome.warnings),
                             ensure_ascii=False,
                         ),
+                        outcome.memory_version,
+                        outcome.snapshot_id or None,
+                        outcome.context_hash,
+                        outcome.style_snapshot_id or None,
+                        outcome.discourse_state_hash,
                         utc_now(),
                     ),
                 )
@@ -10411,6 +10566,71 @@ class V4Database:
                             claim_id,
                             outcome.knowledge_version,
                             fingerprint,
+                            "",
+                            0,
+                            "",
+                            "[]",
+                            "[]",
+                        )
+                    )
+                for memory_id, fingerprint in sorted(
+                    set(narrative_dependency_rows)
+                ):
+                    dependency_rows.append(
+                        (
+                            translation_id,
+                            "narrative_memory",
+                            memory_id,
+                            outcome.knowledge_version,
+                            fingerprint,
+                            "",
+                            0,
+                            "",
+                            "[]",
+                            "[]",
+                        )
+                    )
+                if outcome.snapshot_id:
+                    dependency_rows.extend(
+                        [
+                            (
+                                translation_id,
+                                "narrative_snapshot",
+                                outcome.snapshot_id,
+                                outcome.knowledge_version,
+                                str(snapshot_row["snapshot_hash"]),
+                                "",
+                                0,
+                                "",
+                                "[]",
+                                "[]",
+                            ),
+                            (
+                                translation_id,
+                                "discourse_state",
+                                outcome.snapshot_id,
+                                outcome.knowledge_version,
+                                outcome.discourse_state_hash,
+                                "",
+                                0,
+                                "",
+                                "[]",
+                                "[]",
+                            ),
+                        ]
+                    )
+                if outcome.style_snapshot_id:
+                    style_row = connection.execute(
+                        """SELECT state_hash FROM style_snapshots WHERE id=?""",
+                        (outcome.style_snapshot_id,),
+                    ).fetchone()
+                    dependency_rows.append(
+                        (
+                            translation_id,
+                            "style_snapshot",
+                            outcome.style_snapshot_id,
+                            outcome.knowledge_version,
+                            str(style_row["state_hash"]),
                             "",
                             0,
                             "",

@@ -183,6 +183,14 @@ class TextChunk(BaseModel):
         None,
         description="翻译本块后更新的自包含全书滚动摘要",
     )
+    supplemental_memory_candidates: List[Dict[str, Any]] = Field(
+        default_factory=list,
+        description="只依据当前英文原文提出的低置信度补充叙事记忆",
+    )
+    style_delta: Dict[str, Any] = Field(
+        default_factory=dict,
+        description="当前块明确表现出的有限文体状态变化",
+    )
     
     # 元数据
     token_count: Optional[int] = None

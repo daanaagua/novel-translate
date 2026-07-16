@@ -9,6 +9,7 @@ from typing import Any, Collection, Mapping, Sequence
 
 from .models import V4Block
 from .narrative_models import (
+    DiscourseDelta,
     DiscourseState,
     NarrativeMemoryCandidate,
     NarrativePremapResult,
@@ -166,9 +167,9 @@ def _validate_memory_candidates(
 
 def _validate_discourse_delta(
     raw: Any, allowed_subject_ids: set[str]
-) -> tuple[DiscourseState, list[str]]:
+) -> tuple[DiscourseDelta, list[str]]:
     if not isinstance(raw, Mapping):
-        return DiscourseState(premap_uncertain=True), [
+        return DiscourseDelta(premap_uncertain=True), [
             "discourse_delta: expected an object"
         ]
     warnings: list[str] = []
@@ -187,10 +188,10 @@ def _validate_discourse_delta(
             values = tuple(str(value) for value in raw.get(field_name) or ())
             if any(value not in allowed_subject_ids for value in values):
                 raise ValueError(f"{field_name} includes an unavailable id")
-        return DiscourseState.from_mapping(raw), warnings
+        return DiscourseDelta.from_mapping(raw), warnings
     except (TypeError, ValueError) as exc:
         warnings.append(f"discourse_delta: {exc}")
-        return DiscourseState(premap_uncertain=True), warnings
+        return DiscourseDelta(premap_uncertain=True), warnings
 
 
 def validate_premap_payload(
@@ -342,7 +343,9 @@ class NarrativePremapper:
             except Exception as exc:
                 last_error = str(exc)
         self.last_succeeded = False
-        degraded_state = replace(discourse_state, premap_uncertain=True)
+        degraded_state = DiscourseDelta.from_state(
+            replace(discourse_state, premap_uncertain=True)
+        )
         return NarrativePremapResult(
             semantic_relations=(),
             memory_candidates=(),
