@@ -35,7 +35,11 @@ from src.core.v4 import (
     write_shadow_comparison,
 )
 from src.core.v4.adjudicator import V4Adjudicator
-from src.core.v4.schema_v8 import preview_schema8
+from src.core.v4.schema_v9 import preview_schema9
+
+# Compatibility seam for existing CLI tests and extensions.  It now previews
+# the current schema-9 migration rather than the retired schema-8 migration.
+preview_schema8 = preview_schema9
 from src.core.v4.target_resolver import TargetResolver
 from rich.console import Console
 from rich.theme import Theme

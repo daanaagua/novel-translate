@@ -9,9 +9,9 @@ from typing import Dict, List
 from ...agents.glossary_manager import GlossaryManager
 from ..schemas import ChunkStatus
 from .database import V4Database, normalize_english_form, stable_id
-from .schema_v8 import (
+from .schema_v9 import (
     SchemaUpgradeRequired,
-    confirm_schema8,
+    confirm_schema9,
     inspect_schema,
 )
 
@@ -32,7 +32,7 @@ class V4Migrator:
             and schema8_confirm_token is not None
             and confirm_token != schema8_confirm_token
         ):
-            raise ValueError("conflicting schema 8 confirm tokens")
+            raise ValueError("conflicting schema migration confirm tokens")
         self.project = project
         self.confirm_token = confirm_token or schema8_confirm_token
         self.database: V4Database | None = None
@@ -47,13 +47,13 @@ class V4Migrator:
             / "book.db"
         )
         version = inspect_schema(path)
-        if version == 7:
+        if version == 8:
             if not self.confirm_token:
                 raise SchemaUpgradeRequired(
-                    "parallel_v4 schema 7 requires an explicit upgrade; "
+                    "parallel_v4 schema 8 requires an explicit schema 9 upgrade; "
                     "run migrate-v4 --preview and confirm the migration before importing"
                 )
-            confirm_schema8(path.resolve(), self.confirm_token)
+            confirm_schema9(path.resolve(), self.confirm_token)
         self.database = V4Database(self.project.root_dir)
         return self.database
 

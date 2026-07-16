@@ -38,10 +38,10 @@ from .models import (
     WorkingTargetRule,
 )
 from .matcher import FrozenRenderIndex
-from .schema_v8 import (
+from .schema_v9 import (
     SCHEMA_VERSION,
     SchemaUpgradeRequired,
-    assert_schema8_or_empty,
+    assert_schema9_or_empty,
 )
 
 
@@ -890,7 +890,7 @@ class V4Database:
         self.root = self.project_root / "artifacts" / "parallel_v4"
         self.root.mkdir(parents=True, exist_ok=True)
         self.path = self.root / "book.db"
-        assert_schema8_or_empty(self.path)
+        assert_schema9_or_empty(self.path)
         self.audit_archive = AuditArchive(self.root / "audit")
         self._audit_transactions: Dict[int, AuditArchiveTransaction] = {}
         self._audit_transactions_lock = RLock()

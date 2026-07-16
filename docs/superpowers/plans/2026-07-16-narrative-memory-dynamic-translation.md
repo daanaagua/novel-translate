@@ -52,7 +52,7 @@
 - 修改：`src/core/v4/database.py`
 - 修改：`src/core/v4/migration.py`
 
-- [ ] **步骤 1：编写空库 schema 9 失败测试**
+- [x] **步骤 1：编写空库 schema 9 失败测试**
 
 ```python
 def test_empty_database_initializes_schema9(tmp_path):
@@ -82,7 +82,7 @@ def test_empty_database_initializes_schema9(tmp_path):
     } <= tables
 ```
 
-- [ ] **步骤 2：运行测试确认 schema 仍为 8**
+- [x] **步骤 2：运行测试确认 schema 仍为 8**
 
 运行：
 
@@ -92,7 +92,7 @@ def test_empty_database_initializes_schema9(tmp_path):
 
 预期：FAIL，schema version 为 `8` 或缺少新表。
 
-- [ ] **步骤 3：实现 schema 9 创建脚本**
+- [x] **步骤 3：实现 schema 9 创建脚本**
 
 `schema_v9.py` 定义：
 
@@ -119,7 +119,7 @@ discourse_state_hash
 
 JSON 字段默认使用 `{}` 或 `[]`，外键指向 `blocks`、`knowledge_versions`、`memory_versions` 和相关记忆表。
 
-- [ ] **步骤 4：编写 schema 8→9 迁移和回滚测试**
+- [x] **步骤 4：编写 schema 8→9 迁移和回滚测试**
 
 测试必须断言：
 
@@ -138,7 +138,7 @@ assert result["schema_version"] == 9
 
 另一个测试在重建 `translation_versions` 中途注入异常，断言 schema 仍为 8、活动译文和依赖行数不变。
 
-- [ ] **步骤 5：实现非破坏性迁移**
+- [x] **步骤 5：实现非破坏性迁移**
 
 迁移流程：
 
@@ -161,7 +161,7 @@ def migrate_schema9(path: str | Path, confirm_token: str) -> dict[str, Any]:
 
 重建译文表时复制所有旧列，新增列使用空值或当前初始 `memory_version`。依赖表不删除，外键检查在提交前执行。
 
-- [ ] **步骤 6：切换数据库和迁移器入口**
+- [x] **步骤 6：切换数据库和迁移器入口**
 
 `database.py` 从 `schema_v9` 导入：
 
@@ -199,7 +199,7 @@ git commit -m "feat: add schema 9 narrative storage migration"
 - 修改：`src/core/v4/models.py`
 - 创建：`tests/test_narrative_protocol.py`
 
-- [ ] **步骤 1：编写类型与边界失败测试**
+- [x] **步骤 1：编写类型与边界失败测试**
 
 ```python
 def test_memory_candidate_rejects_unknown_type():
@@ -226,7 +226,7 @@ def test_context_packet_records_dual_versions():
     assert packet.memory_version == 7
 ```
 
-- [ ] **步骤 2：运行测试确认类型不存在**
+- [x] **步骤 2：运行测试确认类型不存在**
 
 运行：
 
@@ -236,7 +236,7 @@ def test_context_packet_records_dual_versions():
 
 预期：FAIL，无法导入新增类型或 `ContextPacket` 不接受字段。
 
-- [ ] **步骤 3：实现不可变类型**
+- [x] **步骤 3：实现不可变类型**
 
 `narrative_models.py` 定义：
 
@@ -279,7 +279,7 @@ class NarrativePremapResult:
 
 构造时校验枚举、长度、置信度、最大条数和字符串字节数。
 
-- [ ] **步骤 4：扩展翻译模型**
+- [x] **步骤 4：扩展翻译模型**
 
 `models.py` 增加：
 
@@ -309,7 +309,7 @@ class ContextPacket:
 
 `TranslationOutcome` 增加 `memory_version`、`snapshot_id`、`narrative_dependencies`、`supplemental_memory_candidates`、`style_delta` 和上下文哈希字段。
 
-- [ ] **步骤 5：运行类型测试**
+- [x] **步骤 5：运行类型测试**
 
 运行：
 
@@ -334,7 +334,7 @@ git commit -m "feat: define bounded narrative data models"
 - 修改：`src/core/v4/__init__.py`
 - 修改：`tests/test_narrative_protocol.py`
 
-- [ ] **步骤 1：编写协议 grounding 测试**
+- [x] **步骤 1：编写协议 grounding 测试**
 
 ```python
 def test_premapper_keeps_valid_sections_when_one_section_is_invalid():
@@ -367,7 +367,7 @@ def test_premapper_keeps_valid_sections_when_one_section_is_invalid():
     assert "memory_candidates" in result.validation_warnings[0]
 ```
 
-- [ ] **步骤 2：运行测试确认失败**
+- [x] **步骤 2：运行测试确认失败**
 
 运行：
 
@@ -377,7 +377,7 @@ def test_premapper_keeps_valid_sections_when_one_section_is_invalid():
 
 预期：FAIL，协议函数不存在。
 
-- [ ] **步骤 3：实现规范化与独立校验**
+- [x] **步骤 3：实现规范化与独立校验**
 
 `narrative_protocol.py` 提供：
 
@@ -404,7 +404,7 @@ def validate_premap_payload(
 
 所有证据 span 使用空白折叠后在当前英文原文中逐字查找；短 ID 只能来自请求白名单。
 
-- [ ] **步骤 4：实现 `NarrativePremapper`**
+- [x] **步骤 4：实现 `NarrativePremapper`**
 
 ```python
 class NarrativePremapper:
@@ -464,7 +464,7 @@ git commit -m "feat: add fused narrative premap protocol"
 - 修改：`src/core/v4/database.py`
 - 创建：`tests/test_narrative_memory.py`
 
-- [ ] **步骤 1：编写缓存幂等测试**
+- [x] **步骤 1：编写缓存幂等测试**
 
 ```python
 def test_premap_cache_key_is_stable_and_reused(database, block):
@@ -483,7 +483,7 @@ def test_premap_cache_key_is_stable_and_reused(database, block):
     assert database.table_count("premap_results") == 1
 ```
 
-- [ ] **步骤 2：编写重复、替代和矛盾测试**
+- [x] **步骤 2：编写重复、替代和矛盾测试**
 
 ```python
 def test_memory_merge_is_append_only_and_preserves_contradiction(database, block):
@@ -498,7 +498,7 @@ def test_memory_merge_is_append_only_and_preserves_contradiction(database, block
     assert opposite.memory_version > first.memory_version
 ```
 
-- [ ] **步骤 3：运行测试确认存储层不存在**
+- [x] **步骤 3：运行测试确认存储层不存在**
 
 运行：
 
@@ -508,7 +508,7 @@ def test_memory_merge_is_append_only_and_preserves_contradiction(database, block
 
 预期：FAIL，无法导入 `NarrativeMemoryStore`。
 
-- [ ] **步骤 4：实现缓存和版本 API**
+- [x] **步骤 4：实现缓存和版本 API**
 
 `NarrativeMemoryStore` 使用 `V4Database.transaction()`：
 
@@ -524,7 +524,7 @@ def save_premap_result(...) -> str: ...
 
 缓存唯一键为规格中的七项哈希材料，响应各分区和校验警告分别存储。
 
-- [ ] **步骤 5：实现追加式合并**
+- [x] **步骤 5：实现追加式合并**
 
 ```python
 def merge_candidates(
@@ -552,7 +552,7 @@ def merge_candidates(
 
 明确重复复用 ID；状态变化和矛盾只追加关系，不修改旧陈述。
 
-- [ ] **步骤 6：运行存储测试**
+- [x] **步骤 6：运行存储测试**
 
 运行：
 
@@ -575,7 +575,7 @@ git commit -m "feat: persist append-only narrative memory"
 - 修改：`src/core/v4/narrative_memory.py`
 - 修改：`tests/test_narrative_memory.py`
 
-- [ ] **步骤 1：编写防后文泄露测试**
+- [x] **步骤 1：编写防后文泄露测试**
 
 ```python
 def test_snapshot_excludes_future_reveal(database, blocks):
@@ -587,7 +587,7 @@ def test_snapshot_excludes_future_reveal(database, blocks):
     assert future.id not in snapshot.visible_memory_ids
 ```
 
-- [ ] **步骤 2：编写非关键词召回测试**
+- [x] **步骤 2：编写非关键词召回测试**
 
 ```python
 def test_retrieval_uses_active_speaker_without_name_in_source(database, block):
@@ -606,7 +606,7 @@ def test_retrieval_uses_active_speaker_without_name_in_source(database, block):
     assert memory.id in {item.id for item in selected.memories}
 ```
 
-- [ ] **步骤 3：运行测试确认失败**
+- [x] **步骤 3：运行测试确认失败**
 
 运行：
 
@@ -616,7 +616,7 @@ def test_retrieval_uses_active_speaker_without_name_in_source(database, block):
 
 预期：FAIL，快照或检索方法不存在。
 
-- [ ] **步骤 4：实现话语状态合并和快照**
+- [x] **步骤 4：实现话语状态合并和快照**
 
 ```python
 def apply_discourse_delta(
@@ -643,7 +643,7 @@ def build_snapshot(
 
 快照只保存有界 ID、状态 JSON 和哈希。
 
-- [ ] **步骤 5：实现多信号检索和字符预算**
+- [x] **步骤 5：实现多信号检索和字符预算**
 
 ```python
 def retrieve_for_block(..., max_chars: int) -> NarrativeRetrieval:
@@ -658,7 +658,7 @@ def retrieve_for_block(..., max_chars: int) -> NarrativeRetrieval:
 
 评分严格使用规格中的确定性特征和稳定同分规则。
 
-- [ ] **步骤 6：运行快照和检索测试**
+- [x] **步骤 6：运行快照和检索测试**
 
 运行：
 

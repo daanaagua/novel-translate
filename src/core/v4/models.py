@@ -373,8 +373,16 @@ class ContextPacket:
     knowledge_version: int
     rendered: str
     required_chars: int
+    memory_version: int = 1
+    snapshot_id: str = ""
+    matched_lexeme_ids: List[str] = field(default_factory=list)
     matched_concept_ids: List[str] = field(default_factory=list)
+    matched_rule_ids: List[str] = field(default_factory=list)
     matched_claim_ids: List[str] = field(default_factory=list)
+    matched_memory_ids: List[str] = field(default_factory=list)
+    style_snapshot_id: str = ""
+    discourse_state_hash: str = ""
+    context_hash: str = ""
 
 
 @dataclass(frozen=True)
@@ -399,11 +407,24 @@ class ClaimDependencySnapshot:
     semantic_fingerprint: str
 
 
+@dataclass(frozen=True)
+class NarrativeDependencySnapshot:
+    """Frozen prompt-semantic identity for one narrative memory."""
+
+    memory_id: str
+    semantic_fingerprint: str
+
+
 @dataclass
 class TranslationOutcome:
     block: V4Block
     knowledge_version: int
     status: str
+    memory_version: int = 1
+    snapshot_id: str = ""
+    context_hash: str = ""
+    style_snapshot_id: str = ""
+    discourse_state_hash: str = ""
     draft_translation: str = ""
     final_translation: str = ""
     analysis: str = ""
@@ -415,6 +436,9 @@ class TranslationOutcome:
     matched_concept_ids: List[str] = field(default_factory=list)
     matched_renderings: tuple[RenderingMatchSnapshot, ...] = ()
     claim_dependencies: tuple[ClaimDependencySnapshot, ...] = ()
+    narrative_dependencies: tuple[NarrativeDependencySnapshot, ...] = ()
+    supplemental_memory_candidates: List[Dict[str, Any]] = field(default_factory=list)
+    style_delta: Dict[str, Any] = field(default_factory=dict)
     audit_calls: List[Dict[str, Any]] = field(default_factory=list)
     attempts: int = 1
     elapsed_ms: int = 0
