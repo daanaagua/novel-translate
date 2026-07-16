@@ -1036,7 +1036,17 @@ class ParallelV4Tests(unittest.TestCase):
             count = connection.execute(
                 "SELECT COUNT(*) FROM translation_versions WHERE pipeline='serial_v3'"
             ).fetchone()[0]
+            imported_lexeme = connection.execute(
+                """SELECT working_target, locked FROM lexemes
+                   WHERE normalized_form='archon'"""
+            ).fetchone()
+            concept_count = connection.execute(
+                """SELECT COUNT(*) FROM concepts
+                   WHERE canonical_source='Archon' AND retired_version IS NULL"""
+            ).fetchone()[0]
         self.assertEqual(count, 1)
+        self.assertEqual(tuple(imported_lexeme), ("执政官", 0))
+        self.assertEqual(concept_count, 0)
 
         (root / "source.txt").write_text("The Archon changed.", encoding="utf-8")
         changed = chapter.model_copy(deep=True)

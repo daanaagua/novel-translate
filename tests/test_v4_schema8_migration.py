@@ -1,15 +1,22 @@
 import hashlib
 import sqlite3
 from contextlib import closing
+from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
 from src.core.v4.database import V4Database
 from src.core.v4.models import ScanOutcome, ScanResponse
+from src.core.v4 import schema_v8
+from src.core.v4.migration import V4Migrator
 from src.core.v4.schema_v8 import (
     SCHEMA_VERSION,
+    SchemaMigrationError,
     SchemaUpgradeRequired,
+    confirm_schema8,
     create_schema8,
+    preview_schema8,
 )
 
 
@@ -24,6 +31,191 @@ def seed_schema7_database(tmp_path):
             """
         )
     return path
+
+
+def seed_schema7_migration_fixture(tmp_path):
+    database = V4Database(tmp_path)
+    path = database.path
+    with closing(sqlite3.connect(path)) as connection:
+        connection.execute("PRAGMA foreign_keys = OFF")
+        connection.executescript(
+            """
+            DROP TABLE source_forms;
+            CREATE TABLE source_forms (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                concept_id TEXT NOT NULL,
+                form TEXT NOT NULL,
+                normalized_form TEXT NOT NULL,
+                grammar_json TEXT NOT NULL DEFAULT '{}'
+            );
+            DROP TABLE mentions;
+            CREATE TABLE mentions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                block_id TEXT NOT NULL,
+                paragraph_id TEXT NOT NULL,
+                source_form TEXT NOT NULL,
+                normalized_form TEXT NOT NULL,
+                discourse_function TEXT NOT NULL,
+                concept_id TEXT NOT NULL,
+                evidence_id INTEGER NOT NULL
+            );
+            DROP TABLE rendering_rules;
+            CREATE TABLE rendering_rules (
+                id TEXT PRIMARY KEY,
+                concept_id TEXT NOT NULL,
+                condition_json TEXT NOT NULL,
+                target TEXT NOT NULL,
+                priority INTEGER NOT NULL DEFAULT 0,
+                status TEXT NOT NULL DEFAULT 'provisional',
+                scope TEXT NOT NULL DEFAULT 'book',
+                locked INTEGER NOT NULL DEFAULT 0,
+                created_version INTEGER NOT NULL,
+                retired_version INTEGER,
+                created_at TEXT NOT NULL
+            );
+            DROP TABLE dependencies;
+            DROP TABLE translation_versions;
+            CREATE TABLE translation_versions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                block_id TEXT NOT NULL,
+                pipeline TEXT NOT NULL,
+                run_id TEXT,
+                knowledge_version INTEGER,
+                status TEXT NOT NULL,
+                draft_translation TEXT NOT NULL DEFAULT '',
+                final_translation TEXT NOT NULL DEFAULT '',
+                analysis TEXT NOT NULL DEFAULT '',
+                semantic_obligations TEXT NOT NULL DEFAULT '',
+                memory_summary TEXT NOT NULL DEFAULT '',
+                warnings_json TEXT NOT NULL DEFAULT '[]',
+                active INTEGER NOT NULL DEFAULT 1,
+                created_at TEXT NOT NULL
+            );
+            CREATE TABLE dependencies (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                translation_id INTEGER NOT NULL,
+                dependency_type TEXT NOT NULL,
+                dependency_id TEXT NOT NULL,
+                knowledge_version INTEGER NOT NULL,
+                UNIQUE(translation_id, dependency_type, dependency_id)
+            );
+            DELETE FROM concepts;
+            DELETE FROM blocks;
+            DELETE FROM source_editions;
+            DELETE FROM knowledge_versions;
+            INSERT INTO knowledge_versions(id, parent_id, reason, created_at)
+            VALUES(1, NULL, 'schema7 base', '2026-01-01T00:00:00+00:00'),
+                  (2, 1, 'target changed', '2026-01-02T00:00:00+00:00');
+            INSERT INTO source_editions(
+                id, raw_sha256, normalized_sha256, parser_version,
+                source_path, active, created_at)
+            VALUES(1, 'raw', 'normalized', 'schema7', 'source.txt', 1, 'now');
+            """
+        )
+        concepts = [
+            ("c-briah-place", "place", "Briah", "", "", "", "provisional", 0),
+            ("c-briah-work", "work", "BRIAH", "", "", "", "provisional", 0),
+            ("c-mal-old", "person", "Malrubius", "旧马", "旧马", "", "provisional", 0),
+            ("c-mal-locked", "person", "MALRUBIUS", "锁定马", "锁定马", "锁定马", "verified", 1),
+            ("c-tri-old", "object", "Triskele", "三曲", "三曲", "", "provisional", 0),
+            ("c-tri-new", "object", "TRISKELE", "三旋", "三旋", "三旋", "verified", 0),
+        ]
+        connection.executemany(
+            """INSERT INTO concepts(
+                   id, kind, canonical_source, default_target, working_target,
+                   verified_target, description, status, scope, locked,
+                   created_version, created_at)
+               VALUES(?, ?, ?, ?, ?, ?, '', ?, 'book', ?, 1, 'now')""",
+            concepts,
+        )
+        for index in range(38):
+            status = "needs_revalidate" if index < 37 else "ready"
+            text = (
+                "Malrubius named the Triskele in Briah."
+                if index == 36
+                else f"Quiet block {index}."
+            )
+            connection.execute(
+                """INSERT INTO blocks(
+                       id, legacy_id, source_edition_id, chapter_id,
+                       chapter_title, chapter_index, block_index, global_index,
+                       source_text, source_hash, status, updated_at)
+                   VALUES(?, ?, 1, 'ch-1', 'Same title', 0, ?, ?, ?, ?, ?, 'now')""",
+                (
+                    f"block-{index:02d}",
+                    f"legacy-{index:02d}",
+                    index,
+                    index,
+                    text,
+                    hashlib.sha256(text.encode()).hexdigest(),
+                    status,
+                ),
+            )
+        for ordinal, concept in enumerate(concepts, start=1):
+            concept_id, _, source, *_ = concept
+            evidence_id = connection.execute(
+                """INSERT INTO evidence(
+                       block_id, paragraph_id, kind, source_form,
+                       evidence_quote, payload_json, confidence, extractor,
+                       created_at)
+                   VALUES('block-36', ?, 'legacy', ?, ?, '{}', 1.0,
+                          'schema7', 'now')""",
+                (f"P{ordinal:03d}", source, source),
+            ).lastrowid
+            connection.execute(
+                """INSERT INTO mentions(
+                       block_id, paragraph_id, source_form, normalized_form,
+                       discourse_function, concept_id, evidence_id)
+                   VALUES('block-36', ?, ?, ?, 'referential', ?, ?)""",
+                (f"P{ordinal:03d}", source, source.casefold(), concept_id, evidence_id),
+            )
+            connection.execute(
+                """INSERT INTO source_forms(
+                       concept_id, form, normalized_form, grammar_json)
+                   VALUES(?, ?, ?, '{}')""",
+                (concept_id, source, source.casefold()),
+            )
+        connection.execute(
+            """INSERT INTO rendering_rules(
+                   id, concept_id, condition_json, target, priority, status,
+                   scope, locked, created_version, created_at)
+               VALUES('locked-rule', 'c-mal-locked', '{}', '锁定马', 100,
+                      'verified', 'book', 1, 1, 'now')"""
+        )
+        active_id = connection.execute(
+            """INSERT INTO translation_versions(
+                   block_id, pipeline, knowledge_version, status,
+                   final_translation, active, created_at)
+               VALUES('block-36', 'parallel_v4', 1, 'completed',
+                      '旧译文', 1, 'now')"""
+        ).lastrowid
+        historical_id = connection.execute(
+            """INSERT INTO translation_versions(
+                   block_id, pipeline, knowledge_version, status,
+                   final_translation, active, created_at)
+               VALUES('block-36', 'parallel_v4', 1, 'completed',
+                      '历史译文', 0, 'before')"""
+        ).lastrowid
+        connection.executemany(
+            """INSERT INTO dependencies(
+                   translation_id, dependency_type, dependency_id,
+                   knowledge_version)
+               VALUES(?, 'concept', 'c-mal-old', 1)""",
+            ((active_id,), (historical_id,)),
+        )
+        connection.execute(
+            """INSERT INTO audit_calls(
+                   purpose, model, request_json, raw_response, accepted,
+                   archive_relative_path, archive_offset,
+                   archive_compressed_length, archive_sha256, created_at)
+               VALUES('locked legacy decision', 'human', '{}', '{}', 1,
+                      'audit/locked.jsonl.zst', 7, 11, 'archive-hash', 'now')"""
+        )
+        connection.execute(
+            "UPDATE schema_meta SET value='7' WHERE key='schema_version'"
+        )
+        connection.commit()
+    return path.resolve()
 
 
 def read_schema_version(path):
@@ -170,6 +362,137 @@ def test_schema7_requires_explicit_preview_and_confirm(tmp_path):
     with pytest.raises(SchemaUpgradeRequired, match="migrate-v4 --preview"):
         V4Database(tmp_path)
     assert read_schema_version(path) == 7
+
+
+def test_minimal_schema7_meta_is_rebuilt_canonically(tmp_path):
+    path = seed_schema7_database(tmp_path).resolve()
+    preview = preview_schema8(path)
+
+    assert confirm_schema8(path, preview["confirm_token"])["status"] == "migrated"
+    V4Database(tmp_path)
+
+
+def test_v4_migrator_delays_database_open_until_explicit_schema_check(tmp_path):
+    path = seed_schema7_database(tmp_path)
+    project = SimpleNamespace(root_dir=tmp_path)
+
+    migrator = V4Migrator(project)
+
+    assert migrator.database is None
+    assert read_schema_version(path) == 7
+    with pytest.raises(SchemaUpgradeRequired, match="explicit upgrade"):
+        migrator.migrate()
+    assert migrator.database is None
+    assert read_schema_version(path) == 7
+
+
+def test_schema7_preview_is_stable_read_only_and_rejects_bad_confirm(tmp_path):
+    path = seed_schema7_migration_fixture(tmp_path)
+    before = filesystem_snapshot(tmp_path)
+
+    first = preview_schema8(path)
+    second = preview_schema8(path)
+
+    assert first == second
+    assert first["status"] == "ready"
+    assert first["source_path"] == str(path)
+    assert first["source_sha256"] == hashlib.sha256(path.read_bytes()).hexdigest()
+    assert first["table_row_counts"]["blocks"] == 38
+    assert len(first["lexeme_collisions"]) == 3
+    assert len(first["target_conflicts"]) == 2
+    assert first["status_repairs"] == 36
+    assert first["stale_tasks"] == 1
+    assert first["confirm_token"]
+    assert filesystem_snapshot(tmp_path) == before
+
+    with pytest.raises(SchemaMigrationError, match="confirm token"):
+        confirm_schema8(path, "wrong-token")
+    assert filesystem_snapshot(tmp_path) == before
+
+
+def test_schema7_confirm_backs_up_migrates_and_is_idempotent(tmp_path):
+    path = seed_schema7_migration_fixture(tmp_path)
+    preview = preview_schema8(path)
+
+    result = confirm_schema8(path, preview["confirm_token"])
+
+    assert result["status"] == "migrated"
+    backup_path = Path(result["backup_path"])
+    assert backup_path.exists()
+    assert backup_path.parent.parent == path.parent
+    assert read_schema_version(backup_path) == 7
+    assert read_schema_version(path) == 8
+    database = V4Database(tmp_path)
+    with closing(database.connect()) as connection:
+        repaired = connection.execute(
+            "SELECT COUNT(*) FROM blocks WHERE status='ready'"
+        ).fetchone()[0]
+        stale = connection.execute(
+            """SELECT validation_status FROM translation_versions
+               WHERE pipeline='parallel_v4' AND active=1"""
+        ).fetchone()[0]
+        task_count = connection.execute(
+            "SELECT COUNT(*) FROM revalidation_tasks"
+        ).fetchone()[0]
+        locked = connection.execute(
+            """SELECT locked, verified_target FROM concepts
+               WHERE id='c-mal-locked'"""
+        ).fetchone()
+        rule = connection.execute(
+            """SELECT concept_id, lexeme_id, locked FROM rendering_rules
+               WHERE id='locked-rule'"""
+        ).fetchone()
+        lexeme = connection.execute(
+            """SELECT working_target, locked FROM lexemes
+               WHERE normalized_form='malrubius'"""
+        ).fetchone()
+        locator = connection.execute(
+            """SELECT archive_relative_path, archive_offset,
+                      archive_compressed_length, archive_sha256
+               FROM audit_calls WHERE purpose='locked legacy decision'"""
+        ).fetchone()
+    assert repaired == 37
+    assert stale == "warning_stale"
+    assert task_count == 1
+    assert tuple(locked) == (1, "锁定马")
+    assert tuple(rule) == ("c-mal-locked", None, 1)
+    assert tuple(lexeme) == ("锁定马", 0)
+    assert tuple(locator) == ("audit/locked.jsonl.zst", 7, 11, "archive-hash")
+
+    second = confirm_schema8(path, preview["confirm_token"])
+    assert second["status"] == "already_schema8"
+    assert second["backup_path"] == result["backup_path"]
+
+
+def test_schema7_confirm_keeps_original_and_backup_on_upgrade_failure(
+    tmp_path, monkeypatch
+):
+    path = seed_schema7_migration_fixture(tmp_path)
+    preview = preview_schema8(path)
+    source_before = path.read_bytes()
+
+    def fail_upgrade(*args, **kwargs):
+        raise RuntimeError("injected migration failure")
+
+    monkeypatch.setattr(schema_v8, "_rebuild_schema7_transaction", fail_upgrade)
+    with pytest.raises(RuntimeError, match="injected migration failure"):
+        confirm_schema8(path, preview["confirm_token"])
+
+    assert path.read_bytes() == source_before
+    backup_path = Path(preview["backup_path"])
+    assert backup_path.exists()
+    assert backup_path.read_bytes() != b""
+
+
+def test_schema7_migration_path_must_be_absolute_and_project_scoped(tmp_path):
+    path = seed_schema7_database(tmp_path)
+    with pytest.raises(SchemaMigrationError, match="absolute"):
+        preview_schema8(Path("artifacts/parallel_v4/book.db"))
+
+    outside = tmp_path / "book.db"
+    outside.write_bytes(path.read_bytes())
+    with pytest.raises(SchemaMigrationError, match="artifacts/parallel_v4"):
+        preview_schema8(outside.resolve())
 
 
 @pytest.mark.parametrize(

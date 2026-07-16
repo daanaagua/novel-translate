@@ -8,16 +8,54 @@ from typing import Dict, List
 
 from ...agents.glossary_manager import GlossaryManager
 from ..schemas import ChunkStatus
-from .database import V4Database, stable_id
+from .database import V4Database, normalize_english_form, stable_id
+from .schema_v8 import (
+    SchemaUpgradeRequired,
+    confirm_schema8,
+    inspect_schema,
+)
 
 
 PARSER_VERSION = "serial-v3-artifacts-1"
 
 
 class V4Migrator:
-    def __init__(self, project):
+    def __init__(
+        self,
+        project,
+        *,
+        confirm_token: str | None = None,
+        schema8_confirm_token: str | None = None,
+    ):
+        if (
+            confirm_token is not None
+            and schema8_confirm_token is not None
+            and confirm_token != schema8_confirm_token
+        ):
+            raise ValueError("conflicting schema 8 confirm tokens")
         self.project = project
-        self.database = V4Database(project.root_dir)
+        self.confirm_token = confirm_token or schema8_confirm_token
+        self.database: V4Database | None = None
+
+    def _open_database(self) -> V4Database:
+        if self.database is not None:
+            return self.database
+        path = (
+            Path(self.project.root_dir)
+            / "artifacts"
+            / "parallel_v4"
+            / "book.db"
+        )
+        version = inspect_schema(path)
+        if version == 7:
+            if not self.confirm_token:
+                raise SchemaUpgradeRequired(
+                    "parallel_v4 schema 7 requires an explicit upgrade; "
+                    "run migrate-v4 --preview and confirm the migration before importing"
+                )
+            confirm_schema8(path.resolve(), self.confirm_token)
+        self.database = V4Database(self.project.root_dir)
+        return self.database
 
     @staticmethod
     def _sha256_bytes(value: bytes) -> str:
@@ -31,9 +69,10 @@ class V4Migrator:
         return "prose"
 
     def migrate(self) -> Dict[str, int | str]:
+        database = self._open_database()
         source_bytes = self.project.source_file.read_bytes()
         source_text = self.project.source_file.read_text(encoding="utf-8")
-        edition_id = self.database.ensure_source_edition(
+        edition_id = database.ensure_source_edition(
             raw_sha256=self._sha256_bytes(source_bytes),
             normalized_sha256=self._sha256_bytes(source_text.encode("utf-8")),
             parser_version=PARSER_VERSION,
@@ -69,24 +108,56 @@ class V4Migrator:
                 )
                 legacy_chunks.append((internal_id, chunk))
                 global_index += 1
-        self.database.upsert_blocks(edition_id, block_rows)
+        database.upsert_blocks(edition_id, block_rows)
 
         glossary = GlossaryManager(str(self.project.glossary_dir))
         glossary.load()
         imported_terms = 0
+        normalized_counts: Dict[str, int] = {}
         for item in glossary.glossary.items:
-            self.database.import_legacy_concept(
-                source=item.src,
-                target=item.default_target,
-                kind=item.category.value if item.category else "concept",
-                description=item.description or "",
-            )
+            normalized = normalize_english_form(item.src)
+            normalized_counts[normalized] = normalized_counts.get(normalized, 0) + 1
+        for item in glossary.glossary.items:
+            with database.transaction() as connection:
+                lexeme_id = database.ensure_lexeme(
+                    item.src,
+                    connection=connection,
+                )
+                connection.execute(
+                    """UPDATE lexemes
+                       SET working_target=CASE
+                               WHEN verified_target='' AND locked=0 THEN ?
+                               ELSE working_target END,
+                           status=CASE
+                               WHEN verified_target='' AND locked=0 THEN 'working'
+                               ELSE status END
+                       WHERE id=? AND retired_version IS NULL""",
+                    (item.default_target, lexeme_id),
+                )
+            explicit_sense = bool(item.rules) or normalized_counts.get(
+                normalize_english_form(item.src), 0
+            ) > 1
+            manually_locked = bool(getattr(item, "locked", False))
+            if explicit_sense or manually_locked:
+                database.import_legacy_concept(
+                    source=item.src,
+                    target=item.default_target,
+                    kind=item.category.value if item.category else "concept",
+                    description=item.description or "",
+                    status="verified" if manually_locked else "legacy_provisional",
+                )
+                if manually_locked and item.default_target:
+                    database.lock_concept_translation(
+                        item.src,
+                        item.default_target,
+                        kind=item.category.value if item.category else "concept",
+                    )
             imported_terms += 1
 
         imported_translations = 0
         for internal_id, chunk in legacy_chunks:
             if chunk.final_translation:
-                self.database.import_legacy_translation(
+                database.import_legacy_translation(
                     block_id=internal_id,
                     status=chunk.status.value,
                     draft=chunk.draft_translation or "",
@@ -101,5 +172,5 @@ class V4Migrator:
             "blocks": len(block_rows),
             "legacy_terms": imported_terms,
             "legacy_translations": imported_translations,
-            "database": str(self.database.path),
+            "database": str(database.path),
         }
