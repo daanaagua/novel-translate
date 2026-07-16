@@ -533,3 +533,207 @@ def test_unresolved_reference_outweighs_recent_unrelated_memory(tmp_path):
 
     assert [memory.id for memory in selected.memories] == [alice_id]
     assert bell_id not in {memory.id for memory in selected.memories}
+
+
+def test_semantic_relation_reference_is_required_under_tight_budget(tmp_path):
+    from src.core.v4.narrative_memory import NarrativeMemoryStore
+    from src.core.v4.narrative_models import render_narrative_memory
+
+    database, blocks = _seed_database(tmp_path)
+    store = NarrativeMemoryStore(database)
+    referenced_id = store.merge_candidates(
+        blocks[0],
+        [
+            _fact(
+                candidate_id="M-referenced",
+                statement="The old gate was already locked.",
+            )
+        ],
+    ).memory_ids[0]
+    unrelated_id = store.merge_candidates(
+        blocks[1],
+        [
+            _fact(
+                candidate_id="M-unrelated",
+                statement="Tecla speaks.",
+                evidence="Tecla speaks",
+            )
+        ],
+    ).memory_ids[0]
+    snapshot = store.build_snapshot(
+        blocks[3],
+        knowledge_version=database.current_knowledge_version(),
+        discourse_state=DiscourseState(),
+    )
+    full = store.retrieve_for_block(
+        blocks[3],
+        snapshot,
+        matched_subject_ids=(),
+        semantic_relation_memory_ids=(referenced_id,),
+        max_chars=4_000,
+    )
+    referenced = next(
+        memory for memory in full.memories if memory.id == referenced_id
+    )
+    one_item_budget = len(
+        render_narrative_memory(referenced, required=True)
+    ) + 1
+
+    selected = store.retrieve_for_block(
+        blocks[3],
+        snapshot,
+        matched_subject_ids=(),
+        semantic_relation_memory_ids=(referenced_id,),
+        max_chars=one_item_budget,
+    )
+
+    assert selected.required_memory_ids == (referenced_id,)
+    assert [memory.id for memory in selected.memories] == [referenced_id]
+    assert unrelated_id not in {memory.id for memory in selected.memories}
+
+
+def test_one_hop_relation_outweighs_recent_unrelated_memory(tmp_path):
+    from src.core.v4.narrative_memory import NarrativeMemoryStore
+    from src.core.v4.narrative_models import render_narrative_memory
+
+    database, blocks = _seed_database(tmp_path)
+    store = NarrativeMemoryStore(database)
+    linked_id = store.merge_candidates(
+        blocks[0],
+        [
+            _fact(
+                candidate_id="M-linked",
+                statement="The gate is locked.",
+            )
+        ],
+    ).memory_ids[0]
+    direct_id = store.merge_candidates(
+        blocks[1],
+        [
+            _fact(
+                candidate_id="M-direct",
+                statement="Tecla remembers the gate.",
+                evidence="Tecla speaks",
+                related=(linked_id,),
+                operation="relate",
+            )
+        ],
+    ).memory_ids[0]
+    unrelated_id = store.merge_candidates(
+        blocks[2],
+        [
+            _fact(
+                candidate_id="M-recent",
+                statement="He waits at place 2.",
+                evidence="He waits at place 2",
+            )
+        ],
+    ).memory_ids[0]
+    snapshot = store.build_snapshot(
+        blocks[3],
+        knowledge_version=database.current_knowledge_version(),
+        discourse_state=DiscourseState(),
+    )
+    full = store.retrieve_for_block(
+        blocks[3],
+        snapshot,
+        matched_subject_ids=(),
+        semantic_relation_memory_ids=(direct_id,),
+        max_chars=4_000,
+    )
+    by_id = {memory.id: memory for memory in full.memories}
+    budget = (
+        len(render_narrative_memory(by_id[direct_id], required=True))
+        + len(render_narrative_memory(by_id[linked_id], required=False))
+        + 2
+    )
+
+    selected = store.retrieve_for_block(
+        blocks[3],
+        snapshot,
+        matched_subject_ids=(),
+        semantic_relation_memory_ids=(direct_id,),
+        max_chars=budget,
+    )
+
+    assert [memory.id for memory in selected.memories] == [
+        direct_id,
+        linked_id,
+    ]
+    assert unrelated_id not in {memory.id for memory in selected.memories}
+
+
+def test_matched_subject_expands_one_hop_relation_without_semantic_reference(
+    tmp_path,
+):
+    from src.core.v4.narrative_memory import NarrativeMemoryStore
+    from src.core.v4.narrative_models import render_narrative_memory
+
+    database, blocks = _seed_database(tmp_path)
+    store = NarrativeMemoryStore(database)
+    linked_id = store.merge_candidates(
+        blocks[0],
+        [
+            _fact(
+                candidate_id="M-linked-subject",
+                statement="Alice once guarded the gate.",
+            )
+        ],
+    ).memory_ids[0]
+    subject_id = store.merge_candidates(
+        blocks[1],
+        [
+            _fact(
+                candidate_id="M-subject",
+                statement="Tecla speaks.",
+                evidence="Tecla speaks",
+                subjects=(
+                    NarrativeSubject(
+                        "concept", "concept-alice", "character"
+                    ),
+                ),
+                related=(linked_id,),
+                operation="relate",
+            )
+        ],
+    ).memory_ids[0]
+    unrelated_id = store.merge_candidates(
+        blocks[2],
+        [
+            _fact(
+                candidate_id="M-recent-subject",
+                statement="He waits at place 2.",
+                evidence="He waits at place 2",
+            )
+        ],
+    ).memory_ids[0]
+    snapshot = store.build_snapshot(
+        blocks[3],
+        knowledge_version=database.current_knowledge_version(),
+        discourse_state=DiscourseState(),
+    )
+    full = store.retrieve_for_block(
+        blocks[3],
+        snapshot,
+        matched_subject_ids=("concept-alice",),
+        max_chars=4_000,
+    )
+    by_id = {memory.id: memory for memory in full.memories}
+    budget = (
+        len(render_narrative_memory(by_id[subject_id], required=False))
+        + len(render_narrative_memory(by_id[linked_id], required=False))
+        + 2
+    )
+
+    selected = store.retrieve_for_block(
+        blocks[3],
+        snapshot,
+        matched_subject_ids=("concept-alice",),
+        max_chars=budget,
+    )
+
+    assert [memory.id for memory in selected.memories] == [
+        subject_id,
+        linked_id,
+    ]
+    assert unrelated_id not in {memory.id for memory in selected.memories}

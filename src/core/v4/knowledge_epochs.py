@@ -49,6 +49,7 @@ class EpochCheckpointResult:
     staged_proposals: int
     deferred_proposals: int
     change_ids: tuple[int, ...]
+    memory_change_ids: tuple[int, ...]
     planned_tasks: int
     payload_hash: str
 
@@ -297,6 +298,10 @@ class KnowledgeEpochCoordinator:
             staged_proposals=int(raw.get("staged_proposals") or 0),
             deferred_proposals=int(raw.get("deferred_proposals") or 0),
             change_ids=tuple(int(value) for value in raw.get("change_ids") or ()),
+            memory_change_ids=tuple(
+                int(value)
+                for value in raw.get("memory_change_ids") or ()
+            ),
             planned_tasks=int(raw.get("planned_tasks") or 0),
             payload_hash=str(raw.get("payload_hash") or ""),
         )
@@ -307,8 +312,19 @@ class KnowledgeEpochCoordinator:
         base_version = int(state["base_knowledge_version"])
         base_memory_version = int(state["base_memory_version"])
         external_change_ids = self.database.knowledge_change_ids_after(base_version)
-        if not staged and not external_change_ids and isinstance(
+        current_memory_version = self.narrative_store.current_memory_version()
+        external_memory_change_ids = (
+            self.narrative_store.memory_change_ids_between(
+                base_memory_version, current_memory_version
+            )
+        )
+        if (
+            not staged
+            and not external_change_ids
+            and not external_memory_change_ids
+            and isinstance(
             state.get("last_result"), Mapping
+            )
         ):
             return self._result_from_state(state["last_result"], reused=True)
         payload_hash = hashlib.sha256(
@@ -317,6 +333,7 @@ class KnowledgeEpochCoordinator:
                     "ordinal": int(state["ordinal"]),
                     "staged": staged,
                     "external_change_ids": external_change_ids,
+                    "external_memory_change_ids": external_memory_change_ids,
                 }
             ).encode("utf-8")
         ).hexdigest()
@@ -382,9 +399,28 @@ class KnowledgeEpochCoordinator:
             base_version, final_high_water
         )
         change_ids = tuple(sorted(set(bounded_change_ids + proposal_change_ids)))
+        bounded_memory_change_ids = (
+            self.narrative_store.memory_change_ids_between(
+                base_memory_version, final_memory_high_water
+            )
+        )
+        memory_change_ids = tuple(
+            sorted(
+                set(
+                    bounded_memory_change_ids
+                    + memory_change_ids
+                    + external_memory_change_ids
+                )
+            )
+        )
         planned_tasks = 0
+        planner = RevalidationPlanner(self.database)
         if change_ids:
-            planned_tasks = int(RevalidationPlanner(self.database).plan(change_ids)["planned"])
+            planned_tasks += int(planner.plan(change_ids)["planned"])
+        if memory_change_ids:
+            planned_tasks += int(
+                planner.plan_memory(memory_change_ids)["planned"]
+            )
         advanced = (
             final_high_water > base_version
             or final_memory_high_water > base_memory_version
@@ -417,6 +453,7 @@ class KnowledgeEpochCoordinator:
             "staged_proposals": staged_count,
             "deferred_proposals": int(state["deferred_proposals"]),
             "change_ids": list(change_ids),
+            "memory_change_ids": list(memory_change_ids),
             "planned_tasks": planned_tasks,
             "payload_hash": payload_hash,
         }

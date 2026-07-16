@@ -543,7 +543,10 @@ class V4TranslationPipeline:
         }
         for value in (
             prior_state.viewpoint_holder,
+            prior_state.narrator_layer,
             prior_state.scene_location,
+            prior_state.scene_time,
+            prior_state.presentation_layer,
         ):
             if value:
                 prior_ids.add(value)
@@ -787,11 +790,19 @@ class V4TranslationPipeline:
             value["id"] for value in provisional_subjects
         )
         error = ""
+        semantic_relation_memory_ids = tuple(
+            dict.fromkeys(
+                memory_id
+                for relation in result.semantic_relations
+                for memory_id in relation.related_memory_ids
+            )
+        )
         try:
             retrieval = self.narrative_store.retrieve_for_block(
                 block,
                 snapshot,
                 matched_subject_ids=matched_subject_ids,
+                semantic_relation_memory_ids=semantic_relation_memory_ids,
                 max_chars=self.config.max_narrative_context_chars,
             )
         except NarrativeContextOverflow as exc:
@@ -850,10 +861,18 @@ class V4TranslationPipeline:
             discourse_state=base.snapshot.discourse_state,
         )
         try:
+            semantic_relation_memory_ids = tuple(
+                dict.fromkeys(
+                    memory_id
+                    for relation in base.result.semantic_relations
+                    for memory_id in relation.related_memory_ids
+                )
+            )
             retrieval = self.narrative_store.retrieve_for_block(
                 block,
                 snapshot,
                 matched_subject_ids=base.matched_subject_ids,
+                semantic_relation_memory_ids=semantic_relation_memory_ids,
                 max_chars=self.config.max_narrative_context_chars,
             )
             error = ""

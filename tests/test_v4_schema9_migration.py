@@ -216,6 +216,37 @@ def test_corrupt_schema9_narrative_table_is_rejected(tmp_path):
         V4Database(tmp_path)
 
 
+def test_existing_schema9_adds_new_revalidation_columns_in_place(tmp_path):
+    database = V4Database(tmp_path)
+    path = database.path
+    with closing(sqlite3.connect(path)) as connection:
+        connection.execute(
+            "ALTER TABLE revalidation_tasks DROP COLUMN to_memory_version"
+        )
+        connection.execute(
+            "ALTER TABLE revalidation_tasks DROP COLUMN from_memory_version"
+        )
+        connection.execute(
+            "ALTER TABLE revalidation_tasks DROP COLUMN change_domain"
+        )
+        connection.commit()
+
+    reopened = V4Database(tmp_path)
+
+    with reopened.connect() as connection:
+        columns = {
+            str(row[1])
+            for row in connection.execute(
+                "PRAGMA table_info(revalidation_tasks)"
+            )
+        }
+    assert {
+        "change_domain",
+        "from_memory_version",
+        "to_memory_version",
+    } <= columns
+
+
 def test_schema9_migration_rejects_duplicate_active_translations(tmp_path):
     from src.core.v4.schema_v9 import (
         SchemaMigrationError,

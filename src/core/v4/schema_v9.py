@@ -199,6 +199,15 @@ TRANSLATION_COLUMNS = {
     "discourse_state_hash": "TEXT NOT NULL DEFAULT ''",
 }
 
+REVALIDATION_COLUMNS = {
+    "change_domain": (
+        "TEXT NOT NULL DEFAULT 'knowledge' "
+        "CHECK (change_domain IN ('knowledge', 'memory'))"
+    ),
+    "from_memory_version": "INTEGER REFERENCES memory_versions(id)",
+    "to_memory_version": "INTEGER REFERENCES memory_versions(id)",
+}
+
 
 REQUIRED_TABLES = {
     "source_structure",
@@ -250,6 +259,17 @@ def _install_schema9_extensions(connection: sqlite3.Connection) -> None:
             connection.execute(
                 f"ALTER TABLE translation_versions ADD COLUMN {name} {declaration}"
             )
+    revalidation_columns = {
+        str(row[1])
+        for row in connection.execute(
+            "PRAGMA table_info(revalidation_tasks)"
+        ).fetchall()
+    }
+    for name, declaration in REVALIDATION_COLUMNS.items():
+        if name not in revalidation_columns:
+            connection.execute(
+                f"ALTER TABLE revalidation_tasks ADD COLUMN {name} {declaration}"
+            )
     if connection.execute("SELECT COUNT(*) FROM memory_versions").fetchone()[0] == 0:
         connection.execute(
             """INSERT INTO memory_versions(
@@ -295,6 +315,8 @@ def _expected_schema9_features() -> tuple[
     dict[tuple[str, str], str],
     dict[str, tuple[Any, ...]],
     set[tuple[str, str, str]],
+    dict[str, tuple[Any, ...]],
+    set[tuple[str, str, str]],
 ]:
     with closing(sqlite3.connect(":memory:")) as connection:
         connection.row_factory = sqlite3.Row
@@ -319,13 +341,42 @@ def _expected_schema9_features() -> tuple[
             )
             if str(row["from"]) in TRANSLATION_COLUMNS
         }
-    return signature, columns, foreign_keys
+        revalidation_columns = {
+            str(row["name"]): (
+                str(row["type"]),
+                int(row["notnull"]),
+                row["dflt_value"],
+                int(row["pk"]),
+            )
+            for row in connection.execute(
+                "PRAGMA table_info(revalidation_tasks)"
+            )
+            if str(row["name"]) in REVALIDATION_COLUMNS
+        }
+        revalidation_foreign_keys = {
+            (str(row["from"]), str(row["table"]), str(row["to"]))
+            for row in connection.execute(
+                "PRAGMA foreign_key_list(revalidation_tasks)"
+            )
+            if str(row["from"]) in REVALIDATION_COLUMNS
+        }
+    return (
+        signature,
+        columns,
+        foreign_keys,
+        revalidation_columns,
+        revalidation_foreign_keys,
+    )
 
 
 def _schema9_errors(connection: sqlite3.Connection) -> list[str]:
-    expected_signature, expected_columns, expected_foreign_keys = (
-        _expected_schema9_features()
-    )
+    (
+        expected_signature,
+        expected_columns,
+        expected_foreign_keys,
+        expected_revalidation_columns,
+        expected_revalidation_foreign_keys,
+    ) = _expected_schema9_features()
     actual_signature = _extension_signature(connection)
     errors: list[str] = []
     for key, expected_sql in expected_signature.items():
@@ -357,6 +408,32 @@ def _schema9_errors(connection: sqlite3.Connection) -> list[str]:
     }
     if actual_foreign_keys != expected_foreign_keys:
         errors.append("translation narrative foreign keys are noncanonical")
+    actual_revalidation_columns = {
+        str(row["name"]): (
+            str(row["type"]),
+            int(row["notnull"]),
+            row["dflt_value"],
+            int(row["pk"]),
+        )
+        for row in connection.execute(
+            "PRAGMA table_info(revalidation_tasks)"
+        )
+        if str(row["name"]) in REVALIDATION_COLUMNS
+    }
+    if actual_revalidation_columns != expected_revalidation_columns:
+        errors.append("revalidation narrative columns are noncanonical")
+    actual_revalidation_foreign_keys = {
+        (str(row["from"]), str(row["table"]), str(row["to"]))
+        for row in connection.execute(
+            "PRAGMA foreign_key_list(revalidation_tasks)"
+        )
+        if str(row["from"]) in REVALIDATION_COLUMNS
+    }
+    if (
+        actual_revalidation_foreign_keys
+        != expected_revalidation_foreign_keys
+    ):
+        errors.append("revalidation narrative foreign keys are noncanonical")
     version = connection.execute(
         "SELECT value FROM schema_meta WHERE key='schema_version'"
     ).fetchone()
@@ -404,7 +481,29 @@ def assert_schema9_or_empty(path: Path) -> None:
     path = Path(path)
     version = inspect_schema(path)
     if version == SCHEMA_VERSION:
-        _assert_schema9_features(path)
+        with closing(sqlite3.connect(path)) as connection:
+            connection.row_factory = sqlite3.Row
+            connection.execute("PRAGMA foreign_keys = ON")
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                _install_schema9_extensions(connection)
+                errors = _schema9_errors(connection)
+                if errors:
+                    raise SchemaUpgradeRequired(
+                        "parallel_v4 schema 9 is incomplete or corrupt "
+                        f"({'; '.join(errors[:6])}); "
+                        "run migrate-v4 --preview"
+                    )
+                connection.commit()
+            except sqlite3.DatabaseError as exc:
+                connection.rollback()
+                raise SchemaUpgradeRequired(
+                    "parallel_v4 schema 9 is incomplete or corrupt "
+                    f"({exc}); run migrate-v4 --preview"
+                ) from None
+            except Exception:
+                connection.rollback()
+                raise
         return
     if version is not None:
         raise SchemaUpgradeRequired(

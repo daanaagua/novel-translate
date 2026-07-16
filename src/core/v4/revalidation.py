@@ -61,6 +61,60 @@ class _Candidate:
     changes: dict[int, dict[str, Any]] = field(default_factory=dict)
 
 
+@dataclass
+class _MemoryCandidate:
+    translation_id: int
+    block_id: str
+    knowledge_version: int
+    from_memory_version: int
+    source_hash: str
+    changes: dict[int, dict[str, Any]] = field(default_factory=dict)
+
+
+def classify_memory_change(change_kind: str, high_impact: bool = False) -> int:
+    """Return the conservative revalidation impact for a narrative change."""
+
+    if high_impact:
+        return 3
+    normalized = str(change_kind or "").strip().casefold()
+    if any(
+        token in normalized
+        for token in (
+            "viewpoint",
+            "timeline",
+            "scene_time",
+            "narrator",
+            "presentation_layer",
+            "identity",
+        )
+    ):
+        return 3
+    if any(
+        token in normalized
+        for token in (
+            "relationship",
+            "location",
+            "character_state",
+            "contradiction",
+            "supersede",
+            "answer",
+            "close_question",
+        )
+    ):
+        return 2
+    if any(
+        token in normalized
+        for token in (
+            "render_only",
+            "address",
+            "honorific",
+            "style_signal",
+        )
+    ):
+        return 1
+    return 0
+
+
 def _canonical_json(value: Any) -> str:
     return json.dumps(
         value,
@@ -75,6 +129,19 @@ def _change_set_hash(change_ids: Sequence[int], to_version: int) -> str:
         {
             "change_ids": sorted(set(int(value) for value in change_ids)),
             "to_knowledge_version": int(to_version),
+        }
+    )
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _memory_change_set_hash(
+    change_ids: Sequence[int], to_memory_version: int
+) -> str:
+    canonical = _canonical_json(
+        {
+            "change_domain": "memory",
+            "change_ids": sorted(set(int(value) for value in change_ids)),
+            "to_memory_version": int(to_memory_version),
         }
     )
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
@@ -442,6 +509,511 @@ class RevalidationPlanner:
         with self.database.transaction() as connection:
             with self.database._method_savepoint(connection, "revalidation_plan"):
                 return self._plan_in_transaction(connection, normalized)
+
+    def plan_memory(self, change_ids: Sequence[int]) -> dict[str, Any]:
+        """Plan only translations whose frozen narrative context can change."""
+
+        normalized = self._normalize_change_ids(change_ids)
+        if not normalized:
+            return {**self._empty_result(), "planned_block_ids": []}
+        with self.database.transaction() as connection:
+            with self.database._method_savepoint(
+                connection, "memory_revalidation_plan"
+            ):
+                return self._plan_memory_in_transaction(connection, normalized)
+
+    def _plan_memory_in_transaction(
+        self, connection: sqlite3.Connection, change_ids: list[int]
+    ) -> dict[str, Any]:
+        connection.execute(
+            "CREATE TEMP TABLE memory_revalidation_input(id INTEGER PRIMARY KEY)"
+        )
+        connection.executemany(
+            "INSERT INTO memory_revalidation_input(id) VALUES(?)",
+            [(change_id,) for change_id in change_ids],
+        )
+        rows = connection.execute(
+            """SELECT mc.* FROM memory_changes mc
+               JOIN memory_revalidation_input input ON input.id=mc.id
+               ORDER BY mc.id"""
+        ).fetchall()
+        found = {int(row["id"]) for row in rows}
+        missing = sorted(set(change_ids) - found)
+        if missing:
+            raise KeyError(f"unknown narrative memory change: {missing[0]}")
+
+        effective_rows: list[tuple[sqlite3.Row, int]] = []
+        for row in rows:
+            try:
+                payload = json.loads(str(row["payload_json"] or "{}"))
+            except (TypeError, ValueError, json.JSONDecodeError):
+                payload = {}
+            high_impact = bool(
+                isinstance(payload, dict) and payload.get("high_impact")
+            )
+            impact = max(
+                int(row["impact_level"]),
+                classify_memory_change(
+                    str(row["change_kind"]), high_impact=high_impact
+                ),
+            )
+            if (
+                impact > 0
+                and str(row["old_fingerprint"] or "")
+                != str(row["new_fingerprint"] or "")
+            ):
+                effective_rows.append((row, impact))
+
+        retired_payload = _canonical_json({"reason": "translation_inactive"})
+        retired = connection.execute(
+            """UPDATE revalidation_tasks AS task
+               SET status='resolved_noop', result_json=?, resolved_at=?
+               WHERE task.status='pending'
+                 AND task.change_domain='memory'
+                 AND NOT EXISTS(
+                     SELECT 1 FROM translation_versions tv
+                     WHERE tv.id=task.translation_id AND tv.active=1
+                 )""",
+            (retired_payload, utc_now()),
+        ).rowcount
+        if not effective_rows:
+            result = self._empty_result(len(change_ids), 0)
+            result.update(
+                {
+                    "retired": int(retired),
+                    "planned_block_ids": [],
+                }
+            )
+            return result
+
+        connection.execute(
+            """CREATE TEMP TABLE memory_revalidation_changes(
+                   change_id INTEGER PRIMARY KEY,
+                   memory_version INTEGER NOT NULL,
+                   impact_level INTEGER NOT NULL,
+                   change_kind TEXT NOT NULL,
+                   subject_type TEXT NOT NULL,
+                   subject_id TEXT NOT NULL,
+                   old_fingerprint TEXT NOT NULL,
+                   new_fingerprint TEXT NOT NULL
+               )"""
+        )
+        connection.executemany(
+            """INSERT INTO memory_revalidation_changes(
+                   change_id, memory_version, impact_level, change_kind,
+                   subject_type, subject_id, old_fingerprint, new_fingerprint)
+               VALUES(?, ?, ?, ?, ?, ?, ?, ?)""",
+            [
+                (
+                    int(row["id"]),
+                    int(row["memory_version"]),
+                    impact,
+                    str(row["change_kind"]),
+                    str(row["subject_type"]),
+                    str(row["subject_id"]),
+                    str(row["old_fingerprint"] or ""),
+                    str(row["new_fingerprint"] or ""),
+                )
+                for row, impact in effective_rows
+            ],
+        )
+
+        candidates: dict[int, _MemoryCandidate] = {}
+        direct_rows = connection.execute(
+            """SELECT DISTINCT
+                      tv.id translation_id, tv.block_id,
+                      tv.knowledge_version, tv.memory_version from_memory_version,
+                      b.source_hash, b.source_text,
+                      change.change_id, change.memory_version,
+                      change.impact_level, change.change_kind,
+                      change.subject_type, change.subject_id
+               FROM memory_revalidation_changes change
+               JOIN dependencies dependency
+                 ON dependency.dependency_type='narrative_memory'
+                AND dependency.dependency_id=change.subject_id
+               JOIN translation_versions tv
+                 ON tv.id=dependency.translation_id
+               JOIN blocks b ON b.id=tv.block_id
+               JOIN source_editions edition
+                 ON edition.id=b.source_edition_id AND edition.active=1
+               WHERE tv.active=1 AND tv.pipeline='parallel_v4'
+                 AND tv.status IN ('completed','completed_with_warnings')
+                 AND b.status IN ('completed','completed_with_warnings')
+                 AND tv.memory_version IS NOT NULL
+                 AND change.memory_version>tv.memory_version
+                 AND dependency.dependency_fingerprint
+                     <>change.new_fingerprint
+               ORDER BY tv.id, change.change_id"""
+        ).fetchall()
+        for row in direct_rows:
+            if _authentic_source(
+                str(row["source_text"]), str(row["source_hash"])
+            ):
+                self._add_memory_candidate(
+                    candidates, row, "narrative_dependency"
+                )
+
+        subject_rows = connection.execute(
+            """SELECT DISTINCT
+                      tv.id translation_id, tv.block_id,
+                      tv.knowledge_version, tv.memory_version from_memory_version,
+                      b.source_hash, b.source_text,
+                      change.change_id, change.memory_version,
+                      change.impact_level, change.change_kind,
+                      change.subject_type, change.subject_id
+               FROM memory_revalidation_changes change
+               JOIN narrative_memories memory
+                 ON memory.id=change.subject_id
+               JOIN narrative_memory_subjects memory_subject
+                 ON memory_subject.memory_id=memory.id
+               JOIN dependencies dependency
+                 ON dependency.dependency_type=memory_subject.subject_type
+                AND dependency.dependency_id=memory_subject.subject_id
+               JOIN translation_versions tv
+                 ON tv.id=dependency.translation_id
+               JOIN blocks b ON b.id=tv.block_id
+               JOIN source_editions edition
+                 ON edition.id=b.source_edition_id AND edition.active=1
+               WHERE change.old_fingerprint=''
+                 AND tv.active=1 AND tv.pipeline='parallel_v4'
+                 AND tv.status IN ('completed','completed_with_warnings')
+                 AND b.status IN ('completed','completed_with_warnings')
+                 AND tv.memory_version IS NOT NULL
+                 AND change.memory_version>tv.memory_version
+                 AND b.global_index>=memory.reveal_global_index
+               ORDER BY tv.id, change.change_id"""
+        ).fetchall()
+        for row in subject_rows:
+            if _authentic_source(
+                str(row["source_text"]), str(row["source_hash"])
+            ):
+                self._add_memory_candidate(
+                    candidates, row, "subject_visibility"
+                )
+
+        reveal_rows = connection.execute(
+            """SELECT DISTINCT
+                      tv.id translation_id, tv.block_id,
+                      tv.knowledge_version, tv.memory_version from_memory_version,
+                      b.source_hash, b.source_text,
+                      change.change_id, change.memory_version,
+                      change.impact_level, change.change_kind,
+                      change.subject_type, change.subject_id
+               FROM memory_revalidation_changes change
+               JOIN narrative_memories memory
+                 ON memory.id=change.subject_id
+               JOIN translation_versions tv
+                 ON tv.memory_version IS NOT NULL
+                AND change.memory_version>tv.memory_version
+               JOIN dependencies snapshot_dependency
+                 ON snapshot_dependency.translation_id=tv.id
+                AND snapshot_dependency.dependency_type='narrative_snapshot'
+               JOIN blocks b ON b.id=tv.block_id
+               JOIN source_editions edition
+                 ON edition.id=b.source_edition_id AND edition.active=1
+               WHERE change.old_fingerprint=''
+                 AND change.impact_level>=2
+                 AND tv.active=1 AND tv.pipeline='parallel_v4'
+                 AND tv.status IN ('completed','completed_with_warnings')
+                 AND b.status IN ('completed','completed_with_warnings')
+                 AND b.global_index>=memory.reveal_global_index
+               ORDER BY tv.id, change.change_id"""
+        ).fetchall()
+        for row in reveal_rows:
+            if _authentic_source(
+                str(row["source_text"]), str(row["source_hash"])
+            ):
+                self._add_memory_candidate(
+                    candidates, row, "high_impact_reveal"
+                )
+
+        counters = {"created": 0, "merged": 0, "unchanged": 0}
+        planned_blocks: list[str] = []
+        for candidate in candidates.values():
+            outcome = self._upsert_memory_candidate(connection, candidate)
+            if outcome is not None:
+                counters[outcome] += 1
+                planned_blocks.append(candidate.block_id)
+        return {
+            "requested": len(change_ids),
+            "effective": len(effective_rows),
+            "planned": sum(counters.values()),
+            **counters,
+            "retired": int(retired),
+            "planned_block_ids": sorted(set(planned_blocks)),
+        }
+
+    @staticmethod
+    def _add_memory_candidate(
+        candidates: dict[int, _MemoryCandidate],
+        row: sqlite3.Row,
+        via: str,
+    ) -> None:
+        translation_id = int(row["translation_id"])
+        candidate = candidates.setdefault(
+            translation_id,
+            _MemoryCandidate(
+                translation_id=translation_id,
+                block_id=str(row["block_id"]),
+                knowledge_version=int(row["knowledge_version"]),
+                from_memory_version=int(row["from_memory_version"]),
+                source_hash=str(row["source_hash"]),
+            ),
+        )
+        change_id = int(row["change_id"])
+        detail = candidate.changes.setdefault(
+            change_id,
+            {
+                "memory_version": int(row["memory_version"]),
+                "impact_level": int(row["impact_level"]),
+                "change_kind": str(row["change_kind"]),
+                "subjects": set(),
+                "via": set(),
+            },
+        )
+        detail["subjects"].add(
+            (str(row["subject_type"]), str(row["subject_id"]))
+        )
+        detail["via"].add(via)
+
+    @staticmethod
+    def _memory_change_rows(
+        connection: sqlite3.Connection, change_ids: set[int]
+    ) -> dict[int, sqlite3.Row]:
+        rows: dict[int, sqlite3.Row] = {}
+        ordered = sorted(change_ids)
+        for start in range(0, len(ordered), 500):
+            chunk = ordered[start : start + 500]
+            placeholders = ",".join("?" for _ in chunk)
+            for row in connection.execute(
+                f"""SELECT id, memory_version, impact_level, change_kind,
+                            subject_type, subject_id, old_fingerprint,
+                            new_fingerprint, payload_json
+                     FROM memory_changes WHERE id IN ({placeholders})""",
+                chunk,
+            ).fetchall():
+                rows[int(row["id"])] = row
+        return rows
+
+    @staticmethod
+    def _memory_task_result(
+        candidate: _MemoryCandidate,
+        change_ids: set[int],
+        change_rows: Mapping[int, sqlite3.Row],
+        persisted_details: Mapping[int, Mapping[str, Any]] | None = None,
+    ) -> str:
+        persisted_details = persisted_details or {}
+        subjects: set[tuple[str, str]] = set()
+        reasons: list[dict[str, Any]] = []
+        safe_patch = True
+        for change_id in sorted(change_ids):
+            row = change_rows[change_id]
+            detail = candidate.changes.get(change_id)
+            persisted = persisted_details.get(change_id)
+            if persisted is not None:
+                change_subjects = set(persisted["subjects"])
+                vias = list(persisted["via"])
+            elif detail is not None:
+                change_subjects = set(detail["subjects"])
+                vias = sorted(detail["via"])
+            else:
+                change_subjects = {
+                    (str(row["subject_type"]), str(row["subject_id"]))
+                }
+                vias = ["persisted_memory_change"]
+            subjects.update(change_subjects)
+            try:
+                payload = json.loads(str(row["payload_json"] or "{}"))
+            except (TypeError, ValueError, json.JSONDecodeError):
+                payload = {}
+            exact_unique = bool(
+                isinstance(payload, dict)
+                and payload.get("exact_unique_render_change")
+            )
+            safe_patch = bool(
+                safe_patch
+                and int(row["impact_level"]) == 1
+                and exact_unique
+            )
+            reasons.append(
+                {
+                    "change_id": change_id,
+                    "change_kind": str(row["change_kind"]),
+                    "via": vias,
+                    "subjects": [
+                        {
+                            "subject_type": subject_type,
+                            "subject_id": subject_id,
+                        }
+                        for subject_type, subject_id in sorted(
+                            change_subjects
+                        )
+                    ],
+                }
+            )
+        return _canonical_json(
+            {
+                "change_domain": "memory",
+                "change_ids": sorted(change_ids),
+                "subjects": [
+                    {
+                        "subject_type": subject_type,
+                        "subject_id": subject_id,
+                    }
+                    for subject_type, subject_id in sorted(subjects)
+                ],
+                "omitted_subjects": 0,
+                "reasons": reasons,
+                "omitted_reasons": 0,
+                "source_hash": candidate.source_hash,
+                "recommended_action": (
+                    "safe_patch" if safe_patch else "retranslate"
+                ),
+            }
+        )
+
+    def _upsert_memory_candidate(
+        self,
+        connection: sqlite3.Connection,
+        candidate: _MemoryCandidate,
+    ) -> str | None:
+        tasks = connection.execute(
+            """SELECT * FROM revalidation_tasks
+               WHERE translation_id=? AND change_domain='memory'
+                 AND status IN ('pending','validating')
+               ORDER BY CASE status WHEN 'pending' THEN 0 ELSE 1 END,
+                        created_at, id""",
+            (candidate.translation_id,),
+        ).fetchall()
+        pending = [row for row in tasks if row["status"] == "pending"]
+        validating_ids: set[int] = set()
+        existing_ids: set[int] = set()
+        existing_details: dict[int, dict[str, Any]] = {}
+        for task in tasks:
+            parsed = _parse_task_result(task["result_json"])
+            if (
+                int(task["from_knowledge_version"])
+                != candidate.knowledge_version
+                or int(task["to_knowledge_version"])
+                != candidate.knowledge_version
+                or int(task["from_memory_version"])
+                != candidate.from_memory_version
+                or str(task["block_id"]) != candidate.block_id
+            ):
+                raise ValueError(
+                    "pending memory revalidation task does not match translation"
+                )
+            if task["status"] == "validating":
+                validating_ids.update(parsed["change_ids"])
+            else:
+                existing_ids.update(parsed["change_ids"])
+                existing_details.update(parsed["details"])
+
+        candidate_ids = set(candidate.changes) - validating_ids
+        if not candidate_ids:
+            return None
+        current = pending[0] if pending else None
+        for duplicate in pending[1:]:
+            connection.execute(
+                """UPDATE revalidation_tasks
+                   SET status='resolved_noop', result_json=?, resolved_at=?
+                   WHERE id=?""",
+                (
+                    _canonical_json(
+                        {"reason": "duplicate_pending_memory_task"}
+                    ),
+                    utc_now(),
+                    duplicate["id"],
+                ),
+            )
+        merged_ids = existing_ids | candidate_ids
+        if len(merged_ids) > MAX_CHANGE_IDS:
+            raise PlanningBudgetError(
+                "merged memory revalidation change_ids exceed budget"
+            )
+        rows = self._memory_change_rows(connection, merged_ids)
+        if set(rows) != merged_ids:
+            raise ValueError(
+                "pending memory revalidation task references unknown changes"
+            )
+        if any(
+            int(row["memory_version"]) <= candidate.from_memory_version
+            for row in rows.values()
+        ):
+            raise ValueError(
+                "memory revalidation changes must be newer than translation"
+            )
+        to_memory_version = max(
+            int(row["memory_version"]) for row in rows.values()
+        )
+        if current is not None and merged_ids == existing_ids:
+            return "unchanged"
+        impact = max(int(row["impact_level"]) for row in rows.values())
+        change_hash = _memory_change_set_hash(
+            sorted(merged_ids), to_memory_version
+        )
+        result_json = self._memory_task_result(
+            candidate,
+            merged_ids,
+            rows,
+            existing_details,
+        )
+        if len(result_json.encode("utf-8")) > MAX_RESULT_BYTES:
+            raise PlanningBudgetError(
+                "memory revalidation result exceeds byte budget"
+            )
+        conflict = connection.execute(
+            """SELECT id FROM revalidation_tasks
+               WHERE translation_id=? AND change_set_hash=?
+                 AND (? IS NULL OR id<>?)""",
+            (
+                candidate.translation_id,
+                change_hash,
+                current["id"] if current is not None else None,
+                current["id"] if current is not None else None,
+            ),
+        ).fetchone()
+        if conflict is not None:
+            return "unchanged" if current is not None else None
+        if current is None:
+            connection.execute(
+                """INSERT INTO revalidation_tasks(
+                       id, translation_id, block_id,
+                       from_knowledge_version, to_knowledge_version,
+                       change_set_hash, impact_level, status, action,
+                       attempts, result_json, created_at, change_domain,
+                       from_memory_version, to_memory_version)
+                   VALUES(?, ?, ?, ?, ?, ?, ?, 'pending', '', 0, ?, ?,
+                          'memory', ?, ?)""",
+                (
+                    _task_id(candidate.translation_id, change_hash),
+                    candidate.translation_id,
+                    candidate.block_id,
+                    candidate.knowledge_version,
+                    candidate.knowledge_version,
+                    change_hash,
+                    impact,
+                    result_json,
+                    utc_now(),
+                    candidate.from_memory_version,
+                    to_memory_version,
+                ),
+            )
+            return "created"
+        connection.execute(
+            """UPDATE revalidation_tasks
+               SET change_set_hash=?, impact_level=?, result_json=?,
+                   to_memory_version=?
+               WHERE id=? AND status='pending'""",
+            (
+                change_hash,
+                impact,
+                result_json,
+                to_memory_version,
+                current["id"],
+            ),
+        )
+        return "merged"
 
     def _plan_in_transaction(
         self, connection: sqlite3.Connection, change_ids: list[int]
@@ -1114,6 +1686,19 @@ class RevalidationRunner:
         return (self.validator_factories[0], self.validator_factories[0])
 
     @staticmethod
+    def _narrative_context_requires_retranslation(
+        task_snapshot: Mapping[str, Any],
+    ) -> bool:
+        memory_version = task_snapshot.get("translation_memory_version")
+        return bool(
+            str(task_snapshot.get("translation_snapshot_id") or "")
+            or (
+                type(memory_version) is int
+                and int(memory_version) > 1
+            )
+        )
+
+    @staticmethod
     def _retranslation_category(error: BaseException | str, status: str = "") -> str:
         message = f"{type(error).__name__} {error}".casefold()
         if any(
@@ -1326,6 +1911,31 @@ class RevalidationRunner:
                 summary["claimed"] += 1
                 impact = int(claim.task_snapshot["impact_level"])
                 audits: list[dict[str, Any]] = []
+                if (
+                    str(
+                        claim.task_snapshot.get(
+                            "change_domain", "knowledge"
+                        )
+                    )
+                    == "memory"
+                ):
+                    self._retranslate_or_warn(
+                        claim,
+                        reason="narrative_memory_change",
+                        result={
+                            "recommended_action": "retranslate",
+                            "from_memory_version": claim.task_snapshot.get(
+                                "from_memory_version"
+                            ),
+                            "to_memory_version": claim.task_snapshot.get(
+                                "to_memory_version"
+                            ),
+                        },
+                        audits=audits,
+                        run_id=run_id,
+                        summary=summary,
+                    )
+                    continue
                 if impact >= 3:
                     self._retranslate_or_warn(
                         claim,
@@ -1447,6 +2057,21 @@ class RevalidationRunner:
                         run_id=run_id,
                     )
                     summary["noop"] += 1
+                    continue
+                if (
+                    decision == "patch_required"
+                    and self._narrative_context_requires_retranslation(
+                        claim.task_snapshot
+                    )
+                ):
+                    self._retranslate_or_warn(
+                        claim,
+                        reason="narrative_context_requires_full_retranslation",
+                        result=result,
+                        audits=audits,
+                        run_id=run_id,
+                        summary=summary,
+                    )
                     continue
                 if decision != "patch_required" or self.repairer is None:
                     self._retranslate_or_warn(

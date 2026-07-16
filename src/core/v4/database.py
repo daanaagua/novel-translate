@@ -11654,14 +11654,31 @@ class V4Database:
             raise ValueError(
                 "translation knowledge version does not match revalidation task"
             )
+        change_domain = str(task["change_domain"] or "knowledge")
+        if change_domain not in {"knowledge", "memory"}:
+            raise ValueError("revalidation task change domain is invalid")
+        if change_domain == "memory" and (
+            current["memory_version"] is None
+            or task["from_memory_version"] is None
+            or int(current["memory_version"])
+            != int(task["from_memory_version"])
+        ):
+            raise ValueError(
+                "translation memory version does not match revalidation task"
+            )
         base = self._revalidation_base_result(task["result_json"])
         change_ids = base.get("change_ids")
         if not isinstance(change_ids, list) or not change_ids:
             raise ValueError("revalidation task has no bounded change set")
         rows: Dict[int, sqlite3.Row] = {}
         placeholders = ",".join("?" for _ in change_ids)
+        change_table = (
+            "memory_changes"
+            if change_domain == "memory"
+            else "knowledge_changes"
+        )
         for row in connection.execute(
-            f"""SELECT * FROM knowledge_changes
+            f"""SELECT * FROM {change_table}
                  WHERE id IN ({placeholders}) ORDER BY id""",
             tuple(change_ids),
         ).fetchall():
@@ -11688,6 +11705,23 @@ class V4Database:
                 change_payload = {}
             if not isinstance(change_payload, dict):
                 change_payload = {}
+            memory_summary: Dict[str, Any] = {}
+            if change_domain == "memory":
+                memory = connection.execute(
+                    """SELECT memory_type, statement, truth_status, visibility,
+                              status, high_impact
+                       FROM narrative_memories WHERE id=?""",
+                    (row["subject_id"],),
+                ).fetchone()
+                if memory is not None:
+                    memory_summary = {
+                        "memory_type": str(memory["memory_type"]),
+                        "statement": str(memory["statement"])[:4096],
+                        "truth_status": str(memory["truth_status"]),
+                        "visibility": str(memory["visibility"]),
+                        "status": str(memory["status"]),
+                        "high_impact": bool(memory["high_impact"]),
+                    }
             reason = reason_by_id.get(int(change_id), {})
             raw_subjects = reason.get("subjects", [])
             if not raw_subjects:
@@ -11736,10 +11770,12 @@ class V4Database:
                     ],
                     "old": self._revalidation_summary(change_payload.get("old")),
                     "new": self._revalidation_summary(change_payload.get("new")),
+                    "memory": memory_summary,
                 }
             )
         payload = {
             "task_alias": "T001",
+            "change_domain": change_domain,
             "coverage_complete": len(change_ids) <= 64,
             "omitted_case_count": max(0, len(change_ids) - 64),
             "impact_level": int(task["impact_level"]),
@@ -11756,6 +11792,15 @@ class V4Database:
             },
             "cases": cases,
         }
+        if change_domain == "memory":
+            payload.update(
+                {
+                    "from_memory_version": int(
+                        task["from_memory_version"]
+                    ),
+                    "to_memory_version": int(task["to_memory_version"]),
+                }
+            )
         snapshot = {
             "task_id": str(task["id"]),
             "translation_id": int(task["translation_id"]),
@@ -11771,6 +11816,25 @@ class V4Database:
                 str(current["final_translation"]).encode("utf-8")
             ).hexdigest(),
             "translation_knowledge_version": int(current["knowledge_version"]),
+            "change_domain": change_domain,
+            "from_memory_version": (
+                int(task["from_memory_version"])
+                if task["from_memory_version"] is not None
+                else None
+            ),
+            "to_memory_version": (
+                int(task["to_memory_version"])
+                if task["to_memory_version"] is not None
+                else None
+            ),
+            "translation_memory_version": (
+                int(current["memory_version"])
+                if current["memory_version"] is not None
+                else None
+            ),
+            "translation_snapshot_id": str(
+                current["snapshot_id"] or ""
+            ),
             "source_hash": str(current["source_hash"]),
             "source_text_hash": hashlib.sha256(
                 source_text.encode("utf-8")
@@ -11855,6 +11919,15 @@ class V4Database:
                      OR original.block_id<>task.block_id
                      OR original.knowledge_version IS NULL
                      OR original.knowledge_version<>task.from_knowledge_version
+                     OR (
+                         task.change_domain='memory'
+                         AND (
+                             original.memory_version IS NULL
+                             OR task.from_memory_version IS NULL
+                             OR original.memory_version
+                                <>task.from_memory_version
+                         )
+                     )
                  )
                ORDER BY task.created_at, task.id"""
         ).fetchall()
@@ -12093,10 +12166,24 @@ class V4Database:
         current_version = int(
             connection.execute("SELECT MAX(id) FROM knowledge_versions").fetchone()[0]
         )
+        current_memory_version = int(
+            connection.execute("SELECT MAX(id) FROM memory_versions").fetchone()[0]
+        )
+        change_domain = str(task["change_domain"] or "knowledge")
         if (
             frozen.block.id != str(task["block_id"])
             or frozen.knowledge_version != current_version
             or frozen.knowledge_version < int(task["to_knowledge_version"])
+            or frozen.memory_version != current_memory_version
+            or (
+                change_domain == "memory"
+                and (
+                    task["to_memory_version"] is None
+                    or frozen.memory_version
+                    < int(task["to_memory_version"])
+                    or not frozen.snapshot_id
+                )
+            )
             or frozen.status
             not in {
                 V4BlockStatus.COMPLETED.value,
@@ -12135,6 +12222,85 @@ class V4Database:
         if previous is None:
             raise ValueError("revalidation retranslation active translation changed")
 
+        snapshot_row: sqlite3.Row | None = None
+        visible_memory_ids: set[str] = set()
+        narrative_dependency_rows: list[tuple[str, str]] = []
+        if frozen.snapshot_id:
+            snapshot_row = connection.execute(
+                "SELECT * FROM narrative_snapshots WHERE id=?",
+                (frozen.snapshot_id,),
+            ).fetchone()
+            if snapshot_row is None:
+                raise ValueError(
+                    "revalidation narrative snapshot does not exist"
+                )
+            if (
+                str(snapshot_row["block_id"]) != str(task["block_id"])
+                or int(snapshot_row["knowledge_version"])
+                != frozen.knowledge_version
+                or int(snapshot_row["memory_version"])
+                != frozen.memory_version
+            ):
+                raise ValueError(
+                    "revalidation narrative snapshot version mismatch"
+                )
+            visible_memory_ids = {
+                str(value)
+                for value in json.loads(
+                    snapshot_row["visible_memory_ids_json"] or "[]"
+                )
+            }
+            expected_discourse_hash = hashlib.sha256(
+                str(snapshot_row["discourse_state_json"]).encode("utf-8")
+            ).hexdigest()
+            if frozen.discourse_state_hash != expected_discourse_hash:
+                raise ValueError(
+                    "revalidation discourse state hash mismatch"
+                )
+            if re.fullmatch(r"[0-9a-f]{64}", frozen.context_hash) is None:
+                raise ValueError(
+                    "revalidation context hash is invalid"
+                )
+            for dependency in frozen.narrative_dependencies:
+                memory_id = str(dependency.memory_id).strip()
+                fingerprint = str(
+                    dependency.semantic_fingerprint
+                ).strip()
+                if memory_id not in visible_memory_ids:
+                    raise ValueError(
+                        "revalidation narrative dependency is not visible"
+                    )
+                row = connection.execute(
+                    """SELECT semantic_fingerprint
+                       FROM narrative_memories WHERE id=?""",
+                    (memory_id,),
+                ).fetchone()
+                if (
+                    row is None
+                    or str(row["semantic_fingerprint"]) != fingerprint
+                ):
+                    raise ValueError(
+                        "revalidation narrative dependency fingerprint mismatch"
+                    )
+                narrative_dependency_rows.append(
+                    (memory_id, fingerprint)
+                )
+        elif frozen.narrative_dependencies:
+            raise ValueError(
+                "revalidation narrative dependencies require a snapshot"
+            )
+        style_state_hash = ""
+        if frozen.style_snapshot_id:
+            style_row = connection.execute(
+                "SELECT state_hash FROM style_snapshots WHERE id=?",
+                (frozen.style_snapshot_id,),
+            ).fetchone()
+            if style_row is None:
+                raise ValueError(
+                    "revalidation style snapshot does not exist"
+                )
+            style_state_hash = str(style_row["state_hash"])
+
         dependency_groups: Dict[tuple[str, str], List[RenderingMatchSnapshot]] = {}
         for match in frozen.matched_renderings:
             lexeme_id = str(match.lexeme_id or "").strip()
@@ -12171,9 +12337,12 @@ class V4Database:
                    block_id, pipeline, run_id, knowledge_version, status,
                    draft_translation, final_translation, analysis,
                    semantic_obligations, memory_summary, warnings_json,
-                   validation_status, validated_knowledge_version, active, created_at)
+                   validation_status, validated_knowledge_version,
+                   memory_version, snapshot_id, context_hash,
+                   style_snapshot_id, discourse_state_hash,
+                   active, created_at)
                VALUES(?, 'parallel_v4', ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                      'clean', ?, 0, ?)""",
+                      'clean', ?, ?, ?, ?, ?, ?, 0, ?)""",
             (
                 task["block_id"],
                 run_id,
@@ -12186,6 +12355,11 @@ class V4Database:
                 frozen.memory_summary,
                 json.dumps(_mutable_render_value(frozen.warnings), ensure_ascii=False),
                 frozen.knowledge_version,
+                frozen.memory_version,
+                frozen.snapshot_id or None,
+                frozen.context_hash,
+                frozen.style_snapshot_id or None,
+                frozen.discourse_state_hash,
                 utc_now(),
             ),
         )
@@ -12250,6 +12424,67 @@ class V4Database:
                     claim_id,
                     frozen.knowledge_version,
                     str(fingerprint),
+                    "",
+                    0,
+                    "",
+                    "[]",
+                    "[]",
+                )
+            )
+        for memory_id, fingerprint in sorted(
+            set(narrative_dependency_rows)
+        ):
+            dependency_rows.append(
+                (
+                    replacement_id,
+                    "narrative_memory",
+                    memory_id,
+                    frozen.knowledge_version,
+                    fingerprint,
+                    "",
+                    0,
+                    "",
+                    "[]",
+                    "[]",
+                )
+            )
+        if snapshot_row is not None:
+            dependency_rows.extend(
+                [
+                    (
+                        replacement_id,
+                        "narrative_snapshot",
+                        frozen.snapshot_id,
+                        frozen.knowledge_version,
+                        str(snapshot_row["snapshot_hash"]),
+                        "",
+                        0,
+                        "",
+                        "[]",
+                        "[]",
+                    ),
+                    (
+                        replacement_id,
+                        "discourse_state",
+                        frozen.snapshot_id,
+                        frozen.knowledge_version,
+                        frozen.discourse_state_hash,
+                        "",
+                        0,
+                        "",
+                        "[]",
+                        "[]",
+                    ),
+                ]
+            )
+        if frozen.style_snapshot_id:
+            dependency_rows.append(
+                (
+                    replacement_id,
+                    "style_snapshot",
+                    frozen.style_snapshot_id,
+                    frozen.knowledge_version,
+                    style_state_hash,
                     "",
                     0,
                     "",

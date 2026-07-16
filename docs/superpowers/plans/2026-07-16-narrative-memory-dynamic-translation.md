@@ -450,7 +450,7 @@ return render_semantic_relations(result.semantic_relations)
 
 预期：全部 PASS。
 
-- [ ] **步骤 7：Commit**
+- [x] **步骤 7：Commit**
 
 ```powershell
 git add src/core/v4/narrative_protocol.py src/core/v4/semantic_mapper.py src/core/v4/__init__.py tests/test_narrative_protocol.py
@@ -987,7 +987,7 @@ git commit -m "feat: persist narrative translation dependencies"
 - 修改：`src/core/v4/database.py`
 - 修改：`tests/test_narrative_revalidation.py`
 
-- [ ] **步骤 1：编写影响级别测试**
+- [x] **步骤 1：编写影响级别测试**
 
 ```python
 @pytest.mark.parametrize(
@@ -1004,7 +1004,7 @@ def test_memory_change_impact(change_kind, impact):
     assert classify_memory_change(change_kind, high_impact=False) == impact
 ```
 
-- [ ] **步骤 2：编写无关块不重验和失败保旧稿测试**
+- [x] **步骤 2：编写无关块不重验和失败保旧稿测试**
 
 ```python
 def test_memory_change_only_plans_actual_dependents(database):
@@ -1018,7 +1018,7 @@ def test_failed_memory_retranslation_keeps_old_active_translation(database):
     assert active["block-1"]["final_translation"] == "old valid translation"
 ```
 
-- [ ] **步骤 3：运行测试确认失败**
+- [x] **步骤 3：运行测试确认失败**
 
 运行：
 
@@ -1028,7 +1028,7 @@ def test_failed_memory_retranslation_keeps_old_active_translation(database):
 
 预期：FAIL，planner 不识别记忆变化。
 
-- [ ] **步骤 4：扩展重验规划**
+- [x] **步骤 4：扩展重验规划**
 
 增加记忆变化查询，按 dependency type、fingerprint、位置可见性和版本生成 change set。动作规则：
 
@@ -1043,11 +1043,11 @@ else:
 
 身份、时间、地点、视角、叙述层和高影响揭示边界禁止局部字符串替换。
 
-- [ ] **步骤 5：实现失败兜底和有限状态**
+- [x] **步骤 5：实现失败兜底和有限状态**
 
 重译失败写 `completed_with_warning`，保留旧活动版本；成功替代必须再次验证冻结知识/记忆版本。重复 change set 复用已有任务，不生成循环。
 
-- [ ] **步骤 6：运行记忆和既有重验测试**
+- [x] **步骤 6：运行记忆和既有重验测试**
 
 运行：
 

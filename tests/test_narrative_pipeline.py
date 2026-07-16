@@ -107,6 +107,29 @@ def test_noncontiguous_blocks_start_new_dynamic_island():
     ] == [[0, 1], [3]]
 
 
+def test_provisional_subjects_include_all_prior_discourse_layers(tmp_path):
+    from src.core.v4.pipeline import V4TranslationPipeline
+
+    database = V4Database(tmp_path / "book")
+    pipeline = V4TranslationPipeline(database, lambda: object())
+    block = _blocks(1)[0]
+
+    subjects = pipeline._provisional_subjects(
+        block,
+        DiscourseState(
+            narrator_layer="layer-narrator",
+            scene_time="time-night",
+            presentation_layer="layer-dream",
+        ),
+    )
+
+    assert {subject["id"] for subject in subjects} >= {
+        "layer-narrator",
+        "time-night",
+        "layer-dream",
+    }
+
+
 def test_context_includes_semantics_memory_discourse_and_exact_dependencies(
     tmp_path,
 ):

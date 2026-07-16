@@ -107,6 +107,22 @@ class NarrativeMemoryStore:
             row = owned.execute("SELECT MAX(id) FROM memory_versions").fetchone()
         return int(row[0])
 
+    def memory_change_ids_between(
+        self, lower_exclusive: int, upper_inclusive: int
+    ) -> list[int]:
+        if lower_exclusive >= upper_inclusive:
+            return []
+        with closing(self.database.connect()) as connection:
+            return [
+                int(row[0])
+                for row in connection.execute(
+                    """SELECT id FROM memory_changes
+                       WHERE memory_version>? AND memory_version<=?
+                       ORDER BY id""",
+                    (int(lower_exclusive), int(upper_inclusive)),
+                ).fetchall()
+            ]
+
     def _create_memory_version(
         self,
         connection: sqlite3.Connection,
@@ -661,7 +677,10 @@ class NarrativeMemoryStore:
                 *discourse_state.addressed_parties,
                 *discourse_state.unresolved_references,
                 discourse_state.viewpoint_holder,
+                discourse_state.narrator_layer,
                 discourse_state.scene_location,
+                discourse_state.scene_time,
+                discourse_state.presentation_layer,
             )
             if value
         }
@@ -785,6 +804,7 @@ class NarrativeMemoryStore:
         snapshot: NarrativeSnapshot,
         *,
         matched_subject_ids: Sequence[str],
+        semantic_relation_memory_ids: Sequence[str] = (),
         max_chars: int,
     ) -> NarrativeRetrieval:
         if max_chars < 1:
@@ -792,6 +812,11 @@ class NarrativeMemoryStore:
         if not snapshot.visible_memory_ids:
             return NarrativeRetrieval((), (), 0)
         placeholders = ",".join("?" for _ in snapshot.visible_memory_ids)
+        direct_relation_ids = {
+            str(value)
+            for value in semantic_relation_memory_ids
+            if str(value) in snapshot.visible_memory_ids
+        }
         with closing(self.database.connect()) as connection:
             rows = connection.execute(
                 f"""SELECT * FROM narrative_memories
@@ -819,29 +844,73 @@ class NarrativeMemoryStore:
         discourse.update(snapshot.discourse_state.unresolved_references)
         if snapshot.discourse_state.viewpoint_holder:
             discourse.add(snapshot.discourse_state.viewpoint_holder)
+        if snapshot.discourse_state.narrator_layer:
+            discourse.add(snapshot.discourse_state.narrator_layer)
         if snapshot.discourse_state.scene_location:
             discourse.add(snapshot.discourse_state.scene_location)
+        if snapshot.discourse_state.scene_time:
+            discourse.add(snapshot.discourse_state.scene_time)
+        if snapshot.discourse_state.presentation_layer:
+            discourse.add(snapshot.discourse_state.presentation_layer)
+        one_hop_seed_ids = set(direct_relation_ids)
+        for memory_id, memory_subjects in subjects_by_memory.items():
+            subject_ids = {value.subject_id for value in memory_subjects}
+            if subject_ids & matched or subject_ids & discourse:
+                one_hop_seed_ids.add(memory_id)
+        one_hop_ids: set[str] = set()
+        if one_hop_seed_ids:
+            seed_placeholders = ",".join("?" for _ in one_hop_seed_ids)
+            with closing(self.database.connect()) as connection:
+                link_rows = connection.execute(
+                    f"""SELECT from_memory_id, to_memory_id
+                        FROM narrative_memory_links
+                        WHERE created_memory_version<=?
+                          AND (
+                              from_memory_id IN ({seed_placeholders})
+                              OR to_memory_id IN ({seed_placeholders})
+                          )""",
+                    (
+                        snapshot.memory_version,
+                        *sorted(one_hop_seed_ids),
+                        *sorted(one_hop_seed_ids),
+                    ),
+                ).fetchall()
+            visible_ids = set(snapshot.visible_memory_ids)
+            for link in link_rows:
+                from_id = str(link["from_memory_id"])
+                to_id = str(link["to_memory_id"])
+                if from_id in one_hop_seed_ids and to_id in visible_ids:
+                    one_hop_ids.add(to_id)
+                if to_id in one_hop_seed_ids and from_id in visible_ids:
+                    one_hop_ids.add(from_id)
+            one_hop_ids.difference_update(one_hop_seed_ids)
         ranked = []
         for row in rows:
+            memory_id = str(row["id"])
             memory_subjects = subjects_by_memory.get(str(row["id"]), [])
             subject_ids = {value.subject_id for value in memory_subjects}
             direct = bool(subject_ids & matched)
             participant = bool(subject_ids & discourse)
+            semantic_reference = memory_id in direct_relation_ids
+            one_hop_relation = memory_id in one_hop_ids
             distance = max(
                 0, block.global_index - int(row["reveal_global_index"])
             )
             score = (
                 100 * int(direct)
                 + 80 * int(participant)
+                + 70 * int(semantic_reference)
                 + 50 * int(distance <= 3)
                 + 30 * int(str(row["memory_type"]) == "open_question")
                 + 25 * int(bool(row["high_impact"]))
+                + 20 * int(one_hop_relation)
                 + int(float(row["confidence"]) * 20)
                 - min(distance, 50)
             )
             record = self._record_from_row(row, memory_subjects)
             required = bool(
-                (record.high_impact and (direct or participant))
+                semantic_reference
+                or (record.high_impact and (direct or participant))
                 or (
                     record.visibility == "render_only"
                     and (direct or participant)
