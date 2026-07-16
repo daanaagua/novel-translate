@@ -1058,8 +1058,13 @@ def test_translation_proposals_record_one_shared_semantic_change_and_repeat_noop
             }
         ],
     )
-    version = database.commit_translation_proposals("proposal-run", [outcome])
+    result = database.commit_translation_proposals(
+        "proposal-run", [outcome], return_change_ids=True
+    )
+    version = result["knowledge_version"]
     assert version is not None
+    assert result["change_ids"] == sorted(set(result["change_ids"]))
+    assert len(result["change_ids"]) == 1
     with closing(database.connect()) as connection:
         changes = connection.execute(
             "SELECT impact_level FROM knowledge_changes WHERE knowledge_version=?",
@@ -1073,7 +1078,9 @@ def test_translation_proposals_record_one_shared_semantic_change_and_repeat_noop
             "SELECT COUNT(*) FROM dependencies WHERE dependency_type='concept'"
         ).fetchone()[0] == 0
     assert [row[0] for row in changes] == [2]
-    assert database.commit_translation_proposals("proposal-run", [outcome]) is None
+    assert database.commit_translation_proposals(
+        "proposal-run", [outcome], return_change_ids=True
+    ) == {"knowledge_version": None, "change_ids": []}
     with closing(database.connect()) as connection:
         after = (
             connection.execute("SELECT COUNT(*) FROM knowledge_versions").fetchone()[0],
@@ -1981,6 +1988,109 @@ def test_revalidation_planner_uses_fresh_occurrences_without_regex_and_filters_s
     assert "NovelName appeared." not in tasks[0]["result_json"]
 
 
+def test_revalidation_concept_occurrence_ignores_links_created_after_change(tmp_path):
+    database = _database(tmp_path, ["Alias"])
+    concept_id = database.import_legacy_concept(
+        "Canonical", "Canonical", "person", "temporal"
+    )
+    with database.transaction() as connection:
+        version = int(
+            connection.execute("SELECT MAX(id) FROM knowledge_versions").fetchone()[0]
+        )
+        connection.execute(
+            """INSERT INTO lexemes(
+                   id, language, normalized_form, canonical_form,
+                   created_version, created_at)
+               VALUES('lexeme-temporal-late', 'en', 'alias', 'Alias', ?, 'now')""",
+            (version,),
+        )
+        block = connection.execute(
+            "SELECT id, source_hash FROM blocks WHERE id='block-0'"
+        ).fetchone()
+        connection.execute(
+            """INSERT INTO form_occurrences(
+                   lexeme_id, block_id, start_offset, end_offset,
+                   source_form, source_hash, created_at)
+               VALUES('lexeme-temporal-late', ?, 0, 5, 'Alias', ?, 'now')""",
+            (block["id"], block["source_hash"]),
+        )
+    _insert_revalidation_translation(database, "block-0")
+    change_id = _insert_revalidation_change(
+        database,
+        subject_type="concept",
+        subject_id=concept_id,
+        new_fingerprint="concept-at-k4",
+    )
+    with database.transaction() as connection:
+        late_version = database.create_knowledge_version("late link", connection)
+        connection.execute(
+            """INSERT INTO concept_lexemes(
+                   concept_id, lexeme_id, role, confidence, status,
+                   created_version, created_at)
+               VALUES(?, 'lexeme-temporal-late', 'alias', 1.0, 'verified', ?, 'now')""",
+            (concept_id, late_version),
+        )
+
+    assert RevalidationPlanner(database).plan([change_id])["planned"] == 0
+
+
+def test_revalidation_concept_occurrence_uses_link_valid_at_historical_change(
+    tmp_path,
+):
+    database = _database(tmp_path, ["Alias"])
+    concept_id = database.import_legacy_concept(
+        "Canonical", "Canonical", "person", "temporal"
+    )
+    with database.transaction() as connection:
+        link_version = int(
+            connection.execute("SELECT MAX(id) FROM knowledge_versions").fetchone()[0]
+        )
+        connection.execute(
+            """INSERT INTO lexemes(
+                   id, language, normalized_form, canonical_form,
+                   created_version, created_at)
+               VALUES('lexeme-temporal-old', 'en', 'alias-old', 'Alias', ?, 'now')""",
+            (link_version,),
+        )
+        connection.execute(
+            """INSERT INTO concept_lexemes(
+                   concept_id, lexeme_id, role, confidence, status,
+                   created_version, created_at)
+               VALUES(?, 'lexeme-temporal-old', 'alias', 1.0, 'verified', ?, 'now')""",
+            (concept_id, link_version),
+        )
+        block = connection.execute(
+            "SELECT id, source_hash FROM blocks WHERE id='block-0'"
+        ).fetchone()
+        connection.execute(
+            """INSERT INTO form_occurrences(
+                   lexeme_id, block_id, start_offset, end_offset,
+                   source_form, source_hash, created_at)
+               VALUES('lexeme-temporal-old', ?, 0, 5, 'Alias', ?, 'now')""",
+            (block["id"], block["source_hash"]),
+        )
+    translation_id = _insert_revalidation_translation(database, "block-0")
+    change_id = _insert_revalidation_change(
+        database,
+        subject_type="concept",
+        subject_id=concept_id,
+        new_fingerprint="concept-before-retirement",
+    )
+    with database.transaction() as connection:
+        retired_version = database.create_knowledge_version("retire link", connection)
+        connection.execute(
+            """UPDATE concept_lexemes SET retired_version=?
+               WHERE concept_id=? AND lexeme_id='lexeme-temporal-old'""",
+            (retired_version, concept_id),
+        )
+
+    assert RevalidationPlanner(database).plan([change_id])["planned"] == 1
+    with closing(database.connect()) as connection:
+        assert connection.execute(
+            "SELECT translation_id FROM revalidation_tasks"
+        ).fetchone()[0] == translation_id
+
+
 def test_revalidation_pending_is_idempotent_and_merges_supersets_canonically(tmp_path):
     database = _database(tmp_path, ["Alpha"])
     _insert_revalidation_translation(
@@ -2010,6 +2120,11 @@ def test_revalidation_pending_is_idempotent_and_merges_supersets_canonically(tmp
         before_tuple = (before["id"], before["attempts"], before["created_at"])
     planner.plan([first, first])
     planner.plan([second, first])
+    with closing(database.connect()) as connection:
+        merged_result_json = str(
+            connection.execute("SELECT result_json FROM revalidation_tasks").fetchone()[0]
+        )
+    planner.plan([second, first])
     planner.plan([first])
 
     with closing(database.connect()) as connection:
@@ -2019,6 +2134,7 @@ def test_revalidation_pending_is_idempotent_and_merges_supersets_canonically(tmp
     assert (task["id"], task["attempts"], task["created_at"]) == before_tuple
     assert task["impact_level"] == 3
     assert json.loads(task["result_json"])["change_ids"] == [first, second]
+    assert task["result_json"] == merged_result_json
     expected_hash = hashlib.sha256(
         json.dumps(
             {
@@ -2030,6 +2146,115 @@ def test_revalidation_pending_is_idempotent_and_merges_supersets_canonically(tmp
         ).encode("utf-8")
     ).hexdigest()
     assert task["change_set_hash"] == expected_hash
+
+
+def test_revalidation_pending_merge_preserves_occurrence_provenance(tmp_path):
+    database = _database(tmp_path, ["NovelName"])
+    concept_id = database.import_legacy_concept(
+        "NovelName", "NovelName", "person", "provenance"
+    )
+    with database.transaction() as connection:
+        lexeme_id = str(
+            connection.execute(
+                "SELECT primary_lexeme_id FROM concepts WHERE id=?", (concept_id,)
+            ).fetchone()[0]
+        )
+        block = connection.execute(
+            "SELECT id, source_hash FROM blocks WHERE id='block-0'"
+        ).fetchone()
+        connection.execute(
+            """INSERT INTO form_occurrences(
+                   lexeme_id, block_id, start_offset, end_offset,
+                   source_form, source_hash, created_at)
+               VALUES(?, ?, 0, 9, 'NovelName', ?, 'now')""",
+            (lexeme_id, block["id"], block["source_hash"]),
+        )
+    translation_id = _insert_revalidation_translation(database, "block-0")
+    occurrence_change = _insert_revalidation_change(
+        database,
+        subject_type="lexeme",
+        subject_id=lexeme_id,
+        new_fingerprint="occurrence-change",
+        change_kind="source_form_added",
+    )
+    planner = RevalidationPlanner(database)
+    assert planner.plan([occurrence_change])["planned"] == 1
+    with database.transaction() as connection:
+        translation = connection.execute(
+            """SELECT tv.knowledge_version, b.source_text
+               FROM translation_versions tv JOIN blocks b ON b.id=tv.block_id
+               WHERE tv.id=?""",
+            (translation_id,),
+        ).fetchone()
+        connection.execute(
+            """INSERT INTO dependencies(
+                   translation_id, dependency_type, dependency_id,
+                   knowledge_version, dependency_fingerprint,
+                   matched_form, source_spans_json)
+               VALUES(?, 'concept', 'concept-later-dependency', ?, 'old', ?, ?)""",
+            (
+                translation_id,
+                translation["knowledge_version"],
+                translation["source_text"],
+                json.dumps([[0, len(translation["source_text"])]]),
+            ),
+        )
+    dependency_change = _insert_revalidation_change(
+        database,
+        subject_type="concept",
+        subject_id="concept-later-dependency",
+        new_fingerprint="dependency-change",
+    )
+
+    assert planner.plan([dependency_change])["merged"] == 1
+    with closing(database.connect()) as connection:
+        payload = json.loads(
+            connection.execute("SELECT result_json FROM revalidation_tasks").fetchone()[0]
+        )
+    reasons = {reason["change_id"]: reason for reason in payload["reasons"]}
+    assert reasons[occurrence_change]["via"] == ["occurrence"]
+    assert reasons[dependency_change]["via"] == ["dependency"]
+    assert reasons[occurrence_change]["subjects"] == [
+        {"subject_id": lexeme_id, "subject_type": "lexeme"}
+    ]
+
+
+def test_revalidation_pending_merge_rejects_missing_old_provenance_atomically(tmp_path):
+    database = _database(tmp_path, ["Alpha"])
+    _insert_revalidation_translation(
+        database,
+        "block-0",
+        dependency=("concept", "concept-protocol", "old"),
+    )
+    first = _insert_revalidation_change(
+        database, subject_type="concept", subject_id="concept-protocol"
+    )
+    planner = RevalidationPlanner(database)
+    planner.plan([first])
+    with database.transaction() as connection:
+        payload = json.loads(
+            connection.execute("SELECT result_json FROM revalidation_tasks").fetchone()[0]
+        )
+        payload["reasons"] = []
+        connection.execute(
+            "UPDATE revalidation_tasks SET result_json=?",
+            (json.dumps(payload, sort_keys=True),),
+        )
+    with closing(database.connect()) as connection:
+        before = tuple(connection.execute("SELECT * FROM revalidation_tasks").fetchone())
+    second = _insert_revalidation_change(
+        database,
+        subject_type="concept",
+        subject_id="concept-protocol",
+        new_fingerprint="newer",
+    )
+
+    with pytest.raises(ValueError, match="provenance"):
+        planner.plan([second])
+
+    with closing(database.connect()) as connection:
+        after = tuple(connection.execute("SELECT * FROM revalidation_tasks").fetchone())
+    assert after == before
 
 
 def test_revalidation_validating_snapshot_is_immutable_with_pending_successor(tmp_path):
@@ -2286,6 +2511,44 @@ def test_revalidation_expands_only_database_verified_concept_redirects(tmp_path)
         (subject["subject_type"], subject["subject_id"])
         for subject in json.loads(tasks[0]["result_json"])["subjects"]
     } == {("concept", retired_id)}
+    with database.transaction() as connection:
+        translation = connection.execute(
+            """SELECT tv.knowledge_version, b.source_text
+               FROM translation_versions tv JOIN blocks b ON b.id=tv.block_id
+               WHERE tv.id=?""",
+            (real_translation,),
+        ).fetchone()
+        connection.execute(
+            """INSERT INTO dependencies(
+                   translation_id, dependency_type, dependency_id,
+                   knowledge_version, dependency_fingerprint,
+                   matched_form, source_spans_json)
+               VALUES(?, 'concept', 'concept-after-redirect', ?, 'old', ?, ?)""",
+            (
+                real_translation,
+                translation["knowledge_version"],
+                translation["source_text"],
+                json.dumps([[0, len(translation["source_text"])]]),
+            ),
+        )
+    later_change = _insert_revalidation_change(
+        database,
+        subject_type="concept",
+        subject_id="concept-after-redirect",
+        new_fingerprint="later-change",
+    )
+
+    assert RevalidationPlanner(database).plan([later_change])["merged"] == 1
+    with closing(database.connect()) as connection:
+        merged_payload = json.loads(
+            connection.execute("SELECT result_json FROM revalidation_tasks").fetchone()[0]
+        )
+    reasons = {
+        reason["change_id"]: reason for reason in merged_payload["reasons"]
+    }
+    assert reasons[change_id]["subjects"] == [
+        {"subject_id": retired_id, "subject_type": "concept"}
+    ]
 
 
 def test_revalidation_expands_only_verified_rule_and_lexeme_relationships(tmp_path):
@@ -2435,9 +2698,11 @@ def test_revalidation_rejects_oversized_final_result_atomically(tmp_path):
         ).fetchone()[0] == 0
 
 
-def test_revalidation_plans_all_real_translations_but_not_ready_blocks(tmp_path):
-    translated = _database(tmp_path / "translated", [f"Alpha {i}" for i in range(36)])
-    for index in range(36):
+def test_revalidation_scales_to_one_thousand_active_completed_translations(tmp_path):
+    translated = _database(
+        tmp_path / "translated", [f"Alpha {i}" for i in range(1_000)]
+    )
+    for index in range(1_000):
         _insert_revalidation_translation(
             translated,
             f"block-{index}",
@@ -2446,7 +2711,7 @@ def test_revalidation_plans_all_real_translations_but_not_ready_blocks(tmp_path)
     change_id = _insert_revalidation_change(
         translated, subject_type="concept", subject_id="concept-many"
     )
-    assert RevalidationPlanner(translated).plan([change_id])["planned"] == 36
+    assert RevalidationPlanner(translated).plan([change_id])["planned"] == 1_000
 
     ready = _database(tmp_path / "ready", [f"Alpha {i}" for i in range(36)])
     ready_change = _insert_revalidation_change(

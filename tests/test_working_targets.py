@@ -937,15 +937,8 @@ def test_target_change_records_change_then_planner_targets_only_active_translati
         [{"concept_id": concept_id, "target": "塞万里安", "rules": []}]
     )
 
-    with closing(database.connect()) as connection:
-        change_ids = [
-            row[0]
-            for row in connection.execute(
-                "SELECT id FROM knowledge_changes WHERE knowledge_version=?",
-                (result["knowledge_version"],),
-            )
-        ]
-    planned = RevalidationPlanner(database).plan(change_ids)
+    assert result["change_ids"] == sorted(set(result["change_ids"]))
+    planned = RevalidationPlanner(database).plan(result["change_ids"])
 
     assert result["affected_blocks"] == 0
     assert planned["planned"] == 1

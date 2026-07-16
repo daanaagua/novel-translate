@@ -21,11 +21,15 @@ _MAX_PAYLOAD_BYTES = 64 * 1024
 _MAX_PAYLOAD_IDS = 64
 _MAX_SUBJECT_ID_CHARS = 256
 _MAX_RESULT_SUBJECTS = 128
-_MAX_RESULT_REASONS = 256
+_MAX_RESULT_REASONS = MAX_CHANGE_IDS
 
 
 class PlanningBudgetError(ValueError):
     """Raised before committing a plan that exceeds a persisted size budget."""
+
+
+class PlanningProtocolError(ValueError):
+    """Raised when persisted task provenance cannot be safely merged."""
 
 
 @dataclass
@@ -63,7 +67,7 @@ def _task_id(translation_id: int, change_hash: str) -> str:
     return f"revalidate_{digest[:24]}"
 
 
-def _result_change_ids(raw: Any) -> set[int]:
+def _parse_task_result(raw: Any) -> dict[str, Any]:
     if not isinstance(raw, str):
         raise ValueError("pending revalidation result_json must be text")
     if len(raw.encode("utf-8")) > MAX_RESULT_BYTES:
@@ -108,16 +112,52 @@ def _result_change_ids(raw: Any) -> set[int]:
         or item["change_id"] <= 0
         or not isinstance(item.get("change_kind"), str)
         or not isinstance(item.get("via"), list)
+        or not item["via"]
         or any(not isinstance(via, str) for via in item["via"])
+        or not isinstance(item.get("subjects"), list)
+        or not item["subjects"]
+        or any(
+            not isinstance(subject, dict)
+            or not isinstance(subject.get("subject_type"), str)
+            or not isinstance(subject.get("subject_id"), str)
+            for subject in item["subjects"]
+        )
         for item in reasons
     ):
-        raise ValueError("pending revalidation reasons are invalid")
+        raise PlanningProtocolError(
+            "pending revalidation provenance reasons are invalid"
+        )
     for key in ("omitted_subjects", "omitted_reasons"):
         if key in payload and (type(payload[key]) is not int or payload[key] < 0):
             raise ValueError(f"pending revalidation {key} must be a non-negative integer")
-    if reasons and len(reasons) + int(payload.get("omitted_reasons", 0)) != len(values):
-        raise ValueError("pending revalidation reason count is inconsistent")
-    return set(values)
+    if int(payload.get("omitted_reasons", 0)) != 0:
+        raise PlanningProtocolError(
+            "pending revalidation provenance cannot omit reasons"
+        )
+    if len(reasons) != len(values):
+        raise PlanningProtocolError(
+            "pending revalidation provenance reason count is inconsistent"
+        )
+    details: dict[int, dict[str, Any]] = {}
+    for reason in reasons:
+        change_id = int(reason["change_id"])
+        if change_id not in values or change_id in details:
+            raise PlanningProtocolError(
+                "pending revalidation provenance change IDs are inconsistent"
+            )
+        details[change_id] = {
+            "change_kind": str(reason["change_kind"]),
+            "via": tuple(sorted(set(str(value) for value in reason["via"]))),
+            "subjects": tuple(
+                sorted(
+                    {
+                        (str(subject["subject_type"]), str(subject["subject_id"]))
+                        for subject in reason["subjects"]
+                    }
+                )
+            ),
+        }
+    return {"change_ids": set(values), "details": details, "payload": payload}
 
 
 def _authentic_source(source_text: str, source_hash: str) -> bool:
@@ -173,16 +213,24 @@ class RevalidationPlanner:
         if retired_id == canonical_id:
             return False
         retired = connection.execute(
-            "SELECT retired_version FROM concepts WHERE id=?", (retired_id,)
+            "SELECT created_version, retired_version FROM concepts WHERE id=?",
+            (retired_id,),
         ).fetchone()
         canonical = connection.execute(
-            "SELECT 1 FROM concepts WHERE id=?", (canonical_id,)
+            "SELECT created_version, retired_version FROM concepts WHERE id=?",
+            (canonical_id,),
         ).fetchone()
         if (
             retired is None
             or canonical is None
+            or int(retired["created_version"]) > change_version
+            or int(canonical["created_version"]) > change_version
             or retired["retired_version"] is None
             or int(retired["retired_version"]) > change_version
+            or (
+                canonical["retired_version"] is not None
+                and int(canonical["retired_version"]) <= change_version
+            )
         ):
             return False
         current = retired_id
@@ -231,7 +279,10 @@ class RevalidationPlanner:
                 "canonical_concept_id", payload.get("canonical_id", subject_id)
             )
             if explicit_canonical == subject_id and connection.execute(
-                "SELECT 1 FROM concepts WHERE id=?", (subject_id,)
+                """SELECT 1 FROM concepts
+                   WHERE id=? AND created_version<=?
+                     AND (retired_version IS NULL OR retired_version>?)""",
+                (subject_id, change_version, change_version),
             ).fetchone() is not None:
                 values: list[Any] = []
                 for key in ("retired_concept_id", "old_concept_id"):
@@ -269,8 +320,9 @@ class RevalidationPlanner:
                     continue
                 if connection.execute(
                     f"""SELECT 1 FROM rendering_rules
-                         WHERE id=? AND {owner_column}=? AND created_version<=?""",
-                    (rule_id, subject_id, change_version),
+                         WHERE id=? AND {owner_column}=? AND created_version<=?
+                           AND (retired_version IS NULL OR retired_version>?)""",
+                    (rule_id, subject_id, change_version, change_version),
                 ).fetchone() is not None:
                     subjects.add(("rule", rule_id))
 
@@ -292,8 +344,9 @@ class RevalidationPlanner:
                     continue
                 if connection.execute(
                     """SELECT 1 FROM concept_lexemes
-                       WHERE concept_id=? AND lexeme_id=? AND created_version<=?""",
-                    (subject_id, lexeme_id, change_version),
+                       WHERE concept_id=? AND lexeme_id=? AND created_version<=?
+                         AND (retired_version IS NULL OR retired_version>?)""",
+                    (subject_id, lexeme_id, change_version, change_version),
                 ).fetchone() is not None:
                     subjects.add(("lexeme", lexeme_id))
         return sorted(subjects)
@@ -544,7 +597,9 @@ class RevalidationPlanner:
                FROM revalidation_subjects subject
                JOIN concept_lexemes link
                  ON link.concept_id=subject.subject_id
-                AND link.retired_version IS NULL
+                AND link.created_version<=subject.knowledge_version
+                AND (link.retired_version IS NULL
+                     OR link.retired_version>subject.knowledge_version)
                 AND subject.subject_type='concept'
                JOIN form_occurrences occurrence ON occurrence.lexeme_id=link.lexeme_id
                JOIN blocks b ON b.id=occurrence.block_id
@@ -649,11 +704,12 @@ class RevalidationPlanner:
             (candidate.translation_id,),
         ).fetchall()
         pending = [row for row in tasks if row["status"] == "pending"]
-        task_change_ids: dict[str, set[int]] = {}
+        task_results: dict[str, dict[str, Any]] = {}
         for row in tasks:
             row_id = str(row["id"])
-            parsed_ids = _result_change_ids(row["result_json"])
-            task_change_ids[row_id] = parsed_ids
+            parsed_result = _parse_task_result(row["result_json"])
+            parsed_ids = set(parsed_result["change_ids"])
+            task_results[row_id] = parsed_result
             if (
                 int(row["from_knowledge_version"]) != candidate.from_version
                 or str(row["block_id"]) != candidate.block_id
@@ -662,6 +718,14 @@ class RevalidationPlanner:
             persisted_changes = self._change_rows(connection, parsed_ids)
             if set(persisted_changes) != parsed_ids:
                 raise ValueError("pending revalidation task references unknown changes")
+            if any(
+                parsed_result["details"][change_id]["change_kind"]
+                != str(persisted_changes[change_id]["change_kind"])
+                for change_id in parsed_ids
+            ):
+                raise PlanningProtocolError(
+                    "pending revalidation provenance change kind is inconsistent"
+                )
             if any(
                 int(change["knowledge_version"]) <= candidate.from_version
                 for change in persisted_changes.values()
@@ -689,7 +753,7 @@ class RevalidationPlanner:
         validating_ids: set[int] = set()
         for row in tasks:
             if row["status"] == "validating":
-                validating_ids.update(task_change_ids[str(row["id"])])
+                validating_ids.update(task_results[str(row["id"])]["change_ids"])
         for detail in candidate.changes.values():
             if int(detail["knowledge_version"]) <= candidate.from_version:
                 raise ValueError("revalidation changes must be newer than translation")
@@ -698,11 +762,20 @@ class RevalidationPlanner:
             return None
 
         existing_ids: set[int] = set()
+        existing_details: dict[int, dict[str, Any]] = {}
         current: sqlite3.Row | None = pending[0] if pending else None
         if current is not None:
-            existing_ids.update(task_change_ids[str(current["id"])])
+            for task in pending:
+                result = task_results[str(task["id"])]
+                existing_ids.update(result["change_ids"])
+                for change_id, detail in result["details"].items():
+                    prior = existing_details.get(change_id)
+                    if prior is not None and prior != detail:
+                        raise PlanningProtocolError(
+                            "pending revalidation provenance conflicts across tasks"
+                        )
+                    existing_details[change_id] = detail
             for duplicate in pending[1:]:
-                existing_ids.update(task_change_ids[str(duplicate["id"])])
                 connection.execute(
                     """UPDATE revalidation_tasks
                        SET status='resolved_noop', result_json=?, resolved_at=?
@@ -756,7 +829,9 @@ class RevalidationPlanner:
         if conflict is not None:
             return "unchanged" if current is not None else None
 
-        result_json = self._task_result(candidate, merged_ids, change_rows)
+        result_json = self._task_result(
+            candidate, merged_ids, change_rows, existing_details
+        )
         if len(result_json.encode("utf-8")) > MAX_RESULT_BYTES:
             raise PlanningBudgetError("revalidation result exceeds byte budget")
         if current is None:
@@ -793,28 +868,36 @@ class RevalidationPlanner:
         candidate: _Candidate,
         change_ids: set[int],
         change_rows: dict[int, sqlite3.Row],
+        persisted_details: dict[int, dict[str, Any]] | None = None,
     ) -> str:
+        persisted_details = persisted_details or {}
         subjects: set[tuple[str, str]] = set()
         reasons: list[dict[str, Any]] = []
         for change_id in sorted(change_ids):
+            persisted = persisted_details.get(change_id)
             detail = candidate.changes.get(change_id)
-            if detail is None:
-                row = change_rows[change_id]
-                change_subjects = {
-                    (str(row["subject_type"]), str(row["subject_id"]))
-                }
-                vias = ["dependency"]
-                change_kind = str(row["change_kind"])
-            else:
+            if persisted is not None:
+                change_subjects = set(persisted["subjects"])
+                vias = list(persisted["via"])
+                change_kind = str(persisted["change_kind"])
+            elif detail is not None:
                 change_subjects = set(detail["subjects"])
                 vias = sorted(detail["via"])
                 change_kind = str(detail["change_kind"])
+            else:
+                raise PlanningProtocolError(
+                    f"missing revalidation provenance for change {change_id}"
+                )
             subjects.update(change_subjects)
             reasons.append(
                 {
                     "change_id": change_id,
                     "change_kind": change_kind,
                     "via": vias,
+                    "subjects": [
+                        {"subject_type": subject_type, "subject_id": subject_id}
+                        for subject_type, subject_id in sorted(change_subjects)
+                    ],
                 }
             )
         ordered_subjects = sorted(subjects)
@@ -825,8 +908,8 @@ class RevalidationPlanner:
                 for subject_type, subject_id in ordered_subjects[:_MAX_RESULT_SUBJECTS]
             ],
             "omitted_subjects": max(0, len(ordered_subjects) - _MAX_RESULT_SUBJECTS),
-            "reasons": reasons[:_MAX_RESULT_REASONS],
-            "omitted_reasons": max(0, len(reasons) - _MAX_RESULT_REASONS),
+            "reasons": reasons,
+            "omitted_reasons": 0,
             "source_hash": candidate.source_hash,
         }
         return _canonical_json(payload)

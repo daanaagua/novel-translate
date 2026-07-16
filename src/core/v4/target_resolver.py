@@ -285,6 +285,7 @@ class TargetResolver:
         resolved = queued = changed = 0
         last_version = None
         affected_blocks = 0
+        change_ids: set[int] = set()
         try:
             for start in range(0, len(candidates), 24):
                 batch = candidates[start : start + 24]
@@ -303,6 +304,7 @@ class TargetResolver:
                 resolved += int(applied["resolved"])
                 changed += int(applied["changed"])
                 affected_blocks += int(applied["affected_blocks"])
+                change_ids.update(int(value) for value in applied["change_ids"])
                 if applied["knowledge_version"] is not None:
                     last_version = applied["knowledge_version"]
             status = "completed_with_errors" if queued else "completed"
@@ -320,4 +322,5 @@ class TargetResolver:
             "affected_blocks": affected_blocks,
             "subject_type": "lexeme",
             "prepared_blocks": preparation,
+            "change_ids": sorted(change_ids),
         }

@@ -2105,7 +2105,7 @@ class CoreferenceCoordinator:
         self,
         case: CoreferenceCase,
         connection: sqlite3.Connection,
-    ) -> tuple[str | None, int]:
+    ) -> tuple[str | None, int, list[int]]:
         related = self._related_active_concepts(case, connection)
         if len(related) > 1:
             return None, 0
@@ -2149,7 +2149,8 @@ class CoreferenceCoordinator:
 
         related = self._related_active_concepts(case, connection)
         if len(related) < 2:
-            return self._safe_model_same_binding(case, connection)
+            target, changed = self._safe_model_same_binding(case, connection)
+            return target, changed, []
         mention_ids = tuple(mention.mention_id for mention in case.mentions)
         try:
             with self.database._method_savepoint(
@@ -2162,7 +2163,7 @@ class CoreferenceCoordinator:
                     connection=connection,
                 )
                 if not bool(result.get("changed")):
-                    return str(result["canonical_id"]), 0
+                    return str(result["canonical_id"]), 0, []
                 canonical_id = str(result["canonical_id"])
                 self.database.bind_mentions(
                     canonical_id,
@@ -2180,13 +2181,13 @@ class CoreferenceCoordinator:
                     raise _ProtectedBindingConflict(
                         "dual-model same cannot safely bind every merged mention"
                     )
-                return canonical_id, 1
+                return canonical_id, 1, list(result["change_ids"])
         except (
             _ProtectedBindingConflict,
             ConceptAnchorConflictError,
             ConceptMergeConflictError,
         ):
-            return None, 0
+            return None, 0, []
 
     def _complete_cached_same(
         self,
@@ -2194,7 +2195,7 @@ class CoreferenceCoordinator:
         decision_id: str,
         *,
         connection: sqlite3.Connection | None = None,
-    ) -> int:
+    ) -> tuple[int, list[int]]:
         if connection is None:
             with self.database.transaction() as owned_connection:
                 return self._complete_cached_same(
@@ -2202,7 +2203,7 @@ class CoreferenceCoordinator:
                     decision_id,
                     connection=owned_connection,
                 )
-        target, changed = self._merge_model_same_anchors(
+        target, changed, change_ids = self._merge_model_same_anchors(
             case,
             decision_id,
             connection,
@@ -2227,7 +2228,7 @@ class CoreferenceCoordinator:
                     "UPDATE coreference_decisions SET votes_json=? WHERE id=?",
                     (self._decision_votes_json(votes), decision_id),
                 )
-        return changed
+        return changed, change_ids
 
     @staticmethod
     def _model_vote_payload(
@@ -2332,13 +2333,13 @@ class CoreferenceCoordinator:
     ) -> tuple[str, str]:
         """Resolve one case after deterministic rules, never creating a queue item."""
 
-        relation, reason, _, _, _ = self._resolve_dual_model_with_effect(case)
+        relation, reason, _, _, _, _ = self._resolve_dual_model_with_effect(case)
         return relation, reason
 
     def _resolve_dual_model_with_effect(
         self,
         case: CoreferenceCase,
-    ) -> tuple[str, str, int, bool, bool]:
+    ) -> tuple[str, str, int, bool, bool, list[int]]:
         """Return relation, reason, binding changes, model source, and fallback use."""
 
         preflight = self._deterministic_relation(case)
@@ -2351,12 +2352,12 @@ class CoreferenceCoordinator:
                 case, semantic_cache_key(case, model_names)
             )
             if cached is not None:
-                changed = (
+                changed, change_ids = (
                     self._complete_cached_same(case, cached[2])
                     if cached[0] == "same"
-                    else 0
+                    else (0, [])
                 )
-                return cached[0], cached[1], changed, True, False
+                return cached[0], cached[1], changed, True, False, change_ids
         deterministic = self._resolve_deterministic_with_effect(case)
         if deterministic[0] is not None:
             return (
@@ -2365,23 +2366,24 @@ class CoreferenceCoordinator:
                 deterministic[2],
                 False,
                 False,
+                [],
             )
         return self._resolve_dual_models_only(case)
 
     def _resolve_dual_models_only(
         self,
         case: CoreferenceCase,
-    ) -> tuple[str, str, int, bool, bool]:
+    ) -> tuple[str, str, int, bool, bool, list[int]]:
         client_a, client_b, model_names = self._model_clients()
         decision_payload_hash = semantic_cache_key(case, model_names)
         cached = self._cached_dual_decision(case, decision_payload_hash)
         if cached is not None:
-            changed = (
+            changed, change_ids = (
                 self._complete_cached_same(case, cached[2])
                 if cached[0] == "same"
-                else 0
+                else (0, [])
             )
-            return cached[0], cached[1], changed, True, False
+            return cached[0], cached[1], changed, True, False, change_ids
 
         frozen_payload_a, frozen_payload_b = self.model_payloads(
             case, model_names
@@ -2461,6 +2463,7 @@ class CoreferenceCoordinator:
                         deterministic[2],
                         False,
                         False,
+                        [],
                     )
                 raced = self._cached_dual_decision(
                     case,
@@ -2468,16 +2471,16 @@ class CoreferenceCoordinator:
                     connection=connection,
                 )
                 if raced is not None:
-                    changed = (
+                    changed, change_ids = (
                         self._complete_cached_same(
                             case,
                             raced[2],
                             connection=connection,
                         )
                         if raced[0] == "same"
-                        else 0
+                        else (0, [])
                     )
-                    return raced[0], raced[1], changed, True, False
+                    return raced[0], raced[1], changed, True, False, change_ids
 
                 target_concept_id = None
                 bindings_changed = 0
@@ -2516,6 +2519,7 @@ class CoreferenceCoordinator:
                 }
 
                 fallback = None
+                change_ids: list[int] = []
                 if relation == "uncertain":
                     fallback = self.database.apply_coreference_fallback(
                         case.lexeme_id,
@@ -2523,6 +2527,7 @@ class CoreferenceCoordinator:
                         connection=connection,
                     )
                     model_votes.append(fallback)
+                    change_ids.extend(int(value) for value in fallback["change_ids"])
 
                 votes_json = self._decision_votes_json(model_votes)
 
@@ -2588,11 +2593,13 @@ class CoreferenceCoordinator:
                     (
                         target_concept_id,
                         bindings_changed,
+                        merge_change_ids,
                     ) = self._merge_model_same_anchors(
                         case,
                         decision_id,
                         connection,
                     )
+                    change_ids.extend(merge_change_ids)
                     resolution_vote["effect"] = {
                         "bindings_changed": bindings_changed,
                         "unified_identity": target_concept_id is not None,
@@ -2667,9 +2674,16 @@ class CoreferenceCoordinator:
                         connection=connection,
                         archive_payload=False,
                     )
-        return relation, reason, bindings_changed, True, fallback is not None
+        return (
+            relation,
+            reason,
+            bindings_changed,
+            True,
+            fallback is not None,
+            sorted(set(change_ids)),
+        )
 
-    def run(self, max_cases: int | None = None) -> dict[str, int]:
+    def run(self, max_cases: int | None = None) -> dict[str, Any]:
         """Resolve frozen cases without producing blocking human work."""
 
         cases = self.freeze_cases(max_cases=max_cases)
@@ -2683,10 +2697,19 @@ class CoreferenceCoordinator:
             "protocol_failures": 0,
             "fallbacks": 0,
         }
+        change_ids: set[int] = set()
         for case in cases:
-            relation, rule, bindings_changed, model_result, fallback_applied = (
+            (
+                relation,
+                rule,
+                bindings_changed,
+                model_result,
+                fallback_applied,
+                case_change_ids,
+            ) = (
                 self._resolve_dual_model_with_effect(case)
             )
+            change_ids.update(case_change_ids)
             if relation == "same":
                 if model_result:
                     summary["model_merges"] += int(bindings_changed > 0)
@@ -2701,7 +2724,7 @@ class CoreferenceCoordinator:
                 summary["fallbacks"] += int(fallback_applied)
                 if rule == "model_protocol_failure":
                     summary["protocol_failures"] += 1
-        return summary
+        return {**summary, "change_ids": sorted(change_ids)}
 
     @staticmethod
     def payload_bytes(case: CoreferenceCase) -> bytes:

@@ -4333,6 +4333,7 @@ def test_dual_model_run_summary_is_exact_and_honors_max_cases(tmp_path):
         "uncertain": 0,
         "protocol_failures": 0,
         "fallbacks": 0,
+        "change_ids": [],
     }
     assert len(clients_a[0].calls) == len(clients_b[0].calls) == 1
 

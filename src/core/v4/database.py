@@ -1601,6 +1601,7 @@ class V4Database:
                     "canonical_id": canonical_id,
                     "merged_concept_ids": [],
                     "changed": False,
+                    "change_ids": [],
                     "knowledge_version": current_version,
                     "decision_id": decision_id,
                     "reason": reason,
@@ -2139,7 +2140,8 @@ class V4Database:
             canonical_new_state["effective_subject_link"] = (
                 f"merge:{canonical_id}:{merged_digest}"
             )
-            self.record_render_change(
+            change_ids: list[int] = []
+            change = self.record_render_change(
                 connection,
                 subject_type="concept",
                 subject_id=canonical_id,
@@ -2149,8 +2151,10 @@ class V4Database:
                 reason=f"{reason}; decision={decision_id}",
                 knowledge_version=version,
             )
+            if change["change_id"] is not None:
+                change_ids.append(int(change["change_id"]))
             for old_id in merged_ids:
-                self.record_render_change(
+                change = self.record_render_change(
                     connection,
                     subject_type="concept",
                     subject_id=old_id,
@@ -2162,6 +2166,8 @@ class V4Database:
                     reason=f"{reason}; canonical={canonical_id}",
                     knowledge_version=version,
                 )
+                if change["change_id"] is not None:
+                    change_ids.append(int(change["change_id"]))
             self.record_audit_call(
                 run_id=None,
                 block_id=None,
@@ -2190,6 +2196,7 @@ class V4Database:
                 "canonical_id": canonical_id,
                 "merged_concept_ids": merged_ids,
                 "changed": True,
+                "change_ids": sorted(set(change_ids)),
                 "knowledge_version": version,
                 "decision_id": decision_id,
                 "reason": reason,
@@ -3002,6 +3009,7 @@ class V4Database:
 
         changed = False
         knowledge_version: int | None = None
+        change_ids: list[int] = []
         if (
             selected
             and not lexeme_locked
@@ -3025,7 +3033,7 @@ class V4Database:
                     knowledge_version = self.create_knowledge_version(
                         f"coreference fallback target: {lexeme_id}", connection
                     )
-                    self.record_render_change(
+                    change = self.record_render_change(
                         connection,
                         subject_type="lexeme",
                         subject_id=lexeme_id,
@@ -3037,6 +3045,8 @@ class V4Database:
                         reason=f"coreference fallback target: {lexeme_id}",
                         knowledge_version=knowledge_version,
                     )
+                    if change["change_id"] is not None:
+                        change_ids.append(int(change["change_id"]))
         digest = hashlib.sha256()
         for candidate in ranked:
             digest.update(
@@ -3103,6 +3113,7 @@ class V4Database:
             "reason": reason,
             "changed": changed,
             "knowledge_version": knowledge_version,
+            "change_ids": sorted(set(change_ids)),
             "candidates": bounded_candidates,
             "total_candidates": len(ranked),
             "omitted_candidates": max(
@@ -7625,7 +7636,8 @@ class V4Database:
         kind: str,
         description: str,
         status: str = "legacy_provisional",
-    ) -> str:
+        return_change_ids: bool = False,
+    ) -> str | Dict[str, Any]:
         normalized = normalize_english_form(source)
         concept_id = stable_id("concept", normalized)
         with self.transaction() as connection:
@@ -7673,7 +7685,11 @@ class V4Database:
                     rule_exists,
                 )
             ):
-                return concept_id
+                return (
+                    {"concept_id": concept_id, "change_ids": []}
+                    if return_change_ids
+                    else concept_id
+                )
             old_state = self._render_state_for_subject(
                 connection, "concept", concept_id
             )
@@ -7722,7 +7738,7 @@ class V4Database:
             new_state = self._render_state_for_subject(
                 connection, "concept", concept_id
             )
-            self.record_render_change(
+            change = self.record_render_change(
                 connection,
                 subject_type="concept",
                 subject_id=concept_id,
@@ -7731,6 +7747,11 @@ class V4Database:
                 change_kind="rendering_rule" if target else "concept_import",
                 reason=f"import legacy concept: {source}",
                 knowledge_version=version,
+            )
+            change_ids = (
+                [int(change["change_id"])]
+                if change["change_id"] is not None
+                else []
             )
             self.record_audit_call(
                 run_id=None,
@@ -7753,6 +7774,8 @@ class V4Database:
                 connection=connection,
                 archive_payload=False,
             )
+        if return_change_ids:
+            return {"concept_id": concept_id, "change_ids": change_ids}
         return concept_id
 
     def lock_concept_translation(
@@ -7806,6 +7829,7 @@ class V4Database:
                     "target": target,
                     "knowledge_version": None,
                     "affected_translations": 0,
+                    "change_ids": [],
                 }
             version = self.create_knowledge_version(
                 f"human lock concept translation: {source}", connection
@@ -7872,7 +7896,7 @@ class V4Database:
             semantic_changed = render_fingerprint(
                 "concept", concept_id, old_state
             ) != render_fingerprint("concept", concept_id, new_state)
-            self.record_render_change(
+            change = self.record_render_change(
                 connection,
                 subject_type="concept",
                 subject_id=concept_id,
@@ -7882,6 +7906,11 @@ class V4Database:
                 reason=f"human lock concept translation: {source}",
                 knowledge_version=version,
                 record_metadata=True,
+            )
+            change_ids = (
+                [int(change["change_id"])]
+                if change["change_id"] is not None
+                else []
             )
             connection.execute(
                 """UPDATE verification_tasks
@@ -7896,6 +7925,7 @@ class V4Database:
             "target": target,
             "knowledge_version": version,
             "affected_translations": 0,
+            "change_ids": change_ids,
         }
 
     def merge_concept_forms(
@@ -8031,6 +8061,7 @@ class V4Database:
                     "aliases": alias_values,
                     "merged_concept_ids": [],
                     "changed": False,
+                    "change_ids": [],
                     "knowledge_version": current_version,
                     "authorization_audit_id": None,
                     "decision_id": None,
@@ -8080,8 +8111,9 @@ class V4Database:
                 connection=connection,
                 archive_payload=False,
             )
+            change_ids: list[int] = []
             if preparation_changed:
-                self.record_render_change(
+                change = self.record_render_change(
                     connection,
                     subject_type="concept",
                     subject_id=canonical_id,
@@ -8093,6 +8125,8 @@ class V4Database:
                     reason=f"human prepare concept forms: {canonical_source}",
                     knowledge_version=preparation_version,
                 )
+                if change["change_id"] is not None:
+                    change_ids.append(int(change["change_id"]))
             if not needs_merge:
                 return {
                     "canonical_id": canonical_id,
@@ -8110,6 +8144,7 @@ class V4Database:
                     },
                     "rule_conflicts": 0,
                     "affected_translations": 0,
+                    "change_ids": sorted(set(change_ids)),
                 }
             reason = (
                 f"{HUMAN_CONCEPT_FORM_REDIRECT_PREFIX}{authorization_id}: "
@@ -8129,6 +8164,9 @@ class V4Database:
                 "aliases": alias_values,
                 "authorization_audit_id": authorization_id,
                 "affected_translations": affected_translations,
+                "change_ids": sorted(
+                    set(change_ids) | set(result.get("change_ids") or [])
+                ),
             }
 
     def import_legacy_translation(
@@ -8652,10 +8690,12 @@ class V4Database:
                     "knowledge_version": None,
                     "affected_blocks": 0,
                     "subjects": processed,
+                    "change_ids": [],
                 }
             version = self.create_knowledge_version(
                 "resolve provisional working translations", connection
             )
+            change_ids: list[int] = []
             for decision in changed:
                 subject_type = decision["subject_type"]
                 subject_id = decision["subject_id"]
@@ -8723,7 +8763,7 @@ class V4Database:
                     if decision["old_state"].get("rules") != new_state.get("rules")
                     else "target"
                 )
-                self.record_render_change(
+                change = self.record_render_change(
                     connection,
                     subject_type=subject_type,
                     subject_id=subject_id,
@@ -8733,6 +8773,8 @@ class V4Database:
                     reason="resolve provisional working translations",
                     knowledge_version=version,
                 )
+                if change["change_id"] is not None:
+                    change_ids.append(int(change["change_id"]))
             affected = self._invalidate_working_target_dependents(
                 connection,
                 [
@@ -8763,6 +8805,7 @@ class V4Database:
                     }
                     for item in changed
                 ],
+                "change_ids": sorted(set(change_ids)),
             }
 
     def _concept_snapshot_from_connection(
@@ -10366,7 +10409,8 @@ class V4Database:
         run_id: str,
         outcomes: Sequence[TranslationOutcome],
         enqueue_review: bool = False,
-    ) -> Optional[int]:
+        return_change_ids: bool = False,
+    ) -> Optional[int] | Dict[str, Any]:
         proposals = [
             (outcome, "term", payload)
             for outcome in outcomes
@@ -10378,7 +10422,11 @@ class V4Database:
             for payload in outcome.relation_proposals
         ]
         if not proposals:
-            return None
+            return (
+                {"knowledge_version": None, "change_ids": []}
+                if return_change_ids
+                else None
+            )
         proposals.sort(key=lambda item: (item[0].block.global_index, item[1], json.dumps(item[2], sort_keys=True)))
         with self.transaction() as connection:
             material_terms: Dict[str, tuple[str, str]] = {}
@@ -10407,6 +10455,7 @@ class V4Database:
             )
             has_novel_proposal = False
             changed_concepts: set[str] = set()
+            change_ids: list[int] = []
             old_render_states: Dict[str, Dict[str, Any]] = {}
             proposed_concepts: set[str] = set()
             seen_proposal_keys: set[tuple[str, str, str]] = set()
@@ -10548,7 +10597,7 @@ class V4Database:
                         ),
                     )
             for concept_id in sorted(changed_concepts):
-                self.record_render_change(
+                change = self.record_render_change(
                     connection,
                     subject_type="concept",
                     subject_id=concept_id,
@@ -10560,6 +10609,8 @@ class V4Database:
                     reason=f"translation proposals {run_id}",
                     knowledge_version=version,
                 )
+                if change["change_id"] is not None:
+                    change_ids.append(int(change["change_id"]))
             if proposed_concepts:
                 import re
 
@@ -10636,7 +10687,13 @@ class V4Database:
                             utc_now(),
                         ),
                     )
-            return version if has_novel_proposal else None
+            result_version = version if has_novel_proposal else None
+            if return_change_ids:
+                return {
+                    "knowledge_version": result_version,
+                    "change_ids": sorted(set(change_ids)) if has_novel_proposal else [],
+                }
+            return result_version
 
     def active_translations(self, pipeline: str = "parallel_v4") -> Dict[str, Dict[str, Any]]:
         with closing(self.connect()) as connection:
@@ -10739,7 +10796,8 @@ class V4Database:
         high_impact: bool = False,
         status: str = "proposed",
         locked: bool = False,
-    ) -> str:
+        return_change_ids: bool = False,
+    ) -> str | Dict[str, Any]:
         if kind not in {
             "translation_constraint",
             "temporal_constraint",
@@ -10784,7 +10842,11 @@ class V4Database:
                 and bool(existing["locked"]) == bool(locked)
                 and existing["retired_version"] is None
             ):
-                return claim_id
+                return (
+                    {"claim_id": claim_id, "change_ids": []}
+                    if return_change_ids
+                    else claim_id
+                )
             old_state = self._claim_state_for_subject(connection, claim_id)
             version = self.create_knowledge_version("create claim", connection)
             if existing is None:
@@ -10822,7 +10884,7 @@ class V4Database:
                     ),
                 )
             new_state = self._claim_state_for_subject(connection, claim_id)
-            self.record_render_change(
+            change = self.record_render_change(
                 connection,
                 subject_type="claim",
                 subject_id=claim_id,
@@ -10832,6 +10894,11 @@ class V4Database:
                 reason="create claim",
                 knowledge_version=version,
                 record_metadata=True,
+            )
+            change_ids = (
+                [int(change["change_id"])]
+                if change["change_id"] is not None
+                else []
             )
             if (high_impact or kind == "translation_constraint") and status in {
                 "proposed",
@@ -10860,6 +10927,8 @@ class V4Database:
                         utc_now(),
                     ),
                 )
+        if return_change_ids:
+            return {"claim_id": claim_id, "change_ids": change_ids}
         return claim_id
 
     def list_claims(self, include_retired: bool = False) -> List[Dict[str, Any]]:
@@ -11349,7 +11418,8 @@ class V4Database:
         run_id: str,
         task: Dict[str, Any],
         votes: Sequence[Dict[str, Any]],
-    ) -> str:
+        return_change_ids: bool = False,
+    ) -> str | Dict[str, Any]:
         with self.transaction() as connection:
             current = connection.execute(
                 "SELECT status FROM verification_tasks WHERE id=?",
@@ -11358,7 +11428,13 @@ class V4Database:
             if current is None:
                 raise KeyError(f"核验任务不存在: {task['id']}")
             if current["status"] != "open":
-                return str(current["status"])
+                current_status = str(current["status"])
+                return (
+                    {"status": current_status, "change_ids": []}
+                    if return_change_ids
+                    else current_status
+                )
+            change_ids: list[int] = []
             version = int(connection.execute("SELECT MAX(id) FROM knowledge_versions").fetchone()[0])
             for index, vote in enumerate(votes, start=1):
                 audit_id = self.record_audit_call(
@@ -11435,7 +11511,7 @@ class V4Database:
                     new_render_state = self._render_state_for_subject(
                         connection, "concept", str(task["subject_id"])
                     )
-                    self.record_render_change(
+                    change = self.record_render_change(
                         connection,
                         subject_type="concept",
                         subject_id=str(task["subject_id"]),
@@ -11450,12 +11526,14 @@ class V4Database:
                         reason=f"double verification {task['id']}",
                         knowledge_version=version,
                     )
+                    if change["change_id"] is not None:
+                        change_ids.append(int(change["change_id"]))
                 elif task["subject_type"] == "claim":
                     connection.execute(
                         "UPDATE claims SET status='verified' WHERE id=? AND locked=0",
                         (task["subject_id"],),
                     )
-                    self.record_render_change(
+                    change = self.record_render_change(
                         connection,
                         subject_type="claim",
                         subject_id=str(task["subject_id"]),
@@ -11467,6 +11545,8 @@ class V4Database:
                         reason=f"double verification {task['id']}",
                         knowledge_version=version,
                     )
+                    if change["change_id"] is not None:
+                        change_ids.append(int(change["change_id"]))
                 status = "verified"
             else:
                 status = "needs_human"
@@ -11487,6 +11567,8 @@ class V4Database:
                 "UPDATE verification_tasks SET status=?, resolved_at=? WHERE id=?",
                 (status, utc_now(), task["id"]),
             )
+            if return_change_ids:
+                return {"status": status, "change_ids": sorted(set(change_ids))}
             return status
 
     def list_human_queue(self, status: str = "open") -> List[Dict[str, Any]]:
@@ -11511,6 +11593,7 @@ class V4Database:
                 raise KeyError(f"人工队列项不存在: {item_id}")
             if row["status"] != "open":
                 raise ValueError(f"人工队列项 {item_id} 已处理: {row['status']}")
+            change_ids: list[int] = []
             if action == "retry":
                 if row["kind"] == "context_overflow" and row["block_id"]:
                     connection.execute(
@@ -11538,6 +11621,7 @@ class V4Database:
                     "status": "retried",
                     "knowledge_version": None,
                     "affected_translations": 0,
+                    "change_ids": [],
                 }
             if row["kind"] == "high_impact_verification":
                 payload = json.loads(row["payload_json"])
@@ -11620,7 +11704,7 @@ class V4Database:
                     new_render_state = self._render_state_for_subject(
                         connection, "concept", str(subject_id)
                     )
-                    self.record_render_change(
+                    change = self.record_render_change(
                         connection,
                         subject_type="concept",
                         subject_id=str(subject_id),
@@ -11634,6 +11718,8 @@ class V4Database:
                         reason=f"human {action} high impact item {item_id}",
                         knowledge_version=version,
                     )
+                    if change["change_id"] is not None:
+                        change_ids.append(int(change["change_id"]))
                 elif subject_type == "claim":
                     if action == "accept":
                         replacement_statement = str(
@@ -11651,7 +11737,7 @@ class V4Database:
                                WHERE id=? AND locked=0""",
                             (version, subject_id),
                         )
-                    self.record_render_change(
+                    change = self.record_render_change(
                         connection,
                         subject_type="claim",
                         subject_id=str(subject_id),
@@ -11663,6 +11749,8 @@ class V4Database:
                         reason=f"human {action} high impact item {item_id}",
                         knowledge_version=version,
                     )
+                    if change["change_id"] is not None:
+                        change_ids.append(int(change["change_id"]))
                 resolved_status = "accepted" if action == "accept" else "rejected"
                 connection.execute(
                     "UPDATE human_queue SET status=?, resolved_at=? WHERE id=?",
@@ -11673,6 +11761,7 @@ class V4Database:
                     "status": resolved_status,
                     "knowledge_version": version,
                     "affected_translations": 0,
+                    "change_ids": sorted(set(change_ids)),
                 }
             if row["kind"] != "translation_proposal":
                 raise ValueError("该队列项不是可接受或拒绝的知识建议")
@@ -11761,7 +11850,7 @@ class V4Database:
                     new_render_state = self._render_state_for_subject(
                         connection, "concept", concept_id
                     )
-                    self.record_render_change(
+                    change = self.record_render_change(
                         connection,
                         subject_type="concept",
                         subject_id=concept_id,
@@ -11775,6 +11864,8 @@ class V4Database:
                         reason=f"human {action} queue item {item_id}",
                         knowledge_version=version,
                     )
+                    if change["change_id"] is not None:
+                        change_ids.append(int(change["change_id"]))
             resolved_status = "accepted" if action == "accept" else "rejected"
             connection.execute(
                 "UPDATE human_queue SET status=?, resolved_at=? WHERE id=?",
@@ -11785,6 +11876,7 @@ class V4Database:
                 "status": resolved_status,
                 "knowledge_version": version,
                 "affected_translations": 0,
+                "change_ids": sorted(set(change_ids)),
             }
 
     def amend_human_item(self, item_id: int, replacement: str) -> Dict[str, Any]:
@@ -11820,7 +11912,7 @@ class V4Database:
                 "UPDATE human_queue SET payload_json=? WHERE id=?",
                 (json.dumps(payload, ensure_ascii=False), item_id),
             )
-            return {"id": item_id, "payload": payload}
+            return {"id": item_id, "payload": payload, "change_ids": []}
 
     def export_rows(self, pipeline: str = "parallel_v4") -> List[Dict[str, Any]]:
         with closing(self.connect()) as connection:

@@ -129,10 +129,15 @@ class V4Verifier:
         run_id = f"verify_{uuid4().hex}"
         self.database.start_run(run_id, "verify", {"max_tasks": max_tasks})
         verified = needs_human = 0
+        change_ids: set[int] = set()
         try:
             for task in tasks:
                 votes = [self._vote(task, 1), self._vote(task, 2)]
-                status = self.database.commit_verification_result(run_id, task, votes)
+                result = self.database.commit_verification_result(
+                    run_id, task, votes, return_change_ids=True
+                )
+                status = result["status"]
+                change_ids.update(int(value) for value in result["change_ids"])
                 verified += status == "verified"
                 needs_human += status == "needs_human"
             self.database.finish_run(run_id, "completed")
@@ -144,4 +149,5 @@ class V4Verifier:
             "tasks": len(tasks),
             "verified": verified,
             "needs_human": needs_human,
+            "change_ids": sorted(change_ids),
         }

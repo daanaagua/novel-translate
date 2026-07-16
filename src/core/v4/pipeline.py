@@ -794,6 +794,7 @@ class V4TranslationPipeline:
         completed = warnings = failed = manual = 0
         paused = False
         knowledge_stale = False
+        change_ids: set[int] = set()
         cursor = 0
         try:
             render_bundle = self.database.freeze_render_bundle(
@@ -818,6 +819,7 @@ class V4TranslationPipeline:
                 "final_workers": workers,
                 "knowledge_stale": False,
                 "frozen_knowledge_version": None,
+                "change_ids": [],
             }
         run_config["frozen_knowledge_version"] = knowledge_version
         run_config["target_snapshot_signature"] = target_signature
@@ -849,11 +851,20 @@ class V4TranslationPipeline:
                     wave_outcomes,
                     audit_mode=self.config.audit_mode,
                 )
-                proposal_version = self.database.commit_translation_proposals(
+                proposal_result = self.database.commit_translation_proposals(
                     run_id,
                     wave_outcomes,
                     enqueue_review=self.config.decision_mode == "interactive",
+                    return_change_ids=True,
                 )
+                if isinstance(proposal_result, dict):
+                    proposal_version = proposal_result["knowledge_version"]
+                    change_ids.update(
+                        int(value) for value in proposal_result["change_ids"]
+                    )
+                else:
+                    # Preserve compatibility with injected/legacy scalar writers.
+                    proposal_version = proposal_result
                 completed += sum(o.status == V4BlockStatus.COMPLETED.value for o in wave_outcomes)
                 warnings += sum(
                     o.status == V4BlockStatus.COMPLETED_WITH_WARNINGS.value
@@ -918,4 +929,5 @@ class V4TranslationPipeline:
             "final_workers": workers,
             "knowledge_stale": knowledge_stale,
             "frozen_knowledge_version": knowledge_version,
+            "change_ids": sorted(change_ids),
         }

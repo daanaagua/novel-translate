@@ -279,15 +279,8 @@ class ParallelV4V2Tests(unittest.TestCase):
             self.database.get_block_by_identifier(block.id).status,
             "completed",
         )
-        with closing(self.database.connect()) as connection:
-            change_ids = [
-                row[0]
-                for row in connection.execute(
-                    "SELECT id FROM knowledge_changes WHERE knowledge_version=?",
-                    (result["knowledge_version"],),
-                )
-            ]
-        planned = RevalidationPlanner(self.database).plan(change_ids)
+        self.assertEqual(result["change_ids"], sorted(set(result["change_ids"])))
+        planned = RevalidationPlanner(self.database).plan(result["change_ids"])
         self.assertEqual(planned["planned"], 1)
         self.assertEqual(self.database.status_summary()["needs_revalidate"], 1)
         self.assertEqual(
