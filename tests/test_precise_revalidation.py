@@ -2990,3 +2990,77 @@ def test_task11_lease_cas_expiry_and_completed_rerun(tmp_path):
     ).run()
     assert summary["claimed"] == 0
     assert model.requests == []
+
+
+def test_task11_claim_retires_inactive_translation_superseded_by_active_version(tmp_path):
+    database = _database(tmp_path, ["Alpha"])
+    old_translation = _task11_task(database, impact=1)
+    with database.transaction() as connection:
+        task = connection.execute("SELECT * FROM revalidation_tasks").fetchone()
+        connection.execute(
+            "UPDATE translation_versions SET active=0 WHERE id=?",
+            (old_translation,),
+        )
+        replacement = int(
+            connection.execute(
+                """INSERT INTO translation_versions(
+                       block_id, pipeline, knowledge_version, status,
+                       draft_translation, final_translation, active, created_at)
+                   VALUES('block-0', 'parallel_v4', ?, 'completed',
+                          'replacement', 'replacement', 1, 'now')""",
+                (task["to_knowledge_version"],),
+            ).lastrowid
+        )
+
+    assert database.claim_revalidation_task("worker-a") is None
+    assert database.claim_revalidation_task("worker-b") is None
+    with closing(database.connect()) as connection:
+        task = connection.execute("SELECT * FROM revalidation_tasks").fetchone()
+    assert task["status"] == "resolved_noop"
+    assert task["action"] == "superseded_by_active_translation"
+    assert task["replacement_translation_id"] == replacement
+    result = json.loads(task["result_json"])
+    assert result["replacement_translation_id"] == replacement
+    assert result["replacement_knowledge_version"] == task["to_knowledge_version"]
+    assert "_lease" not in result
+
+
+def test_task11_patch_rejects_claimed_translation_knowledge_version_drift(tmp_path):
+    database = _database(tmp_path, ["Alpha"])
+    old_translation = _task11_task(database, impact=1)
+    claim = database.claim_revalidation_task("worker-a")
+    assert claim is not None
+    block = database.get_block_by_identifier("block-0")
+    outcome = TranslationOutcome(
+        block=block,
+        knowledge_version=int(claim.task_snapshot["to_knowledge_version"]),
+        status="completed",
+        draft_translation="新译名完整译文",
+        final_translation="新译名完整译文",
+    )
+    with database.transaction() as connection:
+        connection.execute(
+            "UPDATE translation_versions SET knowledge_version=? WHERE id=?",
+            (claim.task_snapshot["to_knowledge_version"], old_translation),
+        )
+
+    with pytest.raises(ValueError, match="knowledge|snapshot|stale"):
+        database.commit_revalidation_resolution(
+            claim,
+            status="resolved_patch",
+            action="patch_required",
+            result={"reason": "should not commit"},
+            outcome=outcome,
+        )
+    with closing(database.connect()) as connection:
+        versions = connection.execute(
+            "SELECT id, active FROM translation_versions ORDER BY id"
+        ).fetchall()
+        task = connection.execute("SELECT * FROM revalidation_tasks").fetchone()
+    assert [(row["id"], row["active"]) for row in versions] == [
+        (old_translation, 1)
+    ]
+    assert task["status"] == "resolved_noop"
+    assert task["action"] == "stale_translation"
+    assert task["replacement_translation_id"] is None
+    assert database.claim_revalidation_task("worker-b") is None

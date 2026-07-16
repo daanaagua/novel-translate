@@ -11257,10 +11257,13 @@ class V4Database:
 
     @classmethod
     def _revalidation_base_result(cls, raw: Any) -> Dict[str, Any]:
-        try:
-            result = json.loads(str(raw or "{}"))
-        except (TypeError, ValueError, json.JSONDecodeError):
-            raise ValueError("revalidation task result is invalid JSON") from None
+        if isinstance(raw, Mapping):
+            result = deepcopy(dict(raw))
+        else:
+            try:
+                result = json.loads(str(raw or "{}"))
+            except (TypeError, ValueError, json.JSONDecodeError):
+                raise ValueError("revalidation task result is invalid JSON") from None
         if not isinstance(result, dict):
             raise ValueError("revalidation task result must be an object")
         result.pop("_lease", None)
@@ -11346,6 +11349,14 @@ class V4Database:
             current["source_edition_active"]
         ) != 1:
             raise ValueError("revalidation translation is outside the active source")
+        if (
+            current["knowledge_version"] is None
+            or int(current["knowledge_version"])
+            != int(task["from_knowledge_version"])
+        ):
+            raise ValueError(
+                "translation knowledge version does not match revalidation task"
+            )
         base = self._revalidation_base_result(task["result_json"])
         change_ids = base.get("change_ids")
         if not isinstance(change_ids, list) or not change_ids:
@@ -11462,9 +11473,99 @@ class V4Database:
             "translation_hash": hashlib.sha256(
                 str(current["final_translation"]).encode("utf-8")
             ).hexdigest(),
+            "translation_knowledge_version": int(current["knowledge_version"]),
             "source_hash": str(current["source_hash"]),
+            "source_text_hash": hashlib.sha256(
+                source_text.encode("utf-8")
+            ).hexdigest(),
         }
         return payload, snapshot
+
+    def _resolve_stale_revalidation_task(
+        self,
+        connection: sqlite3.Connection,
+        task: sqlite3.Row,
+        raw_result: Any,
+    ) -> str:
+        replacement = connection.execute(
+            """SELECT id, knowledge_version
+               FROM translation_versions
+               WHERE block_id=? AND pipeline='parallel_v4' AND active=1 AND id<>?
+               ORDER BY id DESC LIMIT 1""",
+            (task["block_id"], task["translation_id"]),
+        ).fetchone()
+        result = self._revalidation_base_result(raw_result)
+        if replacement is not None:
+            action = "superseded_by_active_translation"
+            replacement_id: Optional[int] = int(replacement["id"])
+            result.update(
+                {
+                    "reason": action,
+                    "replacement_translation_id": replacement_id,
+                    "replacement_knowledge_version": (
+                        int(replacement["knowledge_version"])
+                        if replacement["knowledge_version"] is not None
+                        else None
+                    ),
+                }
+            )
+        else:
+            action = "stale_translation"
+            replacement_id = None
+            original = connection.execute(
+                "SELECT knowledge_version FROM translation_versions WHERE id=?",
+                (task["translation_id"],),
+            ).fetchone()
+            result.update(
+                {
+                    "reason": action,
+                    "stale_translation_id": int(task["translation_id"]),
+                    "stale_knowledge_version": (
+                        int(original["knowledge_version"])
+                        if original is not None
+                        and original["knowledge_version"] is not None
+                        else None
+                    ),
+                }
+            )
+        connection.execute(
+            """UPDATE revalidation_tasks
+               SET status='resolved_noop', action=?, result_json=?,
+                   replacement_translation_id=?, error=NULL, resolved_at=?
+               WHERE id=? AND status IN ('pending','validating')""",
+            (
+                action,
+                self._revalidation_canonical(result),
+                replacement_id,
+                utc_now(),
+                task["id"],
+            ),
+        )
+        return action
+
+    def _retire_stale_pending_revalidation_tasks(
+        self, connection: sqlite3.Connection
+    ) -> int:
+        stale = connection.execute(
+            """SELECT task.*
+               FROM revalidation_tasks task
+               LEFT JOIN translation_versions original
+                 ON original.id=task.translation_id
+               WHERE task.status='pending'
+                 AND (
+                     original.id IS NULL OR original.active<>1
+                     OR original.pipeline<>'parallel_v4'
+                     OR original.block_id<>task.block_id
+                     OR original.knowledge_version IS NULL
+                     OR original.knowledge_version<>task.from_knowledge_version
+                 )
+               ORDER BY task.created_at, task.id"""
+        ).fetchall()
+        for task in stale:
+            self._resolve_stale_revalidation_task(
+                connection, task, task["result_json"]
+            )
+        return len(stale)
 
     @staticmethod
     def _freeze_revalidation(value: Any) -> Any:
@@ -11540,6 +11641,7 @@ class V4Database:
         with self.transaction() as connection:
             now = datetime.now(timezone.utc)
             self._requeue_expired_revalidation_tasks(connection, now)
+            self._retire_stale_pending_revalidation_tasks(connection)
             sql = "SELECT * FROM revalidation_tasks WHERE status='pending'"
             params: List[Any] = []
             if excluded:
@@ -11711,17 +11813,8 @@ class V4Database:
                 connection, claim
             )
             if stale_error:
-                stored.pop("_lease", None)
-                connection.execute(
-                    """UPDATE revalidation_tasks
-                       SET status='pending', action='', result_json=?, error=?,
-                           resolved_at=NULL, replacement_translation_id=NULL
-                       WHERE id=? AND status='validating'""",
-                    (
-                        self._revalidation_canonical(stored),
-                        stale_error[:1024],
-                        claim.task_id,
-                    ),
+                self._resolve_stale_revalidation_task(
+                    connection, task, stored
                 )
             else:
                 self._record_revalidation_audits(
