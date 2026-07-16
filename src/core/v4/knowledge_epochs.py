@@ -228,25 +228,31 @@ class KnowledgeEpochCoordinator:
         )
         inserted = 0
         batch: list[FormOccurrence] = []
-        for block in self.database.list_blocks():
-            for lexeme_id, source_form, start, end in matcher.finditer(
-                block.source_text
-            ):
-                batch.append(
-                    FormOccurrence(
-                        lexeme_id=lexeme_id,
-                        block_id=block.id,
-                        start_offset=start,
-                        end_offset=end,
-                        source_form=source_form,
-                        source_hash=block.source_hash,
+        blocks = self.database.list_blocks()
+        with self.database.transaction() as connection:
+            for block in blocks:
+                for lexeme_id, source_form, start, end in matcher.finditer(
+                    block.source_text
+                ):
+                    batch.append(
+                        FormOccurrence(
+                            lexeme_id=lexeme_id,
+                            block_id=block.id,
+                            start_offset=start,
+                            end_offset=end,
+                            source_form=source_form,
+                            source_hash=block.source_hash,
+                        )
                     )
+                    if len(batch) == OCCURRENCE_BATCH_SIZE:
+                        inserted += self.database.record_form_occurrences(
+                            batch, connection=connection
+                        )
+                        batch.clear()
+            if batch:
+                inserted += self.database.record_form_occurrences(
+                    batch, connection=connection
                 )
-                if len(batch) == OCCURRENCE_BATCH_SIZE:
-                    inserted += self.database.record_form_occurrences(batch)
-                    batch.clear()
-        if batch:
-            inserted += self.database.record_form_occurrences(batch)
         return inserted
 
     def _result_from_state(

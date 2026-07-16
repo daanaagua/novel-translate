@@ -2576,6 +2576,70 @@ def test_sql_commit_failure_truncates_only_uncommitted_audit_frame(tmp_path):
         ).fetchone()[0] == 0
 
 
+def test_occurrence_backfill_reuses_one_transaction_for_2001_matches(
+    tmp_path, monkeypatch,
+):
+    root = tmp_path / "occurrence-transaction-book"
+    database = V4Database(root)
+    edition = database.ensure_source_edition(
+        "occurrence-raw", "occurrence-normalized", "scale", "synthetic.txt"
+    )
+    source_text = " ".join(["Term"] * 2_001)
+    database.upsert_blocks(
+        edition,
+        [
+            {
+                "id": "occurrence-block",
+                "chapter_id": "chapter-1",
+                "chapter_title": "Chapter 1",
+                "chapter_index": 0,
+                "block_index": 0,
+                "global_index": 0,
+                "block_type": "prose",
+                "source_text": source_text,
+                "source_hash": hashlib.sha256(source_text.encode("utf-8")).hexdigest(),
+                "token_count": 2_001,
+            }
+        ],
+    )
+    lexeme_id = database.ensure_lexeme("Term")
+    coordinator = KnowledgeEpochCoordinator(database, ["occurrence-block"])
+
+    budget_scans = 0
+    batch_sizes = []
+    batch_connections = []
+    original_source_bytes = database._source_bytes
+    original_record = database.record_form_occurrences
+
+    def counted_source_bytes(connection):
+        nonlocal budget_scans
+        budget_scans += 1
+        return original_source_bytes(connection)
+
+    def counted_record(rows, **kwargs):
+        batch_sizes.append(len(rows))
+        batch_connections.append(kwargs.get("connection"))
+        return original_record(rows, **kwargs)
+
+    monkeypatch.setattr(database, "_source_bytes", counted_source_bytes)
+    monkeypatch.setattr(database, "record_form_occurrences", counted_record)
+
+    inserted = coordinator.backfill_form_occurrences({"Term": lexeme_id})
+
+    assert inserted == 2_001
+    assert batch_sizes == [1_000, 1_000, 1]
+    assert batch_connections[0] is not None
+    assert all(
+        connection is batch_connections[0] for connection in batch_connections
+    )
+    assert budget_scans <= 1
+    assert coordinator.backfill_form_occurrences({"Term": lexeme_id}) == 0
+    with closing(database.connect()) as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM form_occurrences"
+        ).fetchone()[0] == 2_001
+
+
 def test_three_million_words_backfill_uses_one_active_source_pass_and_is_idempotent(
     tmp_path, monkeypatch,
 ):
