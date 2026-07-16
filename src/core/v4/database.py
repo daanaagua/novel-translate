@@ -26,7 +26,9 @@ from .audit_archive import (
     StorageBudget,
 )
 from .models import (
+    ClaimDependencySnapshot,
     FormOccurrence,
+    RenderingMatchSnapshot,
     ScanOutcome,
     TranslationOutcome,
     V4Block,
@@ -105,6 +107,17 @@ MAX_DEPENDENCY_TARGETS = 32
 MAX_DEPENDENCY_RULE_IDS = 128
 MAX_RENDER_STATE_RULES = 4
 MAX_DEPENDENCY_DISTINCT_VALUES = 256
+MAX_FROZEN_CLAIMS = 256
+MAX_FROZEN_CLAIM_BYTES = 128 * 1024
+MAX_FROZEN_CLAIMS_PER_BLOCK = 128
+MAX_PRIOR_CONCEPTS_PER_BLOCK = 128
+MAX_PRIOR_CONCEPT_PAIRS = 4096
+MAX_PRIOR_CANDIDATES_PER_CONCEPT = 8
+MAX_PRIOR_CANDIDATES_TOTAL = 4_096
+MAX_PRIOR_CANDIDATE_CHARS = 4_096
+MAX_TRANSLATION_AUDIT_NODES = 32_768
+MAX_TRANSLATION_AUDIT_STRING_CHARS = 4 * 1024 * 1024
+MAX_TRANSLATION_AUDIT_BYTES = 16 * 1024 * 1024
 
 
 def _validate_render_value(value: Any) -> None:
@@ -151,6 +164,50 @@ def _validate_render_value(value: Any) -> None:
             raise ValueError(
                 f"render state exceeds {_RENDER_MAX_INPUT_BYTES} UTF-8 bytes"
             )
+
+
+def _validate_translation_audit_value(value: Any) -> int:
+    """Validate a copied audit payload with explicit production-sized bounds."""
+
+    nodes = 0
+    total_bytes = 0
+    stack: list[tuple[Any, int]] = [(value, 1)]
+    while stack:
+        current, depth = stack.pop()
+        nodes += 1
+        if nodes > MAX_TRANSLATION_AUDIT_NODES:
+            raise ValueError("translation audit payload has too many nodes")
+        if depth > 24:
+            raise ValueError("translation audit payload is too deeply nested")
+        if isinstance(current, Mapping):
+            if len(current) > 4_096:
+                raise ValueError("translation audit mapping is too large")
+            for key, item in current.items():
+                if not isinstance(key, str) or len(key) > 1_024:
+                    raise ValueError("translation audit mapping key is invalid")
+                total_bytes += len(key.encode("utf-8"))
+                stack.append((item, depth + 1))
+        elif isinstance(current, (list, tuple)):
+            if len(current) > MAX_TRANSLATION_AUDIT_NODES:
+                raise ValueError("translation audit sequence is too large")
+            stack.extend((item, depth + 1) for item in current)
+        elif isinstance(current, str):
+            if len(current) > MAX_TRANSLATION_AUDIT_STRING_CHARS:
+                raise ValueError("translation audit string is too long")
+            total_bytes += len(current.encode("utf-8"))
+        elif isinstance(current, float):
+            if not math.isfinite(current):
+                raise ValueError("translation audit number must be finite")
+        elif current is None or isinstance(current, (bool, int)):
+            pass
+        else:
+            raise TypeError(
+                "translation audit contains unsupported type: "
+                f"{type(current).__name__}"
+            )
+        if total_bytes > MAX_TRANSLATION_AUDIT_BYTES:
+            raise ValueError("translation audit payload exceeds 16 MiB")
+    return total_bytes
 
 
 def _canonical_render_value(value: Any) -> Any:
@@ -228,6 +285,45 @@ def _effective_rule_summary(
 def _render_semantic_summary(
     subject_type: str, subject_id: str, state: Mapping[str, Any]
 ) -> Dict[str, Any]:
+    if subject_type == "claim":
+        exists = bool(state.get("exists", bool(state)))
+        active = exists and bool(state.get("active", not state.get("retired")))
+        accepted = active and bool(
+            state.get("accepted", str(state.get("status") or "") == "verified")
+        )
+        kind = str(state.get("kind") or "") if exists else ""
+        return {
+            "subject_type": "claim",
+            "subject_id": subject_id,
+            "exists": exists,
+            "active": active,
+            "accepted": accepted,
+            "prompt_effective": bool(
+                accepted and kind == "translation_constraint"
+            ),
+            "kind": kind,
+            "statement": str(state.get("statement") or "") if exists else "",
+            "subject_form": str(state.get("subject_form") or "") if exists else "",
+            "scope": str(state.get("scope") or "") if exists else "",
+            "reveal_global_index": (
+                int(state.get("reveal_global_index") or 0) if exists else None
+            ),
+            "reveal_boundary": bool(
+                exists
+                and (
+                    state.get("reveal_boundary")
+                    or kind == "reveal_boundary"
+                )
+            ),
+            "locked": bool(exists and state.get("locked")),
+            "high_impact_constraint": bool(
+                exists
+                and (
+                    state.get("high_impact_constraint")
+                    or state.get("high_impact")
+                )
+            ),
+        }
     retired = bool(state.get("retired"))
     rules_value = state.get("rules", state.get("rendering_rules", ())) or ()
     if not isinstance(rules_value, (list, tuple)):
@@ -309,34 +405,59 @@ def render_fingerprint(
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
-def _render_impact(
+def _derive_render_change(
     old_summary: Mapping[str, Any],
     new_summary: Mapping[str, Any],
-    change_kind: str,
-) -> int:
-    kind = str(change_kind or "").strip().casefold()
+) -> tuple[str, int]:
+    """Derive the persisted kind/impact solely from semantic before/after state."""
+
+    if old_summary == new_summary:
+        return "metadata", 0
+    if (
+        old_summary.get("subject_type") == "claim"
+        or new_summary.get("subject_type") == "claim"
+    ):
+        high_impact = any(
+            bool(summary.get(key))
+            for summary in (old_summary, new_summary)
+            for key in ("locked", "high_impact_constraint", "reveal_boundary")
+        )
+        reveal_changed = old_summary.get("reveal_global_index") != new_summary.get(
+            "reveal_global_index"
+        ) and bool(old_summary.get("exists") and new_summary.get("exists"))
+        return (
+            ("claim_lock", 3)
+            if high_impact or reveal_changed
+            else ("claim_constraint", 2)
+        )
     old_locked = bool(old_summary.get("locked"))
     new_locked = bool(new_summary.get("locked"))
     old_high = bool(old_summary.get("high_impact_constraint"))
     new_high = bool(new_summary.get("high_impact_constraint"))
     if (
-        kind in _RENDER_LOCK_CHANGE_KINDS
-        or old_locked != new_locked
+        old_locked != new_locked
         or old_high != new_high
         or ((old_locked or new_locked) and old_summary != new_summary)
     ):
-        return 3
-    if kind in _RENDER_STRUCTURAL_CHANGE_KINDS:
-        return 2
+        return "human_lock", 3
     if old_summary.get("rules") != new_summary.get("rules"):
-        return 2
+        return "rendering_rule", 2
     if old_summary.get("rendering_rules_sha256") != new_summary.get(
         "rendering_rules_sha256"
     ):
-        return 2
+        return "rendering_rule", 2
     if old_summary.get("links") != new_summary.get("links"):
-        return 2
-    return 1
+        return "subject_link", 2
+    if old_summary.get("forms") != new_summary.get("forms"):
+        return "source_form", 2
+    if old_summary.get("active") != new_summary.get("active"):
+        return "subject_link", 2
+    if (
+        old_summary.get("subject_id") != new_summary.get("subject_id")
+        or old_summary.get("subject_type") != new_summary.get("subject_type")
+    ):
+        return "concept_redirect", 2
+    return "target", 1
 
 
 def _bounded_dependency_values(values: Iterable[str], limit: int) -> Dict[str, Any]:
@@ -495,6 +616,24 @@ class FrozenRenderBundle:
     block_ids: tuple[str, ...]
 
 
+@dataclass(frozen=True)
+class _TranslationCommitSnapshot:
+    block: V4Block
+    knowledge_version: int
+    status: str
+    draft_translation: str
+    final_translation: str
+    analysis: str
+    semantic_obligations: str
+    memory_summary: str
+    warnings: tuple[Any, ...]
+    matched_concept_ids: tuple[str, ...]
+    matched_renderings: tuple[RenderingMatchSnapshot, ...]
+    claim_dependencies: tuple[ClaimDependencySnapshot, ...]
+    audit_calls: tuple[Mapping[str, Any], ...]
+    error: str | None
+
+
 def _immutable_render_value(value: Any) -> Any:
     if isinstance(value, Mapping):
         return MappingProxyType(
@@ -505,6 +644,163 @@ def _immutable_render_value(value: Any) -> Any:
     if isinstance(value, tuple):
         return tuple(_immutable_render_value(item) for item in value)
     return value
+
+
+def _copy_render_value(value: Any) -> Any:
+    """Copy JSON-like input without changing sequence order."""
+
+    if isinstance(value, Mapping):
+        return {str(key): _copy_render_value(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_copy_render_value(item) for item in value]
+    return value
+
+
+def _mutable_render_value(value: Any) -> Any:
+    """Thaw an immutable commit snapshot into JSON-serializable containers."""
+
+    if isinstance(value, Mapping):
+        return {str(key): _mutable_render_value(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_mutable_render_value(item) for item in value]
+    return value
+
+
+def _strict_snapshot_mapping(
+    value: Mapping[str, Any], *, allowed: set[str], required: set[str], label: str
+) -> Dict[str, Any]:
+    raw = dict(value)
+    keys = set(raw)
+    if not required <= keys or not keys <= allowed:
+        raise ValueError(f"{label} mapping fields are invalid")
+    _validate_render_value(raw)
+    return raw
+
+
+def _snapshot_render_match(value: Any) -> RenderingMatchSnapshot:
+    if type(value) is RenderingMatchSnapshot:
+        return value
+    if not isinstance(value, Mapping):
+        raise ValueError(
+            "translation matches must be RenderingMatchSnapshot or strict mapping"
+        )
+    raw = _strict_snapshot_mapping(
+        value,
+        allowed={
+            "lexeme_id",
+            "concept_id",
+            "matched_form",
+            "start_offset",
+            "end_offset",
+            "rendered_target",
+            "applied_rule_ids",
+            "dependency_fingerprint",
+        },
+        required={
+            "lexeme_id",
+            "matched_form",
+            "start_offset",
+            "end_offset",
+            "rendered_target",
+        },
+        label="RenderingMatchSnapshot",
+    )
+    raw_rule_ids = raw.get("applied_rule_ids", ()) or ()
+    if isinstance(raw_rule_ids, (str, bytes)) or not isinstance(
+        raw_rule_ids, (list, tuple)
+    ):
+        raise ValueError("translation match rule IDs must be a sequence")
+    return RenderingMatchSnapshot(
+        lexeme_id=str(raw["lexeme_id"]),
+        concept_id=(
+            str(raw["concept_id"]) if raw.get("concept_id") is not None else None
+        ),
+        matched_form=str(raw["matched_form"]),
+        start_offset=int(raw["start_offset"]),
+        end_offset=int(raw["end_offset"]),
+        rendered_target=str(raw["rendered_target"]),
+        applied_rule_ids=tuple(str(item) for item in raw_rule_ids),
+        dependency_fingerprint=str(raw.get("dependency_fingerprint") or ""),
+    )
+
+
+def _snapshot_claim_dependency(value: Any) -> ClaimDependencySnapshot:
+    if type(value) is ClaimDependencySnapshot:
+        return value
+    if not isinstance(value, Mapping):
+        raise ValueError(
+            "claim dependencies must be ClaimDependencySnapshot or strict mapping"
+        )
+    raw = _strict_snapshot_mapping(
+        value,
+        allowed={"claim_id", "semantic_fingerprint"},
+        required={"claim_id", "semantic_fingerprint"},
+        label="ClaimDependencySnapshot",
+    )
+    return ClaimDependencySnapshot(
+        claim_id=str(raw["claim_id"]),
+        semantic_fingerprint=str(raw["semantic_fingerprint"]),
+    )
+
+
+def _snapshot_translation_outcome(value: Any) -> _TranslationCommitSnapshot:
+    if not isinstance(value, TranslationOutcome):
+        raise TypeError("translation batch entries must be TranslationOutcome")
+    block = value.block
+    if type(block) is not V4Block:
+        raise TypeError("translation outcome block must be V4Block")
+    knowledge_version = value.knowledge_version
+    if isinstance(knowledge_version, bool) or not isinstance(knowledge_version, int):
+        raise ValueError("translation knowledge version must be an integer")
+    raw_matches = value.matched_renderings
+    if not isinstance(raw_matches, (list, tuple)):
+        raise ValueError("translation matches must be a bounded sequence")
+    if len(raw_matches) > MAX_TRANSLATION_MATCHES:
+        raise ValueError(
+            f"translation match snapshot exceeds {MAX_TRANSLATION_MATCHES} entries"
+        )
+    raw_claims = value.claim_dependencies
+    if not isinstance(raw_claims, (list, tuple)) or len(raw_claims) > MAX_FROZEN_CLAIMS:
+        raise ValueError("claim dependency snapshot is not a bounded sequence")
+    raw_concepts = value.matched_concept_ids
+    if not isinstance(raw_concepts, (list, tuple)) or len(raw_concepts) > 4096:
+        raise ValueError("matched concept IDs are not a bounded sequence")
+    raw_warnings = value.warnings
+    if not isinstance(raw_warnings, (list, tuple)) or len(raw_warnings) > 1024:
+        raise ValueError("translation warnings are not a bounded sequence")
+    warnings = _copy_render_value(raw_warnings)
+    _validate_render_value(warnings)
+    raw_audits = value.audit_calls
+    if not isinstance(raw_audits, (list, tuple)) or len(raw_audits) > 128:
+        raise ValueError("translation audit calls are not a bounded sequence")
+    audits: list[Mapping[str, Any]] = []
+    audit_bytes = 0
+    for audit in raw_audits:
+        if not isinstance(audit, Mapping):
+            raise ValueError("translation audit calls must be mappings")
+        copied = _copy_render_value(audit)
+        audit_bytes += _validate_translation_audit_value(copied)
+        if audit_bytes > MAX_TRANSLATION_AUDIT_BYTES:
+            raise ValueError("translation audit snapshot exceeds 16 MiB")
+        audits.append(_immutable_render_value(copied))
+    return _TranslationCommitSnapshot(
+        block=block,
+        knowledge_version=knowledge_version,
+        status=str(value.status),
+        draft_translation=str(value.draft_translation),
+        final_translation=str(value.final_translation),
+        analysis=str(value.analysis),
+        semantic_obligations=str(value.semantic_obligations),
+        memory_summary=str(value.memory_summary),
+        warnings=tuple(warnings),
+        matched_concept_ids=tuple(str(item) for item in raw_concepts),
+        matched_renderings=tuple(_snapshot_render_match(item) for item in raw_matches),
+        claim_dependencies=tuple(
+            _snapshot_claim_dependency(item) for item in raw_claims
+        ),
+        audit_calls=tuple(audits),
+        error=str(value.error) if value.error is not None else None,
+    )
 
 
 def _safe_rule_condition(raw: Any, rule_id: str) -> Dict[str, Any]:
@@ -3938,8 +4234,6 @@ class V4Database:
         self._require_active_transaction(connection)
         if not isinstance(reason, str) or not reason.strip():
             raise ValueError("render change reason cannot be empty")
-        if not isinstance(change_kind, str) or not change_kind.strip():
-            raise ValueError("render change_kind cannot be empty")
         old_fingerprint = render_fingerprint(subject_type, subject_id, old_state)
         new_fingerprint = render_fingerprint(subject_type, subject_id, new_state)
         old_summary = _render_semantic_summary(subject_type, subject_id, old_state)
@@ -3958,21 +4252,36 @@ class V4Database:
         )
         semantic_changed = old_fingerprint != new_fingerprint
         metadata_changed = raw_old != raw_new
+        version = knowledge_version
+        if version is not None:
+            version = int(version)
+            version_row = connection.execute(
+                """SELECT id, (SELECT MAX(id) FROM knowledge_versions) current_id
+                   FROM knowledge_versions WHERE id=?""",
+                (version,),
+            ).fetchone()
+            if version_row is None:
+                raise ValueError(f"unknown knowledge version: {version}")
+            if version != int(version_row["current_id"]):
+                raise ValueError(
+                    "render change knowledge_version must be the current knowledge version"
+                )
         if not semantic_changed and (not record_metadata or not metadata_changed):
             return {
                 "changed": False,
                 "semantic_changed": False,
                 "knowledge_version": None,
                 "impact_level": 0,
+                "change_kind": "metadata",
+                "change_id": None,
                 "old_fingerprint": old_fingerprint,
                 "new_fingerprint": new_fingerprint,
             }
-        impact = (
-            _render_impact(old_summary, new_summary, change_kind)
+        derived_kind, impact = (
+            _derive_render_change(old_summary, new_summary)
             if semantic_changed
-            else 0
+            else ("metadata", 0)
         )
-        version = knowledge_version
         if version is None:
             version = self.create_knowledge_version(reason.strip()[:512], connection)
         payload = {
@@ -3986,7 +4295,33 @@ class V4Database:
         )
         if len(payload_json.encode("utf-8")) > _RENDER_MAX_INPUT_BYTES:
             raise ValueError("render change payload exceeds size limit")
-        connection.execute(
+        existing = connection.execute(
+            """SELECT id FROM knowledge_changes
+               WHERE knowledge_version=? AND subject_type=? AND subject_id=?
+                 AND change_kind=? AND old_fingerprint=? AND new_fingerprint=?
+               ORDER BY id LIMIT 1""",
+            (
+                version,
+                subject_type.strip(),
+                subject_id.strip(),
+                derived_kind,
+                old_fingerprint,
+                new_fingerprint,
+            ),
+        ).fetchone()
+        if existing is not None:
+            return {
+                "changed": True,
+                "semantic_changed": semantic_changed,
+                "knowledge_version": int(version),
+                "impact_level": impact,
+                "change_kind": derived_kind,
+                "change_id": int(existing["id"]),
+                "old_fingerprint": old_fingerprint,
+                "new_fingerprint": new_fingerprint,
+                "reused": True,
+            }
+        cursor = connection.execute(
             """INSERT INTO knowledge_changes(
                    knowledge_version, subject_type, subject_id, change_kind,
                    old_fingerprint, new_fingerprint, impact_level,
@@ -3996,7 +4331,7 @@ class V4Database:
                 version,
                 subject_type.strip(),
                 subject_id.strip(),
-                change_kind.strip(),
+                derived_kind,
                 old_fingerprint,
                 new_fingerprint,
                 impact,
@@ -4009,6 +4344,8 @@ class V4Database:
             "semantic_changed": semantic_changed,
             "knowledge_version": int(version),
             "impact_level": impact,
+            "change_kind": derived_kind,
+            "change_id": int(cursor.lastrowid),
             "old_fingerprint": old_fingerprint,
             "new_fingerprint": new_fingerprint,
         }
@@ -4141,6 +4478,34 @@ class V4Database:
         if row["retired_version"] is not None:
             state["retired"] = True
         return state
+
+    def _claim_state_for_subject(
+        self, connection: sqlite3.Connection, claim_id: str
+    ) -> Dict[str, Any]:
+        row = connection.execute(
+            "SELECT * FROM claims WHERE id=?", (str(claim_id),)
+        ).fetchone()
+        if row is None:
+            return {}
+        return self._claim_state_from_row(row)
+
+    @staticmethod
+    def _claim_state_from_row(row: Mapping[str, Any]) -> Dict[str, Any]:
+        return {
+            "exists": True,
+            "active": row["retired_version"] is None,
+            "accepted": str(row["status"]) == "verified",
+            "kind": str(row["kind"]),
+            "statement": str(row["statement"]),
+            "subject_form": str(row["subject_form"]),
+            "scope": str(row["scope"]),
+            "reveal_global_index": int(row["reveal_global_index"]),
+            "reveal_boundary": str(row["kind"]) == "reveal_boundary",
+            "locked": bool(row["locked"]),
+            "high_impact_constraint": bool(row["high_impact"]),
+            # Metadata is retained only so record_metadata can audit it at impact 0.
+            "confidence": float(row["confidence"]),
+        }
 
     def ensure_source_edition(
         self,
@@ -4664,6 +5029,9 @@ class V4Database:
                             f"{ambiguity.paragraph_id}:{ambiguity.constraint}"
                         ),
                     )
+                    old_claim_state = self._claim_state_for_subject(
+                        connection, claim_id
+                    )
                     connection.execute(
                         """INSERT OR IGNORE INTO claims(
                                id, kind, statement, subject_form, status, scope,
@@ -4685,6 +5053,19 @@ class V4Database:
                         """INSERT OR IGNORE INTO claim_evidence(claim_id, evidence_id)
                            VALUES(?, ?)""",
                         (claim_id, evidence_id),
+                    )
+                    self.record_render_change(
+                        connection,
+                        subject_type="claim",
+                        subject_id=claim_id,
+                        old_state=old_claim_state,
+                        new_state=self._claim_state_for_subject(
+                            connection, claim_id
+                        ),
+                        change_kind="claim",
+                        reason=f"scan ambiguity claim {claim_id}",
+                        knowledge_version=version,
+                        record_metadata=True,
                     )
                     verification_payload = {
                         "kind": "translation_constraint",
@@ -9147,9 +9528,45 @@ class V4Database:
                  AND kind='translation_constraint'
                  AND status='verified'
                  AND reveal_global_index<=?
-               ORDER BY locked DESC, confidence DESC, id""",
-            (maximum_reveal,),
+               ORDER BY locked DESC, confidence DESC, id
+               LIMIT ?""",
+            (maximum_reveal, MAX_FROZEN_CLAIMS + 1),
         ).fetchall()
+        if len(claim_rows) > MAX_FROZEN_CLAIMS:
+            raise KnowledgeSnapshotError(
+                "claims", f"claim limit exceeds {MAX_FROZEN_CLAIMS}"
+            )
+        claim_payloads: Dict[str, Dict[str, Any]] = {}
+        claim_bytes = 0
+        for row in claim_rows:
+            claim_id = str(row["id"])
+            state = self._claim_state_from_row(row)
+            payload = {
+                "id": claim_id,
+                "statement": str(row["statement"]),
+                "subject_form": str(row["subject_form"]),
+                "scope": str(row["scope"]),
+                "reveal_global_index": int(row["reveal_global_index"]),
+                "locked": bool(row["locked"]),
+                "high_impact": bool(row["high_impact"]),
+                "semantic_fingerprint": render_fingerprint(
+                    "claim", claim_id, state
+                ),
+            }
+            claim_bytes += len(
+                json.dumps(
+                    payload,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode("utf-8")
+            )
+            if claim_bytes > MAX_FROZEN_CLAIM_BYTES:
+                raise KnowledgeSnapshotError(
+                    "claims",
+                    f"claim payload exceeds {MAX_FROZEN_CLAIM_BYTES} UTF-8 bytes",
+                )
+            claim_payloads[claim_id] = payload
         occurrence_blocks: Dict[str, set[str]] = {}
         if claim_rows:
             claim_ids = [str(row["id"]) for row in claim_rows]
@@ -9168,8 +9585,8 @@ class V4Database:
             block = blocks[block_id]
             source_lower = str(block["source_text"]).lower()
             reveal_index = int(block["global_index"])
-            claims_by_block[block_id] = [
-                dict(claim)
+            matched_claims = [
+                claim_payloads[str(claim["id"])]
                 for claim in claim_rows
                 if int(claim["reveal_global_index"]) <= reveal_index
                 and (
@@ -9187,11 +9604,23 @@ class V4Database:
                     )
                 )
             ]
+            if len(matched_claims) > MAX_FROZEN_CLAIMS_PER_BLOCK:
+                raise KnowledgeSnapshotError(
+                    "claims",
+                    f"block {block_id} claim limit exceeds "
+                    f"{MAX_FROZEN_CLAIMS_PER_BLOCK}",
+                )
+            claims_by_block[block_id] = matched_claims
 
-        concepts_by_block: Dict[str, List[Dict[str, Any]]] = {
-            block_id: index.matched_concepts(str(blocks[block_id]["source_text"]))
-            for block_id in ordered_ids
-        }
+        concepts_by_block: Dict[str, List[Dict[str, Any]]] = {}
+        remaining_pairs = MAX_PRIOR_CONCEPT_PAIRS
+        for block_id in ordered_ids:
+            block_concepts = index.matched_concepts(
+                str(blocks[block_id]["source_text"])
+            )
+            take = min(MAX_PRIOR_CONCEPTS_PER_BLOCK, remaining_pairs)
+            concepts_by_block[block_id] = list(block_concepts[:take])
+            remaining_pairs -= len(concepts_by_block[block_id])
         concept_pairs = [
             (block_id, str(concept["id"]))
             for block_id in ordered_ids
@@ -9199,6 +9628,29 @@ class V4Database:
         ]
         if not concept_pairs or max_prior_chars <= 0 or max_paragraphs_per_concept <= 0:
             return claims_by_block, prior_by_block
+
+        forms_by_pair: Dict[tuple[str, str], tuple[str, ...]] = {}
+        for block_id in ordered_ids:
+            for concept in concepts_by_block[block_id]:
+                forms = tuple(
+                    sorted(
+                        {
+                            str(form).strip()
+                            for form in concept.get("forms", ())
+                            if str(form).strip()
+                        },
+                        key=len,
+                        reverse=True,
+                    )
+                )
+                if len(forms) > MAX_DEPENDENCY_FORMS or sum(
+                    len(form.encode("utf-8")) for form in forms
+                ) > _RENDER_MAX_INPUT_BYTES:
+                    raise KnowledgeSnapshotError(
+                        "prior_evidence",
+                        f"concept {concept['id']} source forms exceed bounds",
+                    )
+                forms_by_pair[(block_id, str(concept["id"]))] = forms
 
         encoded_pairs = json.dumps(
             concept_pairs, ensure_ascii=False, separators=(",", ":")
@@ -9208,62 +9660,80 @@ class V4Database:
                    SELECT CAST(json_extract(value, '$[0]') AS TEXT) block_id,
                           CAST(json_extract(value, '$[1]') AS TEXT) concept_id
                    FROM json_each(?)
+               ), candidate_blocks AS (
+                   SELECT pairs.block_id target_block_id,
+                          pairs.concept_id,
+                          c.canonical_source concept_source,
+                          prior.id prior_id,
+                          prior.legacy_id,
+                          prior.global_index,
+                          SUBSTR(prior.source_text, 1, ?) source_text
+                   FROM pairs
+                   JOIN blocks target ON target.id=pairs.block_id
+                   JOIN concepts c ON c.id=pairs.concept_id
+                   JOIN blocks prior
+                     ON prior.source_edition_id=target.source_edition_id
+                    AND prior.global_index<target.global_index
+                   WHERE EXISTS (
+                       SELECT 1
+                       FROM concept_lexemes cl
+                       JOIN source_forms sf ON sf.lexeme_id=cl.lexeme_id
+                       WHERE cl.concept_id=pairs.concept_id
+                         AND cl.retired_version IS NULL
+                         AND INSTR(LOWER(prior.source_text), LOWER(sf.form))>0
+                   )
+               ), ranked AS (
+                   SELECT candidate_blocks.*,
+                          ROW_NUMBER() OVER (
+                              PARTITION BY target_block_id, concept_id
+                              ORDER BY global_index, prior_id
+                          ) first_rank,
+                          ROW_NUMBER() OVER (
+                              PARTITION BY target_block_id, concept_id
+                              ORDER BY global_index DESC, prior_id DESC
+                          ) last_rank
+                   FROM candidate_blocks
                )
-               SELECT pairs.block_id target_block_id,
-                       pairs.concept_id, c.canonical_source concept_source,
-                       prior.legacy_id, prior.global_index, prior.source_text,
-                       sf.form
-                FROM pairs
-                JOIN blocks target ON target.id=pairs.block_id
-                JOIN concepts c ON c.id=pairs.concept_id
-                JOIN concept_lexemes cl
-                  ON cl.concept_id=pairs.concept_id
-                 AND cl.retired_version IS NULL
-                JOIN source_forms sf ON sf.lexeme_id=cl.lexeme_id
-                JOIN blocks prior
-                  ON prior.source_edition_id=target.source_edition_id
-                 AND prior.global_index<target.global_index
-                 AND INSTR(LOWER(prior.source_text), LOWER(sf.form))>0
-                ORDER BY pairs.block_id, pairs.concept_id,
-                         prior.global_index, prior.id, sf.form""",
-            (encoded_pairs,),
+               SELECT target_block_id, concept_id, concept_source,
+                      legacy_id, global_index, source_text
+               FROM ranked
+               WHERE first_rank<=? OR last_rank<=?
+               ORDER BY target_block_id, concept_id, global_index, prior_id
+               LIMIT ?""",
+            (
+                encoded_pairs,
+                MAX_PRIOR_CANDIDATE_CHARS + 1,
+                MAX_PRIOR_CANDIDATES_PER_CONCEPT,
+                MAX_PRIOR_CANDIDATES_PER_CONCEPT,
+                MAX_PRIOR_CANDIDATES_TOTAL + 1,
+            ),
         ).fetchall()
 
-        candidate_groups: Dict[
-            tuple[str, str, int, str], Dict[str, Any]
-        ] = {}
-        for row in candidate_rows:
-            key = (
-                str(row["target_block_id"]),
-                str(row["concept_id"]),
-                int(row["global_index"]),
-                str(row["legacy_id"]),
+        if len(candidate_rows) > MAX_PRIOR_CANDIDATES_TOTAL:
+            raise KnowledgeSnapshotError(
+                "prior_evidence",
+                f"prior candidate limit exceeds {MAX_PRIOR_CANDIDATES_TOTAL}",
             )
-            candidate = candidate_groups.setdefault(
-                key,
-                {
-                    "target_block_id": key[0],
-                    "concept_id": key[1],
-                    "concept_source": str(row["concept_source"]),
-                    "legacy_id": key[3],
-                    "global_index": key[2],
-                    "source_text": str(row["source_text"]),
-                    "forms": set(),
-                },
-            )
-            candidate["forms"].add(str(row["form"]))
 
         candidates_by_pair: Dict[tuple[str, str], List[Dict[str, Any]]] = {}
-        for candidate in candidate_groups.values():
-            forms = sorted(
-                {form for form in candidate.pop("forms") if form},
-                key=len,
-                reverse=True,
-            )
-            patterns = [
+        for row in candidate_rows:
+            pair = (str(row["target_block_id"]), str(row["concept_id"]))
+            forms = forms_by_pair.get(pair, ())
+            source_text = str(row["source_text"])
+            if len(source_text) > MAX_PRIOR_CANDIDATE_CHARS:
+                source_text = source_text[:MAX_PRIOR_CANDIDATE_CHARS]
+            candidate = {
+                "target_block_id": pair[0],
+                "concept_id": pair[1],
+                "concept_source": str(row["concept_source"]),
+                "legacy_id": str(row["legacy_id"]),
+                "global_index": int(row["global_index"]),
+                "source_text": source_text,
+            }
+            patterns = tuple(
                 re.compile(rf"(?<!\w){re.escape(form)}(?!\w)", re.IGNORECASE)
                 for form in forms
-            ]
+            )
             for paragraph_index, paragraph in enumerate(
                 part.strip()
                 for part in re.split(
@@ -9320,13 +9790,24 @@ class V4Database:
                     )
                     if paragraph_key in seen_paragraphs:
                         continue
-                    added_chars = len(str(item["source_text"]))
-                    if results and used_chars + added_chars > max_prior_chars:
+                    remaining_chars = max_prior_chars - used_chars
+                    if remaining_chars <= 0:
                         exhausted = True
                         break
-                    results.append(item)
+                    bounded_item = dict(item)
+                    bounded_item["source_text"] = str(item["source_text"])[
+                        :remaining_chars
+                    ]
+                    added_chars = len(str(bounded_item["source_text"]))
+                    if not added_chars:
+                        exhausted = True
+                        break
+                    results.append(bounded_item)
                     seen_paragraphs.add(paragraph_key)
                     used_chars += added_chars
+                    if used_chars >= max_prior_chars:
+                        exhausted = True
+                        break
                 if exhausted:
                     break
             prior_by_block[block_id] = results
@@ -9626,13 +10107,71 @@ class V4Database:
 
     def commit_translation_batch(
         self,
-        run_id: str,
+        run_id: str | None,
         outcomes: Sequence[TranslationOutcome],
         pipeline: str = "parallel_v4",
         audit_mode: str = "full",
     ) -> None:
-        ordered = sorted(outcomes, key=lambda item: item.block.global_index)
+        if isinstance(outcomes, (str, bytes)) or not isinstance(outcomes, Sequence):
+            raise TypeError("translation outcomes must be a sequence")
+        ordered = sorted(
+            (_snapshot_translation_outcome(outcome) for outcome in outcomes),
+            key=lambda item: item.block.global_index,
+        )
         with self.transaction() as connection:
+            versions = sorted({outcome.knowledge_version for outcome in ordered})
+            if versions:
+                placeholders = ",".join("?" for _ in versions)
+                existing_versions = {
+                    int(row[0])
+                    for row in connection.execute(
+                        f"SELECT id FROM knowledge_versions WHERE id IN ({placeholders})",
+                        versions,
+                    ).fetchall()
+                }
+                missing_versions = set(versions) - existing_versions
+                if missing_versions:
+                    raise ValueError(
+                        f"unknown translation knowledge version: {min(missing_versions)}"
+                    )
+            if run_id:
+                run = connection.execute(
+                    "SELECT knowledge_version, config_json FROM runs WHERE id=?",
+                    (run_id,),
+                ).fetchone()
+                if run is None:
+                    raise ValueError(f"unknown translation run: {run_id}")
+                run_version = int(run["knowledge_version"])
+                if any(
+                    outcome.knowledge_version != run_version for outcome in ordered
+                ):
+                    raise ValueError(
+                        "translation outcome knowledge version does not match run knowledge version"
+                    )
+                try:
+                    run_config = json.loads(str(run["config_json"] or "{}"))
+                except json.JSONDecodeError as exc:
+                    raise ValueError("translation run bundle config is invalid") from exc
+                if not isinstance(run_config, dict):
+                    raise ValueError("translation run bundle config must be a mapping")
+                has_frozen_version = "frozen_knowledge_version" in run_config
+                has_bundle_signature = "target_snapshot_signature" in run_config
+                if has_frozen_version or has_bundle_signature:
+                    if not (has_frozen_version and has_bundle_signature):
+                        raise ValueError("translation run frozen bundle config is incomplete")
+                    try:
+                        frozen_version = int(run_config["frozen_knowledge_version"])
+                    except (TypeError, ValueError) as exc:
+                        raise ValueError(
+                            "translation run frozen bundle version is invalid"
+                        ) from exc
+                    signature = str(run_config["target_snapshot_signature"])
+                    if frozen_version != run_version or re.fullmatch(
+                        r"[0-9a-f]{64}", signature
+                    ) is None:
+                        raise ValueError(
+                            "translation run frozen bundle version/signature is inconsistent"
+                        )
             block_ids = list(dict.fromkeys(outcome.block.id for outcome in ordered))
             source_rows: Dict[str, sqlite3.Row] = {}
             if block_ids:
@@ -9698,20 +10237,13 @@ class V4Database:
                     )
                 dependency_groups: Dict[tuple[str, str], List[Any]] = {}
                 for match in matches:
-                    lexeme_id = str(getattr(match, "lexeme_id", "") or "").strip()
-                    concept_id = str(getattr(match, "concept_id", "") or "").strip()
-                    matched_form = str(getattr(match, "matched_form", "") or "")
-                    rendered_target = str(
-                        getattr(match, "rendered_target", "") or ""
-                    )
-                    fingerprint = str(
-                        getattr(match, "dependency_fingerprint", "") or ""
-                    )
-                    try:
-                        start = int(getattr(match, "start_offset"))
-                        end = int(getattr(match, "end_offset"))
-                    except (AttributeError, TypeError, ValueError) as exc:
-                        raise ValueError("translation match span must be numeric") from exc
+                    lexeme_id = str(match.lexeme_id or "").strip()
+                    concept_id = str(match.concept_id or "").strip()
+                    matched_form = str(match.matched_form or "")
+                    rendered_target = str(match.rendered_target or "")
+                    fingerprint = str(match.dependency_fingerprint or "")
+                    start = int(match.start_offset)
+                    end = int(match.end_offset)
                     if not lexeme_id or len(lexeme_id) > 256:
                         raise ValueError("translation match lexeme_id is invalid")
                     if len(concept_id) > 256:
@@ -9734,7 +10266,7 @@ class V4Database:
                         raise ValueError(
                             f"translation match source span drift for block {outcome.block.id}"
                         )
-                    raw_rule_ids = getattr(match, "applied_rule_ids", ()) or ()
+                    raw_rule_ids = match.applied_rule_ids or ()
                     if isinstance(raw_rule_ids, (str, bytes)):
                         raise ValueError("translation match rule IDs must be a sequence")
                     rule_ids = tuple(str(value).strip() for value in raw_rule_ids)
@@ -9773,7 +10305,11 @@ class V4Database:
                         outcome.status, outcome.draft_translation, outcome.final_translation,
                         outcome.analysis, outcome.semantic_obligations,
                         outcome.memory_summary,
-                        json.dumps(outcome.warnings, ensure_ascii=False), utc_now(),
+                        json.dumps(
+                            _mutable_render_value(outcome.warnings),
+                            ensure_ascii=False,
+                        ),
+                        utc_now(),
                     ),
                 )
                 translation_id = int(cursor.lastrowid)
@@ -9822,20 +10358,16 @@ class V4Database:
                                 "[]",
                             )
                         )
-                for claim_id in sorted(set(outcome.claim_dependencies)):
+                claim_snapshots = {
+                    (snapshot.claim_id, snapshot.semantic_fingerprint)
+                    for snapshot in outcome.claim_dependencies
+                }
+                for claim_id, fingerprint in sorted(claim_snapshots):
                     claim_id = str(claim_id).strip()
                     if not claim_id or len(claim_id) > 256:
                         raise ValueError("claim dependency ID is invalid")
-                    fingerprint = hashlib.sha256(
-                        json.dumps(
-                            {
-                                "dependency_type": "claim",
-                                "dependency_id": claim_id,
-                            },
-                            sort_keys=True,
-                            separators=(",", ":"),
-                        ).encode("utf-8")
-                    ).hexdigest()
+                    if re.fullmatch(r"[0-9a-f]{64}", fingerprint) is None:
+                        raise ValueError("claim dependency fingerprint is invalid")
                     dependency_rows.append(
                         (
                             translation_id,
@@ -9861,23 +10393,24 @@ class V4Database:
                         dependency_rows,
                     )
                 for audit in outcome.audit_calls:
+                    thawed_audit = _mutable_render_value(audit)
                     audit_request, audit_raw, audit_parsed = self._audit_fields(
                         audit_mode,
-                        dict(audit.get("request") or {}),
-                        str(audit.get("raw_response") or ""),
-                        audit.get("parsed"),
+                        dict(thawed_audit.get("request") or {}),
+                        str(thawed_audit.get("raw_response") or ""),
+                        thawed_audit.get("parsed"),
                     )
                     self.record_audit_call(
                         run_id=run_id,
                         block_id=outcome.block.id,
-                        purpose=str(audit.get("purpose") or "translate"),
-                        model=str(audit.get("model") or "unknown"),
+                        purpose=str(thawed_audit.get("purpose") or "translate"),
+                        model=str(thawed_audit.get("model") or "unknown"),
                         knowledge_version=outcome.knowledge_version,
                         request=audit_request,
                         raw_response=audit_raw,
                         parsed=audit_parsed,
                         accepted=bool(
-                            audit.get(
+                            thawed_audit.get(
                                 "accepted",
                                 outcome.status
                                 in {
@@ -9886,9 +10419,9 @@ class V4Database:
                                 },
                             )
                         ),
-                        attempts=int(audit.get("attempts") or 1),
-                        elapsed_ms=int(audit.get("elapsed_ms") or 0),
-                        error=audit.get("error") or outcome.error,
+                        attempts=int(thawed_audit.get("attempts") or 1),
+                        elapsed_ms=int(thawed_audit.get("elapsed_ms") or 0),
+                        error=thawed_audit.get("error") or outcome.error,
                         connection=connection,
                     )
                 connection.execute(
@@ -9936,10 +10469,15 @@ class V4Database:
                 target = str(payload.get("tgt") or "").strip()
                 concept_id = stable_id("concept", normalized)
                 existing = connection.execute(
-                    "SELECT default_target FROM concepts WHERE id=? AND retired_version IS NULL",
+                    """SELECT default_target, locked FROM concepts
+                       WHERE id=? AND retired_version IS NULL""",
                     (concept_id,),
                 ).fetchone()
-                if existing is None or (not existing["default_target"] and target):
+                if existing is None or (
+                    target
+                    and str(existing["default_target"] or "") != target
+                    and not bool(existing["locked"])
+                ):
                     material_terms[concept_id] = (source, target)
             version = (
                 self.create_knowledge_version(f"translation proposals {run_id}", connection)
@@ -9948,6 +10486,7 @@ class V4Database:
             )
             has_novel_proposal = False
             changed_concepts: set[str] = set()
+            old_render_states: Dict[str, Dict[str, Any]] = {}
             proposed_concepts: set[str] = set()
             current_block_ids = {outcome.block.id for outcome in outcomes}
             seen_proposal_keys: set[tuple[str, str, str]] = set()
@@ -9961,7 +10500,8 @@ class V4Database:
                     target = str(payload.get("tgt") or "").strip()
                     quote = source if source in outcome.block.source_text else source
                     existing_concept = connection.execute(
-                        "SELECT default_target FROM concepts WHERE id=? AND retired_version IS NULL",
+                        """SELECT default_target, locked FROM concepts
+                           WHERE id=? AND retired_version IS NULL""",
                         (concept_id,),
                     ).fetchone()
                     existing_evidence = connection.execute(
@@ -9973,10 +10513,10 @@ class V4Database:
                     proposal_key = ("term", concept_id, target)
                     changes_decision = (
                         existing_concept is None
-                        or (not existing_concept["default_target"] and bool(target))
                         or (
                             bool(target)
                             and existing_concept["default_target"] != target
+                            and not bool(existing_concept["locked"])
                         )
                     )
                     novel = (
@@ -9986,6 +10526,13 @@ class V4Database:
                     )
                     seen_proposal_keys.add(proposal_key)
                     has_novel_proposal = has_novel_proposal or novel
+                    if concept_id in material_terms:
+                        old_render_states.setdefault(
+                            concept_id,
+                            self._render_state_for_subject(
+                                connection, "concept", concept_id
+                            ),
+                        )
                     cursor = connection.execute(
                         """INSERT INTO evidence(
                                block_id, paragraph_id, kind, source_form, evidence_quote,
@@ -10011,8 +10558,7 @@ class V4Database:
                     if target:
                         connection.execute(
                             """UPDATE concepts
-                               SET default_target=CASE
-                                   WHEN default_target='' THEN ? ELSE default_target END
+                               SET default_target=?
                                WHERE id=? AND locked=0""",
                             (target, concept_id),
                         )
@@ -10081,6 +10627,19 @@ class V4Database:
                             utc_now(),
                         ),
                     )
+            for concept_id in sorted(changed_concepts):
+                self.record_render_change(
+                    connection,
+                    subject_type="concept",
+                    subject_id=concept_id,
+                    old_state=old_render_states.get(concept_id, {}),
+                    new_state=self._render_state_for_subject(
+                        connection, "concept", concept_id
+                    ),
+                    change_kind="proposal",
+                    reason=f"translation proposals {run_id}",
+                    knowledge_version=version,
+                )
             if changed_concepts:
                 import re
 
@@ -10325,26 +10884,69 @@ class V4Database:
             length=24,
         )
         with self.transaction() as connection:
+            existing = connection.execute(
+                "SELECT * FROM claims WHERE id=?", (claim_id,)
+            ).fetchone()
+            if existing is not None and (
+                str(existing["kind"]) == kind
+                and str(existing["statement"]) == statement
+                and str(existing["subject_form"]) == subject_form
+                and str(existing["status"]) == status
+                and str(existing["scope"]) == scope
+                and float(existing["confidence"]) == float(confidence)
+                and int(existing["reveal_global_index"]) == reveal_global_index
+                and bool(existing["high_impact"]) == bool(high_impact)
+                and bool(existing["locked"]) == bool(locked)
+                and existing["retired_version"] is None
+            ):
+                return claim_id
+            old_state = self._claim_state_for_subject(connection, claim_id)
             version = self.create_knowledge_version("create claim", connection)
-            connection.execute(
-                """INSERT OR IGNORE INTO claims(
+            if existing is None:
+                connection.execute(
+                    """INSERT INTO claims(
                        id, kind, statement, subject_form, status, scope, confidence,
                        reveal_global_index, high_impact, locked, created_version, created_at
                    ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                (
-                    claim_id,
-                    kind,
-                    statement,
-                    subject_form,
-                    status,
-                    scope,
-                    confidence,
-                    reveal_global_index,
-                    int(high_impact),
-                    int(locked),
-                    version,
-                    utc_now(),
-                ),
+                    (
+                        claim_id,
+                        kind,
+                        statement,
+                        subject_form,
+                        status,
+                        scope,
+                        confidence,
+                        reveal_global_index,
+                        int(high_impact),
+                        int(locked),
+                        version,
+                        utc_now(),
+                    ),
+                )
+            else:
+                connection.execute(
+                    """UPDATE claims SET status=?, confidence=?, high_impact=?,
+                              locked=?, retired_version=NULL
+                       WHERE id=?""",
+                    (
+                        status,
+                        confidence,
+                        int(high_impact),
+                        int(locked),
+                        claim_id,
+                    ),
+                )
+            new_state = self._claim_state_for_subject(connection, claim_id)
+            self.record_render_change(
+                connection,
+                subject_type="claim",
+                subject_id=claim_id,
+                old_state=old_state,
+                new_state=new_state,
+                change_kind="claim",
+                reason="create claim",
+                knowledge_version=version,
+                record_metadata=True,
             )
             if (high_impact or kind == "translation_constraint") and status in {
                 "proposed",
@@ -10921,6 +11523,13 @@ class V4Database:
                     if task["subject_type"] == "concept"
                     else None
                 )
+                old_claim_state = (
+                    self._claim_state_for_subject(
+                        connection, str(task["subject_id"])
+                    )
+                    if task["subject_type"] == "claim"
+                    else None
+                )
                 version = self.create_knowledge_version(
                     f"double verification {task['id']}", connection
                 )
@@ -10960,6 +11569,18 @@ class V4Database:
                     connection.execute(
                         "UPDATE claims SET status='verified' WHERE id=? AND locked=0",
                         (task["subject_id"],),
+                    )
+                    self.record_render_change(
+                        connection,
+                        subject_type="claim",
+                        subject_id=str(task["subject_id"]),
+                        old_state=old_claim_state or {},
+                        new_state=self._claim_state_for_subject(
+                            connection, str(task["subject_id"])
+                        ),
+                        change_kind="claim",
+                        reason=f"double verification {task['id']}",
+                        knowledge_version=version,
                     )
                 status = "verified"
             else:
@@ -11042,6 +11663,11 @@ class V4Database:
                         connection, "concept", str(subject_id)
                     )
                     if subject_type == "concept"
+                    else None
+                )
+                old_claim_state = (
+                    self._claim_state_for_subject(connection, str(subject_id))
+                    if subject_type == "claim"
                     else None
                 )
                 version = self.create_knowledge_version(
@@ -11140,6 +11766,18 @@ class V4Database:
                                WHERE id=? AND locked=0""",
                             (version, subject_id),
                         )
+                    self.record_render_change(
+                        connection,
+                        subject_type="claim",
+                        subject_id=str(subject_id),
+                        old_state=old_claim_state or {},
+                        new_state=self._claim_state_for_subject(
+                            connection, str(subject_id)
+                        ),
+                        change_kind="claim",
+                        reason=f"human {action} high impact item {item_id}",
+                        knowledge_version=version,
+                    )
                 affected_rows = connection.execute(
                     """SELECT DISTINCT tv.id translation_id, tv.block_id
                        FROM dependencies d

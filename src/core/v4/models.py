@@ -338,6 +338,14 @@ class RenderingMatchSnapshot:
     dependency_fingerprint: str = ""
 
 
+@dataclass(frozen=True)
+class ClaimDependencySnapshot:
+    """Frozen prompt-semantic identity for one matched claim."""
+
+    claim_id: str
+    semantic_fingerprint: str
+
+
 @dataclass
 class TranslationOutcome:
     block: V4Block
@@ -353,7 +361,7 @@ class TranslationOutcome:
     relation_proposals: List[Dict[str, Any]] = field(default_factory=list)
     matched_concept_ids: List[str] = field(default_factory=list)
     matched_renderings: tuple[RenderingMatchSnapshot, ...] = ()
-    claim_dependencies: List[str] = field(default_factory=list)
+    claim_dependencies: tuple[ClaimDependencySnapshot, ...] = ()
     audit_calls: List[Dict[str, Any]] = field(default_factory=list)
     attempts: int = 1
     elapsed_ms: int = 0

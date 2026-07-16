@@ -1,13 +1,15 @@
 import hashlib
 import json
-from contextlib import closing
+import re
+from contextlib import closing, contextmanager
 from dataclasses import replace
 
 import pytest
 
 from src.core.v4.context import ContextBuilder
-from src.core.v4.database import V4Database, render_fingerprint
+from src.core.v4.database import KnowledgeSnapshotError, V4Database, render_fingerprint
 from src.core.v4.pipeline import V4TranslationPipeline
+import src.core.v4.models as v4_models
 from src.core.v4.coreference import cache_key, semantic_cache_key
 from src.core.v4.models import (
     CoreferenceCase,
@@ -23,7 +25,7 @@ from src.core.v4.models import (
 
 def _database(tmp_path, texts):
     root = tmp_path / "book"
-    root.mkdir()
+    root.mkdir(parents=True)
     database = V4Database(root)
     edition = database.ensure_source_edition("raw", "normalized", "test", "source.txt")
     database.upsert_blocks(
@@ -215,6 +217,133 @@ def test_render_fingerprint_has_clear_type_depth_and_size_limits():
         render_fingerprint("lexeme", "lex-1", {"working_target": "x" * 5000})
 
 
+def test_claim_fingerprint_tracks_prompt_semantics_but_not_metadata():
+    base = {
+        "exists": True,
+        "active": True,
+        "accepted": True,
+        "kind": "translation_constraint",
+        "statement": "Keep the title neutral.",
+        "subject_form": "Archon",
+        "scope": "book",
+        "reveal_global_index": 7,
+        "locked": False,
+        "high_impact_constraint": False,
+        "confidence": 0.8,
+        "evidence_count": 1,
+        "created_at": "old",
+    }
+    metadata = {
+        **base,
+        "confidence": 0.1,
+        "evidence_count": 999,
+        "created_at": "new",
+    }
+    assert render_fingerprint("claim", "claim-1", base) == render_fingerprint(
+        "claim", "claim-1", metadata
+    )
+    assert render_fingerprint("claim", "claim-1", base) != render_fingerprint(
+        "claim", "claim-1", {**base, "statement": "Use a different title."}
+    )
+    assert render_fingerprint("claim", "claim-1", base) != render_fingerprint(
+        "claim", "claim-1", {**base, "accepted": False}
+    )
+
+
+def test_claim_create_verify_and_human_resolution_record_semantic_changes(tmp_path):
+    database = _database(tmp_path, ["Archon spoke."])
+    locked_id = database.create_claim(
+        kind="translation_constraint",
+        statement="LOCKED",
+        reveal_global_index=0,
+        subject_form="Archon",
+        status="verified",
+        locked=True,
+    )
+    repeated_version = database.current_knowledge_version()
+    assert database.create_claim(
+        kind="translation_constraint",
+        statement="LOCKED",
+        reveal_global_index=0,
+        subject_form="Archon",
+        status="verified",
+        locked=True,
+    ) == locked_id
+    assert database.current_knowledge_version() == repeated_version
+
+    claim_id = database.create_claim(
+        kind="translation_constraint",
+        statement="PROPOSED",
+        reveal_global_index=0,
+        subject_form="Archon",
+    )
+    task = next(
+        item
+        for item in database.list_verification_tasks()
+        if item["subject_id"] == claim_id
+    )
+    database.start_run("verify-claim", "verify", {})
+    assert database.commit_verification_result(
+        "verify-claim",
+        task,
+        [
+            {"parsed": {"verdict": "support", "rationale": "yes"}},
+            {"parsed": {"verdict": "support", "rationale": "yes"}},
+        ],
+    ) == "verified"
+    with closing(database.connect()) as connection:
+        locked_change = connection.execute(
+            """SELECT impact_level FROM knowledge_changes
+               WHERE subject_type='claim' AND subject_id=? ORDER BY id DESC LIMIT 1""",
+            (locked_id,),
+        ).fetchone()
+        verified_changes = connection.execute(
+            """SELECT impact_level FROM knowledge_changes
+               WHERE subject_type='claim' AND subject_id=? ORDER BY id""",
+            (claim_id,),
+        ).fetchall()
+    assert locked_change[0] == 3
+    assert verified_changes[-1][0] == 2
+
+
+def test_claim_mutation_failure_rolls_back_state_and_version(tmp_path, monkeypatch):
+    database = _database(tmp_path, ["Archon"])
+    claim_id = database.create_claim(
+        kind="translation_constraint",
+        statement="PROPOSED",
+        reveal_global_index=0,
+    )
+    task = next(
+        item
+        for item in database.list_verification_tasks()
+        if item["subject_id"] == claim_id
+    )
+    database.start_run("verify-failure", "verify", {})
+    before = database.current_knowledge_version()
+    monkeypatch.setattr(
+        database,
+        "record_render_change",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("change failed")),
+    )
+    with pytest.raises(RuntimeError, match="change failed"):
+        database.commit_verification_result(
+            "verify-failure",
+            task,
+            [
+                {"parsed": {"verdict": "support", "rationale": "yes"}},
+                {"parsed": {"verdict": "support", "rationale": "yes"}},
+            ],
+        )
+    assert database.current_knowledge_version() == before
+    with closing(database.connect()) as connection:
+        assert connection.execute(
+            "SELECT status FROM claims WHERE id=?", (claim_id,)
+        ).fetchone()[0] == "proposed"
+        assert connection.execute(
+            "SELECT COUNT(*) FROM verification_votes WHERE task_id=?", (task["id"],)
+        ).fetchone()[0] == 0
+
+
 @pytest.mark.parametrize(
     ("old", "new", "kind", "expected"),
     [
@@ -282,6 +411,95 @@ def test_repeat_equal_render_change_creates_no_version_or_change(tmp_path):
     assert database.current_knowledge_version() == before
     with closing(database.connect()) as connection:
         assert connection.execute("SELECT COUNT(*) FROM knowledge_changes").fetchone()[0] == 0
+
+
+def test_record_render_change_derives_kind_and_impact_instead_of_trusting_label(
+    tmp_path
+):
+    database = _database(tmp_path, ["text"])
+    version = database.current_knowledge_version()
+    with database.transaction() as connection:
+        target = database.record_render_change(
+            connection,
+            subject_type="lexeme",
+            subject_id="lex-1",
+            old_state={"working_target": "A"},
+            new_state={"working_target": "B"},
+            change_kind="human_lock",
+            reason="forged label",
+            knowledge_version=version,
+        )
+        rule = database.record_render_change(
+            connection,
+            subject_type="lexeme",
+            subject_id="lex-2",
+            old_state={"working_target": "A", "rules": []},
+            new_state={
+                "working_target": "A",
+                "rules": [
+                    {
+                        "condition": {"speaker": "A"},
+                        "target": "B",
+                        "priority": 1,
+                    }
+                ],
+            },
+            change_kind="target",
+            reason="downgraded label",
+            knowledge_version=version,
+        )
+    assert (target["change_kind"], target["impact_level"]) == ("target", 1)
+    assert (rule["change_kind"], rule["impact_level"]) == (
+        "rendering_rule",
+        2,
+    )
+
+
+def test_record_render_change_rejects_old_version_and_reuses_exact_duplicate(
+    tmp_path
+):
+    database = _database(tmp_path, ["text"])
+    old_version = database.current_knowledge_version()
+    with database.transaction() as connection:
+        current_version = database.create_knowledge_version("new current", connection)
+        with pytest.raises(ValueError, match="current knowledge version"):
+            database.record_render_change(
+                connection,
+                subject_type="lexeme",
+                subject_id="lex-old",
+                old_state={"working_target": "A"},
+                new_state={"working_target": "B"},
+                change_kind="target",
+                reason="stale",
+                knowledge_version=old_version,
+            )
+        first = database.record_render_change(
+            connection,
+            subject_type="lexeme",
+            subject_id="lex-current",
+            old_state={"working_target": "A"},
+            new_state={"working_target": "B"},
+            change_kind="human_lock",
+            reason="first",
+            knowledge_version=current_version,
+        )
+        repeated = database.record_render_change(
+            connection,
+            subject_type="lexeme",
+            subject_id="lex-current",
+            old_state={"working_target": "A"},
+            new_state={"working_target": "B"},
+            change_kind="target",
+            reason="repeat",
+            knowledge_version=current_version,
+        )
+    assert repeated["change_id"] == first["change_id"]
+    with closing(database.connect()) as connection:
+        assert connection.execute(
+            """SELECT COUNT(*) FROM knowledge_changes
+               WHERE knowledge_version=? AND subject_id='lex-current'""",
+            (current_version,),
+        ).fetchone()[0] == 1
 
 
 def test_working_target_uses_its_write_version_for_one_render_change(tmp_path):
@@ -416,7 +634,10 @@ def test_commit_aggregates_exact_lexeme_concept_rule_and_claim_dependencies(tmp_
                 status=V4BlockStatus.COMPLETED.value,
                 final_translation="译文",
                 matched_renderings=matches,
-                claim_dependencies=["claim-1", "claim-1"],
+                claim_dependencies=[
+                    v4_models.ClaimDependencySnapshot("claim-1", "a" * 64),
+                    v4_models.ClaimDependencySnapshot("claim-1", "a" * 64),
+                ],
             )
         ],
     )
@@ -438,6 +659,272 @@ def test_commit_aggregates_exact_lexeme_concept_rule_and_claim_dependencies(tmp_
     assert lexeme["matched_form"] == "ARCHON"
     assert "target_count" in lexeme["rendered_target"]
     assert len(lexeme["dependency_fingerprint"]) == 64
+
+
+def test_frozen_claim_dependency_keeps_semantic_fingerprint_after_same_id_mutates(
+    tmp_path
+):
+    snapshot_type = getattr(v4_models, "ClaimDependencySnapshot", None)
+    assert snapshot_type is not None, "ClaimDependencySnapshot must be public"
+    database = _database(tmp_path, ["Archon spoke."])
+    claim_id = database.create_claim(
+        kind="translation_constraint",
+        statement="OLD STATEMENT",
+        reveal_global_index=0,
+        subject_form="Archon",
+        status="verified",
+        locked=True,
+    )
+    block = database.list_blocks()[0]
+    frozen = database.freeze_render_bundle([block.id])
+    frozen_claim = frozen.claims_by_block[block.id][0]
+    assert re.fullmatch(r"[0-9a-f]{64}", frozen_claim["semantic_fingerprint"])
+    dependency = snapshot_type(
+        claim_id=claim_id,
+        semantic_fingerprint=frozen_claim["semantic_fingerprint"],
+    )
+    database.start_run(
+        "run-claim-fingerprint",
+        "translate",
+        {
+            "frozen_knowledge_version": frozen.knowledge_version,
+            "target_snapshot_signature": frozen.signature,
+        },
+        knowledge_version=frozen.knowledge_version,
+    )
+    database.commit_translation_batch(
+        "run-claim-fingerprint",
+        [
+            TranslationOutcome(
+                block=block,
+                knowledge_version=frozen.knowledge_version,
+                status=V4BlockStatus.COMPLETED.value,
+                claim_dependencies=(dependency,),
+            )
+        ],
+    )
+    with database.transaction() as connection:
+        version = database.create_knowledge_version("update claim statement", connection)
+        old_state = database._claim_state_for_subject(connection, claim_id)
+        connection.execute(
+            "UPDATE claims SET statement='NEW STATEMENT' WHERE id=?", (claim_id,)
+        )
+        database.record_render_change(
+            connection,
+            subject_type="claim",
+            subject_id=claim_id,
+            old_state=old_state,
+            new_state=database._claim_state_for_subject(connection, claim_id),
+            change_kind="metadata",
+            reason="update claim statement",
+            knowledge_version=version,
+        )
+    next_bundle = database.freeze_render_bundle([block.id])
+    assert next_bundle.claims_by_block[block.id][0][
+        "semantic_fingerprint"
+    ] != frozen_claim["semantic_fingerprint"]
+    with closing(database.connect()) as connection:
+        stored = connection.execute(
+            """SELECT dependency_fingerprint FROM dependencies
+               WHERE dependency_type='claim' AND dependency_id=?""",
+            (claim_id,),
+        ).fetchone()[0]
+    assert stored == frozen_claim["semantic_fingerprint"]
+
+
+def test_translation_commit_rejects_unknown_and_run_mismatched_versions(tmp_path):
+    database = _database(tmp_path, ["Alpha"])
+    block = database.list_blocks()[0]
+    database.start_run("run-version", "translate", {})
+    unknown = TranslationOutcome(
+        block=block,
+        knowledge_version=999999,
+        status=V4BlockStatus.COMPLETED.value,
+        matched_renderings=(_match("lex-a", "Alpha", 0, 5, "A"),),
+    )
+    with pytest.raises(ValueError, match="knowledge version"):
+        database.commit_translation_batch("run-version", [unknown])
+
+    run_version = database.current_knowledge_version()
+    database.create_claim(
+        kind="interpretation_hypothesis",
+        statement="newer",
+        reveal_global_index=0,
+    )
+    mismatched = replace(unknown, knowledge_version=database.current_knowledge_version())
+    assert mismatched.knowledge_version != run_version
+    with pytest.raises(ValueError, match="run.*knowledge version|knowledge version.*run"):
+        database.commit_translation_batch("run-version", [mismatched])
+    with closing(database.connect()) as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM translation_versions"
+        ).fetchone()[0] == 0
+        assert connection.execute("SELECT COUNT(*) FROM dependencies").fetchone()[0] == 0
+
+
+def test_translation_commit_rejects_inconsistent_run_bundle_config(tmp_path):
+    database = _database(tmp_path, ["Alpha"])
+    block = database.list_blocks()[0]
+    version = database.current_knowledge_version()
+    database.start_run(
+        "run-bad-bundle",
+        "translate",
+        {
+            "frozen_knowledge_version": version + 1,
+            "target_snapshot_signature": "0" * 64,
+        },
+        knowledge_version=version,
+    )
+    with pytest.raises(ValueError, match="bundle|frozen"):
+        database.commit_translation_batch(
+            "run-bad-bundle",
+            [
+                TranslationOutcome(
+                    block=block,
+                    knowledge_version=version,
+                    status=V4BlockStatus.COMPLETED.value,
+                    matched_renderings=(
+                        _match("lex-a", "Alpha", 0, 5, "A"),
+                    ),
+                )
+            ],
+        )
+
+
+def test_translation_commit_snapshots_inputs_before_transaction_and_rejects_duck_matches(
+    tmp_path, monkeypatch
+):
+    database = _database(tmp_path, ["Alpha"])
+    block = database.list_blocks()[0]
+    database.start_run("run-snapshot", "translate", {})
+    outcome = TranslationOutcome(
+        block=block,
+        knowledge_version=database.current_knowledge_version(),
+        status=V4BlockStatus.COMPLETED.value,
+        final_translation="SAFE",
+    )
+    original_transaction = database.transaction
+
+    @contextmanager
+    def mutate_after_entry_snapshot():
+        outcome.final_translation = "EVIL"
+        with original_transaction() as connection:
+            yield connection
+
+    monkeypatch.setattr(database, "transaction", mutate_after_entry_snapshot)
+    database.commit_translation_batch("run-snapshot", [outcome])
+    with closing(database.connect()) as connection:
+        assert connection.execute(
+            "SELECT final_translation FROM translation_versions"
+        ).fetchone()[0] == "SAFE"
+
+    class EvilDuck:
+        @property
+        def lexeme_id(self):
+            raise AssertionError("getter must never run")
+
+    second = _database(tmp_path / "duck", ["Alpha"])
+    second.start_run("run-duck", "translate", {})
+    evil = TranslationOutcome(
+        block=second.list_blocks()[0],
+        knowledge_version=second.current_knowledge_version(),
+        status=V4BlockStatus.COMPLETED.value,
+        matched_renderings=(EvilDuck(),),
+    )
+    with pytest.raises(ValueError, match="RenderingMatchSnapshot|mapping|snapshot"):
+        second.commit_translation_batch("run-duck", [evil])
+
+
+def test_translation_proposals_record_one_shared_semantic_change_and_repeat_noop(
+    tmp_path
+):
+    database = _database(tmp_path, ["NovelTerm appeared."])
+    database.start_run("proposal-run", "translate", {})
+    block = database.list_blocks()[0]
+    outcome = TranslationOutcome(
+        block=block,
+        knowledge_version=database.current_knowledge_version(),
+        status=V4BlockStatus.COMPLETED.value,
+        term_proposals=[
+            {
+                "src": "NovelTerm",
+                "tgt": "NOVEL",
+                "type": "concept",
+                "context": "term",
+            }
+        ],
+    )
+    version = database.commit_translation_proposals("proposal-run", [outcome])
+    assert version is not None
+    with closing(database.connect()) as connection:
+        changes = connection.execute(
+            "SELECT impact_level FROM knowledge_changes WHERE knowledge_version=?",
+            (version,),
+        ).fetchall()
+        before = (
+            connection.execute("SELECT COUNT(*) FROM knowledge_versions").fetchone()[0],
+            connection.execute("SELECT COUNT(*) FROM knowledge_changes").fetchone()[0],
+        )
+        assert connection.execute(
+            "SELECT COUNT(*) FROM dependencies WHERE dependency_type='concept'"
+        ).fetchone()[0] == 0
+    assert [row[0] for row in changes] == [2]
+    assert database.commit_translation_proposals("proposal-run", [outcome]) is None
+    with closing(database.connect()) as connection:
+        after = (
+            connection.execute("SELECT COUNT(*) FROM knowledge_versions").fetchone()[0],
+            connection.execute("SELECT COUNT(*) FROM knowledge_changes").fetchone()[0],
+        )
+    assert after == before
+
+
+def test_translation_proposal_target_only_change_is_impact_one(tmp_path):
+    database = _database(tmp_path, ["Archon"])
+    concept_id = database.import_legacy_concept("Archon", "", "title", "office")
+    with database.transaction() as connection:
+        connection.execute("UPDATE concepts SET status='verified' WHERE id=?", (concept_id,))
+    database.start_run("proposal-target", "translate", {})
+    block = database.list_blocks()[0]
+    outcome = TranslationOutcome(
+        block=block,
+        knowledge_version=database.current_knowledge_version(),
+        status=V4BlockStatus.COMPLETED.value,
+        term_proposals=[{"src": "Archon", "tgt": "ARCHON", "type": "title"}],
+    )
+    version = database.commit_translation_proposals("proposal-target", [outcome])
+    with closing(database.connect()) as connection:
+        row = connection.execute(
+            """SELECT impact_level FROM knowledge_changes
+               WHERE knowledge_version=? AND subject_id=?""",
+            (version, concept_id),
+        ).fetchone()
+    assert row[0] == 1
+
+
+def test_k0_claim_and_prior_materialization_are_hard_bounded(tmp_path):
+    claims_db = _database(tmp_path / "claims", ["Archon"])
+    version = claims_db.current_knowledge_version()
+    with claims_db.transaction() as connection:
+        connection.executemany(
+            """INSERT INTO claims(
+                   id, kind, statement, subject_form, status, scope, confidence,
+                   reveal_global_index, high_impact, locked, created_version, created_at)
+               VALUES(?, 'translation_constraint', ?, '', 'verified', 'book',
+                      1.0, 0, 0, 0, ?, 'now')""",
+            [(f"claim-{index:04d}", f"statement {index}", version) for index in range(1000)],
+        )
+    with pytest.raises(KnowledgeSnapshotError, match="claim|limit|bound"):
+        claims_db.freeze_render_bundle(["block-0"])
+
+    prior_db = _database(
+        tmp_path / "prior",
+        ["scape " + ("x" * 10000), "The scape opened."],
+    )
+    prior_db.import_legacy_concept("scape", "SCAPE", "concept", "world")
+    bundle = prior_db.freeze_render_bundle(["block-1"])
+    evidence = bundle.prior_concept_evidence_by_block["block-1"]
+    assert len(evidence) <= 2
+    assert sum(len(item["source_text"]) for item in evidence) <= 3600
 
 
 def test_spans_are_bounded_but_occurrence_count_is_complete_and_commit_is_idempotent(tmp_path):

@@ -26,6 +26,7 @@ from .context import ContextBuilder, ContextOverflow
 from .database import FrozenRenderBundle, KnowledgeSnapshotError, V4Database
 from .matcher import FrozenRenderIndex
 from .models import (
+    ClaimDependencySnapshot,
     Island,
     RenderingMatchSnapshot,
     TranslationOutcome,
@@ -715,6 +716,9 @@ class V4TranslationPipeline:
                 )
                 parsed_with_warnings["quality_warnings"] = quality_warnings
                 audit_with_warnings["parsed"] = parsed_with_warnings
+            matched_claim_ids = frozenset(
+                str(claim_id) for claim_id in packet.matched_claim_ids
+            )
             outcome = TranslationOutcome(
                 block=block,
                 knowledge_version=knowledge_version,
@@ -729,7 +733,14 @@ class V4TranslationPipeline:
                 relation_proposals=relation_proposals,
                 matched_concept_ids=list(packet.matched_concept_ids),
                 matched_renderings=frozen_render_matches,
-                claim_dependencies=list(packet.matched_claim_ids),
+                claim_dependencies=tuple(
+                    ClaimDependencySnapshot(
+                        claim_id=str(claim["id"]),
+                        semantic_fingerprint=str(claim["semantic_fingerprint"]),
+                    )
+                    for claim in frozen_claims_by_block.get(block.id, ())
+                    if str(claim["id"]) in matched_claim_ids
+                ),
                 audit_calls=block_audits,
                 attempts=attempts,
                 elapsed_ms=int((time.perf_counter() - started) * 1000),

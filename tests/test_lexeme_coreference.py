@@ -1577,7 +1577,7 @@ def test_merge_concept_redirect_moves_active_associations_and_preserves_history(
     assert tuple(title) == (canonical_id, 0.8, "verified", evidence_ids[1])
     assert old_primary == result["knowledge_version"]
     assert tuple(old_concept) == ("merged", result["knowledge_version"])
-    assert {row[0] for row in changes} == {"concept_merge", "concept_redirect"}
+    assert {row[0] for row in changes} == {"subject_link"}
     assert database.read_audit_payload(old_audit)["raw_response"] == "old concept evidence"
 
 
@@ -4876,7 +4876,7 @@ def test_human_alias_only_change_is_versioned_audited_and_idempotent(tmp_path):
             ).fetchone()[0],
             "changes": connection.execute(
                 """SELECT COUNT(*) FROM knowledge_changes
-                   WHERE change_kind='concept_form_aliases'"""
+                   WHERE change_kind='subject_link'"""
             ).fetchone()[0],
         }
         link = connection.execute(
@@ -4914,7 +4914,7 @@ def test_human_alias_only_change_is_versioned_audited_and_idempotent(tmp_path):
         ).fetchone()[0] == after_first["audits"]
         assert connection.execute(
             """SELECT COUNT(*) FROM knowledge_changes
-               WHERE change_kind='concept_form_aliases'"""
+               WHERE change_kind='subject_link'"""
         ).fetchone()[0] == after_first["changes"]
 
 
