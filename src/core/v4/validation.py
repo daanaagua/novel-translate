@@ -100,6 +100,40 @@ class V4Validator:
                         "；".join(warnings) or "译文需要人工复核",
                     )
                 )
+            if row.get("validation_status") == "warning_stale":
+                try:
+                    task_result = json.loads(
+                        row.get("revalidation_result_json") or "{}"
+                    )
+                except (TypeError, json.JSONDecodeError):
+                    task_result = {}
+                change_ids = task_result.get("change_ids") or []
+                reason = (
+                    task_result.get("reason")
+                    or task_result.get("error_category")
+                    or row.get("revalidation_error")
+                    or row.get("revalidation_task_action")
+                    or "revalidation warning fallback"
+                )
+                old_knowledge_version = (
+                    row.get("revalidation_from_knowledge_version")
+                    or row.get("validated_knowledge_version")
+                    or row.get("revalidation_to_knowledge_version")
+                    or "-"
+                )
+                report.issues.append(
+                    ValidationIssue(
+                        block_id,
+                        "warning",
+                        "warning_stale",
+                        (
+                            f"active translation remains usable but stale; "
+                            f"task={row.get('revalidation_task_id') or '-'}; "
+                            f"change_ids={change_ids}; reason={reason}; "
+                            f"old_knowledge_version={old_knowledge_version}"
+                        ),
+                    )
+                )
             if not final.strip():
                 report.issues.append(
                     ValidationIssue(block_id, "high", "empty_final", "最终译文为空")

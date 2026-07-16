@@ -1259,6 +1259,7 @@ class ParallelV4CliTests(unittest.TestCase):
             patch.object(cli_main, "V4Migrator") as migrator,
             patch.object(cli_main, "_run_scan_v4", stage("scan", {"failed": 0})),
             patch.object(cli_main, "_run_adjudicate_v4", stage("adjudicate", {"failed": 0})),
+            patch.object(cli_main, "_run_coreference_v4", stage("coreference", {"uncertain": 1})),
             patch.object(cli_main, "_run_resolve_targets_v4", stage("resolve", {"queued": 0})),
         ):
             exit_code, output = self.invoke(
@@ -1280,7 +1281,10 @@ class ParallelV4CliTests(unittest.TestCase):
 
         self.assertEqual(exit_code, 0)
         migrator.assert_called_once_with(self.project)
-        self.assertEqual([item[0] for item in calls], ["scan", "adjudicate", "resolve"])
+        self.assertEqual(
+            [item[0] for item in calls],
+            ["scan", "adjudicate", "coreference", "resolve"],
+        )
         self.assertTrue(all(item[2:] == (8, 13, 2, "full", 3, 4) for item in calls))
         self.assertEqual(json.loads(output)["status"], "completed")
 
@@ -1301,6 +1305,7 @@ class ParallelV4CliTests(unittest.TestCase):
             patch.object(cli_main, "V4Migrator"),
             patch.object(cli_main, "_run_scan_v4", failed_scan),
             patch.object(cli_main, "_run_adjudicate_v4", must_not_run),
+            patch.object(cli_main, "_run_coreference_v4", must_not_run),
             patch.object(cli_main, "_run_resolve_targets_v4", must_not_run),
         ):
             exit_code, output = self.invoke("prepare-v4", "book")
@@ -1310,6 +1315,140 @@ class ParallelV4CliTests(unittest.TestCase):
         result = json.loads(output)
         self.assertEqual(result["status"], "failed")
         self.assertEqual(result["failed_stage"], "scan")
+
+    def test_schema8_coreference_and_revalidation_commands_forward_bounded_options(self):
+        import main as cli_main
+
+        constructed = []
+
+        class FakeCoreference:
+            def __init__(self, database, **kwargs):
+                constructed.append(("coreference", database.project_root, kwargs))
+
+            def run(self, max_cases=None):
+                constructed.append(("coreference-run", max_cases))
+                return {"cases": 5, "uncertain": 2, "protocol_failures": 1}
+
+        class FakeRevalidation:
+            def __init__(self, database, **kwargs):
+                constructed.append(("revalidate", database.project_root, kwargs))
+
+            def run(self, max_tasks=None):
+                constructed.append(("revalidate-run", max_tasks))
+                return {"status": "completed_with_warnings", "warnings": 1, "unfinished": 0}
+
+        with (
+            patch.object(cli_main, "V4Migrator"),
+            patch.object(cli_main, "CoreferenceCoordinator", FakeCoreference),
+            patch.object(cli_main, "RevalidationRunner", FakeRevalidation),
+            patch.object(cli_main, "V4Repairer"),
+            patch.object(cli_main, "V4TranslationPipeline"),
+            patch.object(cli_main, "LLMManager", side_effect=lambda config: object()),
+            patch.object(
+                cli_main.config_loader,
+                "load_config",
+                return_value={"llm": {}, "parallel_v4": {}, "translation": {}},
+            ),
+            patch.object(cli_main.config_loader, "load_prompts", return_value={}),
+        ):
+            coref_code, _ = self.invoke(
+                "coreference-v4", "book", "--max-cases", "5", "--max-attempts", "7"
+            )
+            revalidate_code, _ = self.invoke(
+                "revalidate-v4", "book", "--max-tasks", "6", "--max-attempts", "8"
+            )
+
+        self.assertEqual((coref_code, revalidate_code), (0, 0))
+        self.assertIn(("coreference-run", 5), constructed)
+        self.assertIn(("revalidate-run", 6), constructed)
+        self.assertEqual(
+            next(item[2]["max_attempts"] for item in constructed if item[0] == "coreference"),
+            7,
+        )
+        self.assertEqual(
+            next(item[2]["max_attempts"] for item in constructed if item[0] == "revalidate"),
+            8,
+        )
+
+    def test_translate_v4_exposes_epoch_policy_and_warning_exit_is_success(self):
+        import main as cli_main
+
+        captured = {}
+
+        class FakePipeline:
+            def __init__(self, **kwargs):
+                captured["config"] = kwargs["config"]
+
+            def run(self):
+                return {
+                    "completed": 0,
+                    "completed_with_warnings": 1,
+                    "failed_retryable": 0,
+                    "incomplete_requires_human": 0,
+                }
+
+        with (
+            patch.object(cli_main, "V4Migrator"),
+            patch.object(cli_main, "V4TranslationPipeline", FakePipeline),
+            patch.object(
+                cli_main.config_loader,
+                "load_config",
+                return_value={"llm": {}, "parallel_v4": {}, "translation": {}},
+            ),
+            patch.object(cli_main.config_loader, "load_prompts", return_value={}),
+        ):
+            exit_code, _ = self.invoke(
+                "translate-v4",
+                "book",
+                "--decision-mode",
+                "interactive",
+                "--pause-on-review",
+                "--max-knowledge-epochs",
+                "4",
+            )
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(captured["config"].decision_mode, "interactive")
+        self.assertTrue(captured["config"].pause_on_review)
+        self.assertEqual(captured["config"].max_knowledge_epochs, 4)
+        self.assertEqual(
+            captured["config"].unattended_failure_policy, "finish_with_warnings"
+        )
+
+        with (
+            patch.object(cli_main, "V4Migrator"),
+            patch.object(cli_main, "V4TranslationPipeline", FakePipeline),
+            patch.object(
+                cli_main.config_loader,
+                "load_config",
+                return_value={"llm": {}, "parallel_v4": {}, "translation": {}},
+            ),
+            patch.object(cli_main.config_loader, "load_prompts", return_value={}),
+        ):
+            legacy_code, _ = self.invoke(
+                "translate-v4", "book", "--decision-mode", "unattended"
+            )
+        self.assertEqual(legacy_code, 0)
+        self.assertEqual(captured["config"].decision_mode, "auto")
+
+    def test_migrate_v4_preview_and_confirmation_are_explicit(self):
+        import main as cli_main
+
+        database_path = self.root / "artifacts" / "parallel_v4" / "book.db"
+        with patch.object(
+            cli_main, "preview_schema8", return_value={"status": "ready", "confirm_token": "t"}
+        ) as preview:
+            preview_code, preview_output = self.invoke("migrate-v4", "book", "--preview")
+        self.assertEqual(preview_code, 0)
+        preview.assert_called_once_with(database_path.resolve())
+        self.assertEqual(json.loads(preview_output)["confirm_token"], "t")
+
+        with patch.object(cli_main, "V4Migrator") as migrator:
+            migrator.return_value.migrate.return_value = {"status": "migrated"}
+            migrate_code, _ = self.invoke("migrate-v4", "book", "--confirm", "token")
+        self.assertEqual(migrate_code, 0)
+        migrator.assert_called_once_with(self.project, confirm_token="token")
+        migrator.return_value.migrate.assert_called_once_with()
 
     def test_model_preparation_commands_forward_audit_and_attempt_limits(self):
         import main as cli_main

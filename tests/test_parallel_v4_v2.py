@@ -20,8 +20,9 @@ from src.core.v4.migration import V4Migrator
 from src.core.v4.models import ScanOutcome, ScanResponse
 from src.core.v4.repairer import V4Repairer
 from src.core.v4.revalidation import RevalidationPlanner
+from src.core.v4.validation import V4Validator
 from src.core.v4.verifier import V4Verifier
-from src.core.v4.web_review import create_review_server
+from src.core.v4.web_review import REVIEW_HTML, create_review_server
 
 
 class FakeVerifyLLM:
@@ -361,6 +362,121 @@ class ParallelV4V2Tests(unittest.TestCase):
         self.assertIn("〔注1〕", annotated_text)
         self.assertIn("批准的注释", annotated_text)
         self.assertNotIn("未批准的注释", annotated_text)
+
+    def test_warning_stale_exports_by_default_reports_detail_and_strict_rejects(self):
+        self.insert_translations()
+        block = self.database.list_blocks()[0]
+        with self.database.transaction() as connection:
+            translation = connection.execute(
+                "SELECT id FROM translation_versions WHERE block_id=? AND active=1",
+                (block.id,),
+            ).fetchone()
+            connection.execute(
+                "UPDATE translation_versions SET validation_status='warning_stale' WHERE id=?",
+                (translation["id"],),
+            )
+            connection.execute(
+                """INSERT INTO revalidation_tasks(
+                       id, translation_id, block_id, from_knowledge_version,
+                       to_knowledge_version, change_set_hash, impact_level, status,
+                       action, result_json, created_at, resolved_at)
+                   VALUES('warning-task', ?, ?, 1, 1, 'warning-hash', 2,
+                          'completed_with_warning', 'warning_fallback', ?, 'now', 'now')""",
+                (
+                    translation["id"],
+                    block.id,
+                    json.dumps(
+                        {
+                            "reason": "validator_protocol_exhausted",
+                            "change_ids": [17, 23],
+                            "error_category": "protocol",
+                        }
+                    ),
+                ),
+            )
+
+        report = V4Validator(self.database).validate()
+        stale = next(issue for issue in report.issues if issue.code == "warning_stale")
+        self.assertIn("17", stale.message)
+        self.assertIn("validator_protocol_exhausted", stale.message)
+        exported = ParallelV4BookExporter(self.project, self.database).export_v4(
+            self.root / "warning-default"
+        )
+        quality = exported.quality_report_path.read_text(encoding="utf-8")
+        self.assertIn("warning_stale", quality)
+        self.assertIn(block.legacy_id, quality)
+        with self.assertRaisesRegex(ValueError, "warning_stale|strict"):
+            ParallelV4BookExporter(self.project, self.database).export_v4(
+                self.root / "warning-strict", strict_validation=True
+            )
+
+    def test_status_summary_includes_schema8_workflow_counts_and_optional_warnings(self):
+        concept_id = self.database.import_legacy_concept(
+            "Archon", "title target", "title", "office"
+        )
+        with self.database.transaction() as connection:
+            lexeme_id = connection.execute(
+                "SELECT lexeme_id FROM concept_lexemes WHERE concept_id=?",
+                (concept_id,),
+            ).fetchone()[0]
+            connection.execute(
+                """INSERT INTO coreference_decisions(
+                       id, lexeme_id, left_anchor_type, left_anchor_id,
+                       right_anchor_type, right_anchor_id, relation,
+                       decision_source, confidence, locked, payload_hash,
+                       created_version, created_at)
+                   VALUES('uncertain-ui', ?, 'concept', ?, 'mention_set', 'set-1',
+                          'uncertain', 'dual_model', 0.2, 0, 'uncertain-ui-hash', 1, 'now')""",
+                (lexeme_id, concept_id),
+            )
+            connection.execute(
+                """INSERT INTO human_queue(block_id, kind, severity, payload_json, created_at)
+                   VALUES(NULL, 'render_rule_conflict', 'warning', '{}', 'now')"""
+            )
+
+        summary = self.database.status_summary()
+        expected = {
+            "active_lexemes",
+            "active_concepts",
+            "coreference_deterministic_merges",
+            "coreference_model_merges",
+            "coreference_different",
+            "coreference_uncertain",
+            "coreference_model_calls",
+            "coreference_conflicts",
+            "coreference_protocol_failures",
+            "coreference_fallbacks",
+            "revalidation_pending",
+            "revalidation_completed_with_warning",
+            "revalidation_impact_0",
+            "revalidation_impact_3",
+            "current_knowledge_epoch",
+            "frozen_proposals",
+            "optional_human_queue",
+            "blocking_human_queue",
+        }
+        self.assertTrue(expected.issubset(summary), expected - set(summary))
+        self.assertGreaterEqual(summary["active_lexemes"], 1)
+        self.assertGreaterEqual(summary["active_concepts"], 1)
+        self.assertEqual(summary["coreference_uncertain"], 1)
+        self.assertEqual(summary["optional_human_queue"], 1)
+        self.assertEqual(summary["blocking_human_queue"], 0)
+
+        warnings = self.database.review_warning_sections()
+        self.assertEqual(len(warnings["uncertain_coreference"]), 1)
+        self.assertEqual(len(warnings["render_conflicts"]), 1)
+        self.assertEqual(warnings["warning_stale"], [])
+        self.assertIn('id="warning-uncertain-coreference"', REVIEW_HTML)
+        self.assertIn('id="warning-render-conflicts"', REVIEW_HTML)
+        self.assertIn('id="warning-stale"', REVIEW_HTML)
+        self.assertNotIn("unfinished warning", REVIEW_HTML.casefold())
+
+    def test_v4_public_api_exports_unattended_coordinators(self):
+        from src.core.v4 import CoreferenceCoordinator, RevalidationRunner, V4Migrator
+
+        self.assertTrue(CoreferenceCoordinator)
+        self.assertTrue(RevalidationRunner)
+        self.assertTrue(V4Migrator)
 
     def test_web_server_is_loopback_and_post_requires_token(self):
         docx = self.root / "web-baseline.docx"

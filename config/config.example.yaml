@@ -58,6 +58,10 @@ translation:
   enable_auto_glossary: true
 
 parallel_v4:
+  decision_mode: "auto"
+  pause_on_review: false
+  unattended_failure_policy: "finish_with_warnings"
+  max_knowledge_epochs: 3
   island_size: 3
   initial_workers: 2
   max_workers: 4

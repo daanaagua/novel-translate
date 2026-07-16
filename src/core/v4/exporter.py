@@ -99,13 +99,27 @@ class ParallelV4BookExporter(BookExporter):
         output_dir: str | Path | None = None,
         allow_warnings: bool = False,
         include_annotations: bool = False,
+        strict_validation: bool = False,
     ) -> V4ExportResult:
         report = V4Validator(self.database).validate()
         if report.high_count:
             raise ValueError(f"严格导出被拒绝：存在 {report.high_count} 个高严重度问题")
-        if report.warning_count and not allow_warnings:
+        stale_warnings = [
+            issue for issue in report.issues if issue.code == "warning_stale"
+        ]
+        other_warnings = [
+            issue
+            for issue in report.issues
+            if issue.severity == "warning" and issue.code != "warning_stale"
+        ]
+        if strict_validation and stale_warnings:
             raise ValueError(
-                f"严格导出被拒绝：存在 {report.warning_count} 个警告；"
+                "strict validation rejected "
+                f"{len(stale_warnings)} warning_stale translation(s)"
+            )
+        if other_warnings and not allow_warnings:
+            raise ValueError(
+                f"严格导出被拒绝：存在 {len(other_warnings)} 个警告；"
                 "确认后可使用 allow_warnings"
             )
         target_dir = (

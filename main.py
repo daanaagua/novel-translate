@@ -19,8 +19,10 @@ from src.core.exporter import BookExporter
 from src.agents.glossary_manager import GlossaryManager
 from src.core.schemas import ChunkStatus
 from src.core.v4 import (
+    CoreferenceCoordinator,
     ParallelV4BookExporter,
     DocxBaselineImporter,
+    RevalidationRunner,
     V4Database,
     V4Migrator,
     V4PipelineConfig,
@@ -33,6 +35,7 @@ from src.core.v4 import (
     write_shadow_comparison,
 )
 from src.core.v4.adjudicator import V4Adjudicator
+from src.core.v4.schema_v8 import preview_schema8
 from src.core.v4.target_resolver import TargetResolver
 from rich.console import Console
 from rich.theme import Theme
@@ -268,11 +271,31 @@ def _positive_int(value):
     return parsed
 
 
+def _decision_mode(value):
+    if value == "unattended":
+        return "auto"
+    if value not in {"auto", "interactive"}:
+        raise argparse.ArgumentTypeError("must be auto or interactive")
+    return value
+
+
 def cmd_migrate_v4(args):
     project = _load_project_or_error(args.book_id)
     if not project:
         return 1
-    result = V4Migrator(project).migrate()
+    try:
+        if getattr(args, "preview", False):
+            database_path = (
+                Path(project.root_dir) / "artifacts" / "parallel_v4" / "book.db"
+            )
+            result = preview_schema8(database_path.resolve())
+        else:
+            result = V4Migrator(
+                project, confirm_token=getattr(args, "confirm", None)
+            ).migrate()
+    except Exception as exc:
+        _print_stage_error("migrate", exc)
+        return 1
     print(json.dumps(result, ensure_ascii=False, indent=2))
     return 0
 
@@ -340,6 +363,17 @@ def _run_adjudicate_v4(project, args):
     )
 
 
+def _run_coreference_v4(project, args):
+    config = config_loader.load_config()
+    llm_config = config["llm"]
+    return CoreferenceCoordinator(
+        V4Database(project.root_dir),
+        llm_factory_a=lambda: LLMManager(llm_config),
+        llm_factory_b=lambda: LLMManager(llm_config),
+        max_attempts=args.max_attempts,
+    ).run(max_cases=getattr(args, "max_cases", None))
+
+
 def _run_resolve_targets_v4(project, args):
     config = config_loader.load_config()
     resolver = TargetResolver(
@@ -405,6 +439,20 @@ def cmd_resolve_targets_v4(args):
     return 1 if result["queued"] else 0
 
 
+def cmd_coreference_v4(args):
+    project = _load_project_or_error(args.book_id)
+    if not project:
+        return 1
+    try:
+        V4Migrator(project).migrate()
+        result = _run_coreference_v4(project, args)
+    except Exception as exc:
+        _print_stage_error("coreference", exc)
+        return 1
+    print(json.dumps(result, ensure_ascii=False, indent=2))
+    return 0
+
+
 def cmd_prepare_v4(args):
     try:
         _adjudication_worker_limits(args)
@@ -423,6 +471,7 @@ def cmd_prepare_v4(args):
     for name, runner, failure_key in (
         ("scan", _run_scan_v4, "failed"),
         ("adjudicate", _run_adjudicate_v4, "failed"),
+        ("coreference", _run_coreference_v4, None),
         ("resolve", _run_resolve_targets_v4, "queued"),
     ):
         try:
@@ -443,7 +492,7 @@ def cmd_prepare_v4(args):
             )
             return 1
         stages[name] = result
-        if int(result.get(failure_key, 0)):
+        if failure_key is not None and int(result.get(failure_key, 0)):
             print(
                 json.dumps(
                     {
@@ -528,7 +577,19 @@ def cmd_translate_v4(args):
         max_attempts=args.max_attempts,
         max_blocks=args.max_blocks,
         include_block_ids=include_block_ids,
-        decision_mode=args.decision_mode,
+        decision_mode=args.decision_mode or settings.get("decision_mode", "auto"),
+        pause_on_review=(
+            args.pause_on_review
+            if args.pause_on_review is not None
+            else bool(settings.get("pause_on_review", False))
+        ),
+        unattended_failure_policy=settings.get(
+            "unattended_failure_policy", "finish_with_warnings"
+        ),
+        max_knowledge_epochs=(
+            args.max_knowledge_epochs
+            or int(settings.get("max_knowledge_epochs", 3))
+        ),
         enable_polish=not args.no_polish,
         enable_semantic_mapper=bool(settings.get("enable_semantic_mapper", True)),
         semantic_temperature=float(settings.get("semantic_temperature", 0.0)),
@@ -558,9 +619,54 @@ def cmd_status_v4(args):
         return 1
     database = V4Database(project.root_dir)
     print(json.dumps(database.status_summary(), ensure_ascii=False, indent=2))
-    print(f"knowledge_version={database.current_knowledge_version()}")
-    print(f"open_human_queue={len(database.list_human_queue())}")
     return 0
+
+
+def cmd_revalidate_v4(args):
+    project = _load_project_or_error(args.book_id)
+    if not project:
+        return 1
+    try:
+        V4Migrator(project).migrate()
+        config = config_loader.load_config()
+        settings = config.get("parallel_v4", {})
+        polish = config.get("translation", {}).get("polish", {})
+        database = V4Database(project.root_dir)
+        llm_config = config["llm"]
+        prompts = config_loader.load_prompts()
+        pipeline = V4TranslationPipeline(
+            database=database,
+            llm_factory=lambda: LLMManager(llm_config),
+            prompts=prompts,
+            config=V4PipelineConfig(
+                max_attempts=args.max_attempts,
+                max_context_chars=int(settings.get("max_context_chars", 24000)),
+                enable_polish=bool(settings.get("enable_polish", True)),
+                decision_mode="auto",
+            ),
+        )
+        repairer = V4Repairer(
+            database,
+            llm_factory=lambda: LLMManager(llm_config),
+            max_attempts=args.max_attempts,
+            max_tokens=int(polish.get("max_tokens", 37200)),
+            max_context_chars=int(settings.get("max_context_chars", 24000)),
+        )
+        result = RevalidationRunner(
+            database,
+            validator_factories=(
+                lambda: LLMManager(llm_config),
+                lambda: LLMManager(llm_config),
+            ),
+            repairer=repairer,
+            translate_block_factory=lambda: pipeline.translate_block_factory(),
+            max_attempts=args.max_attempts,
+        ).run(max_tasks=args.max_tasks)
+    except Exception as exc:
+        _print_stage_error("revalidate", exc)
+        return 1
+    print(json.dumps(result, ensure_ascii=False, indent=2))
+    return 1 if int(result.get("unfinished", 0)) else 0
 
 
 def cmd_serve_v4(args):
@@ -719,6 +825,7 @@ def cmd_export_v4(args):
             output_dir=args.output_dir,
             allow_warnings=args.allow_warnings,
             include_annotations=args.include_annotations,
+            strict_validation=args.strict_validation,
         )
     except Exception as exc:
         print(f"[ERROR] 导出失败: {exc}")
@@ -791,6 +898,9 @@ def main(argv=None):
 
     p_migrate_v4 = subparsers.add_parser("migrate-v4", help="非破坏性导入串行项目到parallel_v4")
     p_migrate_v4.add_argument("book_id", help="项目ID")
+    migrate_action = p_migrate_v4.add_mutually_exclusive_group()
+    migrate_action.add_argument("--preview", action="store_true")
+    migrate_action.add_argument("--confirm", metavar="TOKEN")
     p_migrate_v4.set_defaults(func=cmd_migrate_v4)
 
     p_baseline_v4 = subparsers.add_parser("import-baseline-v4", help="导入逐段DOCX外部译文基线")
@@ -838,8 +948,16 @@ def main(argv=None):
     )
     p_resolve_targets_v4.set_defaults(func=cmd_resolve_targets_v4)
 
+    p_coreference_v4 = subparsers.add_parser(
+        "coreference-v4", help="执行确定性优先的双模型共指协调"
+    )
+    p_coreference_v4.add_argument("book_id", help="项目ID")
+    p_coreference_v4.add_argument("--max-cases", type=_non_negative_int)
+    p_coreference_v4.add_argument("--max-attempts", type=_positive_int, default=2)
+    p_coreference_v4.set_defaults(func=cmd_coreference_v4)
+
     p_prepare_v4 = subparsers.add_parser(
-        "prepare-v4", help="依次执行本地索引、候选裁决和工作译名解析"
+        "prepare-v4", help="依次执行扫描、候选裁决、共指协调和工作译名解析"
     )
     p_prepare_v4.add_argument("book_id", help="项目ID")
     p_prepare_v4.add_argument("--initial-workers", type=_positive_int, default=2)
@@ -849,6 +967,7 @@ def main(argv=None):
         "--block", action="append", help="仅准备指定文本块，可重复提供ID或旧版ID"
     )
     p_prepare_v4.add_argument("--max-clusters", type=_non_negative_int)
+    p_prepare_v4.add_argument("--max-cases", type=_non_negative_int)
     p_prepare_v4.add_argument("--max-attempts", type=_positive_int, default=2)
     p_prepare_v4.add_argument(
         "--audit-mode", choices=["full", "response", "minimal"]
@@ -874,6 +993,14 @@ def main(argv=None):
     p_verify_v4.add_argument("--max-attempts", type=_positive_int, default=2)
     p_verify_v4.set_defaults(func=cmd_verify_v4)
 
+    p_revalidate_v4 = subparsers.add_parser(
+        "revalidate-v4", help="执行精确失效校验、修复与整块重译"
+    )
+    p_revalidate_v4.add_argument("book_id", help="项目ID")
+    p_revalidate_v4.add_argument("--max-tasks", type=_non_negative_int)
+    p_revalidate_v4.add_argument("--max-attempts", type=_positive_int, default=2)
+    p_revalidate_v4.set_defaults(func=cmd_revalidate_v4)
+
     p_translate_v4 = subparsers.add_parser("translate-v4", help="执行带屏障的并行两层翻译")
     p_translate_v4.add_argument("book_id", help="项目ID")
     p_translate_v4.add_argument("--island-size", type=int)
@@ -891,10 +1018,14 @@ def main(argv=None):
     )
     p_translate_v4.add_argument(
         "--decision-mode",
-        choices=["interactive", "unattended"],
-        default="unattended",
-        help="interactive在出现新知识建议的批次后暂停；unattended自动继续",
+        type=_decision_mode,
+        choices=["auto", "interactive"],
+        help="auto自动继续；interactive可在评审检查点暂停",
     )
+    p_translate_v4.add_argument(
+        "--pause-on-review", action="store_true", default=None
+    )
+    p_translate_v4.add_argument("--max-knowledge-epochs", type=_positive_int)
     p_translate_v4.add_argument("--no-polish", action="store_true")
     p_translate_v4.add_argument("--force", "-f", action="store_true", help="强制重翻已完成块")
     p_translate_v4.set_defaults(func=cmd_translate_v4)
@@ -968,6 +1099,7 @@ def main(argv=None):
     p_export_v4.add_argument("book_id", help="项目ID")
     p_export_v4.add_argument("--output-dir")
     p_export_v4.add_argument("--allow-warnings", action="store_true")
+    p_export_v4.add_argument("--strict-validation", action="store_true")
     p_export_v4.add_argument("--include-annotations", action="store_true")
     p_export_v4.set_defaults(func=cmd_export_v4)
 

@@ -13078,7 +13078,39 @@ class V4Database:
             rows = connection.execute(
                 """SELECT b.*, tv.status translation_status, tv.draft_translation,
                           tv.final_translation, tv.analysis, tv.memory_summary,
-                          tv.warnings_json
+                          tv.warnings_json, tv.validation_status,
+                          tv.validated_knowledge_version,
+                          tv.validation_fingerprint,
+                          (SELECT task.id FROM revalidation_tasks task
+                            WHERE task.translation_id=tv.id
+                            ORDER BY task.created_at DESC, task.id DESC LIMIT 1)
+                              revalidation_task_id,
+                          (SELECT task.status FROM revalidation_tasks task
+                            WHERE task.translation_id=tv.id
+                            ORDER BY task.created_at DESC, task.id DESC LIMIT 1)
+                              revalidation_task_status,
+                          (SELECT task.action FROM revalidation_tasks task
+                            WHERE task.translation_id=tv.id
+                            ORDER BY task.created_at DESC, task.id DESC LIMIT 1)
+                              revalidation_task_action,
+                          (SELECT task.from_knowledge_version
+                             FROM revalidation_tasks task
+                            WHERE task.translation_id=tv.id
+                            ORDER BY task.created_at DESC, task.id DESC LIMIT 1)
+                              revalidation_from_knowledge_version,
+                          (SELECT task.to_knowledge_version
+                             FROM revalidation_tasks task
+                            WHERE task.translation_id=tv.id
+                            ORDER BY task.created_at DESC, task.id DESC LIMIT 1)
+                              revalidation_to_knowledge_version,
+                          (SELECT task.result_json FROM revalidation_tasks task
+                            WHERE task.translation_id=tv.id
+                            ORDER BY task.created_at DESC, task.id DESC LIMIT 1)
+                              revalidation_result_json,
+                          (SELECT task.error FROM revalidation_tasks task
+                            WHERE task.translation_id=tv.id
+                            ORDER BY task.created_at DESC, task.id DESC LIMIT 1)
+                              revalidation_error
                    FROM blocks b
                    LEFT JOIN translation_versions tv
                      ON tv.block_id=b.id AND tv.pipeline=? AND tv.active=1
@@ -13102,6 +13134,13 @@ class V4Database:
                        GROUP BY status ORDER BY status"""
                 )
             }
+            for block_status in V4BlockStatus:
+                key = (
+                    "legacy_needs_revalidate"
+                    if block_status is V4BlockStatus.NEEDS_REVALIDATE
+                    else block_status.value
+                )
+                summary.setdefault(key, 0)
             derived = connection.execute(
                 """SELECT COUNT(DISTINCT tv.block_id) block_count,
                           COUNT(DISTINCT task.translation_id) translation_count
@@ -13117,4 +13156,228 @@ class V4Database:
             summary["needs_revalidate_translations"] = int(
                 derived["translation_count"]
             )
+            summary["active_lexemes"] = int(
+                connection.execute(
+                    "SELECT COUNT(*) FROM lexemes WHERE retired_version IS NULL"
+                ).fetchone()[0]
+            )
+            summary["active_concepts"] = int(
+                connection.execute(
+                    "SELECT COUNT(*) FROM concepts WHERE retired_version IS NULL"
+                ).fetchone()[0]
+            )
+            summary["lexemes"] = summary["active_lexemes"]
+            summary["concepts"] = summary["active_concepts"]
+
+            coreference = {
+                (str(row["decision_source"]), str(row["relation"])): int(
+                    row["count"]
+                )
+                for row in connection.execute(
+                    """SELECT decision_source, relation, COUNT(*) count
+                       FROM coreference_decisions
+                       WHERE retired_version IS NULL
+                       GROUP BY decision_source, relation"""
+                )
+            }
+            summary["coreference_deterministic_merges"] = coreference.get(
+                ("deterministic", "same"), 0
+            )
+            summary["coreference_model_merges"] = coreference.get(
+                ("dual_model", "same"), 0
+            )
+            for relation in ("different", "non_entity", "uncertain"):
+                summary[f"coreference_{relation}"] = sum(
+                    count
+                    for (source, value), count in coreference.items()
+                    if value == relation
+                )
+            summary["coreference_model_calls"] = int(
+                connection.execute(
+                    """SELECT COUNT(*) FROM audit_calls
+                       WHERE purpose IN ('coreference', 'dual_model_coreference')"""
+                ).fetchone()[0]
+            )
+            summary["coreference_conflicts"] = coreference.get(
+                ("dual_model", "uncertain"), 0
+            )
+            summary["coreference_protocol_failures"] = int(
+                connection.execute(
+                    """SELECT COUNT(*) FROM audit_calls
+                       WHERE purpose IN ('coreference', 'dual_model_coreference')
+                         AND accepted=0 AND error IS NOT NULL"""
+                ).fetchone()[0]
+            )
+            summary["coreference_fallbacks"] = int(
+                connection.execute(
+                    "SELECT COUNT(*) FROM audit_calls WHERE purpose='coreference_fallback'"
+                ).fetchone()[0]
+            )
+            for short_name in (
+                "deterministic_merges",
+                "model_merges",
+                "different",
+                "non_entity",
+                "uncertain",
+                "model_calls",
+                "conflicts",
+                "protocol_failures",
+                "fallbacks",
+            ):
+                summary[short_name] = summary[f"coreference_{short_name}"]
+
+            revalidation_statuses = (
+                "pending",
+                "validating",
+                "resolved_noop",
+                "resolved_patch",
+                "resolved_retranslate",
+                "completed_with_warning",
+            )
+            status_counts = {
+                str(row["status"]): int(row["count"])
+                for row in connection.execute(
+                    "SELECT status, COUNT(*) count FROM revalidation_tasks GROUP BY status"
+                )
+            }
+            for status in revalidation_statuses:
+                summary[f"revalidation_{status}"] = status_counts.get(status, 0)
+            for status in (
+                "resolved_noop",
+                "resolved_patch",
+                "resolved_retranslate",
+                "completed_with_warning",
+            ):
+                summary[status] = summary[f"revalidation_{status}"]
+            impact_counts = {
+                int(row["impact_level"]): int(row["count"])
+                for row in connection.execute(
+                    """SELECT impact_level, COUNT(*) count
+                       FROM revalidation_tasks GROUP BY impact_level"""
+                )
+            }
+            for impact in range(4):
+                summary[f"revalidation_impact_{impact}"] = impact_counts.get(
+                    impact, 0
+                )
+                summary[f"impact_{impact}"] = summary[
+                    f"revalidation_impact_{impact}"
+                ]
+            summary["warning_stale"] = int(
+                connection.execute(
+                    """SELECT COUNT(*) FROM translation_versions
+                       WHERE active=1 AND pipeline='parallel_v4'
+                         AND validation_status='warning_stale'"""
+                ).fetchone()[0]
+            )
+
+            summary["current_knowledge_epoch"] = 0
+            summary["knowledge_epoch"] = 0
+            summary["staged_proposals"] = 0
+            summary["frozen_proposals"] = 0
+            epoch_row = connection.execute(
+                """SELECT config_json FROM runs
+                   WHERE stage='translate' ORDER BY started_at DESC, id DESC LIMIT 1"""
+            ).fetchone()
+            if epoch_row is not None:
+                try:
+                    run_config = json.loads(str(epoch_row["config_json"] or "{}"))
+                    epoch_state = run_config.get("knowledge_epoch_state") or {}
+                    summary["current_knowledge_epoch"] = int(
+                        epoch_state.get("ordinal") or 0
+                    )
+                    summary["knowledge_epoch"] = summary[
+                        "current_knowledge_epoch"
+                    ]
+                    summary["staged_proposals"] = sum(
+                        len(entry.get("term_proposals") or ())
+                        + len(entry.get("relation_proposals") or ())
+                        for entry in epoch_state.get("staged") or ()
+                        if isinstance(entry, dict)
+                    )
+                    summary["frozen_proposals"] = int(
+                        epoch_state.get("deferred_proposals") or 0
+                    )
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    pass
+
+            optional_severities = ("warning", "review", "low")
+            placeholders = ",".join("?" for _ in optional_severities)
+            summary["optional_human_queue"] = int(
+                connection.execute(
+                    f"""SELECT COUNT(*) FROM human_queue
+                        WHERE status='open' AND severity IN ({placeholders})""",
+                    optional_severities,
+                ).fetchone()[0]
+            )
+            summary["blocking_human_queue"] = int(
+                connection.execute(
+                    f"""SELECT COUNT(*) FROM human_queue
+                        WHERE status='open' AND severity NOT IN ({placeholders})""",
+                    optional_severities,
+                ).fetchone()[0]
+            )
+            summary["open_human_queue"] = (
+                summary["optional_human_queue"]
+                + summary["blocking_human_queue"]
+            )
+            summary["knowledge_version"] = int(
+                connection.execute("SELECT MAX(id) FROM knowledge_versions").fetchone()[0]
+            )
             return summary
+
+    def review_warning_sections(self) -> Dict[str, List[Dict[str, Any]]]:
+        """Return advisory schema-8 queues separately from blocking workflow state."""
+
+        with closing(self.connect()) as connection:
+            uncertain = [
+                dict(row)
+                for row in connection.execute(
+                    """SELECT decision.*, lexeme.canonical_form
+                       FROM coreference_decisions decision
+                       JOIN lexemes lexeme ON lexeme.id=decision.lexeme_id
+                       WHERE decision.retired_version IS NULL
+                         AND decision.relation='uncertain'
+                       ORDER BY decision.created_at, decision.id"""
+                )
+            ]
+            render_conflicts = []
+            for row in connection.execute(
+                """SELECT queue.*, block.legacy_id
+                   FROM human_queue queue
+                   LEFT JOIN blocks block ON block.id=queue.block_id
+                   WHERE queue.status='open'
+                     AND queue.kind IN ('render_rule_conflict', 'schema8_target_conflict')
+                   ORDER BY queue.id"""
+            ):
+                item = dict(row)
+                item["payload"] = json.loads(item.pop("payload_json") or "{}")
+                render_conflicts.append(item)
+            stale = []
+            for row in connection.execute(
+                """SELECT block.id block_id, block.legacy_id,
+                          translation.id translation_id,
+                          translation.knowledge_version old_knowledge_version,
+                          task.id task_id, task.status task_status,
+                          task.action, task.from_knowledge_version,
+                          task.to_knowledge_version, task.result_json, task.error
+                   FROM translation_versions translation
+                   JOIN blocks block ON block.id=translation.block_id
+                   LEFT JOIN revalidation_tasks task ON task.id=(
+                       SELECT latest.id FROM revalidation_tasks latest
+                       WHERE latest.translation_id=translation.id
+                       ORDER BY latest.created_at DESC, latest.id DESC LIMIT 1
+                   )
+                   WHERE translation.active=1
+                     AND translation.pipeline='parallel_v4'
+                     AND translation.validation_status='warning_stale'
+                   ORDER BY block.global_index"""
+            ):
+                item = dict(row)
+                item["result"] = json.loads(item.pop("result_json") or "{}")
+                stale.append(item)
+            return {
+                "uncertain_coreference": uncertain,
+                "render_conflicts": render_conflicts,
+                "warning_stale": stale,
+            }
