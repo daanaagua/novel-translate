@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import heapq
 import json
 import math
 import re
@@ -65,6 +66,393 @@ def normalize_english_form(value: str) -> str:
     elif normalized.endswith("'") or normalized.endswith("’"):
         normalized = normalized[:-1]
     return normalized
+
+
+_RENDER_MAX_DEPTH = 12
+_RENDER_MAX_NODES = 2_048
+_RENDER_MAX_STRING_CHARS = 4_096
+_RENDER_MAX_INPUT_BYTES = 64 * 1024
+_RENDER_METADATA_CHANGE_KINDS = {
+    "description",
+    "kind",
+    "type",
+    "evidence",
+    "evidence_count",
+    "observation",
+    "metadata",
+}
+_RENDER_STRUCTURAL_CHANGE_KINDS = {
+    "rendering_rule",
+    "usage_rule",
+    "condition_rule",
+    "concept_merge",
+    "concept_split",
+    "concept_redirect",
+    "concept_form_aliases",
+    "subject_link",
+    "effective_subject_link",
+}
+_RENDER_LOCK_CHANGE_KINDS = {
+    "human_lock",
+    "lock",
+    "high_impact_constraint",
+    "reveal_boundary",
+}
+MAX_DEPENDENCY_SPANS = 128
+MAX_TRANSLATION_MATCHES = 100_000
+MAX_DEPENDENCY_FORMS = 64
+MAX_DEPENDENCY_TARGETS = 32
+MAX_DEPENDENCY_RULE_IDS = 128
+MAX_RENDER_STATE_RULES = 4
+MAX_DEPENDENCY_DISTINCT_VALUES = 256
+
+
+def _validate_render_value(value: Any) -> None:
+    """Reject unbounded or non-JSON render state before semantic filtering."""
+
+    nodes = 0
+    total_bytes = 0
+    stack: list[tuple[Any, int]] = [(value, 1)]
+    while stack:
+        current, depth = stack.pop()
+        nodes += 1
+        if nodes > _RENDER_MAX_NODES:
+            raise ValueError(f"render state exceeds {_RENDER_MAX_NODES} nodes")
+        if depth > _RENDER_MAX_DEPTH:
+            raise ValueError(f"render state exceeds depth {_RENDER_MAX_DEPTH}")
+        if isinstance(current, Mapping):
+            if len(current) > 512:
+                raise ValueError("render state mapping is too large")
+            for key, item in current.items():
+                if not isinstance(key, str):
+                    raise TypeError("render state mapping keys must be strings")
+                if len(key) > 128:
+                    raise ValueError("render state key string is too long")
+                total_bytes += len(key.encode("utf-8"))
+                stack.append((item, depth + 1))
+        elif isinstance(current, (list, tuple)):
+            if len(current) > _RENDER_MAX_NODES:
+                raise ValueError("render state sequence is too large")
+            stack.extend((item, depth + 1) for item in current)
+        elif isinstance(current, str):
+            if len(current) > _RENDER_MAX_STRING_CHARS:
+                raise ValueError("render state string is too long")
+            total_bytes += len(current.encode("utf-8"))
+        elif isinstance(current, float):
+            if not math.isfinite(current):
+                raise ValueError("render state numbers must be finite")
+        elif current is None or isinstance(current, (bool, int)):
+            pass
+        else:
+            raise TypeError(
+                f"render state contains unsupported type: {type(current).__name__}"
+            )
+        if total_bytes > _RENDER_MAX_INPUT_BYTES:
+            raise ValueError(
+                f"render state exceeds {_RENDER_MAX_INPUT_BYTES} UTF-8 bytes"
+            )
+
+
+def _canonical_render_value(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        return {
+            str(key): _canonical_render_value(item)
+            for key, item in sorted(value.items(), key=lambda pair: str(pair[0]))
+        }
+    if isinstance(value, (list, tuple)):
+        items = [_canonical_render_value(item) for item in value]
+        return sorted(
+            items,
+            key=lambda item: json.dumps(
+                item, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+            ),
+        )
+    return value
+
+
+def _effective_target_summary(subject_type: str, state: Mapping[str, Any]) -> Dict[str, Any]:
+    explicit = str(state.get("effective_target") or "").strip()
+    verified = str(state.get("verified_target") or "").strip()
+    working = str(state.get("working_target") or "").strip()
+    default = str(state.get("default_target") or state.get("target") or "").strip()
+    locked = bool(state.get("locked"))
+    status = str(state.get("status") or "")
+    if explicit:
+        return {"target": explicit, "tier": str(state.get("effective_tier") or "effective")}
+    if verified:
+        return {"target": verified, "tier": "verified"}
+    if (locked or status == "verified") and default:
+        return {"target": default, "tier": "locked_verified"}
+    if working:
+        return {"target": working, "tier": "working"}
+    if subject_type == "lexeme" and default:
+        return {"target": default, "tier": "default"}
+    return {"target": "", "tier": "unset"}
+
+
+def _effective_rule_summary(
+    rule: Mapping[str, Any], default_subject_type: str, default_subject_id: str
+) -> Dict[str, Any]:
+    condition = rule.get("condition", rule.get("condition_json", {}))
+    if isinstance(condition, str):
+        try:
+            condition = json.loads(condition or "{}")
+        except json.JSONDecodeError as exc:
+            raise ValueError("render rule condition_json is invalid") from exc
+    if not isinstance(condition, Mapping):
+        raise TypeError("render rule condition must be a mapping")
+    locked = bool(rule.get("locked"))
+    status = str(rule.get("status") or "")
+    tier = "locked" if locked else "verified" if status == "verified" else "provisional"
+    return {
+        "subject_type": str(rule.get("subject_type") or default_subject_type),
+        "subject_id": str(
+            rule.get("subject_id")
+            or rule.get(f"{default_subject_type}_id")
+            or default_subject_id
+        ),
+        "target": str(rule.get("target") or "").strip(),
+        "condition": _canonical_render_value(condition),
+        "priority": int(rule.get("priority") or 0),
+        "locked": locked,
+        "tier": tier,
+        "scope": str(rule.get("scope") or "book"),
+    }
+
+
+def _render_semantic_summary(
+    subject_type: str, subject_id: str, state: Mapping[str, Any]
+) -> Dict[str, Any]:
+    retired = bool(state.get("retired"))
+    rules_value = state.get("rules", state.get("rendering_rules", ())) or ()
+    if not isinstance(rules_value, (list, tuple)):
+        raise TypeError("render state rules must be a sequence")
+    rules = []
+    for rule in rules_value:
+        if not isinstance(rule, Mapping):
+            raise TypeError("render state rule entries must be mappings")
+        rules.append(_effective_rule_summary(rule, subject_type, subject_id))
+    rules.sort(
+        key=lambda item: json.dumps(
+            item, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+        )
+    )
+    forms_value = state.get("forms", state.get("source_forms", ())) or ()
+    if isinstance(forms_value, str):
+        forms_value = (forms_value,)
+    if not isinstance(forms_value, (list, tuple)):
+        raise TypeError("render state forms must be a sequence")
+    forms = sorted({str(value) for value in forms_value if str(value)})
+    summary: Dict[str, Any] = {
+        "subject_type": str(state.get("effective_subject_type") or subject_type),
+        "subject_id": str(state.get("effective_subject_id") or subject_id),
+        "active": not retired,
+        "effective_target": (
+            {"target": "", "tier": "retired"}
+            if retired
+            else _effective_target_summary(subject_type, state)
+        ),
+        "locked": bool(state.get("locked")),
+        "high_impact_constraint": bool(
+            state.get("high_impact_constraint")
+            or state.get("reveal_boundary")
+            or state.get("constraint_high_impact")
+        ),
+        "rules": [] if retired else rules,
+        "forms": [] if retired else forms,
+    }
+    if state.get("rendering_rules_sha256"):
+        summary["rendering_rules_sha256"] = str(
+            state["rendering_rules_sha256"]
+        )
+        summary["rendering_rule_count"] = int(
+            state.get("rendering_rule_count") or 0
+        )
+    links: Dict[str, Any] = {}
+    for key in (
+        "primary_lexeme_id",
+        "effective_subject_link",
+        "canonical_concept_id",
+        "redirect_winner_id",
+        "binding_role",
+        "binding_reliable",
+        "scope",
+    ):
+        if key in state and state[key] not in (None, ""):
+            links[key] = state[key]
+    if links:
+        summary["links"] = _canonical_render_value(links)
+    return summary
+
+
+def render_fingerprint(
+    subject_type: str, subject_id: str, state: Mapping[str, Any]
+) -> str:
+    """Hash only effective prompt/matching semantics from a bounded state."""
+
+    if not isinstance(subject_type, str) or not subject_type.strip():
+        raise ValueError("render fingerprint subject_type cannot be empty")
+    if not isinstance(subject_id, str) or not subject_id.strip():
+        raise ValueError("render fingerprint subject_id cannot be empty")
+    if not isinstance(state, Mapping):
+        raise TypeError("render fingerprint state must be a mapping")
+    _validate_render_value(state)
+    summary = _render_semantic_summary(subject_type.strip(), subject_id.strip(), state)
+    raw = json.dumps(summary, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    if len(raw.encode("utf-8")) > _RENDER_MAX_INPUT_BYTES:
+        raise ValueError("effective render summary exceeds size limit")
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def _render_impact(
+    old_summary: Mapping[str, Any],
+    new_summary: Mapping[str, Any],
+    change_kind: str,
+) -> int:
+    kind = str(change_kind or "").strip().casefold()
+    old_locked = bool(old_summary.get("locked"))
+    new_locked = bool(new_summary.get("locked"))
+    old_high = bool(old_summary.get("high_impact_constraint"))
+    new_high = bool(new_summary.get("high_impact_constraint"))
+    if (
+        kind in _RENDER_LOCK_CHANGE_KINDS
+        or old_locked != new_locked
+        or old_high != new_high
+        or ((old_locked or new_locked) and old_summary != new_summary)
+    ):
+        return 3
+    if kind in _RENDER_STRUCTURAL_CHANGE_KINDS:
+        return 2
+    if old_summary.get("rules") != new_summary.get("rules"):
+        return 2
+    if old_summary.get("rendering_rules_sha256") != new_summary.get(
+        "rendering_rules_sha256"
+    ):
+        return 2
+    if old_summary.get("links") != new_summary.get("links"):
+        return 2
+    return 1
+
+
+def _bounded_dependency_values(values: Iterable[str], limit: int) -> Dict[str, Any]:
+    ordered = sorted(set(values))
+    digest = hashlib.sha256(
+        json.dumps(
+            ordered, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+        ).encode("utf-8")
+    ).hexdigest()
+    return {
+        "values": ordered[:limit],
+        "count": len(ordered),
+        "omitted": max(0, len(ordered) - limit),
+        "sha256": digest,
+    }
+
+
+def _dependency_row(
+    dependency_type: str,
+    dependency_id: str,
+    matches: Sequence[Any],
+) -> tuple[str, str, int, str, str, str]:
+    forms: set[str] = set()
+    targets: set[str] = set()
+    winner_rows: set[str] = set()
+    rule_id_set: set[str] = set()
+    span_heap: list[tuple[int, int]] = []
+    retained_spans: set[tuple[int, int]] = set()
+    for match in matches:
+        form = str(match.matched_form)
+        target = str(match.rendered_target or "")
+        current_rule_ids = sorted(
+            {str(value) for value in tuple(match.applied_rule_ids or ())}
+        )
+        winner = json.dumps(
+            {
+                "winner_fingerprint": str(match.dependency_fingerprint or ""),
+                "rendered_target": target,
+                "applied_rule_ids": current_rule_ids,
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        for collection, value, label in (
+            (forms, form, "matched forms"),
+            (targets, target, "rendered targets"),
+            (winner_rows, winner, "winner semantics"),
+        ):
+            if (
+                value not in collection
+                and len(collection) >= MAX_DEPENDENCY_DISTINCT_VALUES
+            ):
+                raise ValueError(
+                    f"dependency {dependency_type}:{dependency_id} exceeds distinct {label} limit"
+                )
+            collection.add(value)
+        rule_id_set.update(current_rule_ids)
+        span = (int(match.start_offset), int(match.end_offset))
+        if span in retained_spans:
+            continue
+        if len(span_heap) < MAX_DEPENDENCY_SPANS:
+            heapq.heappush(span_heap, (-span[0], -span[1]))
+            retained_spans.add(span)
+            continue
+        largest = (-span_heap[0][0], -span_heap[0][1])
+        if span < largest:
+            removed = heapq.heapreplace(span_heap, (-span[0], -span[1]))
+            retained_spans.remove((-removed[0], -removed[1]))
+            retained_spans.add(span)
+    form_summary = _bounded_dependency_values(forms, MAX_DEPENDENCY_FORMS)
+    target_summary = _bounded_dependency_values(targets, MAX_DEPENDENCY_TARGETS)
+    rule_ids = sorted(rule_id_set)
+    if len(rule_ids) > MAX_DEPENDENCY_RULE_IDS:
+        raise ValueError(
+            f"dependency {dependency_type}:{dependency_id} exceeds rule ID limit"
+        )
+    fingerprint_payload = {
+        "dependency_type": dependency_type,
+        "dependency_id": dependency_id,
+        "matched_forms": form_summary,
+        "winners": [json.loads(row) for row in sorted(winner_rows)],
+    }
+    dependency_fingerprint = hashlib.sha256(
+        json.dumps(
+            fingerprint_payload,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+    representative = min(
+        forms,
+        key=lambda value: (
+            unicodedata.normalize("NFKC", value).casefold(),
+            value,
+        ),
+    )
+    if target_summary["count"] == 1:
+        rendered_target = str(target_summary["values"][0])
+    else:
+        rendered_target = json.dumps(
+            {
+                "target_count": target_summary["count"],
+                "targets": target_summary["values"],
+                "omitted_targets": target_summary["omitted"],
+                "targets_sha256": target_summary["sha256"],
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+    spans = sorted(retained_spans)
+    return (
+        dependency_fingerprint,
+        representative,
+        len(matches),
+        rendered_target,
+        json.dumps(rule_ids, ensure_ascii=False, separators=(",", ":")),
+        json.dumps(spans, ensure_ascii=False, separators=(",", ":")),
+    )
 
 
 class StaleCandidateSnapshot(RuntimeError):
@@ -986,6 +1374,12 @@ class V4Database:
             )
             canonical_id = str(canonical["id"])
             merged_ids = sorted(set(resolved_ids) - {canonical_id})
+            old_render_states = {
+                concept_id: self._render_state_for_subject(
+                    connection, "concept", concept_id
+                )
+                for concept_id in resolved_ids
+            }
             merged_placeholders = ",".join("?" for _ in merged_ids)
             version = self.create_knowledge_version(
                 f"merge concepts: {reason}", connection
@@ -1069,10 +1463,12 @@ class V4Database:
                         rule_mapping[duplicate_id] = winner_id
 
             dependency_rows = connection.execute(
-                f"""SELECT * FROM dependencies
-                     WHERE dependency_type='concept'
-                       AND dependency_id IN ({placeholders})
-                     ORDER BY translation_id, id""",
+                f"""SELECT d.* FROM dependencies d
+                     JOIN translation_versions tv ON tv.id=d.translation_id
+                     WHERE d.dependency_type='concept'
+                       AND d.dependency_id IN ({placeholders})
+                       AND tv.active=1
+                     ORDER BY d.translation_id, d.id""",
                 resolved_ids,
             ).fetchall()
             dependency_groups: dict[int, list[sqlite3.Row]] = {}
@@ -1394,7 +1790,6 @@ class V4Database:
                     separators=(",", ":"),
                 ).encode("utf-8")
             ).hexdigest()
-            bounded_ids = merged_ids[:MAX_MERGE_AUDIT_IDS]
             canonical_payload = {
                 "canonical_id": canonical_id,
                 "decision_id": decision_id,
@@ -1404,7 +1799,7 @@ class V4Database:
                     else "coreference_decision"
                 ),
                 "reason": reason[:2_000],
-                "merged_concept_ids": bounded_ids,
+                "merged_concept_ids": merged_ids[:MAX_MERGE_AUDIT_IDS],
                 "merged_count": len(merged_ids),
                 "omitted_concept_ids": max(
                     0, len(merged_ids) - MAX_MERGE_AUDIT_IDS
@@ -1415,53 +1810,35 @@ class V4Database:
                 "rule_redirect_count": len(rule_mapping),
                 "selection_criterion": criterion,
             }
-            connection.execute(
-                """INSERT INTO knowledge_changes(
-                       knowledge_version, subject_type, subject_id, change_kind,
-                       old_fingerprint, new_fingerprint, impact_level,
-                       payload_json, created_at)
-                   VALUES(?, 'concept', ?, 'concept_merge', ?, ?, 2, ?, ?)""",
-                (
-                    version,
-                    canonical_id,
-                    merged_digest,
-                    hashlib.sha256(canonical_id.encode("utf-8")).hexdigest(),
-                    json.dumps(
-                        canonical_payload,
-                        ensure_ascii=False,
-                        sort_keys=True,
-                        separators=(",", ":"),
+            canonical_new_state = self._render_state_for_subject(
+                connection, "concept", canonical_id
+            )
+            canonical_new_state["effective_subject_link"] = (
+                f"merge:{canonical_id}:{merged_digest}"
+            )
+            self.record_render_change(
+                connection,
+                subject_type="concept",
+                subject_id=canonical_id,
+                old_state=old_render_states[canonical_id],
+                new_state=canonical_new_state,
+                change_kind="concept_merge",
+                reason=f"{reason}; decision={decision_id}",
+                knowledge_version=version,
+            )
+            for old_id in merged_ids:
+                self.record_render_change(
+                    connection,
+                    subject_type="concept",
+                    subject_id=old_id,
+                    old_state=old_render_states[old_id],
+                    new_state=self._render_state_for_subject(
+                        connection, "concept", old_id
                     ),
-                    now,
-                ),
-            )
-            connection.executemany(
-                """INSERT INTO knowledge_changes(
-                       knowledge_version, subject_type, subject_id, change_kind,
-                       old_fingerprint, new_fingerprint, impact_level,
-                       payload_json, created_at)
-                   VALUES(?, 'concept', ?, 'concept_redirect', ?, ?, 2, ?, ?)""",
-                [
-                    (
-                        version,
-                        old_id,
-                        hashlib.sha256(old_id.encode("utf-8")).hexdigest(),
-                        hashlib.sha256(canonical_id.encode("utf-8")).hexdigest(),
-                        json.dumps(
-                            {
-                                "canonical_id": canonical_id,
-                                "decision_id": decision_id,
-                                "reason": reason[:2_000],
-                            },
-                            ensure_ascii=False,
-                            sort_keys=True,
-                            separators=(",", ":"),
-                        ),
-                        now,
-                    )
-                    for old_id in merged_ids
-                ],
-            )
+                    change_kind="concept_redirect",
+                    reason=f"{reason}; canonical={canonical_id}",
+                    knowledge_version=version,
+                )
             self.record_audit_call(
                 run_id=None,
                 block_id=None,
@@ -2133,6 +2510,9 @@ class V4Database:
         ).fetchone()
         if lexeme is None or lexeme["retired_version"] is not None:
             raise ValueError(f"fallback requires an active lexeme: {lexeme_id}")
+        old_render_state = self._render_state_for_subject(
+            connection, "lexeme", lexeme_id
+        )
 
         placeholders = ",".join("?" for _ in ordered_ids)
         if ordered_ids:
@@ -2298,6 +2678,7 @@ class V4Database:
             reason = "unicode_order"
 
         changed = False
+        knowledge_version: int | None = None
         if (
             selected
             and not lexeme_locked
@@ -2308,14 +2689,31 @@ class V4Database:
                 or str(lexeme["working_target"] or "").strip() != selected
             )
         ):
-            cursor = connection.execute(
-                """UPDATE lexemes
-                   SET default_target=?, working_target=?
-                   WHERE id=? AND retired_version IS NULL AND locked=0
-                     AND status!='verified' AND verified_target=''""",
-                (selected, selected, lexeme_id),
-            )
-            changed = bool(cursor.rowcount)
+            with self._method_savepoint(connection, "coreference_fallback_target"):
+                cursor = connection.execute(
+                    """UPDATE lexemes
+                       SET default_target=?, working_target=?
+                       WHERE id=? AND retired_version IS NULL AND locked=0
+                         AND status!='verified' AND verified_target=''""",
+                    (selected, selected, lexeme_id),
+                )
+                changed = bool(cursor.rowcount)
+                if changed:
+                    knowledge_version = self.create_knowledge_version(
+                        f"coreference fallback target: {lexeme_id}", connection
+                    )
+                    self.record_render_change(
+                        connection,
+                        subject_type="lexeme",
+                        subject_id=lexeme_id,
+                        old_state=old_render_state,
+                        new_state=self._render_state_for_subject(
+                            connection, "lexeme", lexeme_id
+                        ),
+                        change_kind="target",
+                        reason=f"coreference fallback target: {lexeme_id}",
+                        knowledge_version=knowledge_version,
+                    )
         digest = hashlib.sha256()
         for candidate in ranked:
             digest.update(
@@ -2381,6 +2779,7 @@ class V4Database:
             ).hexdigest(),
             "reason": reason,
             "changed": changed,
+            "knowledge_version": knowledge_version,
             "candidates": bounded_candidates,
             "total_candidates": len(ranked),
             "omitted_candidates": max(
@@ -3500,6 +3899,220 @@ class V4Database:
             (parent, reason, utc_now()),
         )
         return int(cursor.lastrowid)
+
+    def record_render_change(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        subject_type: str,
+        subject_id: str,
+        old_state: Mapping[str, Any],
+        new_state: Mapping[str, Any],
+        change_kind: str,
+        reason: str,
+        knowledge_version: int | None = None,
+        record_metadata: bool = False,
+    ) -> Dict[str, Any]:
+        """Persist one bounded render delta in the caller's transaction."""
+
+        self._require_active_transaction(connection)
+        if not isinstance(reason, str) or not reason.strip():
+            raise ValueError("render change reason cannot be empty")
+        if not isinstance(change_kind, str) or not change_kind.strip():
+            raise ValueError("render change_kind cannot be empty")
+        old_fingerprint = render_fingerprint(subject_type, subject_id, old_state)
+        new_fingerprint = render_fingerprint(subject_type, subject_id, new_state)
+        old_summary = _render_semantic_summary(subject_type, subject_id, old_state)
+        new_summary = _render_semantic_summary(subject_type, subject_id, new_state)
+        raw_old = json.dumps(
+            _canonical_render_value(old_state),
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        raw_new = json.dumps(
+            _canonical_render_value(new_state),
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        semantic_changed = old_fingerprint != new_fingerprint
+        metadata_changed = raw_old != raw_new
+        if not semantic_changed and (not record_metadata or not metadata_changed):
+            return {
+                "changed": False,
+                "semantic_changed": False,
+                "knowledge_version": None,
+                "impact_level": 0,
+                "old_fingerprint": old_fingerprint,
+                "new_fingerprint": new_fingerprint,
+            }
+        impact = (
+            _render_impact(old_summary, new_summary, change_kind)
+            if semantic_changed
+            else 0
+        )
+        version = knowledge_version
+        if version is None:
+            version = self.create_knowledge_version(reason.strip()[:512], connection)
+        payload = {
+            "old": old_summary,
+            "new": new_summary,
+            "reason": reason.strip()[:512],
+            "semantic_changed": semantic_changed,
+        }
+        payload_json = json.dumps(
+            payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+        )
+        if len(payload_json.encode("utf-8")) > _RENDER_MAX_INPUT_BYTES:
+            raise ValueError("render change payload exceeds size limit")
+        connection.execute(
+            """INSERT INTO knowledge_changes(
+                   knowledge_version, subject_type, subject_id, change_kind,
+                   old_fingerprint, new_fingerprint, impact_level,
+                   payload_json, created_at)
+               VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                version,
+                subject_type.strip(),
+                subject_id.strip(),
+                change_kind.strip(),
+                old_fingerprint,
+                new_fingerprint,
+                impact,
+                payload_json,
+                utc_now(),
+            ),
+        )
+        return {
+            "changed": True,
+            "semantic_changed": semantic_changed,
+            "knowledge_version": int(version),
+            "impact_level": impact,
+            "old_fingerprint": old_fingerprint,
+            "new_fingerprint": new_fingerprint,
+        }
+
+    def _render_state_for_subject(
+        self,
+        connection: sqlite3.Connection,
+        subject_type: str,
+        subject_id: str,
+    ) -> Dict[str, Any]:
+        if subject_type not in {"lexeme", "concept"}:
+            raise ValueError("render state supports lexeme or concept subjects")
+        table = "lexemes" if subject_type == "lexeme" else "concepts"
+        scope_expression = "scope" if subject_type == "concept" else "'book' AS scope"
+        description_expression = (
+            "description" if subject_type == "concept" else "'' AS description"
+        )
+        row = connection.execute(
+            f"""SELECT default_target, working_target, verified_target,
+                       status, locked, {scope_expression}, {description_expression},
+                       retired_version
+                  FROM {table} WHERE id=?""",
+            (subject_id,),
+        ).fetchone()
+        if row is None:
+            return {}
+        state: Dict[str, Any] = {
+            "default_target": str(row["default_target"] or ""),
+            "working_target": str(row["working_target"] or ""),
+            "verified_target": str(row["verified_target"] or ""),
+            "status": str(row["status"] or ""),
+            "locked": bool(row["locked"]),
+            "scope": str(row["scope"] or "book"),
+            "description": str(row["description"] or ""),
+        }
+        subject_column = f"{subject_type}_id"
+        rule_summaries: list[Dict[str, Any]] = []
+        rule_digest = hashlib.sha256()
+        rule_count = 0
+        for rule in connection.execute(
+            f"""SELECT id, condition_json, target, priority, status,
+                       scope, locked
+                  FROM rendering_rules
+                  WHERE {subject_column}=? AND retired_version IS NULL
+                  ORDER BY id""",
+            (subject_id,),
+        ):
+            summary = {
+                "id": str(rule["id"]),
+                "subject_type": subject_type,
+                "subject_id": subject_id,
+                "condition": _safe_rule_condition(
+                    rule["condition_json"], str(rule["id"])
+                ),
+                "target": str(rule["target"]),
+                "priority": int(rule["priority"]),
+                "status": str(rule["status"]),
+                "scope": str(rule["scope"]),
+                "locked": bool(rule["locked"]),
+            }
+            signature = json.dumps(
+                summary,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+            rule_digest.update(len(signature).to_bytes(8, "big"))
+            rule_digest.update(signature)
+            rule_count += 1
+            if len(rule_summaries) < MAX_RENDER_STATE_RULES:
+                rule_summaries.append(summary)
+        state["rendering_rule_count"] = rule_count
+        state["rendering_rules_sha256"] = rule_digest.hexdigest()
+        state["rules"] = rule_summaries
+        if subject_type == "lexeme":
+            state["forms"] = [
+                str(form["form"])
+                for form in connection.execute(
+                    "SELECT form FROM source_forms WHERE lexeme_id=? ORDER BY form",
+                    (subject_id,),
+                ).fetchall()
+            ]
+        else:
+            concept = connection.execute(
+                "SELECT primary_lexeme_id FROM concepts WHERE id=?",
+                (subject_id,),
+            ).fetchone()
+            primary_lexeme_id = str(concept["primary_lexeme_id"] or "")
+            if primary_lexeme_id:
+                state["primary_lexeme_id"] = primary_lexeme_id
+            active_links = connection.execute(
+                """SELECT lexeme_id, role FROM concept_lexemes
+                   WHERE concept_id=? AND retired_version IS NULL
+                   ORDER BY lexeme_id, role""",
+                (subject_id,),
+            ).fetchall()
+            state["effective_subject_link"] = [
+                {"lexeme_id": str(link["lexeme_id"]), "role": str(link["role"])}
+                for link in active_links
+            ]
+            linked_lexeme_ids = list(
+                dict.fromkeys(str(link["lexeme_id"]) for link in active_links)
+            )
+            if linked_lexeme_ids:
+                placeholders = ",".join("?" for _ in linked_lexeme_ids)
+                state["forms"] = [
+                    str(form["form"])
+                    for form in connection.execute(
+                        f"""SELECT DISTINCT form FROM source_forms
+                            WHERE lexeme_id IN ({placeholders}) ORDER BY form""",
+                        linked_lexeme_ids,
+                    ).fetchall()
+                ]
+        redirect = connection.execute(
+            """SELECT canonical_concept_id FROM concept_redirects
+               WHERE retired_concept_id=?""",
+            (subject_id,),
+        ).fetchone()
+        if redirect is not None:
+            state["redirect_winner_id"] = str(redirect["canonical_concept_id"])
+            state["effective_subject_id"] = str(redirect["canonical_concept_id"])
+        if row["retired_version"] is not None:
+            state["retired"] = True
+        return state
 
     def ensure_source_edition(
         self,
@@ -6658,13 +7271,45 @@ class V4Database:
         normalized = normalize_english_form(source)
         concept_id = stable_id("concept", normalized)
         with self.transaction() as connection:
-            version = self.create_knowledge_version(
-                f"human lock concept translation: {source}", connection
-            )
             existing = connection.execute(
                 "SELECT id FROM concepts WHERE id=? AND retired_version IS NULL",
                 (concept_id,),
             ).fetchone()
+            old_state = self._render_state_for_subject(
+                connection, "concept", concept_id
+            )
+            rule_id = stable_id("rule", f"{concept_id}:human-default:{target}")
+            exact_rule = any(
+                str(rule.get("id") or "") == rule_id
+                and str(rule.get("target") or "") == target
+                and not rule.get("condition")
+                and bool(rule.get("locked"))
+                for rule in old_state.get("rules", [])
+            )
+            exact_description = (
+                not description
+                or str(old_state.get("description") or "") == description
+            )
+            if (
+                existing is not None
+                and bool(old_state.get("locked"))
+                and str(old_state.get("default_target") or "") == target
+                and str(old_state.get("working_target") or "") == target
+                and str(old_state.get("verified_target") or "") == target
+                and exact_rule
+                and source in old_state.get("forms", [])
+                and exact_description
+            ):
+                return {
+                    "concept_id": concept_id,
+                    "source": source,
+                    "target": target,
+                    "knowledge_version": None,
+                    "affected_translations": 0,
+                }
+            version = self.create_knowledge_version(
+                f"human lock concept translation: {source}", connection
+            )
             if existing is None:
                 connection.execute(
                     """INSERT INTO concepts(
@@ -6711,7 +7356,6 @@ class V4Database:
                    WHERE concept_id=? AND retired_version IS NULL AND target!=?""",
                 (version, concept_id, target),
             )
-            rule_id = stable_id("rule", f"{concept_id}:human-default:{target}")
             connection.execute(
                 """INSERT INTO rendering_rules(
                        id, concept_id, condition_json, target, priority, status,
@@ -6721,6 +7365,23 @@ class V4Database:
                        target=excluded.target, priority=100, status='verified',
                        scope='book', locked=1, retired_version=NULL""",
                 (rule_id, concept_id, target, version, utc_now()),
+            )
+            new_state = self._render_state_for_subject(
+                connection, "concept", concept_id
+            )
+            semantic_changed = render_fingerprint(
+                "concept", concept_id, old_state
+            ) != render_fingerprint("concept", concept_id, new_state)
+            self.record_render_change(
+                connection,
+                subject_type="concept",
+                subject_id=concept_id,
+                old_state=old_state,
+                new_state=new_state,
+                change_kind="human_lock" if semantic_changed else "description",
+                reason=f"human lock concept translation: {source}",
+                knowledge_version=version,
+                record_metadata=True,
             )
             connection.execute(
                 """UPDATE verification_tasks
@@ -6786,6 +7447,9 @@ class V4Database:
             ).fetchone()
             if canonical is None:
                 raise KeyError(f"canonical concept does not exist: {canonical_source}")
+            old_canonical_render_state = self._render_state_for_subject(
+                connection, "concept", canonical_id
+            )
 
             current_version = int(
                 connection.execute(
@@ -6934,53 +7598,17 @@ class V4Database:
                 archive_payload=False,
             )
             if preparation_changed:
-                alias_digest = hashlib.sha256(
-                    json.dumps(
-                        alias_values,
-                        ensure_ascii=False,
-                        separators=(",", ":"),
-                    ).encode("utf-8")
-                ).hexdigest()
-                bounded_aliases = alias_values[:MAX_MERGE_AUDIT_IDS]
-                preparation_payload = {
-                    "authorization_audit_id": authorization_id,
-                    "canonical_concept_id": canonical_id,
-                    "aliases": bounded_aliases,
-                    "alias_count": len(alias_values),
-                    "omitted_aliases": max(
-                        0, len(alias_values) - MAX_MERGE_AUDIT_IDS
+                self.record_render_change(
+                    connection,
+                    subject_type="concept",
+                    subject_id=canonical_id,
+                    old_state=old_canonical_render_state,
+                    new_state=self._render_state_for_subject(
+                        connection, "concept", canonical_id
                     ),
-                    "aliases_sha256": alias_digest,
-                    "created_lexeme_count": sum(
-                        int(plan["needs_lexeme"]) for plan in preparation_plan
-                    ),
-                    "created_source_form_count": sum(
-                        int(plan["needs_source_form"])
-                        for plan in preparation_plan
-                    ),
-                    "created_link_count": sum(
-                        int(plan["needs_link"]) for plan in preparation_plan
-                    ),
-                }
-                connection.execute(
-                    """INSERT INTO knowledge_changes(
-                           knowledge_version, subject_type, subject_id, change_kind,
-                           old_fingerprint, new_fingerprint, impact_level,
-                           payload_json, created_at)
-                       VALUES(?, 'concept', ?, 'concept_form_aliases', ?, ?, 1, ?, ?)""",
-                    (
-                        preparation_version,
-                        canonical_id,
-                        hashlib.sha256(canonical_id.encode("utf-8")).hexdigest(),
-                        alias_digest,
-                        json.dumps(
-                            preparation_payload,
-                            ensure_ascii=False,
-                            sort_keys=True,
-                            separators=(",", ":"),
-                        ),
-                        utc_now(),
-                    ),
+                    change_kind="concept_form_aliases",
+                    reason=f"human prepare concept forms: {canonical_source}",
+                    knowledge_version=preparation_version,
                 )
             if not needs_merge:
                 return {
@@ -7571,6 +8199,9 @@ class V4Database:
                         "legacy_concept_id": legacy_concept_id,
                         "target": target,
                         "rules": rules,
+                        "old_state": self._render_state_for_subject(
+                            connection, subject_type, subject_id
+                        ),
                     }
                 )
 
@@ -7658,6 +8289,24 @@ class V4Database:
                             utc_now(),
                         ),
                     )
+                new_state = self._render_state_for_subject(
+                    connection, subject_type, subject_id
+                )
+                change_kind = (
+                    "rendering_rule"
+                    if decision["old_state"].get("rules") != new_state.get("rules")
+                    else "target"
+                )
+                self.record_render_change(
+                    connection,
+                    subject_type=subject_type,
+                    subject_id=subject_id,
+                    old_state=decision["old_state"],
+                    new_state=new_state,
+                    change_kind=change_kind,
+                    reason="resolve provisional working translations",
+                    knowledge_version=version,
+                )
             affected = self._invalidate_working_target_dependents(
                 connection,
                 [
@@ -8587,7 +9236,105 @@ class V4Database:
     ) -> None:
         ordered = sorted(outcomes, key=lambda item: item.block.global_index)
         with self.transaction() as connection:
+            block_ids = list(dict.fromkeys(outcome.block.id for outcome in ordered))
+            source_rows: Dict[str, sqlite3.Row] = {}
+            if block_ids:
+                placeholders = ",".join("?" for _ in block_ids)
+                source_rows = {
+                    str(row["id"]): row
+                    for row in connection.execute(
+                        f"""SELECT b.id, b.source_text, b.source_hash
+                              FROM blocks b
+                              JOIN source_editions se
+                                ON se.id=b.source_edition_id AND se.active=1
+                              WHERE b.id IN ({placeholders})""",
+                        block_ids,
+                    ).fetchall()
+                }
+            if len(source_rows) != len(block_ids):
+                raise ValueError("translation batch references a non-active source block")
             for outcome in ordered:
+                existing_active = connection.execute(
+                    """SELECT id FROM translation_versions
+                       WHERE block_id=? AND pipeline=? AND run_id=?""",
+                    (outcome.block.id, pipeline, run_id),
+                ).fetchone()
+                if existing_active is not None:
+                    continue
+                source_row = source_rows[outcome.block.id]
+                source_text = str(source_row["source_text"])
+                if (
+                    str(source_row["source_hash"]) != str(outcome.block.source_hash)
+                    or source_text != str(outcome.block.source_text)
+                ):
+                    raise ValueError(
+                        f"translation source drift for block {outcome.block.id}"
+                    )
+                stored_source_hash = str(source_row["source_hash"])
+                if re.fullmatch(r"[0-9a-f]{64}", stored_source_hash) and (
+                    hashlib.sha256(source_text.encode("utf-8")).hexdigest()
+                    != stored_source_hash
+                ):
+                    raise ValueError(
+                        f"translation source hash drift for block {outcome.block.id}"
+                    )
+                matches = tuple(outcome.matched_renderings or ())
+                if len(matches) > MAX_TRANSLATION_MATCHES:
+                    raise ValueError(
+                        f"translation match snapshot exceeds {MAX_TRANSLATION_MATCHES} entries"
+                    )
+                dependency_groups: Dict[tuple[str, str], List[Any]] = {}
+                for match in matches:
+                    lexeme_id = str(getattr(match, "lexeme_id", "") or "").strip()
+                    concept_id = str(getattr(match, "concept_id", "") or "").strip()
+                    matched_form = str(getattr(match, "matched_form", "") or "")
+                    rendered_target = str(
+                        getattr(match, "rendered_target", "") or ""
+                    )
+                    fingerprint = str(
+                        getattr(match, "dependency_fingerprint", "") or ""
+                    )
+                    try:
+                        start = int(getattr(match, "start_offset"))
+                        end = int(getattr(match, "end_offset"))
+                    except (AttributeError, TypeError, ValueError) as exc:
+                        raise ValueError("translation match span must be numeric") from exc
+                    if not lexeme_id or len(lexeme_id) > 256:
+                        raise ValueError("translation match lexeme_id is invalid")
+                    if len(concept_id) > 256:
+                        raise ValueError("translation match concept_id is too long")
+                    if len(matched_form) > _RENDER_MAX_STRING_CHARS:
+                        raise ValueError("translation match form is too long")
+                    if len(rendered_target) > _RENDER_MAX_STRING_CHARS:
+                        raise ValueError("translation rendered target is too long")
+                    if len(fingerprint) > 256:
+                        raise ValueError("translation dependency fingerprint is too long")
+                    if not 0 <= start < end <= len(source_text):
+                        raise ValueError(
+                            f"translation match span is outside block {outcome.block.id}"
+                        )
+                    source_form = source_text[start:end]
+                    if (
+                        unicodedata.normalize("NFKC", source_form)
+                        != unicodedata.normalize("NFKC", matched_form)
+                    ):
+                        raise ValueError(
+                            f"translation match source span drift for block {outcome.block.id}"
+                        )
+                    raw_rule_ids = getattr(match, "applied_rule_ids", ()) or ()
+                    if isinstance(raw_rule_ids, (str, bytes)):
+                        raise ValueError("translation match rule IDs must be a sequence")
+                    rule_ids = tuple(str(value).strip() for value in raw_rule_ids)
+                    if (
+                        len(rule_ids) > MAX_DEPENDENCY_RULE_IDS
+                        or any(not value or len(value) > 256 for value in rule_ids)
+                    ):
+                        raise ValueError("translation match rule IDs are invalid")
+                    dependency_groups.setdefault(("lexeme", lexeme_id), []).append(match)
+                    if concept_id:
+                        dependency_groups.setdefault(("concept", concept_id), []).append(match)
+                    for rule_id in sorted(set(rule_ids)):
+                        dependency_groups.setdefault(("rule", rule_id), []).append(match)
                 if pipeline == "parallel_v4":
                     previous_vote = connection.execute(
                         "SELECT * FROM comparison_votes WHERE block_id=?",
@@ -8617,19 +9364,88 @@ class V4Database:
                     ),
                 )
                 translation_id = int(cursor.lastrowid)
-                for concept_id in sorted(set(outcome.matched_concept_ids)):
-                    connection.execute(
-                        """INSERT OR IGNORE INTO dependencies(
-                               translation_id, dependency_type, dependency_id, knowledge_version
-                           ) VALUES(?, 'concept', ?, ?)""",
-                        (translation_id, concept_id, outcome.knowledge_version),
+                dependency_rows: List[tuple[Any, ...]] = []
+                for (dependency_type, dependency_id), group in sorted(
+                    dependency_groups.items()
+                ):
+                    details = _dependency_row(
+                        dependency_type, dependency_id, group
                     )
-                for claim_id in outcome.claim_dependencies:
-                    connection.execute(
-                        """INSERT OR IGNORE INTO dependencies(
-                               translation_id, dependency_type, dependency_id, knowledge_version
-                           ) VALUES(?, 'claim', ?, ?)""",
-                        (translation_id, claim_id, outcome.knowledge_version),
+                    dependency_rows.append(
+                        (
+                            translation_id,
+                            dependency_type,
+                            dependency_id,
+                            outcome.knowledge_version,
+                            *details,
+                        )
+                    )
+                if not matches:
+                    for concept_id in sorted(set(outcome.matched_concept_ids)):
+                        concept_id = str(concept_id).strip()
+                        if not concept_id or len(concept_id) > 256:
+                            raise ValueError("legacy concept dependency ID is invalid")
+                        fingerprint = hashlib.sha256(
+                            json.dumps(
+                                {
+                                    "dependency_type": "concept",
+                                    "dependency_id": concept_id,
+                                },
+                                sort_keys=True,
+                                separators=(",", ":"),
+                            ).encode("utf-8")
+                        ).hexdigest()
+                        dependency_rows.append(
+                            (
+                                translation_id,
+                                "concept",
+                                concept_id,
+                                outcome.knowledge_version,
+                                fingerprint,
+                                "",
+                                0,
+                                "",
+                                "[]",
+                                "[]",
+                            )
+                        )
+                for claim_id in sorted(set(outcome.claim_dependencies)):
+                    claim_id = str(claim_id).strip()
+                    if not claim_id or len(claim_id) > 256:
+                        raise ValueError("claim dependency ID is invalid")
+                    fingerprint = hashlib.sha256(
+                        json.dumps(
+                            {
+                                "dependency_type": "claim",
+                                "dependency_id": claim_id,
+                            },
+                            sort_keys=True,
+                            separators=(",", ":"),
+                        ).encode("utf-8")
+                    ).hexdigest()
+                    dependency_rows.append(
+                        (
+                            translation_id,
+                            "claim",
+                            claim_id,
+                            outcome.knowledge_version,
+                            fingerprint,
+                            "",
+                            0,
+                            "",
+                            "[]",
+                            "[]",
+                        )
+                    )
+                if dependency_rows:
+                    connection.executemany(
+                        """INSERT INTO dependencies(
+                               translation_id, dependency_type, dependency_id,
+                               knowledge_version, dependency_fingerprint,
+                               matched_form, occurrence_count, rendered_target,
+                               applied_rule_ids_json, source_spans_json)
+                           VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                        dependency_rows,
                     )
                 for audit in outcome.audit_calls:
                     audit_request, audit_raw, audit_parsed = self._audit_fields(
@@ -8816,18 +9632,6 @@ class V4Database:
                             int(cursor.lastrowid),
                         ),
                     )
-                    translation = connection.execute(
-                        """SELECT id FROM translation_versions
-                           WHERE block_id=? AND pipeline='parallel_v4' AND active=1""",
-                        (outcome.block.id,),
-                    ).fetchone()
-                    if translation:
-                        connection.execute(
-                            """INSERT OR IGNORE INTO dependencies(
-                                   translation_id, dependency_type, dependency_id, knowledge_version
-                               ) VALUES(?, 'concept', ?, ?)""",
-                            (int(translation["id"]), concept_id, version),
-                        )
                 else:
                     quote = str(payload.get("context") or payload.get("sub") or "relation")
                     existing_evidence = connection.execute(
@@ -9697,6 +10501,13 @@ class V4Database:
                 and all((vote.get("parsed") or {}).get("verdict") == "support" for vote in votes)
             )
             if supported:
+                old_render_state = (
+                    self._render_state_for_subject(
+                        connection, "concept", str(task["subject_id"])
+                    )
+                    if task["subject_type"] == "concept"
+                    else None
+                )
                 version = self.create_knowledge_version(
                     f"double verification {task['id']}", connection
                 )
@@ -9713,6 +10524,24 @@ class V4Database:
                     connection.execute(
                         "UPDATE rendering_rules SET status='verified' WHERE concept_id=? AND locked=0",
                         (task["subject_id"],),
+                    )
+                    new_render_state = self._render_state_for_subject(
+                        connection, "concept", str(task["subject_id"])
+                    )
+                    self.record_render_change(
+                        connection,
+                        subject_type="concept",
+                        subject_id=str(task["subject_id"]),
+                        old_state=old_render_state or {},
+                        new_state=new_render_state,
+                        change_kind=(
+                            "rendering_rule"
+                            if (old_render_state or {}).get("rules")
+                            != new_render_state.get("rules")
+                            else "target"
+                        ),
+                        reason=f"double verification {task['id']}",
+                        knowledge_version=version,
                     )
                 elif task["subject_type"] == "claim":
                     connection.execute(
@@ -9795,6 +10624,13 @@ class V4Database:
                 payload = json.loads(row["payload_json"])
                 subject_type = payload.get("subject_type")
                 subject_id = payload.get("subject_id")
+                old_render_state = (
+                    self._render_state_for_subject(
+                        connection, "concept", str(subject_id)
+                    )
+                    if subject_type == "concept"
+                    else None
+                )
                 version = self.create_knowledge_version(
                     f"human {action} high impact item {item_id}", connection
                 )
@@ -9857,6 +10693,23 @@ class V4Database:
                                WHERE id=? AND locked=0""",
                             (version, subject_id),
                         )
+                    new_render_state = self._render_state_for_subject(
+                        connection, "concept", str(subject_id)
+                    )
+                    self.record_render_change(
+                        connection,
+                        subject_type="concept",
+                        subject_id=str(subject_id),
+                        old_state=old_render_state or {},
+                        new_state=new_render_state,
+                        change_kind=(
+                            "human_lock"
+                            if action == "accept"
+                            else "high_impact_constraint"
+                        ),
+                        reason=f"human {action} high impact item {item_id}",
+                        knowledge_version=version,
+                    )
                 elif subject_type == "claim":
                     if action == "accept":
                         replacement_statement = str(
@@ -9928,6 +10781,9 @@ class V4Database:
                        WHERE c.id=? AND c.retired_version IS NULL""",
                     (concept_id,),
                 ).fetchone()
+                old_render_state = self._render_state_for_subject(
+                    connection, "concept", concept_id
+                )
                 if action == "accept":
                     version = self.create_knowledge_version(
                         f"human accept queue item {item_id}", connection
@@ -9993,6 +10849,23 @@ class V4Database:
                         (version, concept_id),
                     )
                 if version is not None:
+                    new_render_state = self._render_state_for_subject(
+                        connection, "concept", concept_id
+                    )
+                    self.record_render_change(
+                        connection,
+                        subject_type="concept",
+                        subject_id=concept_id,
+                        old_state=old_render_state,
+                        new_state=new_render_state,
+                        change_kind=(
+                            "human_lock"
+                            if action == "accept"
+                            else "high_impact_constraint"
+                        ),
+                        reason=f"human {action} queue item {item_id}",
+                        knowledge_version=version,
+                    )
                     rows = connection.execute(
                         """SELECT b.id, b.source_text, tv.id translation_id
                            FROM blocks b JOIN translation_versions tv ON tv.block_id=b.id

@@ -443,6 +443,8 @@ class ParallelV4Tests(unittest.TestCase):
         result = production.run()
 
         self.assertEqual(result["status"], "completed")
+        self.assertTrue(captured[0].matched_renderings)
+        self.assertEqual(captured[0].matched_renderings[0].matched_form, "Name0")
         warning = captured[0].quality_warnings[0]
         self.assertEqual(warning["kind"], "render_constraints_truncated")
         self.assertEqual(warning["total"], 500)

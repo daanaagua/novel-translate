@@ -324,6 +324,20 @@ class ContextPacket:
     matched_claim_ids: List[str] = field(default_factory=list)
 
 
+@dataclass(frozen=True)
+class RenderingMatchSnapshot:
+    """Bounded, import-safe copy of one frozen render-index match."""
+
+    lexeme_id: str
+    concept_id: Optional[str]
+    matched_form: str
+    start_offset: int
+    end_offset: int
+    rendered_target: str
+    applied_rule_ids: tuple[str, ...] = ()
+    dependency_fingerprint: str = ""
+
+
 @dataclass
 class TranslationOutcome:
     block: V4Block
@@ -338,6 +352,7 @@ class TranslationOutcome:
     term_proposals: List[Dict[str, Any]] = field(default_factory=list)
     relation_proposals: List[Dict[str, Any]] = field(default_factory=list)
     matched_concept_ids: List[str] = field(default_factory=list)
+    matched_renderings: tuple[RenderingMatchSnapshot, ...] = ()
     claim_dependencies: List[str] = field(default_factory=list)
     audit_calls: List[Dict[str, Any]] = field(default_factory=list)
     attempts: int = 1

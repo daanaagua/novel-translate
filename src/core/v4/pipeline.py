@@ -25,7 +25,13 @@ from ..translator import TranslationConfig, TranslationEngine
 from .context import ContextBuilder, ContextOverflow
 from .database import FrozenRenderBundle, KnowledgeSnapshotError, V4Database
 from .matcher import FrozenRenderIndex
-from .models import Island, TranslationOutcome, V4Block, V4BlockStatus
+from .models import (
+    Island,
+    RenderingMatchSnapshot,
+    TranslationOutcome,
+    V4Block,
+    V4BlockStatus,
+)
 from .semantic_mapper import SemanticMapper, SemanticMapperConfig
 
 
@@ -455,13 +461,16 @@ class V4TranslationPipeline:
             if (
                 isinstance(active_bundle, FrozenRenderBundle)
                 and active_bundle.index.signature == concept_snapshot.signature
+                and active_bundle.knowledge_version == knowledge_version
+                and all(
+                    block.id in active_bundle.block_ids for block in island.blocks
+                )
             ):
                 rendering_contexts_by_block = active_bundle.contexts_by_block
             else:
-                fallback_bundle = self.database.freeze_render_bundle(
-                    [block.id for block in island.blocks]
+                raise RuntimeError(
+                    "translation requires the exact frozen render bundle and contexts"
                 )
-                rendering_contexts_by_block = fallback_bundle.contexts_by_block
         engine = TranslationEngine(
             llm_manager=audited_llm,
             glossary_manager=self._glossary_for(
@@ -480,6 +489,7 @@ class V4TranslationPipeline:
         local_summary = ""
         for block in island.blocks:
             render_constraint_warnings: List[Dict[str, Any]] = []
+            frozen_render_matches: tuple[RenderingMatchSnapshot, ...] = ()
             if isinstance(concept_snapshot, FrozenRenderIndex):
                 engine.glossary = self._glossary_for(
                     [block],
@@ -491,6 +501,25 @@ class V4TranslationPipeline:
                     for value in getattr(engine.glossary, "render_warnings", [])
                     if isinstance(value, Mapping)
                 ]
+                frozen_render_matches = tuple(
+                    RenderingMatchSnapshot(
+                        lexeme_id=match.lexeme_id,
+                        concept_id=match.concept_id,
+                        matched_form=match.matched_form,
+                        start_offset=match.start_offset,
+                        end_offset=match.end_offset,
+                        rendered_target=match.rendered_target,
+                        applied_rule_ids=tuple(match.applied_rule_ids),
+                        dependency_fingerprint=match.dependency_fingerprint,
+                    )
+                    for match in concept_snapshot.matched_renderings(
+                        block.source_text,
+                        block_id=block.id,
+                        occurrence_contexts=list(
+                            rendering_contexts_by_block.get(block.id, [])
+                        ),
+                    )
+                )
             frozen_block_concept_ids = [
                 str(concept["id"])
                 for concept in self.database.concepts_for_text(
@@ -513,6 +542,7 @@ class V4TranslationPipeline:
                         knowledge_version=knowledge_version,
                         status=V4BlockStatus.INCOMPLETE_REQUIRES_HUMAN.value,
                         matched_concept_ids=frozen_block_concept_ids,
+                        matched_renderings=frozen_render_matches,
                         error=str(exc),
                     )
                 )
@@ -537,6 +567,7 @@ class V4TranslationPipeline:
                             knowledge_version=knowledge_version,
                             status=V4BlockStatus.INCOMPLETE_REQUIRES_HUMAN.value,
                             matched_concept_ids=list(packet.matched_concept_ids),
+                            matched_renderings=frozen_render_matches,
                             error=(
                                 f"{block.id} 加入旧译文对照后必需上下文 "
                                 f"{packet.required_chars + len(comparison_reference)} 字符超过预算 "
@@ -572,6 +603,7 @@ class V4TranslationPipeline:
                             knowledge_version=knowledge_version,
                             status=V4BlockStatus.INCOMPLETE_REQUIRES_HUMAN.value,
                             matched_concept_ids=list(packet.matched_concept_ids),
+                            matched_renderings=frozen_render_matches,
                             audit_calls=block_audits,
                             elapsed_ms=int((time.perf_counter() - started) * 1000),
                             error=(
@@ -682,6 +714,7 @@ class V4TranslationPipeline:
                 term_proposals=term_proposals,
                 relation_proposals=relation_proposals,
                 matched_concept_ids=list(packet.matched_concept_ids),
+                matched_renderings=frozen_render_matches,
                 claim_dependencies=list(packet.matched_claim_ids),
                 audit_calls=block_audits,
                 attempts=attempts,

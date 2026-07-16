@@ -197,6 +197,27 @@ def payload_hash(case: CoreferenceCase) -> str:
     return hashlib.sha256(payload_bytes(case)).hexdigest()
 
 
+def semantic_payload_dict(case: CoreferenceCase) -> dict[str, Any]:
+    """Cache material for case semantics, excluding only the global version."""
+
+    request_payload = payload_dict(case)
+    semantic_case = dict(request_payload["case"])
+    semantic_case.pop("knowledge_version", None)
+    return {
+        "case": semantic_case,
+        "protocol_version": request_payload["protocol_version"],
+    }
+
+
+def semantic_payload_hash(case: CoreferenceCase) -> str:
+    frozen = _canonical_json_bytes(semantic_payload_dict(case))
+    if len(frozen) > MAX_CASE_PAYLOAD_BYTES:
+        raise CoreferenceProtocolError(
+            "coreference semantic cache payload exceeds the fixed request budget"
+        )
+    return hashlib.sha256(frozen).hexdigest()
+
+
 def _validated_model_names(model_names: Sequence[str]) -> tuple[str, str]:
     if isinstance(model_names, (str, bytes)):
         raise ValueError("coreference requests require two distinct model names")
@@ -223,6 +244,22 @@ def cache_key(case: CoreferenceCase, model_names: Sequence[str]) -> str:
         }
     )
     return f"coreference-cache_{hashlib.sha256(key_material).hexdigest()}"
+
+
+def semantic_cache_key(
+    case: CoreferenceCase, model_names: Sequence[str]
+) -> str:
+    """Build a cache key from stable case semantics and the model pair."""
+
+    names = _validated_model_names(model_names)
+    key_material = _canonical_json_bytes(
+        {
+            "models": sorted(names),
+            "semantic_payload_hash": semantic_payload_hash(case),
+            "protocol_version": COREFERENCE_PROTOCOL_VERSION,
+        }
+    )
+    return f"coreference-semantic-cache_{hashlib.sha256(key_material).hexdigest()}"
 
 
 def _paragraph_order(value: str) -> tuple[int, int | str]:
@@ -2311,7 +2348,7 @@ class CoreferenceCoordinator:
         ):
             _, _, model_names = self._model_clients()
             cached = self._cached_dual_decision(
-                case, cache_key(case, model_names)
+                case, semantic_cache_key(case, model_names)
             )
             if cached is not None:
                 changed = (
@@ -2336,7 +2373,7 @@ class CoreferenceCoordinator:
         case: CoreferenceCase,
     ) -> tuple[str, str, int, bool, bool]:
         client_a, client_b, model_names = self._model_clients()
-        decision_payload_hash = cache_key(case, model_names)
+        decision_payload_hash = semantic_cache_key(case, model_names)
         cached = self._cached_dual_decision(case, decision_payload_hash)
         if cached is not None:
             changed = (
@@ -2399,6 +2436,8 @@ class CoreferenceCoordinator:
             ],
             "protocol_version": COREFERENCE_PROTOCOL_VERSION,
             "frozen_payload_hash": frozen_payload_hash,
+            "request_knowledge_version": case.knowledge_version,
+            "semantic_cache_hash": decision_payload_hash,
         }
         model_votes.append(resolution_vote)
 
@@ -2675,6 +2714,12 @@ class CoreferenceCoordinator:
     @staticmethod
     def cache_key(case: CoreferenceCase, model_names: Sequence[str]) -> str:
         return cache_key(case, model_names)
+
+    @staticmethod
+    def semantic_cache_key(
+        case: CoreferenceCase, model_names: Sequence[str]
+    ) -> str:
+        return semantic_cache_key(case, model_names)
 
     @staticmethod
     def model_payloads(
