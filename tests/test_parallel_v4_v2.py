@@ -253,9 +253,15 @@ class ParallelV4V2Tests(unittest.TestCase):
             )
             connection.execute(
                 """INSERT INTO dependencies(
-                       translation_id, dependency_type, dependency_id, knowledge_version
-                   ) VALUES(?, 'concept', ?, 1)""",
-                (cursor.lastrowid, concept_id),
+                       translation_id, dependency_type, dependency_id,
+                       knowledge_version, matched_form, source_spans_json
+                   ) VALUES(?, 'concept', ?, 1, ?, ?)""",
+                (
+                    cursor.lastrowid,
+                    concept_id,
+                    block.source_text,
+                    json.dumps([[0, len(block.source_text)]]),
+                ),
             )
             connection.execute(
                 "UPDATE blocks SET status='completed' WHERE id=?", (block.id,)

@@ -5,18 +5,24 @@ from __future__ import annotations
 import hashlib
 import json
 import sqlite3
+import unicodedata
 from dataclasses import dataclass, field
 from typing import Any, Sequence
 
 from .database import V4Database, utc_now
 
 
-_COMPLETED_STATUSES = ("completed", "completed_with_warnings")
+MAX_CHANGE_IDS = 1024
+MAX_RESULT_BYTES = 64 * 1024
 _MAX_PAYLOAD_BYTES = 64 * 1024
 _MAX_PAYLOAD_IDS = 64
 _MAX_SUBJECT_ID_CHARS = 256
 _MAX_RESULT_SUBJECTS = 128
 _MAX_RESULT_REASONS = 256
+
+
+class PlanningBudgetError(ValueError):
+    """Raised before committing a plan that exceeds a persisted size budget."""
 
 
 @dataclass
@@ -55,18 +61,68 @@ def _task_id(translation_id: int, change_hash: str) -> str:
 
 
 def _result_change_ids(raw: Any) -> set[int]:
+    if not isinstance(raw, str):
+        raise ValueError("pending revalidation result_json must be text")
+    if len(raw.encode("utf-8")) > MAX_RESULT_BYTES:
+        raise PlanningBudgetError("pending revalidation result exceeds byte budget")
     try:
-        payload = json.loads(str(raw or "{}"))
+        payload = json.loads(raw)
     except (TypeError, ValueError, json.JSONDecodeError):
-        return set()
+        raise ValueError("pending revalidation result_json is invalid JSON") from None
     if not isinstance(payload, dict) or not isinstance(payload.get("change_ids"), list):
-        return set()
-    values: set[int] = set()
+        raise ValueError("pending revalidation result must contain change_ids")
+    raw_ids = payload["change_ids"]
+    if not raw_ids:
+        raise ValueError("pending revalidation change_ids cannot be empty")
+    if len(raw_ids) > MAX_CHANGE_IDS:
+        raise PlanningBudgetError("pending revalidation change_ids exceed budget")
+    values: list[int] = []
     for value in payload["change_ids"]:
-        if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
-            continue
-        values.add(value)
-    return values
+        if type(value) is not int or value <= 0:
+            raise ValueError("pending revalidation change_ids must be positive integers")
+        values.append(value)
+    if values != sorted(set(values)):
+        raise ValueError("pending revalidation change_ids must be sorted and unique")
+    for key in ("subjects", "reasons"):
+        if key in payload and not isinstance(payload[key], list):
+            raise ValueError(f"pending revalidation {key} must be a list")
+    if len(payload.get("subjects", [])) > _MAX_RESULT_SUBJECTS:
+        raise PlanningBudgetError("pending revalidation subjects exceed budget")
+    if len(payload.get("reasons", [])) > _MAX_RESULT_REASONS:
+        raise PlanningBudgetError("pending revalidation reasons exceed budget")
+    subjects = payload.get("subjects", [])
+    if any(
+        not isinstance(item, dict)
+        or not isinstance(item.get("subject_type"), str)
+        or not isinstance(item.get("subject_id"), str)
+        for item in subjects
+    ):
+        raise ValueError("pending revalidation subjects are invalid")
+    reasons = payload.get("reasons", [])
+    if any(
+        not isinstance(item, dict)
+        or type(item.get("change_id")) is not int
+        or item["change_id"] <= 0
+        or not isinstance(item.get("change_kind"), str)
+        or not isinstance(item.get("via"), list)
+        or any(not isinstance(via, str) for via in item["via"])
+        for item in reasons
+    ):
+        raise ValueError("pending revalidation reasons are invalid")
+    for key in ("omitted_subjects", "omitted_reasons"):
+        if key in payload and (type(payload[key]) is not int or payload[key] < 0):
+            raise ValueError(f"pending revalidation {key} must be a non-negative integer")
+    if reasons and len(reasons) + int(payload.get("omitted_reasons", 0)) != len(values):
+        raise ValueError("pending revalidation reason count is inconsistent")
+    return set(values)
+
+
+def _authentic_source(source_text: str, source_hash: str) -> bool:
+    return (
+        len(source_hash) == 64
+        and all(character in "0123456789abcdef" for character in source_hash)
+        and hashlib.sha256(source_text.encode("utf-8")).hexdigest() == source_hash
+    )
 
 
 class RevalidationPlanner:
@@ -83,22 +139,58 @@ class RevalidationPlanner:
             raise TypeError("change_ids must be a sequence of positive integers")
         normalized: set[int] = set()
         for value in change_ids:
-            if isinstance(value, bool):
+            if type(value) is not int or value <= 0:
                 raise ValueError("change_ids must contain positive integers")
-            if isinstance(value, int):
-                change_id = value
-            elif isinstance(value, str) and value.strip().isdigit():
-                change_id = int(value.strip())
-            else:
-                raise ValueError("change_ids must contain positive integers")
-            if change_id <= 0:
-                raise ValueError("change_ids must contain positive integers")
-            normalized.add(change_id)
+            normalized.add(value)
+            if len(normalized) > MAX_CHANGE_IDS:
+                raise PlanningBudgetError("change_ids exceed planning budget")
         return sorted(normalized)
 
     @staticmethod
-    def _safe_payload_subjects(row: sqlite3.Row) -> list[tuple[str, str]]:
-        """Read only explicitly authorized, bounded subject fields."""
+    def _verified_concept_redirect(
+        connection: sqlite3.Connection,
+        retired_id: str,
+        canonical_id: str,
+        change_version: int,
+    ) -> bool:
+        if retired_id == canonical_id:
+            return False
+        retired = connection.execute(
+            "SELECT retired_version FROM concepts WHERE id=?", (retired_id,)
+        ).fetchone()
+        canonical = connection.execute(
+            "SELECT 1 FROM concepts WHERE id=?", (canonical_id,)
+        ).fetchone()
+        if (
+            retired is None
+            or canonical is None
+            or retired["retired_version"] is None
+            or int(retired["retired_version"]) > change_version
+        ):
+            return False
+        current = retired_id
+        visited: set[str] = set()
+        for _ in range(64):
+            if current in visited:
+                return False
+            visited.add(current)
+            edge = connection.execute(
+                """SELECT canonical_concept_id, knowledge_version
+                   FROM concept_redirects WHERE retired_concept_id=?""",
+                (current,),
+            ).fetchone()
+            if edge is None or int(edge["knowledge_version"]) > change_version:
+                return False
+            current = str(edge["canonical_concept_id"])
+            if current == canonical_id:
+                return True
+        return False
+
+    @classmethod
+    def _safe_payload_subjects(
+        cls, connection: sqlite3.Connection, row: sqlite3.Row
+    ) -> list[tuple[str, str]]:
+        """Expand only payload relationships proven by schema-8 rows."""
 
         raw = str(row["payload_json"] or "{}")
         if len(raw.encode("utf-8")) > _MAX_PAYLOAD_BYTES:
@@ -110,65 +202,102 @@ class RevalidationPlanner:
         if not isinstance(payload, dict):
             return []
         kind = str(row["change_kind"] or "").casefold()
-        allowed: dict[str, tuple[str, ...]] = {}
-        list_fields: dict[str, tuple[str, ...]] = {}
-        if any(token in kind for token in ("merge", "redirect", "subject_link")):
-            allowed["concept"] = (
-                "canonical_concept_id",
-                "retired_concept_id",
-                "old_concept_id",
-                "new_concept_id",
-            )
-            list_fields["concept"] = ("merged_concept_ids", "concept_ids")
-        if "rule" in kind:
-            allowed["rule"] = ("rule_id", "old_rule_id", "new_rule_id")
-            list_fields["rule"] = ("rule_ids",)
-        if "claim" in kind:
-            allowed["claim"] = ("claim_id",)
-            list_fields["claim"] = ("claim_ids",)
-        if any(token in kind for token in ("source_form", "alias", "lexeme")):
-            allowed["lexeme"] = ("lexeme_id", "old_lexeme_id", "new_lexeme_id")
-            list_fields["lexeme"] = ("lexeme_ids",)
+        subject_type = str(row["subject_type"] or "").strip()
+        subject_id = str(row["subject_id"] or "").strip()
+        change_version = int(row["knowledge_version"])
         subjects: set[tuple[str, str]] = set()
-        for subject_type, keys in allowed.items():
-            for key in keys:
-                value = payload.get(key)
-                if isinstance(value, str):
-                    subject_id = value.strip()
-                    if 0 < len(subject_id) <= _MAX_SUBJECT_ID_CHARS:
-                        subjects.add((subject_type, subject_id))
-        for subject_type, keys in list_fields.items():
-            for key in keys:
-                values = payload.get(key)
-                if not isinstance(values, list) or len(values) > _MAX_PAYLOAD_IDS:
-                    continue
+
+        if subject_type == "concept" and any(
+            token in kind for token in ("merge", "redirect", "subject_link")
+        ):
+            explicit_canonical = payload.get(
+                "canonical_concept_id", payload.get("canonical_id", subject_id)
+            )
+            if explicit_canonical == subject_id and connection.execute(
+                "SELECT 1 FROM concepts WHERE id=?", (subject_id,)
+            ).fetchone() is not None:
+                values: list[Any] = []
+                for key in ("retired_concept_id", "old_concept_id"):
+                    if key in payload:
+                        values.append(payload[key])
+                merged = payload.get("merged_concept_ids", [])
+                if isinstance(merged, list) and len(merged) <= _MAX_PAYLOAD_IDS:
+                    values.extend(merged)
                 for value in values:
-                    if isinstance(value, str):
-                        subject_id = value.strip()
-                        if 0 < len(subject_id) <= _MAX_SUBJECT_ID_CHARS:
-                            subjects.add((subject_type, subject_id))
+                    if not isinstance(value, str):
+                        continue
+                    retired_id = value.strip()
+                    if (
+                        0 < len(retired_id) <= _MAX_SUBJECT_ID_CHARS
+                        and cls._verified_concept_redirect(
+                            connection, retired_id, subject_id, change_version
+                        )
+                    ):
+                        subjects.add(("concept", retired_id))
+
+        if subject_type in {"concept", "lexeme"} and "rule" in kind:
+            values: list[Any] = []
+            for key in ("rule_id", "old_rule_id", "new_rule_id"):
+                if key in payload:
+                    values.append(payload[key])
+            rule_ids = payload.get("rule_ids", [])
+            if isinstance(rule_ids, list) and len(rule_ids) <= _MAX_PAYLOAD_IDS:
+                values.extend(rule_ids)
+            owner_column = "concept_id" if subject_type == "concept" else "lexeme_id"
+            for value in values:
+                if not isinstance(value, str):
+                    continue
+                rule_id = value.strip()
+                if not 0 < len(rule_id) <= _MAX_SUBJECT_ID_CHARS:
+                    continue
+                if connection.execute(
+                    f"""SELECT 1 FROM rendering_rules
+                         WHERE id=? AND {owner_column}=? AND created_version<=?""",
+                    (rule_id, subject_id, change_version),
+                ).fetchone() is not None:
+                    subjects.add(("rule", rule_id))
+
+        if subject_type == "concept" and any(
+            token in kind for token in ("source_form", "alias", "lexeme")
+        ):
+            values = []
+            for key in ("lexeme_id", "old_lexeme_id", "new_lexeme_id"):
+                if key in payload:
+                    values.append(payload[key])
+            lexeme_ids = payload.get("lexeme_ids", [])
+            if isinstance(lexeme_ids, list) and len(lexeme_ids) <= _MAX_PAYLOAD_IDS:
+                values.extend(lexeme_ids)
+            for value in values:
+                if not isinstance(value, str):
+                    continue
+                lexeme_id = value.strip()
+                if not 0 < len(lexeme_id) <= _MAX_SUBJECT_ID_CHARS:
+                    continue
+                if connection.execute(
+                    """SELECT 1 FROM concept_lexemes
+                       WHERE concept_id=? AND lexeme_id=? AND created_version<=?""",
+                    (subject_id, lexeme_id, change_version),
+                ).fetchone() is not None:
+                    subjects.add(("lexeme", lexeme_id))
         return sorted(subjects)
 
     @staticmethod
     def _dependency_snapshot_is_current(row: sqlite3.Row) -> bool:
         source_hash = str(row["source_hash"] or "")
         source_text = str(row["source_text"] or "")
-        if (
-            len(source_hash) == 64
-            and all(character in "0123456789abcdef" for character in source_hash)
-            and hashlib.sha256(source_text.encode("utf-8")).hexdigest() != source_hash
-        ):
+        if not _authentic_source(source_text, source_hash):
             return False
         raw_spans = str(row["source_spans_json"] or "[]")
-        if raw_spans in {"", "[]"}:
-            return True
         try:
             spans = json.loads(raw_spans)
         except (TypeError, ValueError, json.JSONDecodeError):
             return False
-        if not isinstance(spans, list) or len(spans) > 128:
+        if not isinstance(spans, list) or not spans or len(spans) > 128:
             return False
         matched_form = str(row["matched_form"] or "")
+        if not matched_form:
+            return False
+        normalized_form = unicodedata.normalize("NFKC", matched_form)
         for span in spans:
             if (
                 not isinstance(span, list)
@@ -182,9 +311,27 @@ class RevalidationPlanner:
             start, end = span
             if not 0 <= start < end <= len(source_text):
                 return False
-            if matched_form and source_text[start:end] != matched_form:
+            if unicodedata.normalize("NFKC", source_text[start:end]) != normalized_form:
                 return False
         return True
+
+    @staticmethod
+    def _occurrence_snapshot_is_current(row: sqlite3.Row) -> bool:
+        source_text = str(row["source_text"] or "")
+        block_hash = str(row["source_hash"] or "")
+        occurrence_hash = str(row["occurrence_source_hash"] or "")
+        if not _authentic_source(source_text, block_hash) or occurrence_hash != block_hash:
+            return False
+        start = row["start_offset"]
+        end = row["end_offset"]
+        if type(start) is not int or type(end) is not int:
+            return False
+        if not 0 <= start < end <= len(source_text):
+            return False
+        return (
+            unicodedata.normalize("NFKC", source_text[start:end])
+            == unicodedata.normalize("NFKC", str(row["source_form"] or ""))
+        )
 
     @staticmethod
     def _empty_result(requested: int = 0, effective: int = 0) -> dict[str, Any]:
@@ -266,7 +413,7 @@ class RevalidationPlanner:
             subjects = {
                 (str(row["subject_type"]).strip(), str(row["subject_id"]).strip())
             }
-            subjects.update(self._safe_payload_subjects(row))
+            subjects.update(self._safe_payload_subjects(connection, row))
             for subject_type, subject_id in sorted(subjects):
                 if (
                     not subject_type
@@ -317,6 +464,8 @@ class RevalidationPlanner:
                WHERE tv.active=1 AND tv.pipeline='parallel_v4'
                  AND tv.status IN ('completed','completed_with_warnings')
                  AND b.status IN ('completed','completed_with_warnings')
+                 AND d.knowledge_version=tv.knowledge_version
+                 AND subject.knowledge_version>tv.knowledge_version
                  AND d.dependency_fingerprint<>subject.new_fingerprint
                ORDER BY tv.id, subject.change_id, subject.subject_type, subject.subject_id"""
         ).fetchall()
@@ -329,7 +478,10 @@ class RevalidationPlanner:
             """SELECT DISTINCT
                       tv.id translation_id, tv.block_id,
                       tv.knowledge_version from_version,
-                      b.source_hash,
+                      b.source_hash, b.source_text,
+                      occurrence.source_hash occurrence_source_hash,
+                      occurrence.start_offset, occurrence.end_offset,
+                      occurrence.source_form,
                       subject.change_id, subject.knowledge_version,
                       subject.impact_level, subject.change_kind,
                       subject.subject_type, subject.subject_id
@@ -354,6 +506,7 @@ class RevalidationPlanner:
                  AND tv.active=1 AND tv.pipeline='parallel_v4'
                  AND tv.status IN ('completed','completed_with_warnings')
                  AND b.status IN ('completed','completed_with_warnings')
+                 AND subject.knowledge_version>tv.knowledge_version
                  AND NOT EXISTS(
                      SELECT 1 FROM dependencies existing
                      WHERE existing.translation_id=tv.id
@@ -364,7 +517,10 @@ class RevalidationPlanner:
                SELECT DISTINCT
                       tv.id translation_id, tv.block_id,
                       tv.knowledge_version from_version,
-                      b.source_hash,
+                      b.source_hash, b.source_text,
+                      occurrence.source_hash occurrence_source_hash,
+                      occurrence.start_offset, occurrence.end_offset,
+                      occurrence.source_form,
                       subject.change_id, subject.knowledge_version,
                       subject.impact_level, subject.change_kind,
                       subject.subject_type, subject.subject_id
@@ -391,6 +547,7 @@ class RevalidationPlanner:
                  AND tv.active=1 AND tv.pipeline='parallel_v4'
                  AND tv.status IN ('completed','completed_with_warnings')
                  AND b.status IN ('completed','completed_with_warnings')
+                 AND subject.knowledge_version>tv.knowledge_version
                  AND NOT EXISTS(
                      SELECT 1 FROM dependencies existing
                      WHERE existing.translation_id=tv.id
@@ -400,6 +557,8 @@ class RevalidationPlanner:
                ORDER BY translation_id, change_id, subject_type, subject_id"""
         ).fetchall()
         for row in occurrence_rows:
+            if not self._occurrence_snapshot_is_current(row):
+                continue
             self._add_candidate(candidates, row, "occurrence")
 
         counters = {"created": 0, "merged": 0, "unchanged": 0}
@@ -473,10 +632,50 @@ class RevalidationPlanner:
             (candidate.translation_id,),
         ).fetchall()
         pending = [row for row in tasks if row["status"] == "pending"]
+        task_change_ids: dict[str, set[int]] = {}
+        for row in tasks:
+            row_id = str(row["id"])
+            parsed_ids = _result_change_ids(row["result_json"])
+            task_change_ids[row_id] = parsed_ids
+            if (
+                int(row["from_knowledge_version"]) != candidate.from_version
+                or str(row["block_id"]) != candidate.block_id
+            ):
+                raise ValueError("pending revalidation task does not match translation")
+            persisted_changes = self._change_rows(connection, parsed_ids)
+            if set(persisted_changes) != parsed_ids:
+                raise ValueError("pending revalidation task references unknown changes")
+            if any(
+                int(change["knowledge_version"]) <= candidate.from_version
+                for change in persisted_changes.values()
+            ):
+                raise ValueError("revalidation changes must be newer than translation")
+            expected_to = max(
+                int(change["knowledge_version"])
+                for change in persisted_changes.values()
+            )
+            if (
+                int(row["to_knowledge_version"]) != expected_to
+                or expected_to <= candidate.from_version
+                or str(row["change_set_hash"])
+                != _change_set_hash(sorted(parsed_ids), expected_to)
+                or int(row["impact_level"])
+                != max(
+                    int(change["impact_level"])
+                    for change in persisted_changes.values()
+                )
+            ):
+                raise ValueError("pending revalidation task metadata is inconsistent")
+            payload = json.loads(str(row["result_json"]))
+            if payload.get("source_hash") != candidate.source_hash:
+                raise ValueError("pending revalidation source hash is inconsistent")
         validating_ids: set[int] = set()
         for row in tasks:
             if row["status"] == "validating":
-                validating_ids.update(_result_change_ids(row["result_json"]))
+                validating_ids.update(task_change_ids[str(row["id"])])
+        for detail in candidate.changes.values():
+            if int(detail["knowledge_version"]) <= candidate.from_version:
+                raise ValueError("revalidation changes must be newer than translation")
         candidate_ids = set(candidate.changes) - validating_ids
         if not candidate_ids:
             return None
@@ -484,9 +683,9 @@ class RevalidationPlanner:
         existing_ids: set[int] = set()
         current: sqlite3.Row | None = pending[0] if pending else None
         if current is not None:
-            existing_ids.update(_result_change_ids(current["result_json"]))
+            existing_ids.update(task_change_ids[str(current["id"])])
             for duplicate in pending[1:]:
-                existing_ids.update(_result_change_ids(duplicate["result_json"]))
+                existing_ids.update(task_change_ids[str(duplicate["id"])])
                 connection.execute(
                     """UPDATE revalidation_tasks
                        SET status='resolved_noop', result_json=?, resolved_at=?
@@ -498,13 +697,32 @@ class RevalidationPlanner:
                     ),
                 )
         merged_ids = existing_ids | candidate_ids
-        if current is not None and merged_ids == existing_ids:
-            return "unchanged"
+        if len(merged_ids) > MAX_CHANGE_IDS:
+            raise PlanningBudgetError("merged revalidation change_ids exceed budget")
 
         change_rows = self._change_rows(connection, merged_ids)
         if set(change_rows) != merged_ids:
             raise ValueError("pending revalidation task references unknown changes")
+        if any(
+            int(row["knowledge_version"]) <= candidate.from_version
+            for row in change_rows.values()
+        ):
+            raise ValueError("revalidation changes must be newer than translation")
         to_version = max(int(row["knowledge_version"]) for row in change_rows.values())
+        if to_version <= candidate.from_version:
+            raise ValueError("revalidation target version must move forward")
+        if current is not None and existing_ids:
+            existing_rows = {change_id: change_rows[change_id] for change_id in existing_ids}
+            stored_to = int(current["to_knowledge_version"])
+            expected_to = max(
+                int(row["knowledge_version"]) for row in existing_rows.values()
+            )
+            if stored_to != expected_to:
+                raise ValueError("pending revalidation target version is inconsistent")
+            if to_version < stored_to:
+                raise ValueError("pending revalidation target version cannot decrease")
+        if current is not None and merged_ids == existing_ids:
+            return "unchanged"
         impact = max(int(row["impact_level"]) for row in change_rows.values())
         change_hash = _change_set_hash(sorted(merged_ids), to_version)
         conflict = connection.execute(
@@ -522,6 +740,8 @@ class RevalidationPlanner:
             return "unchanged" if current is not None else None
 
         result_json = self._task_result(candidate, merged_ids, change_rows)
+        if len(result_json.encode("utf-8")) > MAX_RESULT_BYTES:
+            raise PlanningBudgetError("revalidation result exceeds byte budget")
         if current is None:
             connection.execute(
                 """INSERT INTO revalidation_tasks(

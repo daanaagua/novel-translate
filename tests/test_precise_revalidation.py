@@ -4,13 +4,19 @@ import re
 import sqlite3
 from contextlib import closing, contextmanager
 from dataclasses import replace
+from decimal import Decimal
 
 import pytest
 
 from src.core.v4.context import ContextBuilder
 from src.core.v4.database import KnowledgeSnapshotError, V4Database, render_fingerprint
 from src.core.v4.pipeline import V4TranslationPipeline
-from src.core.v4.revalidation import RevalidationPlanner
+from src.core.v4.revalidation import (
+    MAX_CHANGE_IDS,
+    MAX_RESULT_BYTES,
+    PlanningBudgetError,
+    RevalidationPlanner,
+)
 import src.core.v4.models as v4_models
 from src.core.v4.coreference import cache_key, semantic_cache_key
 from src.core.v4.models import (
@@ -125,6 +131,11 @@ def _insert_revalidation_translation(
         connection.execute(
             "UPDATE blocks SET status=? WHERE id=?", (block_status, block_id)
         )
+        source_text = str(
+            connection.execute(
+                "SELECT source_text FROM blocks WHERE id=?", (block_id,)
+            ).fetchone()[0]
+        )
         version = int(
             connection.execute("SELECT MAX(id) FROM knowledge_versions").fetchone()[0]
         )
@@ -142,14 +153,17 @@ def _insert_revalidation_translation(
             connection.execute(
                 """INSERT INTO dependencies(
                        translation_id, dependency_type, dependency_id,
-                       knowledge_version, dependency_fingerprint)
-                   VALUES(?, ?, ?, ?, ?)""",
+                       knowledge_version, dependency_fingerprint,
+                       matched_form, source_spans_json)
+                   VALUES(?, ?, ?, ?, ?, ?, ?)""",
                 (
                     translation_id,
                     dependency_type,
                     dependency_id,
                     version,
                     fingerprint,
+                    source_text,
+                    json.dumps([[0, len(source_text)]]),
                 ),
             )
     return translation_id
@@ -1643,9 +1657,6 @@ def test_revalidation_planner_enforces_translation_and_block_hard_conditions(tmp
         tmp_path,
         ["ready", "no active", "serial only", "parallel active"],
     )
-    change_id = _insert_revalidation_change(
-        database, subject_type="concept", subject_id="concept-hard"
-    )
     _insert_revalidation_translation(
         database,
         "block-0",
@@ -1668,6 +1679,9 @@ def test_revalidation_planner_enforces_translation_and_block_hard_conditions(tmp
         database,
         "block-3",
         dependency=("concept", "concept-hard", "old-fingerprint"),
+    )
+    change_id = _insert_revalidation_change(
+        database, subject_type="concept", subject_id="concept-hard"
     )
 
     result = RevalidationPlanner(database).plan([change_id])
@@ -1709,13 +1723,135 @@ def test_revalidation_planner_rejects_unknown_and_skips_non_effective_changes(tm
     assert planner.plan([])["planned"] == 0
     with pytest.raises(KeyError, match="unknown knowledge change"):
         planner.plan([effective, 999_999])
-    result = planner.plan([str(effective), zero, same, effective])
+    with pytest.raises(ValueError, match="positive integers"):
+        planner.plan([str(effective)])
+    result = planner.plan([effective, zero, same, effective])
 
     assert result["planned"] == 1
     with closing(database.connect()) as connection:
         task = connection.execute("SELECT * FROM revalidation_tasks").fetchone()
     assert task["translation_id"] == translation_id
     assert json.loads(task["result_json"])["change_ids"] == [effective]
+
+
+@pytest.mark.parametrize("bad_id", ["1", 1.0, Decimal("1"), True])
+def test_revalidation_planner_rejects_non_integer_change_ids_atomically(
+    tmp_path, bad_id
+):
+    database = _database(tmp_path, ["Alpha"])
+
+    with pytest.raises(ValueError, match="positive integers"):
+        RevalidationPlanner(database).plan([bad_id])
+
+    with closing(database.connect()) as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM revalidation_tasks"
+        ).fetchone()[0] == 0
+
+
+def test_revalidation_planner_rejects_input_over_budget_before_writes(tmp_path):
+    database = _database(tmp_path, ["Alpha"])
+
+    with pytest.raises(PlanningBudgetError, match="planning budget"):
+        RevalidationPlanner(database).plan(list(range(1, MAX_CHANGE_IDS + 2)))
+
+    with closing(database.connect()) as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM revalidation_tasks"
+        ).fetchone()[0] == 0
+
+
+def test_revalidation_only_plans_changes_strictly_newer_than_translation(tmp_path):
+    database = _database(tmp_path, ["Alpha"])
+    same_or_older = _insert_revalidation_change(
+        database, subject_type="concept", subject_id="concept-forward"
+    )
+    translation_id = _insert_revalidation_translation(
+        database,
+        "block-0",
+        dependency=("concept", "concept-forward", "old-fingerprint"),
+    )
+
+    assert RevalidationPlanner(database).plan([same_or_older])["planned"] == 0
+
+    newer = _insert_revalidation_change(
+        database,
+        subject_type="concept",
+        subject_id="concept-forward",
+        new_fingerprint="newer-fingerprint",
+    )
+    assert RevalidationPlanner(database).plan([same_or_older, newer])["planned"] == 1
+    with closing(database.connect()) as connection:
+        task = connection.execute("SELECT * FROM revalidation_tasks").fetchone()
+        translation_version = int(
+            connection.execute(
+                "SELECT knowledge_version FROM translation_versions WHERE id=?",
+                (translation_id,),
+            ).fetchone()[0]
+        )
+        newer_version = int(
+            connection.execute(
+                "SELECT knowledge_version FROM knowledge_changes WHERE id=?", (newer,)
+            ).fetchone()[0]
+        )
+    assert task["from_knowledge_version"] == translation_version
+    assert task["to_knowledge_version"] == newer_version
+    assert task["from_knowledge_version"] < task["to_knowledge_version"]
+    assert json.loads(task["result_json"])["change_ids"] == [newer]
+
+
+def test_revalidation_requires_dependency_version_to_match_translation(tmp_path):
+    database = _database(tmp_path, ["Alpha"])
+    translation_id = _insert_revalidation_translation(
+        database,
+        "block-0",
+        dependency=("concept", "concept-version", "old-fingerprint"),
+    )
+    with database.transaction() as connection:
+        connection.execute(
+            "UPDATE dependencies SET knowledge_version=knowledge_version-1 WHERE translation_id=?",
+            (translation_id,),
+        )
+    change_id = _insert_revalidation_change(
+        database, subject_type="concept", subject_id="concept-version"
+    )
+
+    assert RevalidationPlanner(database).plan([change_id])["planned"] == 0
+
+
+def test_revalidation_requires_authentic_source_and_provable_dependency_spans(tmp_path):
+    database = _database(
+        tmp_path, ["uppercase", "malformed", "bad span", "valid"]
+    )
+    translations = [
+        _insert_revalidation_translation(
+            database,
+            f"block-{index}",
+            dependency=("concept", "concept-source", "old-fingerprint"),
+        )
+        for index in range(4)
+    ]
+    with database.transaction() as connection:
+        connection.execute(
+            "UPDATE blocks SET source_hash=upper(source_hash) WHERE id='block-0'"
+        )
+        connection.execute(
+            "UPDATE blocks SET source_hash='not-a-sha256' WHERE id='block-1'"
+        )
+        connection.execute(
+            "UPDATE dependencies SET source_spans_json='[[0,2]]' WHERE translation_id=?",
+            (translations[2],),
+        )
+    change_id = _insert_revalidation_change(
+        database, subject_type="concept", subject_id="concept-source"
+    )
+
+    assert RevalidationPlanner(database).plan([change_id])["planned"] == 1
+    with closing(database.connect()) as connection:
+        planned = connection.execute(
+            "SELECT translation_id FROM revalidation_tasks"
+        ).fetchall()
+    assert [row[0] for row in planned] == [translations[3]]
 
 
 def test_revalidation_planner_uses_fresh_occurrences_without_regex_and_filters_stale(
@@ -1887,6 +2023,11 @@ def test_revalidation_retires_inactive_pending_and_plans_replacement(tmp_path):
         version = int(
             connection.execute("SELECT MAX(id) FROM knowledge_versions").fetchone()[0]
         )
+        source_text = str(
+            connection.execute(
+                "SELECT source_text FROM blocks WHERE id='block-0'"
+            ).fetchone()[0]
+        )
         new_translation = int(
             connection.execute(
                 """INSERT INTO translation_versions(
@@ -1899,12 +2040,24 @@ def test_revalidation_retires_inactive_pending_and_plans_replacement(tmp_path):
         connection.execute(
             """INSERT INTO dependencies(
                    translation_id, dependency_type, dependency_id,
-                   knowledge_version, dependency_fingerprint)
-               VALUES(?, 'concept', 'concept-replacement', ?, 'old')""",
-            (new_translation, version),
+                   knowledge_version, dependency_fingerprint,
+                   matched_form, source_spans_json)
+               VALUES(?, 'concept', 'concept-replacement', ?, 'old', ?, ?)""",
+            (
+                new_translation,
+                version,
+                source_text,
+                json.dumps([[0, len(source_text)]]),
+            ),
         )
 
-    planner.plan([change_id])
+    replacement_change = _insert_revalidation_change(
+        database,
+        subject_type="concept",
+        subject_id="concept-replacement",
+        new_fingerprint="replacement-new",
+    )
+    planner.plan([change_id, replacement_change])
 
     with closing(database.connect()) as connection:
         rows = connection.execute(
@@ -1915,6 +2068,7 @@ def test_revalidation_retires_inactive_pending_and_plans_replacement(tmp_path):
         (new_translation, "pending"),
     ]
     assert json.loads(rows[0]["result_json"])["reason"] == "translation_inactive"
+    assert json.loads(rows[1]["result_json"])["change_ids"] == [replacement_change]
 
 
 def test_status_summary_derives_revalidation_without_overwriting_block_status(tmp_path):
@@ -1992,6 +2146,217 @@ def test_revalidation_does_not_trust_arbitrary_payload_subjects(tmp_path):
     )
 
     assert RevalidationPlanner(database).plan([change_id])["planned"] == 0
+    with closing(database.connect()) as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM revalidation_tasks"
+        ).fetchone()[0] == 0
+
+
+def test_revalidation_expands_only_database_verified_concept_redirects(tmp_path):
+    database = _database(tmp_path, ["real merge", "forged merge"])
+    canonical_id = database.import_legacy_concept(
+        "Canonical", "Canonical", "person", "canonical"
+    )
+    retired_id = database.import_legacy_concept(
+        "Retired", "Retired", "person", "retired"
+    )
+    real_translation = _insert_revalidation_translation(
+        database,
+        "block-0",
+        dependency=("concept", retired_id, "old-fingerprint"),
+    )
+    _insert_revalidation_translation(
+        database,
+        "block-1",
+        dependency=("concept", "forged-concept", "old-fingerprint"),
+    )
+    with database.transaction() as connection:
+        version = database.create_knowledge_version("verified merge", connection)
+        connection.execute(
+            "UPDATE concepts SET status='merged', retired_version=? WHERE id=?",
+            (version, retired_id),
+        )
+        connection.execute(
+            """INSERT INTO concept_redirects(
+                   retired_concept_id, canonical_concept_id, reason,
+                   knowledge_version, created_at)
+               VALUES(?, ?, 'verified merge', ?, 'now')""",
+            (retired_id, canonical_id, version),
+        )
+        change_id = int(
+            connection.execute(
+                """INSERT INTO knowledge_changes(
+                       knowledge_version, subject_type, subject_id, change_kind,
+                       old_fingerprint, new_fingerprint, impact_level,
+                       payload_json, created_at)
+                   VALUES(?, 'concept', ?, 'concept_merge', 'old', 'new', 1, ?, 'now')""",
+                (
+                    version,
+                    canonical_id,
+                    json.dumps(
+                        {
+                            "canonical_concept_id": canonical_id,
+                            "merged_concept_ids": [retired_id, "forged-concept"],
+                        },
+                        sort_keys=True,
+                    ),
+                ),
+            ).lastrowid
+        )
+
+    assert RevalidationPlanner(database).plan([change_id])["planned"] == 1
+    with closing(database.connect()) as connection:
+        tasks = connection.execute(
+            "SELECT translation_id, result_json FROM revalidation_tasks"
+        ).fetchall()
+    assert [row["translation_id"] for row in tasks] == [real_translation]
+    assert {
+        (subject["subject_type"], subject["subject_id"])
+        for subject in json.loads(tasks[0]["result_json"])["subjects"]
+    } == {("concept", retired_id)}
+
+
+def test_revalidation_expands_only_verified_rule_and_lexeme_relationships(tmp_path):
+    database = _database(
+        tmp_path, ["actual lexeme", "forged lexeme", "actual rule", "forged rule"]
+    )
+    concept_id = database.import_legacy_concept(
+        "Linked", "Linked", "person", "linked"
+    )
+    with database.transaction() as connection:
+        lexeme_id = str(
+            connection.execute(
+                "SELECT primary_lexeme_id FROM concepts WHERE id=?", (concept_id,)
+            ).fetchone()[0]
+        )
+        version = int(
+            connection.execute("SELECT MAX(id) FROM knowledge_versions").fetchone()[0]
+        )
+        connection.execute(
+            """INSERT INTO rendering_rules(
+                   id, concept_id, condition_json, target, priority, status,
+                   scope, locked, created_version, created_at)
+               VALUES('rule-linked', ?, '{}', 'Linked', 0, 'verified',
+                      'book', 0, ?, 'now')""",
+            (concept_id, version),
+        )
+    actual_lexeme = _insert_revalidation_translation(
+        database,
+        "block-0",
+        dependency=("lexeme", lexeme_id, "old-fingerprint"),
+    )
+    _insert_revalidation_translation(
+        database,
+        "block-1",
+        dependency=("lexeme", "forged-lexeme", "old-fingerprint"),
+    )
+    actual_rule = _insert_revalidation_translation(
+        database,
+        "block-2",
+        dependency=("rule", "rule-linked", "old-fingerprint"),
+    )
+    _insert_revalidation_translation(
+        database,
+        "block-3",
+        dependency=("rule", "forged-rule", "old-fingerprint"),
+    )
+    change_id = _insert_revalidation_change(
+        database,
+        subject_type="concept",
+        subject_id=concept_id,
+        change_kind="rule_alias_lexeme_update",
+        payload={
+            "lexeme_ids": [lexeme_id, "forged-lexeme"],
+            "rule_ids": ["rule-linked", "forged-rule"],
+        },
+    )
+
+    assert RevalidationPlanner(database).plan([change_id])["planned"] == 2
+    with closing(database.connect()) as connection:
+        planned = connection.execute(
+            "SELECT translation_id FROM revalidation_tasks ORDER BY translation_id"
+        ).fetchall()
+    assert [row[0] for row in planned] == [actual_lexeme, actual_rule]
+
+
+@pytest.mark.parametrize(
+    ("corrupt_result", "expected_error"),
+    [
+        ("{", ValueError),
+        (json.dumps({"change_ids": ["1"]}), ValueError),
+        (
+            json.dumps({"change_ids": list(range(1, MAX_CHANGE_IDS + 2))}),
+            PlanningBudgetError,
+        ),
+        ("x" * (MAX_RESULT_BYTES + 1), PlanningBudgetError),
+    ],
+    ids=["invalid-json", "non-integer-id", "too-many-ids", "too-many-bytes"],
+)
+def test_revalidation_rejects_corrupt_pending_results_atomically(
+    tmp_path, corrupt_result, expected_error
+):
+    database = _database(tmp_path, ["Alpha"])
+    _insert_revalidation_translation(
+        database,
+        "block-0",
+        dependency=("concept", "concept-corrupt", "old-fingerprint"),
+    )
+    first = _insert_revalidation_change(
+        database, subject_type="concept", subject_id="concept-corrupt"
+    )
+    planner = RevalidationPlanner(database)
+    planner.plan([first])
+    with database.transaction() as connection:
+        connection.execute(
+            "UPDATE revalidation_tasks SET result_json=?", (corrupt_result,)
+        )
+    with closing(database.connect()) as connection:
+        before = tuple(connection.execute("SELECT * FROM revalidation_tasks").fetchone())
+    second = _insert_revalidation_change(
+        database,
+        subject_type="concept",
+        subject_id="concept-corrupt",
+        new_fingerprint="newer-fingerprint",
+    )
+
+    with pytest.raises(expected_error):
+        planner.plan([second])
+
+    with closing(database.connect()) as connection:
+        after = tuple(connection.execute("SELECT * FROM revalidation_tasks").fetchone())
+    assert after == before
+
+
+def test_revalidation_rejects_oversized_final_result_atomically(tmp_path):
+    database = _database(tmp_path, ["Alpha"])
+    _insert_revalidation_translation(
+        database,
+        "block-0",
+        dependency=("concept", "concept-result-budget", "old-fingerprint"),
+    )
+    change_ids = []
+    with database.transaction() as connection:
+        for index in range(257):
+            version = database.create_knowledge_version(
+                f"large result {index}", connection
+            )
+            change_ids.append(
+                int(
+                    connection.execute(
+                        """INSERT INTO knowledge_changes(
+                               knowledge_version, subject_type, subject_id,
+                               change_kind, old_fingerprint, new_fingerprint,
+                               impact_level, payload_json, created_at)
+                           VALUES(?, 'concept', 'concept-result-budget', ?,
+                                  'old-fingerprint', ?, 1, '{}', 'now')""",
+                        (version, "large-" + ("x" * 400), f"new-{index}"),
+                    ).lastrowid
+                )
+            )
+
+    with pytest.raises(PlanningBudgetError, match="result exceeds byte budget"):
+        RevalidationPlanner(database).plan(change_ids)
+
     with closing(database.connect()) as connection:
         assert connection.execute(
             "SELECT COUNT(*) FROM revalidation_tasks"

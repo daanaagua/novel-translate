@@ -929,8 +929,10 @@ class ParallelV4Tests(unittest.TestCase):
         self.assertEqual(queue_count, 1)
         with self.database.transaction() as connection:
             dependency = connection.execute(
-                """SELECT tv.id translation_id, tv.knowledge_version, c.id concept_id
-                   FROM translation_versions tv JOIN concepts c
+                """SELECT tv.id translation_id, tv.knowledge_version,
+                          c.id concept_id, b.source_text
+                   FROM translation_versions tv JOIN blocks b ON b.id=tv.block_id
+                   JOIN concepts c
                      ON c.canonical_source='Archon' AND c.retired_version IS NULL
                    WHERE tv.pipeline='parallel_v4' AND tv.active=1
                    ORDER BY tv.id LIMIT 1"""
@@ -938,12 +940,15 @@ class ParallelV4Tests(unittest.TestCase):
             connection.execute(
                 """INSERT INTO dependencies(
                        translation_id, dependency_type, dependency_id,
-                       knowledge_version, dependency_fingerprint)
-                   VALUES(?, 'concept', ?, ?, 'pre-accept-fingerprint')""",
+                       knowledge_version, dependency_fingerprint,
+                       matched_form, source_spans_json)
+                   VALUES(?, 'concept', ?, ?, 'pre-accept-fingerprint', ?, ?)""",
                 (
                     dependency["translation_id"],
                     dependency["concept_id"],
                     dependency["knowledge_version"],
+                    dependency["source_text"],
+                    json.dumps([[0, len(dependency["source_text"])]]),
                 ),
             )
         decision = self.database.resolve_human_item(1, "accept")

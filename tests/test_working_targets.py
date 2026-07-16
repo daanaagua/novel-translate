@@ -1,3 +1,4 @@
+import hashlib
 import json
 from contextlib import closing
 
@@ -123,7 +124,7 @@ def _database(tmp_path, sources):
                 "global_index": index,
                 "block_type": "prose",
                 "source_text": source,
-                "source_hash": f"hash-{index}",
+                "source_hash": hashlib.sha256(source.encode("utf-8")).hexdigest(),
                 "token_count": len(source.split()),
                 "status": "ready",
             }
@@ -131,6 +132,42 @@ def _database(tmp_path, sources):
         ],
     )
     return database
+
+
+def _plan_newer_changes_for_active_translation(database):
+    with database.transaction() as connection:
+        translation = connection.execute(
+            """SELECT tv.id, tv.knowledge_version, b.source_text
+               FROM translation_versions tv JOIN blocks b ON b.id=tv.block_id
+               WHERE tv.pipeline='parallel_v4' AND tv.active=1
+               ORDER BY tv.id LIMIT 1"""
+        ).fetchone()
+        changes = connection.execute(
+            """SELECT id, subject_type, subject_id, old_fingerprint
+               FROM knowledge_changes
+               WHERE knowledge_version>? AND impact_level>0
+                 AND old_fingerprint<>new_fingerprint
+               ORDER BY id""",
+            (translation["knowledge_version"],),
+        ).fetchall()
+        for change in changes:
+            connection.execute(
+                """INSERT OR IGNORE INTO dependencies(
+                       translation_id, dependency_type, dependency_id,
+                       knowledge_version, dependency_fingerprint,
+                       matched_form, source_spans_json)
+                   VALUES(?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    translation["id"],
+                    change["subject_type"],
+                    change["subject_id"],
+                    translation["knowledge_version"],
+                    change["old_fingerprint"],
+                    translation["source_text"],
+                    json.dumps([[0, len(translation["source_text"])]]),
+                ),
+            )
+    return RevalidationPlanner(database).plan([int(row["id"]) for row in changes])
 
 
 def _seed_concept(database, source, *, kind="person", blocks=None):
@@ -867,20 +904,30 @@ def test_target_change_records_change_then_planner_targets_only_active_translati
         connection.execute(
             """INSERT INTO dependencies(
                    translation_id, dependency_type, dependency_id, knowledge_version,
-                   dependency_fingerprint)
-               SELECT id, 'concept', ?, 1, 'old-fingerprint'
+                   dependency_fingerprint, matched_form, source_spans_json)
+               SELECT id, 'concept', ?, 1, 'old-fingerprint', ?, ?
                FROM translation_versions
                WHERE block_id=? AND pipeline='parallel_v4' AND active=1""",
-            (concept_id, blocks[0].id),
+            (
+                concept_id,
+                blocks[0].source_text,
+                json.dumps([[0, len(blocks[0].source_text)]]),
+                blocks[0].id,
+            ),
         )
         connection.execute(
             """INSERT INTO dependencies(
                    translation_id, dependency_type, dependency_id, knowledge_version,
-                   dependency_fingerprint)
-               SELECT tv.id, 'lexeme', c.primary_lexeme_id, 1, 'old-fingerprint'
+                   dependency_fingerprint, matched_form, source_spans_json)
+               SELECT tv.id, 'lexeme', c.primary_lexeme_id, 1, 'old-fingerprint', ?, ?
                FROM translation_versions tv JOIN concepts c ON c.id=?
                WHERE tv.block_id=? AND tv.pipeline='parallel_v4' AND tv.active=1""",
-            (concept_id, blocks[0].id),
+            (
+                blocks[0].source_text,
+                json.dumps([[0, len(blocks[0].source_text)]]),
+                concept_id,
+                blocks[0].id,
+            ),
         )
         connection.execute(
             "UPDATE blocks SET status='completed' WHERE id=?", (blocks[0].id,)
@@ -1150,7 +1197,15 @@ def test_midrun_target_change_stops_before_mixing_without_mutating_block_status(
     assert [block.status for block in database.list_blocks()] == ["completed", "ready"]
     assert set(database.active_translations()) == {"block_000"}
     assert database.active_translations()["block_000"]["status"] == "completed"
+    planned = _plan_newer_changes_for_active_translation(database)
+    assert planned["planned"] == 1
+    assert database.status_summary()["needs_revalidate"] == 1
+    assert database.active_translations()["block_000"]["status"] == "completed"
+    assert [block.status for block in database.list_blocks()] == ["completed", "ready"]
     with closing(database.connect()) as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM revalidation_tasks WHERE status='pending'"
+        ).fetchone()[0] == 1
         assert connection.execute(
             "SELECT status FROM runs WHERE id=?", (result["run_id"],)
         ).fetchone()[0] == result["status"]
@@ -1190,6 +1245,15 @@ def test_atomic_finalizer_reports_a_last_moment_knowledge_race(tmp_path, monkeyp
     assert result["knowledge_stale"] is True
     assert database.get_block_by_identifier("block_000").status == "completed"
     assert database.active_translations()["block_000"]["status"] == "completed"
+    planned = _plan_newer_changes_for_active_translation(database)
+    assert planned["planned"] == 1
+    assert database.status_summary()["needs_revalidate"] == 1
+    assert database.get_block_by_identifier("block_000").status == "completed"
+    assert database.active_translations()["block_000"]["status"] == "completed"
+    with closing(database.connect()) as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM revalidation_tasks WHERE status='pending'"
+        ).fetchone()[0] == 1
 
 
 def test_working_target_candidates_use_one_connection_for_contexts_and_baselines(

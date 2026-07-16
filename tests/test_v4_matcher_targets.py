@@ -33,7 +33,7 @@ def _db(tmp_path, texts):
                 "global_index": index,
                 "block_type": "prose",
                 "source_text": text,
-                "source_hash": f"hash-{index}",
+                "source_hash": hashlib.sha256(text.encode("utf-8")).hexdigest(),
                 "token_count": len(text.split()),
                 "status": "ready",
             }
@@ -502,7 +502,14 @@ def test_usage_scope_controls_cross_block_context_without_origin_narrowing(
                        lexeme_id, block_id, start_offset, end_offset,
                        source_form, source_hash, created_at)
                    VALUES(?, ?, 0, 6, 'Archon', ?, 'now')""",
-                (lexeme_id, f"block_{index}", f"hash-{index}"),
+                (
+                    lexeme_id,
+                    f"block_{index}",
+                    connection.execute(
+                        "SELECT source_hash FROM blocks WHERE id=?",
+                        (f"block_{index}",),
+                    ).fetchone()[0],
+                ),
             )
         usage_id = connection.execute(
             """INSERT INTO usage_decisions(
@@ -1110,6 +1117,16 @@ def test_atomic_finish_detects_changed_signature_and_rolls_back_on_failure(
             )
         ],
     )
+    with db.transaction() as connection:
+        connection.execute(
+            """UPDATE dependencies
+               SET matched_form=?, source_spans_json=?
+               WHERE translation_id=(
+                   SELECT id FROM translation_versions
+                   WHERE block_id=? AND pipeline='parallel_v4' AND active=1
+               )""",
+            (block.source_text, json.dumps([[0, len(block.source_text)]]), block.id),
+        )
     original = db._concept_snapshot_from_connection
     change_ids = []
 
