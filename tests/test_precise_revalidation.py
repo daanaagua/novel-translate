@@ -5,13 +5,16 @@ from dataclasses import replace
 
 import pytest
 
+from src.core.v4.context import ContextBuilder
 from src.core.v4.database import V4Database, render_fingerprint
+from src.core.v4.pipeline import V4TranslationPipeline
 from src.core.v4.coreference import cache_key, semantic_cache_key
 from src.core.v4.models import (
     CoreferenceCase,
     CoreferenceConceptAnchor,
     CoreferenceMention,
     CoreferenceTypeObservation,
+    Island,
     RenderingMatchSnapshot,
     TranslationOutcome,
     V4BlockStatus,
@@ -289,7 +292,8 @@ def test_working_target_uses_its_write_version_for_one_render_change(tmp_path):
     )
     with closing(database.connect()) as connection:
         changes = connection.execute(
-            "SELECT * FROM knowledge_changes ORDER BY id"
+            "SELECT * FROM knowledge_changes WHERE knowledge_version=? ORDER BY id",
+            (result["knowledge_version"],),
         ).fetchall()
         versions = connection.execute(
             "SELECT COUNT(*) FROM knowledge_versions WHERE id=?",
@@ -532,11 +536,55 @@ def test_source_text_must_still_match_its_real_sha256(tmp_path):
                     knowledge_version=database.current_knowledge_version(),
                     status=V4BlockStatus.COMPLETED.value,
                     matched_renderings=(
-                        _match("lex-o", changed_text, 0, len(changed_text), "欧米伽"),
+                        _match("lex-o", changed_text, 0, len(changed_text), "Omega"),
                     ),
                 )
             ],
         )
+
+
+@pytest.mark.parametrize(
+    "forged_hash",
+    [
+        hashlib.sha256(b"Alpha").hexdigest().upper(),
+        "not-a-sha256",
+        "0" * 64,
+    ],
+)
+def test_exact_dependencies_require_authentic_lowercase_source_hash(
+    tmp_path, forged_hash
+):
+    database = _database(tmp_path, ["Alpha"])
+    database.start_run("run-forged-hash", "translate", {})
+    original = database.list_blocks()[0]
+    forged_block = replace(original, source_hash=forged_hash)
+    with database.transaction() as connection:
+        connection.execute(
+            "UPDATE blocks SET source_hash=? WHERE id=?",
+            (forged_hash, original.id),
+        )
+
+    with pytest.raises(ValueError, match="hash"):
+        database.commit_translation_batch(
+            "run-forged-hash",
+            [
+                TranslationOutcome(
+                    block=forged_block,
+                    knowledge_version=database.current_knowledge_version(),
+                    status=V4BlockStatus.COMPLETED.value,
+                    matched_renderings=(
+                        _match("lex-a", "Alpha", 0, 5, "A"),
+                    ),
+                )
+            ],
+        )
+    with closing(database.connect()) as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM translation_versions"
+        ).fetchone()[0] == 0
+        assert connection.execute(
+            "SELECT COUNT(*) FROM dependencies"
+        ).fetchone()[0] == 0
 
 
 def test_translation_proposals_do_not_backfill_false_exact_dependencies(tmp_path):
@@ -590,3 +638,325 @@ def test_replacement_keeps_historical_dependencies_on_old_translation(tmp_path):
         translations[1]["id"],
     ]
     assert [row["rendered_target"] for row in dependencies] == ["甲", "阿尔法"]
+
+
+def test_merge_only_rewrites_active_translation_dependency_rows(tmp_path):
+    database = _database(tmp_path, ["scape"])
+    canonical_id = database.import_legacy_concept(
+        "scape", "SCAPE", "concept", "canonical"
+    )
+    old_id = database.import_legacy_concept(
+        "scapes", "SCAPES", "concept", "plural"
+    )
+    version = database.current_knowledge_version()
+    with database.transaction() as connection:
+        inactive_translation = connection.execute(
+            """INSERT INTO translation_versions(
+                   block_id, pipeline, knowledge_version, status,
+                   final_translation, active, created_at)
+               VALUES('block-0', 'parallel_v4', ?, 'completed', 'old', 0, 'old')""",
+            (version,),
+        ).lastrowid
+        active_translation = connection.execute(
+            """INSERT INTO translation_versions(
+                   block_id, pipeline, knowledge_version, status,
+                   final_translation, active, created_at)
+               VALUES('block-0', 'parallel_v4', ?, 'completed', 'new', 1, 'new')""",
+            (version,),
+        ).lastrowid
+        connection.executemany(
+            """INSERT INTO dependencies(
+                   translation_id, dependency_type, dependency_id,
+                   knowledge_version, dependency_fingerprint, matched_form,
+                   occurrence_count, rendered_target, applied_rule_ids_json,
+                   source_spans_json)
+               VALUES(?, 'concept', ?, ?, ?, ?, ?, ?, ?, ?)""",
+            [
+                (
+                    inactive_translation,
+                    old_id,
+                    version,
+                    "historical-fingerprint",
+                    "scapes",
+                    7,
+                    "HISTORICAL",
+                    '["historical-rule"]',
+                    "[[11,17]]",
+                ),
+                (
+                    active_translation,
+                    canonical_id,
+                    version,
+                    "active-canonical",
+                    "scape",
+                    1,
+                    "SCAPE",
+                    "[]",
+                    "[[0,5]]",
+                ),
+                (
+                    active_translation,
+                    old_id,
+                    version,
+                    "active-old",
+                    "scapes",
+                    2,
+                    "SCAPES",
+                    "[]",
+                    "[[6,12]]",
+                ),
+            ],
+        )
+        inactive_before = tuple(
+            connection.execute(
+                "SELECT * FROM dependencies WHERE translation_id=?",
+                (inactive_translation,),
+            ).fetchone()
+        )
+
+    database.merge_concept_forms("scape", ["scapes"])
+
+    with closing(database.connect()) as connection:
+        inactive_after = tuple(
+            connection.execute(
+                "SELECT * FROM dependencies WHERE translation_id=?",
+                (inactive_translation,),
+            ).fetchone()
+        )
+        active_rows = connection.execute(
+            """SELECT dependency_id, occurrence_count FROM dependencies
+               WHERE translation_id=? AND dependency_type='concept'""",
+            (active_translation,),
+        ).fetchall()
+    assert inactive_after == inactive_before
+    assert [tuple(row) for row in active_rows] == [(canonical_id, 3)]
+
+
+def test_rule_rebuild_metadata_does_not_raise_target_change_impact(tmp_path):
+    database = _database(tmp_path, ["Archon"])
+    concept_id = database.import_legacy_concept(
+        "Archon", "", "title", "office"
+    )
+    rule = {"condition": {"speaker": "A"}, "target": "HONORIFIC"}
+    database.apply_working_target_decisions(
+        [{"concept_id": concept_id, "target": "A", "rules": [rule]}]
+    )
+    second = database.apply_working_target_decisions(
+        [{"concept_id": concept_id, "target": "B", "rules": [rule]}]
+    )
+    with closing(database.connect()) as connection:
+        change = connection.execute(
+            """SELECT impact_level, change_kind FROM knowledge_changes
+               WHERE knowledge_version=?""",
+            (second["knowledge_version"],),
+        ).fetchone()
+    assert tuple(change) == (1, "target")
+
+
+def test_synonymous_rule_id_and_version_rebuild_has_same_state_fingerprint(tmp_path):
+    database = _database(tmp_path, ["Archon"])
+    concept_id = database.import_legacy_concept("Archon", "", "title", "office")
+    database.apply_working_target_decisions(
+        [
+            {
+                "concept_id": concept_id,
+                "target": "A",
+                "rules": [
+                    {"condition": {"speaker": "A"}, "target": "HONORIFIC"}
+                ],
+            }
+        ]
+    )
+    with database.transaction() as connection:
+        lexeme_id = connection.execute(
+            "SELECT primary_lexeme_id FROM concepts WHERE id=?", (concept_id,)
+        ).fetchone()[0]
+        old_state = database._render_state_for_subject(
+            connection, "lexeme", lexeme_id
+        )
+        row = connection.execute(
+            """SELECT * FROM rendering_rules
+               WHERE lexeme_id=? AND retired_version IS NULL""",
+            (lexeme_id,),
+        ).fetchone()
+        connection.execute(
+            "UPDATE rendering_rules SET retired_version=created_version WHERE id=?",
+            (row["id"],),
+        )
+        connection.execute(
+            """INSERT INTO rendering_rules(
+                   id, lexeme_id, condition_json, target, priority, status,
+                   scope, locked, created_version, created_at)
+               VALUES('replacement-rule', ?, ?, ?, ?, 'legacy_provisional',
+                      ?, ?, ?, 'replacement-time')""",
+            (
+                lexeme_id,
+                row["condition_json"],
+                row["target"],
+                row["priority"],
+                row["scope"],
+                row["locked"],
+                row["created_version"],
+            ),
+        )
+        new_state = database._render_state_for_subject(
+            connection, "lexeme", lexeme_id
+        )
+
+    assert old_state["rendering_rules_sha256"] == new_state[
+        "rendering_rules_sha256"
+    ]
+    assert render_fingerprint("lexeme", lexeme_id, old_state) == render_fingerprint(
+        "lexeme", lexeme_id, new_state
+    )
+
+
+def test_legacy_import_creates_one_version_change_and_audit_then_replays_noop(
+    tmp_path, monkeypatch
+):
+    database = _database(tmp_path, ["Archon"])
+    before = database.current_knowledge_version()
+    concept_id = database.import_legacy_concept(
+        "Archon", "ARCHON", "title", "office"
+    )
+    created_version = database.current_knowledge_version()
+    assert created_version == before + 1
+    with closing(database.connect()) as connection:
+        concept = connection.execute(
+            "SELECT created_version FROM concepts WHERE id=?", (concept_id,)
+        ).fetchone()
+        lexeme = connection.execute(
+            """SELECT created_version FROM lexemes
+               WHERE id=(SELECT primary_lexeme_id FROM concepts WHERE id=?)""",
+            (concept_id,),
+        ).fetchone()
+        rule = connection.execute(
+            "SELECT created_version FROM rendering_rules WHERE concept_id=?",
+            (concept_id,),
+        ).fetchone()
+        changes = connection.execute(
+            "SELECT impact_level FROM knowledge_changes WHERE knowledge_version=?",
+            (created_version,),
+        ).fetchall()
+        audits = connection.execute(
+            "SELECT purpose FROM audit_calls WHERE knowledge_version=?",
+            (created_version,),
+        ).fetchall()
+        counts_before = {
+            table: connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+            for table in (
+                "knowledge_versions",
+                "knowledge_changes",
+                "audit_calls",
+                "concepts",
+                "lexemes",
+                "rendering_rules",
+            )
+        }
+    assert concept[0] == lexeme[0] == rule[0] == created_version
+    assert [row[0] for row in changes] == [2]
+    assert [row[0] for row in audits] == ["legacy_concept_import"]
+
+    assert (
+        database.import_legacy_concept("Archon", "ARCHON", "title", "office")
+        == concept_id
+    )
+    with closing(database.connect()) as connection:
+        counts_after = {
+            table: connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+            for table in counts_before
+        }
+    assert counts_after == counts_before
+
+    failure_root = tmp_path / "failure"
+    failure_root.mkdir()
+    failing = _database(failure_root, ["Other"])
+    failing_before = failing.current_knowledge_version()
+    monkeypatch.setattr(
+        failing,
+        "record_audit_call",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("audit failed")),
+    )
+    with pytest.raises(RuntimeError, match="audit failed"):
+        failing.import_legacy_concept("Other", "OTHER", "title", "other")
+    assert failing.current_knowledge_version() == failing_before
+    with closing(failing.connect()) as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM concepts WHERE canonical_source='Other'"
+        ).fetchone()[0] == 0
+
+
+def test_full_translation_context_is_frozen_at_k0_and_mixed_bundle_is_rejected(
+    tmp_path
+):
+    database = _database(
+        tmp_path,
+        ["Old scape evidence.", "Nothing here.", "The scape opened."],
+    )
+    database.import_legacy_concept("scape", "SCAPE", "concept", "world")
+    current = database.list_blocks()[2]
+    frozen = database.freeze_render_bundle([current.id])
+
+    claim_id = database.create_claim(
+        kind="translation_constraint",
+        statement="NEW CLAIM",
+        reveal_global_index=current.global_index,
+        subject_form="scape",
+        status="verified",
+        locked=True,
+    )
+    changed_prior = "New scape evidence."
+    with database.transaction() as connection:
+        connection.execute(
+            "UPDATE blocks SET source_text=?, source_hash=? WHERE id='block-0'",
+            (
+                changed_prior,
+                hashlib.sha256(changed_prior.encode("utf-8")).hexdigest(),
+            ),
+        )
+    next_bundle = database.freeze_render_bundle([current.id])
+
+    assert frozen.knowledge_version < next_bundle.knowledge_version
+    assert frozen.claims_by_block[current.id] == ()
+    assert [item["id"] for item in next_bundle.claims_by_block[current.id]] == [
+        claim_id
+    ]
+    assert frozen.prior_concept_evidence_by_block[current.id][0][
+        "source_text"
+    ] == "Old scape evidence."
+    assert next_bundle.prior_concept_evidence_by_block[current.id][0][
+        "source_text"
+    ] == changed_prior
+    assert frozen.signature != next_bundle.signature
+
+    old_packet = ContextBuilder(database, 5000).build(
+        current,
+        knowledge_version=frozen.knowledge_version,
+        concept_snapshot=frozen.index,
+        frozen_claims=frozen.claims_by_block[current.id],
+        frozen_prior_concept_evidence=(
+            frozen.prior_concept_evidence_by_block[current.id]
+        ),
+    )
+    assert old_packet.knowledge_version == frozen.knowledge_version
+    assert old_packet.matched_claim_ids == []
+    assert "NEW CLAIM" not in old_packet.rendered
+    assert "Old scape evidence." in old_packet.rendered
+    assert changed_prior not in old_packet.rendered
+    with pytest.raises(RuntimeError, match="frozen claims"):
+        ContextBuilder(database, 5000).build(
+            current,
+            knowledge_version=frozen.knowledge_version,
+            concept_snapshot=frozen.index,
+        )
+
+    pipeline = V4TranslationPipeline(database, lambda: None)
+    pipeline._active_render_bundle = frozen
+    database.import_legacy_concept("other", "OTHER", "concept", "other")
+    mixed_bundle = database.freeze_render_bundle([current.id])
+    with pytest.raises(RuntimeError, match="exact frozen render bundle"):
+        pipeline._translate_island(
+            Island(id="mixed", blocks=[current]),
+            frozen.knowledge_version,
+            mixed_bundle.index,
+        )

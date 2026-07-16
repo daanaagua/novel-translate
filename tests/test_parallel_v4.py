@@ -1,5 +1,6 @@
 import json
 import io
+import hashlib
 import tempfile
 import unittest
 from contextlib import closing
@@ -185,7 +186,7 @@ class ParallelV4Tests(unittest.TestCase):
                     "global_index": index,
                     "block_type": "prose",
                     "source_text": source,
-                    "source_hash": f"hash-{index}",
+                    "source_hash": hashlib.sha256(source.encode("utf-8")).hexdigest(),
                     "token_count": len(source.split()),
                     "status": status,
                 }
@@ -1132,7 +1133,9 @@ class ParallelV4CliTests(unittest.TestCase):
                     "global_index": 0,
                     "block_type": "prose",
                     "source_text": "Severian waited.",
-                    "source_hash": "hash-1",
+                    "source_hash": hashlib.sha256(
+                        "Severian waited.".encode("utf-8")
+                    ).hexdigest(),
                     "token_count": 2,
                     "status": "pending",
                 }
@@ -1392,7 +1395,9 @@ class ParallelV4CliTests(unittest.TestCase):
                     "global_index": 0,
                     "block_type": "prose",
                     "source_text": "Severian waited.",
-                    "source_hash": "hash",
+                    "source_hash": hashlib.sha256(
+                        "Severian waited.".encode("utf-8")
+                    ).hexdigest(),
                     "token_count": 2,
                     "status": "pending",
                 }

@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 import json
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Dict, List, Mapping, Optional, Sequence
 
 from .database import V4Database
+from .matcher import FrozenRenderIndex
 from .models import ContextPacket, V4Block
 
 
@@ -76,13 +77,35 @@ class ContextBuilder:
         local_summary: str = "",
         knowledge_version: Optional[int] = None,
         concept_snapshot: Optional[Sequence[Dict[str, Any]]] = None,
+        frozen_claims: Optional[Sequence[Mapping[str, Any]]] = None,
+        frozen_prior_concept_evidence: Optional[
+            Sequence[Mapping[str, Any]]
+        ] = None,
     ) -> ContextPacket:
-        version = knowledge_version or self.database.current_knowledge_version()
+        version = (
+            knowledge_version
+            if knowledge_version is not None
+            else self.database.current_knowledge_version()
+        )
         concepts = self.database.concepts_for_text(
             block.source_text, concept_snapshot=concept_snapshot
         )
-        claims = self.database.claims_for_block(block)
-        prior_evidence = self.database.prior_concept_source_evidence(block, concepts)
+        if isinstance(concept_snapshot, FrozenRenderIndex) and (
+            frozen_claims is None or frozen_prior_concept_evidence is None
+        ):
+            raise RuntimeError(
+                "frozen claims and prior evidence are required with a frozen render index"
+            )
+        claims = (
+            [dict(claim) for claim in frozen_claims]
+            if frozen_claims is not None
+            else self.database.claims_for_block(block)
+        )
+        prior_evidence = (
+            [dict(item) for item in frozen_prior_concept_evidence]
+            if frozen_prior_concept_evidence is not None
+            else self.database.prior_concept_source_evidence(block, concepts)
+        )
         parts = [
             "<translation_constraints>",
             "只使用当前位置可知的信息；不得根据后文推断身份、性别或谜底。",

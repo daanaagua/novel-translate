@@ -203,7 +203,12 @@ def _effective_rule_summary(
         raise TypeError("render rule condition must be a mapping")
     locked = bool(rule.get("locked"))
     status = str(rule.get("status") or "")
-    tier = "locked" if locked else "verified" if status == "verified" else "provisional"
+    explicit_tier = str(
+        rule.get("effective_tier") or rule.get("tier") or ""
+    ).strip()
+    tier = explicit_tier or (
+        "locked" if locked else "verified" if status == "verified" else "provisional"
+    )
     return {
         "subject_type": str(rule.get("subject_type") or default_subject_type),
         "subject_id": str(
@@ -481,6 +486,10 @@ class FrozenRenderBundle:
     knowledge_version: int
     index: FrozenRenderIndex
     contexts_by_block: Mapping[str, tuple[Mapping[str, Any], ...]]
+    claims_by_block: Mapping[str, tuple[Mapping[str, Any], ...]]
+    prior_concept_evidence_by_block: Mapping[
+        str, tuple[Mapping[str, Any], ...]
+    ]
     signature: str
     render_signature: str
     block_ids: tuple[str, ...]
@@ -1524,6 +1533,7 @@ class V4Database:
                 )
 
             dependency_temp = f"merge_dependency_{uuid.uuid4().hex}"
+            dependency_member_temp = f"merge_dependency_member_{uuid.uuid4().hex}"
             connection.execute(
                 f"""CREATE TEMP TABLE {dependency_temp}(
                        winner_id INTEGER PRIMARY KEY,
@@ -1537,17 +1547,26 @@ class V4Database:
                        applied_rule_ids_json TEXT NOT NULL,
                        source_spans_json TEXT NOT NULL)"""
             )
+            connection.execute(
+                f"""CREATE TEMP TABLE {dependency_member_temp}(
+                       dependency_row_id INTEGER PRIMARY KEY)"""
+            )
             if dependency_plan:
                 connection.executemany(
                     f"INSERT INTO {dependency_temp} VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     dependency_plan,
                 )
+                connection.executemany(
+                    f"INSERT INTO {dependency_member_temp} VALUES(?)",
+                    [(int(row["id"]),) for row in dependency_rows],
+                )
                 connection.execute(
                     f"""DELETE FROM dependencies
-                         WHERE dependency_type='concept'
-                           AND dependency_id IN ({placeholders})
+                         WHERE id IN (
+                                   SELECT dependency_row_id
+                                   FROM {dependency_member_temp}
+                               )
                            AND id NOT IN (SELECT winner_id FROM {dependency_temp})""",
-                    resolved_ids,
                 )
                 connection.execute(
                     f"""UPDATE dependencies
@@ -1569,6 +1588,7 @@ class V4Database:
                                                WHERE winner_id=dependencies.id)
                          WHERE id IN (SELECT winner_id FROM {dependency_temp})"""
                 )
+            connection.execute(f"DROP TABLE {dependency_member_temp}")
             connection.execute(f"DROP TABLE {dependency_temp}")
 
             connection.execute(
@@ -4025,9 +4045,8 @@ class V4Database:
             "description": str(row["description"] or ""),
         }
         subject_column = f"{subject_type}_id"
-        rule_summaries: list[Dict[str, Any]] = []
+        all_rule_summaries: list[Dict[str, Any]] = []
         rule_digest = hashlib.sha256()
-        rule_count = 0
         for rule in connection.execute(
             f"""SELECT id, condition_json, target, priority, status,
                        scope, locked
@@ -4036,8 +4055,7 @@ class V4Database:
                   ORDER BY id""",
             (subject_id,),
         ):
-            summary = {
-                "id": str(rule["id"]),
+            raw_summary = {
                 "subject_type": subject_type,
                 "subject_id": subject_id,
                 "condition": _safe_rule_condition(
@@ -4049,6 +4067,19 @@ class V4Database:
                 "scope": str(rule["scope"]),
                 "locked": bool(rule["locked"]),
             }
+            summary = _effective_rule_summary(
+                raw_summary, subject_type, subject_id
+            )
+            all_rule_summaries.append(summary)
+        all_rule_summaries.sort(
+            key=lambda item: json.dumps(
+                item,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+        )
+        for summary in all_rule_summaries:
             signature = json.dumps(
                 summary,
                 ensure_ascii=False,
@@ -4057,12 +4088,9 @@ class V4Database:
             ).encode("utf-8")
             rule_digest.update(len(signature).to_bytes(8, "big"))
             rule_digest.update(signature)
-            rule_count += 1
-            if len(rule_summaries) < MAX_RENDER_STATE_RULES:
-                rule_summaries.append(summary)
-        state["rendering_rule_count"] = rule_count
+        state["rendering_rule_count"] = len(all_rule_summaries)
         state["rendering_rules_sha256"] = rule_digest.hexdigest()
-        state["rules"] = rule_summaries
+        state["rules"] = all_rule_summaries[:MAX_RENDER_STATE_RULES]
         if subject_type == "lexeme":
             state["forms"] = [
                 str(form["form"])
@@ -7224,13 +7252,73 @@ class V4Database:
         normalized = normalize_english_form(source)
         concept_id = stable_id("concept", normalized)
         with self.transaction() as connection:
-            version = int(connection.execute("SELECT MAX(id) FROM knowledge_versions").fetchone()[0])
+            lexeme_id = stable_id("lexeme", f"en:{normalized}")
+            rule_id = (
+                stable_id("rule", f"{concept_id}:default:{target}")
+                if target
+                else ""
+            )
+            concept_exists = connection.execute(
+                """SELECT 1 FROM concepts
+                   WHERE id=? AND retired_version IS NULL""",
+                (concept_id,),
+            ).fetchone() is not None
+            lexeme_exists = connection.execute(
+                """SELECT 1 FROM lexemes
+                   WHERE id=? AND retired_version IS NULL""",
+                (lexeme_id,),
+            ).fetchone() is not None
+            form_exists = connection.execute(
+                """SELECT 1 FROM source_forms
+                   WHERE lexeme_id=? AND form=? AND normalized_form=?""",
+                (lexeme_id, source, normalized),
+            ).fetchone() is not None
+            link_exists = connection.execute(
+                """SELECT 1 FROM concept_lexemes
+                   WHERE concept_id=? AND lexeme_id=?
+                     AND retired_version IS NULL""",
+                (concept_id, lexeme_id),
+            ).fetchone() is not None
+            rule_exists = not target or connection.execute(
+                """SELECT 1 FROM rendering_rules
+                   WHERE id=? AND concept_id=? AND condition_json='{}'
+                     AND target=? AND priority=0 AND status=?
+                     AND scope='book' AND locked=0
+                     AND retired_version IS NULL""",
+                (rule_id, concept_id, target, status),
+            ).fetchone() is not None
+            if all(
+                (
+                    concept_exists,
+                    lexeme_exists,
+                    form_exists,
+                    link_exists,
+                    rule_exists,
+                )
+            ):
+                return concept_id
+            old_state = self._render_state_for_subject(
+                connection, "concept", concept_id
+            )
+            version = self.create_knowledge_version(
+                f"import legacy concept: {source}", connection
+            )
+            now = utc_now()
             connection.execute(
                 """INSERT OR IGNORE INTO concepts(
                        id, kind, canonical_source, default_target, description,
                        status, scope, locked, created_version, created_at
                    ) VALUES(?, ?, ?, ?, ?, ?, 'book', 0, ?, ?)""",
-                (concept_id, kind, source, target, description, status, version, utc_now()),
+                (
+                    concept_id,
+                    kind,
+                    source,
+                    target,
+                    description,
+                    status,
+                    version,
+                    now,
+                ),
             )
             lexeme_id = self._ensure_schema8_lexeme(
                 connection,
@@ -7238,6 +7326,7 @@ class V4Database:
                 normalized_form=normalized,
                 concept_id=concept_id,
                 knowledge_version=version,
+                created_at=now,
             )
             connection.execute(
                 """INSERT OR IGNORE INTO source_forms(
@@ -7246,14 +7335,47 @@ class V4Database:
                 (lexeme_id, source, normalized),
             )
             if target:
-                rule_id = stable_id("rule", f"{concept_id}:default:{target}")
                 connection.execute(
                     """INSERT OR IGNORE INTO rendering_rules(
                            id, concept_id, condition_json, target, priority, status,
                            scope, locked, created_version, created_at
                        ) VALUES(?, ?, '{}', ?, 0, ?, 'book', 0, ?, ?)""",
-                    (rule_id, concept_id, target, status, version, utc_now()),
+                    (rule_id, concept_id, target, status, version, now),
                 )
+            new_state = self._render_state_for_subject(
+                connection, "concept", concept_id
+            )
+            self.record_render_change(
+                connection,
+                subject_type="concept",
+                subject_id=concept_id,
+                old_state=old_state,
+                new_state=new_state,
+                change_kind="rendering_rule" if target else "concept_import",
+                reason=f"import legacy concept: {source}",
+                knowledge_version=version,
+            )
+            self.record_audit_call(
+                run_id=None,
+                block_id=None,
+                purpose="legacy_concept_import",
+                model="none",
+                knowledge_version=version,
+                request={
+                    "source": source,
+                    "target": target,
+                    "kind": kind,
+                    "status": status,
+                },
+                raw_response="",
+                parsed={"concept_id": concept_id, "lexeme_id": lexeme_id},
+                accepted=True,
+                attempts=1,
+                elapsed_ms=0,
+                error=None,
+                connection=connection,
+                archive_payload=False,
+            )
         return concept_id
 
     def lock_concept_translation(
@@ -7279,13 +7401,14 @@ class V4Database:
                 connection, "concept", concept_id
             )
             rule_id = stable_id("rule", f"{concept_id}:human-default:{target}")
-            exact_rule = any(
-                str(rule.get("id") or "") == rule_id
-                and str(rule.get("target") or "") == target
-                and not rule.get("condition")
-                and bool(rule.get("locked"))
-                for rule in old_state.get("rules", [])
-            )
+            exact_rule = connection.execute(
+                """SELECT 1 FROM rendering_rules
+                   WHERE id=? AND concept_id=? AND condition_json='{}'
+                     AND target=? AND priority=100 AND status='verified'
+                     AND scope='book' AND locked=1
+                     AND retired_version IS NULL""",
+                (rule_id, concept_id, target),
+            ).fetchone() is not None
             exact_description = (
                 not description
                 or str(old_state.get("description") or "") == description
@@ -8959,6 +9082,10 @@ class V4Database:
         knowledge_version: int,
         render_signature: str,
         contexts_by_block: Mapping[str, Sequence[Mapping[str, Any]]],
+        claims_by_block: Mapping[str, Sequence[Mapping[str, Any]]],
+        prior_concept_evidence_by_block: Mapping[
+            str, Sequence[Mapping[str, Any]]
+        ],
     ) -> str:
         payload = {
             "render_signature": str(render_signature),
@@ -8966,11 +9093,244 @@ class V4Database:
                 str(block_id): [dict(context) for context in contexts_by_block[block_id]]
                 for block_id in sorted(contexts_by_block)
             },
+            "claims": {
+                str(block_id): [dict(claim) for claim in claims_by_block[block_id]]
+                for block_id in sorted(claims_by_block)
+            },
+            "prior_concept_evidence": {
+                str(block_id): [
+                    dict(item)
+                    for item in prior_concept_evidence_by_block[block_id]
+                ]
+                for block_id in sorted(prior_concept_evidence_by_block)
+            },
         }
         raw = json.dumps(
             payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")
         )
         return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+    def _frozen_context_knowledge_from_connection(
+        self,
+        connection: sqlite3.Connection,
+        block_ids: Sequence[str],
+        index: FrozenRenderIndex,
+        *,
+        max_prior_chars: int = 3600,
+        max_paragraphs_per_concept: int = 2,
+    ) -> tuple[Dict[str, List[Dict[str, Any]]], Dict[str, List[Dict[str, Any]]]]:
+        """Batch-load claims and grounded prior evidence from the K0 snapshot."""
+
+        ordered_ids = list(dict.fromkeys(str(value) for value in block_ids))
+        claims_by_block: Dict[str, List[Dict[str, Any]]] = {
+            block_id: [] for block_id in ordered_ids
+        }
+        prior_by_block: Dict[str, List[Dict[str, Any]]] = {
+            block_id: [] for block_id in ordered_ids
+        }
+        if not ordered_ids:
+            return claims_by_block, prior_by_block
+        placeholders = ",".join("?" for _ in ordered_ids)
+        block_rows = connection.execute(
+            f"""SELECT id, legacy_id, source_edition_id, global_index, source_text
+                FROM blocks WHERE id IN ({placeholders})""",
+            ordered_ids,
+        ).fetchall()
+        blocks = {str(row["id"]): row for row in block_rows}
+        if len(blocks) != len(ordered_ids):
+            raise KeyError("frozen context references a missing source block")
+
+        maximum_reveal = max(int(row["global_index"]) for row in block_rows)
+        claim_rows = connection.execute(
+            """SELECT * FROM claims
+               WHERE retired_version IS NULL
+                 AND kind='translation_constraint'
+                 AND status='verified'
+                 AND reveal_global_index<=?
+               ORDER BY locked DESC, confidence DESC, id""",
+            (maximum_reveal,),
+        ).fetchall()
+        occurrence_blocks: Dict[str, set[str]] = {}
+        if claim_rows:
+            claim_ids = [str(row["id"]) for row in claim_rows]
+            claim_placeholders = ",".join("?" for _ in claim_ids)
+            for row in connection.execute(
+                f"""SELECT ce.claim_id, e.block_id
+                    FROM claim_evidence ce
+                    JOIN evidence e ON e.id=ce.evidence_id
+                    WHERE ce.claim_id IN ({claim_placeholders})""",
+                claim_ids,
+            ):
+                occurrence_blocks.setdefault(str(row["claim_id"]), set()).add(
+                    str(row["block_id"])
+                )
+        for block_id in ordered_ids:
+            block = blocks[block_id]
+            source_lower = str(block["source_text"]).lower()
+            reveal_index = int(block["global_index"])
+            claims_by_block[block_id] = [
+                dict(claim)
+                for claim in claim_rows
+                if int(claim["reveal_global_index"]) <= reveal_index
+                and (
+                    (
+                        str(claim["scope"]) == "occurrence"
+                        and block_id
+                        in occurrence_blocks.get(str(claim["id"]), set())
+                    )
+                    or (
+                        str(claim["scope"]) != "occurrence"
+                        and (
+                            not str(claim["subject_form"])
+                            or str(claim["subject_form"]).lower() in source_lower
+                        )
+                    )
+                )
+            ]
+
+        concepts_by_block: Dict[str, List[Dict[str, Any]]] = {
+            block_id: index.matched_concepts(str(blocks[block_id]["source_text"]))
+            for block_id in ordered_ids
+        }
+        concept_pairs = [
+            (block_id, str(concept["id"]))
+            for block_id in ordered_ids
+            for concept in concepts_by_block[block_id]
+        ]
+        if not concept_pairs or max_prior_chars <= 0 or max_paragraphs_per_concept <= 0:
+            return claims_by_block, prior_by_block
+
+        encoded_pairs = json.dumps(
+            concept_pairs, ensure_ascii=False, separators=(",", ":")
+        )
+        candidate_rows = connection.execute(
+            """WITH pairs AS (
+                   SELECT CAST(json_extract(value, '$[0]') AS TEXT) block_id,
+                          CAST(json_extract(value, '$[1]') AS TEXT) concept_id
+                   FROM json_each(?)
+               )
+               SELECT pairs.block_id target_block_id,
+                       pairs.concept_id, c.canonical_source concept_source,
+                       prior.legacy_id, prior.global_index, prior.source_text,
+                       sf.form
+                FROM pairs
+                JOIN blocks target ON target.id=pairs.block_id
+                JOIN concepts c ON c.id=pairs.concept_id
+                JOIN concept_lexemes cl
+                  ON cl.concept_id=pairs.concept_id
+                 AND cl.retired_version IS NULL
+                JOIN source_forms sf ON sf.lexeme_id=cl.lexeme_id
+                JOIN blocks prior
+                  ON prior.source_edition_id=target.source_edition_id
+                 AND prior.global_index<target.global_index
+                 AND INSTR(LOWER(prior.source_text), LOWER(sf.form))>0
+                ORDER BY pairs.block_id, pairs.concept_id,
+                         prior.global_index, prior.id, sf.form""",
+            (encoded_pairs,),
+        ).fetchall()
+
+        candidate_groups: Dict[
+            tuple[str, str, int, str], Dict[str, Any]
+        ] = {}
+        for row in candidate_rows:
+            key = (
+                str(row["target_block_id"]),
+                str(row["concept_id"]),
+                int(row["global_index"]),
+                str(row["legacy_id"]),
+            )
+            candidate = candidate_groups.setdefault(
+                key,
+                {
+                    "target_block_id": key[0],
+                    "concept_id": key[1],
+                    "concept_source": str(row["concept_source"]),
+                    "legacy_id": key[3],
+                    "global_index": key[2],
+                    "source_text": str(row["source_text"]),
+                    "forms": set(),
+                },
+            )
+            candidate["forms"].add(str(row["form"]))
+
+        candidates_by_pair: Dict[tuple[str, str], List[Dict[str, Any]]] = {}
+        for candidate in candidate_groups.values():
+            forms = sorted(
+                {form for form in candidate.pop("forms") if form},
+                key=len,
+                reverse=True,
+            )
+            patterns = [
+                re.compile(rf"(?<!\w){re.escape(form)}(?!\w)", re.IGNORECASE)
+                for form in forms
+            ]
+            for paragraph_index, paragraph in enumerate(
+                part.strip()
+                for part in re.split(
+                    r"\n\s*\n", str(candidate["source_text"]).strip()
+                )
+                if part.strip()
+            ):
+                if any(pattern.search(paragraph) for pattern in patterns):
+                    candidates_by_pair.setdefault(
+                        (
+                            str(candidate["target_block_id"]),
+                            str(candidate["concept_id"]),
+                        ),
+                        [],
+                    ).append(
+                        {
+                            "concept_id": str(candidate["concept_id"]),
+                            "concept_source": str(candidate["concept_source"]),
+                            "legacy_id": str(candidate["legacy_id"]),
+                            "global_index": int(candidate["global_index"]),
+                            "paragraph_id": f"P{paragraph_index:03d}",
+                            "source_text": paragraph,
+                        }
+                    )
+
+        for block_id in ordered_ids:
+            results: List[Dict[str, Any]] = []
+            seen_paragraphs: set[tuple[int, int]] = set()
+            used_chars = 0
+            exhausted = False
+            for concept in concepts_by_block[block_id]:
+                matches = sorted(
+                    candidates_by_pair.get((block_id, str(concept["id"])), []),
+                    key=lambda item: (
+                        int(item["global_index"]), str(item["paragraph_id"])
+                    ),
+                )
+                if not matches:
+                    continue
+                selected = [matches[0]]
+                for candidate in reversed(matches[1:]):
+                    if len(selected) >= max_paragraphs_per_concept:
+                        break
+                    selected.append(candidate)
+                selected.sort(
+                    key=lambda item: (
+                        int(item["global_index"]), str(item["paragraph_id"])
+                    )
+                )
+                for item in selected:
+                    paragraph_key = (
+                        int(item["global_index"]),
+                        int(str(item["paragraph_id"])[1:]),
+                    )
+                    if paragraph_key in seen_paragraphs:
+                        continue
+                    added_chars = len(str(item["source_text"]))
+                    if results and used_chars + added_chars > max_prior_chars:
+                        exhausted = True
+                        break
+                    results.append(item)
+                    seen_paragraphs.add(paragraph_key)
+                    used_chars += added_chars
+                if exhausted:
+                    break
+            prior_by_block[block_id] = results
+        return claims_by_block, prior_by_block
 
     def freeze_render_bundle(
         self, block_ids: Sequence[str]
@@ -8992,8 +9352,11 @@ class V4Database:
             contexts = self._rendering_contexts_for_blocks_from_connection(
                 connection, ordered_ids
             )
+            claims, prior_evidence = self._frozen_context_knowledge_from_connection(
+                connection, ordered_ids, index
+            )
             signature = self._render_bundle_signature(
-                version, index.signature, contexts
+                version, index.signature, contexts, claims, prior_evidence
             )
             immutable_contexts = MappingProxyType(
                 {
@@ -9004,10 +9367,30 @@ class V4Database:
                     for block_id in ordered_ids
                 }
             )
+            immutable_claims = MappingProxyType(
+                {
+                    block_id: tuple(
+                        _immutable_render_value(claim)
+                        for claim in claims.get(block_id, [])
+                    )
+                    for block_id in ordered_ids
+                }
+            )
+            immutable_prior_evidence = MappingProxyType(
+                {
+                    block_id: tuple(
+                        _immutable_render_value(item)
+                        for item in prior_evidence.get(block_id, [])
+                    )
+                    for block_id in ordered_ids
+                }
+            )
             return FrozenRenderBundle(
                 knowledge_version=version,
                 index=index,
                 contexts_by_block=immutable_contexts,
+                claims_by_block=immutable_claims,
+                prior_concept_evidence_by_block=immutable_prior_evidence,
                 signature=signature,
                 render_signature=index.signature,
                 block_ids=ordered_ids,
@@ -9029,12 +9412,16 @@ class V4Database:
                 ).fetchone()[0]
             )
             snapshot = self._render_snapshot_from_connection(connection)
-            render_signature = self.target_snapshot_signature(snapshot)
+            index = FrozenRenderIndex.compile(snapshot, self.target_snapshot_signature)
+            render_signature = index.signature
             contexts = self._rendering_contexts_for_blocks_from_connection(
                 connection, ordered_ids
             )
+            claims, prior_evidence = self._frozen_context_knowledge_from_connection(
+                connection, ordered_ids, index
+            )
             return self._render_bundle_signature(
-                version, render_signature, contexts
+                version, render_signature, contexts, claims, prior_evidence
             )
         finally:
             connection.rollback()
@@ -9081,7 +9468,8 @@ class V4Database:
             # Preserve the historical validation/read hook before rendering.
             self._concept_snapshot_from_connection(connection)
             snapshot = self._render_snapshot_from_connection(connection)
-            render_signature = self.target_snapshot_signature(snapshot)
+            index = FrozenRenderIndex.compile(snapshot, self.target_snapshot_signature)
+            render_signature = index.signature
             if context_block_ids is None:
                 current_signature = render_signature
             else:
@@ -9093,8 +9481,17 @@ class V4Database:
                 contexts = self._rendering_contexts_for_blocks_from_connection(
                     connection, context_block_ids
                 )
+                claims, prior_evidence = (
+                    self._frozen_context_knowledge_from_connection(
+                        connection, context_block_ids, index
+                    )
+                )
                 current_signature = self._render_bundle_signature(
-                    version, render_signature, contexts
+                    version,
+                    render_signature,
+                    contexts,
+                    claims,
+                    prior_evidence,
                 )
             stale = force_revalidate or current_signature != expected_signature
             persisted_status = (
@@ -9279,6 +9676,22 @@ class V4Database:
                         f"translation source hash drift for block {outcome.block.id}"
                     )
                 matches = tuple(outcome.matched_renderings or ())
+                if matches:
+                    computed_source_hash = hashlib.sha256(
+                        source_text.encode("utf-8")
+                    ).hexdigest()
+                    if (
+                        re.fullmatch(r"[0-9a-f]{64}", stored_source_hash) is None
+                        or stored_source_hash != computed_source_hash
+                        or re.fullmatch(
+                            r"[0-9a-f]{64}", str(outcome.block.source_hash)
+                        )
+                        is None
+                        or str(outcome.block.source_hash) != computed_source_hash
+                    ):
+                        raise ValueError(
+                            f"translation source hash drift for block {outcome.block.id}"
+                        )
                 if len(matches) > MAX_TRANSLATION_MATCHES:
                     raise ValueError(
                         f"translation match snapshot exceeds {MAX_TRANSLATION_MATCHES} entries"

@@ -456,17 +456,27 @@ class V4TranslationPipeline:
         rendering_contexts_by_block: Mapping[
             str, Sequence[Mapping[str, Any]]
         ] = {}
+        frozen_claims_by_block: Mapping[
+            str, Sequence[Mapping[str, Any]]
+        ] = {}
+        frozen_prior_evidence_by_block: Mapping[
+            str, Sequence[Mapping[str, Any]]
+        ] = {}
         if isinstance(concept_snapshot, FrozenRenderIndex):
             active_bundle = getattr(self, "_active_render_bundle", None)
             if (
                 isinstance(active_bundle, FrozenRenderBundle)
-                and active_bundle.index.signature == concept_snapshot.signature
+                and active_bundle.index is concept_snapshot
                 and active_bundle.knowledge_version == knowledge_version
                 and all(
                     block.id in active_bundle.block_ids for block in island.blocks
                 )
             ):
                 rendering_contexts_by_block = active_bundle.contexts_by_block
+                frozen_claims_by_block = active_bundle.claims_by_block
+                frozen_prior_evidence_by_block = (
+                    active_bundle.prior_concept_evidence_by_block
+                )
             else:
                 raise RuntimeError(
                     "translation requires the exact frozen render bundle and contexts"
@@ -534,6 +544,10 @@ class V4TranslationPipeline:
                     local_summary=local_summary,
                     knowledge_version=knowledge_version,
                     concept_snapshot=concept_snapshot,
+                    frozen_claims=frozen_claims_by_block.get(block.id, ()),
+                    frozen_prior_concept_evidence=(
+                        frozen_prior_evidence_by_block.get(block.id, ())
+                    ),
                 )
             except ContextOverflow as exc:
                 outcomes.append(
