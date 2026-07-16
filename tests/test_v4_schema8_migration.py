@@ -465,6 +465,69 @@ def test_schema7_confirm_backs_up_migrates_and_is_idempotent(tmp_path):
     assert second["backup_path"] == result["backup_path"]
 
 
+def test_schema7_occurrence_backfill_preserves_matcher_boundaries_and_offsets(
+    tmp_path,
+):
+    path = seed_schema7_migration_fixture(tmp_path)
+    source_text = "SEVERIAN Severiana ia; cosmos OS. O’Neill O’Neills and O'Neill."
+    forms = (
+        ("c-severian", "person", "Severian"),
+        ("c-ia", "term", "ia"),
+        ("c-os", "term", "os"),
+        ("c-oneill", "person", "O’Neill"),
+    )
+    with closing(sqlite3.connect(path)) as connection:
+        connection.executemany(
+            """INSERT INTO concepts(
+                   id, kind, canonical_source, default_target, working_target,
+                   verified_target, description, status, scope, locked,
+                   created_version, created_at)
+               VALUES(?, ?, ?, '', '', '', '', 'provisional', 'book', 0,
+                      1, 'now')""",
+            forms,
+        )
+        connection.execute(
+            """UPDATE blocks
+               SET source_text=?, source_hash=?
+               WHERE id='block-00'""",
+            (source_text, hashlib.sha256(source_text.encode()).hexdigest()),
+        )
+        connection.commit()
+
+    preview = preview_schema8(path)
+    confirm_schema8(path, preview["confirm_token"])
+
+    with closing(sqlite3.connect(path)) as connection:
+        occurrences = connection.execute(
+            """SELECT l.normalized_form, o.source_form,
+                      o.start_offset, o.end_offset
+               FROM form_occurrences AS o
+               JOIN lexemes AS l ON l.id=o.lexeme_id
+               WHERE o.block_id='block-00'
+               ORDER BY o.start_offset, l.normalized_form"""
+        ).fetchall()
+
+    expected_sources = (
+        ("severian", "SEVERIAN", source_text.index("SEVERIAN")),
+        ("ia", "ia", source_text.index(" ia;") + 1),
+        ("os", "OS", source_text.index(" OS.") + 1),
+        ("o'neill", "O’Neill", source_text.index("O’Neill")),
+    )
+    assert occurrences == [
+        (
+            normalized,
+            source,
+            start,
+            start + len(source),
+        )
+        for normalized, source, start in expected_sources
+    ]
+    assert all(
+        source_text[start:end] == source
+        for _, source, start, end in occurrences
+    )
+
+
 def test_migrated_stale_task_has_claimable_bounded_provenance(tmp_path):
     path = seed_schema7_migration_fixture(tmp_path)
     preview = preview_schema8(path)

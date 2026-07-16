@@ -7,7 +7,6 @@ import hashlib
 import hmac
 import json
 import os
-import re
 import shutil
 import unicodedata
 import uuid
@@ -16,6 +15,8 @@ from datetime import datetime, timezone
 from functools import lru_cache
 from pathlib import Path
 from typing import Any, Mapping
+
+from .matcher import MultiFormMatcher
 
 
 SCHEMA_VERSION = 8
@@ -1243,35 +1244,39 @@ def _rebuild_schema7_transaction(
             block_by_id = {
                 str(row.get("id") or ""): row for row in analysis["blocks"]
             }
+            forms_by_source: dict[str, set[str]] = {}
             for group in groups.values():
                 lexeme_id = str(group["lexeme_id"])
-                patterns = sorted(
-                    {str(item) for item in group["forms"] if str(item)},
-                    key=lambda item: (-len(item), item),
+                for form in group["forms"]:
+                    source_form = str(form).strip()
+                    if source_form:
+                        forms_by_source.setdefault(source_form, set()).add(lexeme_id)
+            occurrence_matcher = MultiFormMatcher.compile(forms_by_source)
+            for block_id, block in block_by_id.items():
+                source_text = str(block.get("source_text") or "")
+                source_hash = block.get("source_hash") or hashlib.sha256(
+                    source_text.encode()
+                ).hexdigest()
+                occurrence_rows = [
+                    (
+                        lexeme_id,
+                        block_id,
+                        start_offset,
+                        end_offset,
+                        source_form,
+                        source_hash,
+                        now,
+                    )
+                    for lexeme_id, source_form, start_offset, end_offset
+                    in occurrence_matcher.finditer(source_text)
+                ]
+                connection.executemany(
+                    """INSERT OR IGNORE INTO form_occurrences(
+                           lexeme_id, block_id, start_offset, end_offset,
+                           source_form, source_hash, created_at)
+                       VALUES(?, ?, ?, ?, ?, ?, ?)""",
+                    occurrence_rows,
                 )
-                for block_id, block in block_by_id.items():
-                    source_text = str(block.get("source_text") or "")
-                    occupied: set[tuple[int, int]] = set()
-                    for form in patterns:
-                        for match in re.finditer(re.escape(form), source_text, re.IGNORECASE):
-                            span = (match.start(), match.end())
-                            if span in occupied:
-                                continue
-                            occupied.add(span)
-                            _insert_mapping(
-                                connection,
-                                "form_occurrences",
-                                {
-                                    "lexeme_id": lexeme_id,
-                                    "block_id": block_id,
-                                    "start_offset": span[0],
-                                    "end_offset": span[1],
-                                    "source_form": match.group(0),
-                                    "source_hash": block.get("source_hash") or hashlib.sha256(source_text.encode()).hexdigest(),
-                                    "created_at": now,
-                                },
-                                ignore=True,
-                            )
 
             for block_id in analysis["repair_block_ids"]:
                 connection.execute(
