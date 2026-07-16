@@ -1,4 +1,5 @@
 import hashlib
+import json
 import sqlite3
 from contextlib import closing
 from pathlib import Path
@@ -462,6 +463,78 @@ def test_schema7_confirm_backs_up_migrates_and_is_idempotent(tmp_path):
     second = confirm_schema8(path, preview["confirm_token"])
     assert second["status"] == "already_schema8"
     assert second["backup_path"] == result["backup_path"]
+
+
+def test_migrated_stale_task_has_claimable_bounded_provenance(tmp_path):
+    path = seed_schema7_migration_fixture(tmp_path)
+    preview = preview_schema8(path)
+    confirm_schema8(path, preview["confirm_token"])
+    database = V4Database(tmp_path)
+
+    claim = database.claim_revalidation_task("migration-test")
+
+    assert claim is not None
+    assert len(claim.payload["cases"]) == 1
+    with closing(database.connect()) as connection:
+        task = connection.execute(
+            "SELECT result_json FROM revalidation_tasks WHERE id=?",
+            (claim.task_id,),
+        ).fetchone()
+        result = json.loads(task["result_json"])
+        change_ids = result["change_ids"]
+        reasons = result["reasons"]
+        changes = connection.execute(
+            """SELECT id, change_kind FROM knowledge_changes
+               WHERE id IN ({})""".format(
+                ",".join("?" for _ in change_ids)
+            ),
+            change_ids,
+        ).fetchall()
+    assert change_ids
+    assert [reason["change_id"] for reason in reasons] == change_ids
+    assert all(reason["via"] == ["schema7_migration"] for reason in reasons)
+    assert [row["id"] for row in changes] == change_ids
+
+
+def test_confirm_rejects_reused_backup_with_wrong_sha256(tmp_path):
+    path = seed_schema7_migration_fixture(tmp_path)
+    preview = preview_schema8(path)
+    backup = Path(preview["backup_path"])
+    backup.parent.mkdir(parents=True)
+    backup.write_bytes(path.read_bytes())
+    with closing(sqlite3.connect(backup)) as connection:
+        connection.execute(
+            "UPDATE concepts SET default_target='tampered' WHERE id='c-mal-old'"
+        )
+        connection.commit()
+    source_before = path.read_bytes()
+
+    with pytest.raises(SchemaMigrationError, match="backup.*SHA-256"):
+        confirm_schema8(path, preview["confirm_token"])
+
+    assert path.read_bytes() == source_before
+    assert read_schema_version(path) == 7
+
+
+def test_sidecar_cleanup_failure_happens_before_atomic_replace(
+    tmp_path, monkeypatch
+):
+    path = seed_schema7_migration_fixture(tmp_path)
+    preview = preview_schema8(path)
+    sidecar = Path(f"{path}-wal")
+    sidecar.write_bytes(b"")
+    original_unlink = Path.unlink
+
+    def fail_source_sidecar(self, *args, **kwargs):
+        if self == sidecar:
+            raise PermissionError("injected sidecar cleanup failure")
+        return original_unlink(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "unlink", fail_source_sidecar)
+    with pytest.raises(PermissionError, match="sidecar cleanup"):
+        confirm_schema8(path, preview["confirm_token"])
+
+    assert read_schema_version(path) == 7
 
 
 def test_schema7_confirm_keeps_original_and_backup_on_upgrade_failure(

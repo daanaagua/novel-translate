@@ -8,6 +8,7 @@ import hmac
 import json
 import os
 import re
+import shutil
 import unicodedata
 import uuid
 from contextlib import closing
@@ -1280,12 +1281,112 @@ def _rebuild_schema7_transaction(
             translations_by_id = {
                 int(row.get("id") or 0): row for row in analysis["translations"]
             }
+            if "knowledge_changes" in renamed:
+                for legacy in _table_rows(
+                    connection, _legacy_name("knowledge_changes")
+                ):
+                    _insert_mapping(
+                        connection, "knowledge_changes", legacy, ignore=True
+                    )
             for translation_id in analysis["stale_translation_ids"]:
                 translation = translations_by_id[int(translation_id)]
                 from_version = int(translation.get("knowledge_version") or max_version)
+                dependency = connection.execute(
+                    """SELECT dependency_type, dependency_id,
+                              dependency_fingerprint
+                       FROM dependencies WHERE translation_id=?
+                       ORDER BY id LIMIT 1""",
+                    (translation_id,),
+                ).fetchone()
+                subject_type = (
+                    str(dependency["dependency_type"])
+                    if dependency is not None
+                    else "translation"
+                )
+                subject_id = (
+                    str(dependency["dependency_id"])
+                    if dependency is not None
+                    else str(translation_id)
+                )
+                change_kind = "schema7_stale_dependency"
+                change_payload = {
+                    "reason": "schema 7 active translation predates migrated knowledge",
+                    "old": {"knowledge_version": from_version},
+                    "new": {"knowledge_version": max_version},
+                }
+                change_id = int(
+                    connection.execute(
+                        """INSERT INTO knowledge_changes(
+                               knowledge_version, subject_type, subject_id,
+                               change_kind, old_fingerprint, new_fingerprint,
+                               impact_level, payload_json, created_at)
+                           VALUES(?, ?, ?, ?, '', ?, 2, ?, ?)""",
+                        (
+                            max_version,
+                            subject_type,
+                            subject_id,
+                            change_kind,
+                            (
+                                str(dependency["dependency_fingerprint"])
+                                if dependency is not None
+                                else ""
+                            ),
+                            json.dumps(
+                                change_payload,
+                                ensure_ascii=False,
+                                sort_keys=True,
+                                separators=(",", ":"),
+                            ),
+                            now,
+                        ),
+                    ).lastrowid
+                )
                 change_hash = hashlib.sha256(
-                    f"schema7:{translation_id}:{from_version}:{max_version}".encode()
+                    json.dumps(
+                        {
+                            "change_ids": [change_id],
+                            "to_knowledge_version": max_version,
+                        },
+                        ensure_ascii=False,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    ).encode("utf-8")
                 ).hexdigest()
+                task_result = json.dumps(
+                    {
+                        "change_ids": [change_id],
+                        "subjects": [
+                            {
+                                "subject_type": subject_type,
+                                "subject_id": subject_id,
+                            }
+                        ],
+                        "omitted_subjects": 0,
+                        "reasons": [
+                            {
+                                "change_id": change_id,
+                                "change_kind": change_kind,
+                                "via": ["schema7_migration"],
+                                "subjects": [
+                                    {
+                                        "subject_type": subject_type,
+                                        "subject_id": subject_id,
+                                    }
+                                ],
+                            }
+                        ],
+                        "omitted_reasons": 0,
+                        "source_hash": str(
+                            block_by_id.get(
+                                str(translation.get("block_id") or ""), {}
+                            ).get("source_hash")
+                            or ""
+                        ),
+                    },
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
                 _insert_mapping(
                     connection,
                     "revalidation_tasks",
@@ -1300,7 +1401,7 @@ def _rebuild_schema7_transaction(
                         "status": "pending",
                         "action": "",
                         "attempts": 0,
-                        "result_json": "{}",
+                        "result_json": task_result,
                         "created_at": now,
                     },
                     ignore=True,
@@ -1348,7 +1449,7 @@ def _rebuild_schema7_transaction(
                         },
                     )
 
-            for table in ("knowledge_changes", "revalidation_tasks"):
+            for table in ("revalidation_tasks",):
                 if table not in renamed:
                     continue
                 for legacy in _table_rows(connection, _legacy_name(table)):
@@ -1398,6 +1499,13 @@ def _sqlite_backup(source: Path, destination: Path) -> None:
         source_connection.backup(destination_connection)
 
 
+def _best_effort_unlink(path: Path) -> None:
+    try:
+        path.unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
 def confirm_schema8(path: str | Path, confirm_token: str) -> dict[str, Any]:
     """Confirm a matching preview, retain a backup, then atomically install schema 8."""
 
@@ -1419,6 +1527,15 @@ def confirm_schema8(path: str | Path, confirm_token: str) -> dict[str, Any]:
             raise SchemaMigrationError("schema migration backup path is already occupied")
     else:
         _sqlite_backup(source, backup)
+        # SQLite's backup API can rewrite page-header bytes. The retained copy
+        # is normalized to the quiescent source bytes so reuse can be bound to
+        # the preview's byte hash without trusting path or schema alone.
+        if _sha256_file(backup) != str(preview["source_sha256"]):
+            shutil.copyfile(source, backup)
+    if _sha256_file(backup) != str(preview["source_sha256"]):
+        raise SchemaMigrationError(
+            "existing schema migration backup SHA-256 does not match preview source"
+        )
     staging = source.parent / f".{source.name}.{uuid.uuid4().hex}.migrating"
     try:
         _sqlite_backup(backup, staging)
@@ -1430,18 +1547,18 @@ def confirm_schema8(path: str | Path, confirm_token: str) -> dict[str, Any]:
         if inspect_schema(staging) != SCHEMA_VERSION:
             raise SchemaMigrationError("staged database did not reach schema 8")
         _assert_schema8_features(staging)
+        # All fallible validation and cleanup must finish before the atomic
+        # replacement. A raised cleanup error therefore leaves schema 7 live.
+        for database_path in (source, staging):
+            for suffix in ("-wal", "-shm"):
+                sidecar = Path(f"{database_path}{suffix}")
+                if sidecar.exists():
+                    sidecar.unlink()
         os.replace(staging, source)
-        for suffix in ("-wal", "-shm"):
-            sidecar = Path(f"{source}{suffix}")
-            if sidecar.exists():
-                sidecar.unlink()
     finally:
-        if staging.exists():
-            staging.unlink()
+        _best_effort_unlink(staging)
         for suffix in ("-wal", "-shm"):
-            sidecar = Path(f"{staging}{suffix}")
-            if sidecar.exists():
-                sidecar.unlink()
+            _best_effort_unlink(Path(f"{staging}{suffix}"))
     return {
         **preview,
         **summary,
