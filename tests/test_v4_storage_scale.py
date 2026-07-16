@@ -1,6 +1,8 @@
 import hashlib
 import json
+import re
 import sqlite3
+import time
 from contextlib import closing
 from concurrent.futures import ThreadPoolExecutor
 from threading import Barrier
@@ -15,6 +17,8 @@ from src.core.v4.audit_archive import (
 )
 from src.core.v4.candidate_clusters import CandidateCluster, CandidateContext
 from src.core.v4.database import SCHEMA_VERSION, V4Database
+from src.core.v4 import matcher as matcher_module
+from src.core.v4.knowledge_epochs import KnowledgeEpochCoordinator
 from src.core.v4.lexical_index import LexicalCandidate
 from src.core.v4.models import (
     FormOccurrence,
@@ -478,6 +482,25 @@ def test_unreleased_legacy_schema7_adjudication_table_is_not_migrated_in_place(t
     assert tuple(row) == ("defer", payload_json)
     assert "UNIQUE(run_id, cluster_id)" in table_sql.replace("\n", " ")
     assert version == "7"
+
+
+def test_multi_form_matcher_preserves_boundaries_case_curly_punctuation_and_offsets():
+    matcher = matcher_module.MultiFormMatcher.compile(
+        {
+            "Archon": ("lex-archon",),
+            "O’Neill": ("lex-curly",),
+        }
+    )
+    text = "ARCHON met O’Neill; Archoness and O'Neill."
+
+    matches = list(matcher.finditer(text))
+
+    curly_start = text.index("O’Neill")
+    assert matches == [
+        ("lex-archon", "ARCHON", 0, 6),
+        ("lex-curly", "O’Neill", curly_start, curly_start + len("O’Neill")),
+    ]
+    assert all(text[start:end] == source for _, source, start, end in matches)
 
 
 def test_legacy_schema7_migration_recovers_adjudication_version_for_exact_retry(tmp_path):
@@ -2551,3 +2574,158 @@ def test_sql_commit_failure_truncates_only_uncommitted_audit_frame(tmp_path):
         assert connection.execute(
             "SELECT COUNT(*) FROM audit_calls WHERE run_id='audit-commit-fail'"
         ).fetchone()[0] == 0
+
+
+def test_three_million_words_backfill_uses_one_active_source_pass_and_is_idempotent(
+    tmp_path, monkeypatch,
+):
+    root = tmp_path / "three-million-book"
+    database = V4Database(root)
+    edition = database.ensure_source_edition(
+        "three-million-raw", "three-million-normalized", "scale", "synthetic.txt"
+    )
+    new_forms = [f"Term{index:04d}" for index in range(100)]
+    block_rows = []
+    source_bytes = 0
+    for index in range(10_000):
+        words = ["x"] * 300
+        if index % 2 == 0:
+            words[-1] = new_forms[(index // 2) % len(new_forms)]
+        source_text = " ".join(words)
+        source_bytes += len(source_text.encode("utf-8"))
+        block_rows.append(
+            {
+                "id": f"scale-block-{index:05d}",
+                "legacy_id": f"scale_{index:05d}",
+                "chapter_id": f"chapter-{index // 100:03d}",
+                "chapter_title": f"Chapter {index // 100}",
+                "chapter_index": index // 100,
+                "block_index": index % 100,
+                "global_index": index,
+                "block_type": "prose",
+                "source_text": source_text,
+                "source_hash": hashlib.sha256(source_text.encode("utf-8")).hexdigest(),
+                "token_count": 300,
+                "status": "ready",
+            }
+        )
+    database.upsert_blocks(edition, block_rows)
+    del block_rows
+
+    with database.transaction() as connection:
+        version = int(
+            connection.execute("SELECT MAX(id) FROM knowledge_versions").fetchone()[0]
+        )
+        connection.executemany(
+            """INSERT INTO lexemes(
+                   id, language, normalized_form, canonical_form,
+                   created_version, created_at)
+               VALUES(?, 'en', ?, ?, ?, 'now')""",
+            [
+                (f"existing-lexeme-{index:04d}", f"existing{index:04d}", f"Existing{index:04d}", version)
+                for index in range(1_900)
+            ],
+        )
+        connection.executemany(
+            """INSERT INTO source_forms(
+                   lexeme_id, form, normalized_form, grammar_json)
+               VALUES(?, ?, ?, '{}')""",
+            [
+                (f"existing-lexeme-{index:04d}", f"Existing{index:04d}", f"existing{index:04d}")
+                for index in range(1_900)
+            ],
+        )
+
+    first_block = database.get_block_by_identifier("scale-block-00000")
+    run_id = "three-million-occurrence-backfill"
+    database.start_run(run_id, "translate", {"scale_test": True})
+    coordinator = KnowledgeEpochCoordinator(
+        database,
+        [first_block.id],
+        max_knowledge_epochs=2,
+        decision_mode="auto",
+    )
+    coordinator.stage(
+        run_id,
+        [
+            TranslationOutcome(
+                block=first_block,
+                knowledge_version=database.current_knowledge_version(),
+                status=V4BlockStatus.COMPLETED.value,
+                term_proposals=[
+                    {
+                        "src": form,
+                        "tgt": f"译名{index:04d}",
+                        "type": "concept",
+                        "context": "scale",
+                    }
+                    for index, form in enumerate(new_forms)
+                ],
+            )
+        ],
+    )
+
+    traversals = {"calls": 0, "blocks": 0}
+    batch_sizes = []
+    original_list_blocks = database.list_blocks
+    original_record = database.record_form_occurrences
+
+    def counted_list_blocks(*args, **kwargs):
+        rows = original_list_blocks(*args, **kwargs)
+        traversals["calls"] += 1
+        traversals["blocks"] += len(rows)
+        return rows
+
+    def counted_record(rows, **kwargs):
+        batch_sizes.append(len(rows))
+        return original_record(rows, **kwargs)
+
+    monkeypatch.setattr(database, "list_blocks", counted_list_blocks)
+    monkeypatch.setattr(database, "record_form_occurrences", counted_record)
+    compile_calls = {"forms": 0}
+    original_compile = re.compile
+
+    def counted_compile(pattern, *args, **kwargs):
+        if isinstance(pattern, str) and pattern.startswith(r"\bTerm"):
+            compile_calls["forms"] += 1
+        return original_compile(pattern, *args, **kwargs)
+
+    monkeypatch.setattr(re, "compile", counted_compile)
+    started = time.perf_counter()
+    checkpoint = coordinator.checkpoint(run_id)
+    elapsed = time.perf_counter() - started
+
+    assert checkpoint.applied
+    assert traversals == {"calls": 1, "blocks": 10_000}
+    assert compile_calls["forms"] <= 1
+    assert batch_sizes and max(batch_sizes) <= 1_000 and len(batch_sizes) >= 5
+    with closing(database.connect()) as connection:
+        assert connection.execute("SELECT COUNT(*) FROM lexemes").fetchone()[0] == 2_000
+        assert connection.execute("SELECT COUNT(*) FROM form_occurrences").fetchone()[0] == 5_000
+        bad_slices = connection.execute(
+            """SELECT COUNT(*)
+               FROM form_occurrences occurrence
+               JOIN blocks block ON block.id=occurrence.block_id
+               WHERE substr(block.source_text, occurrence.start_offset + 1,
+                            occurrence.end_offset - occurrence.start_offset)
+                     != occurrence.source_form"""
+        ).fetchone()[0]
+        assert bad_slices == 0
+        active_bytes = int(connection.execute("PRAGMA page_count").fetchone()[0]) * int(
+            connection.execute("PRAGMA page_size").fetchone()[0]
+        )
+    StorageBudget(source_bytes).check(active_bytes)
+
+    with closing(database.connect()) as connection:
+        form_map = {
+            str(row["form"]): str(row["lexeme_id"])
+            for row in connection.execute(
+                """SELECT form, lexeme_id FROM source_forms
+                   WHERE form LIKE 'Term%' ORDER BY form"""
+            )
+        }
+    second_inserted = coordinator.backfill_form_occurrences(form_map)
+    assert second_inserted == 0
+    with closing(database.connect()) as connection:
+        assert connection.execute("SELECT COUNT(*) FROM form_occurrences").fetchone()[0] == 5_000
+    print(f"three_million_local_algorithm_seconds={elapsed:.3f}")

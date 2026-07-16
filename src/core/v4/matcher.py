@@ -209,6 +209,38 @@ class AhoConceptMatcher:
         return self.match(text)
 
 
+class MultiFormMatcher:
+    """Compiled multi-form matcher for one-pass occurrence backfills."""
+
+    def __init__(self, matcher: AhoConceptMatcher):
+        self._matcher = matcher
+
+    @classmethod
+    def compile(
+        cls,
+        forms: Mapping[str, Iterable[str] | str],
+    ) -> "MultiFormMatcher":
+        if not isinstance(forms, Mapping):
+            raise TypeError("forms must be a mapping from source form to lexeme ids")
+        compiled: Dict[str, tuple[str, ...]] = {}
+        for raw_form, raw_ids in forms.items():
+            form = str(raw_form).strip()
+            if not form:
+                continue
+            values = (raw_ids,) if isinstance(raw_ids, str) else tuple(raw_ids)
+            identity_ids = tuple(
+                sorted({str(value).strip() for value in values if str(value).strip()})
+            )
+            if identity_ids:
+                compiled[form] = identity_ids
+        return cls(AhoConceptMatcher(compiled))
+
+    def finditer(self, text: str) -> Iterator[tuple[str, str, int, int]]:
+        if not isinstance(text, str):
+            raise TypeError("text must be a string")
+        yield from self._matcher.iter_matches(text)
+
+
 @dataclass(frozen=True)
 class MatchedRendering:
     lexeme_id: str

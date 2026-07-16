@@ -10684,12 +10684,6 @@ class V4Database:
                 if change["change_id"] is not None:
                     change_ids.append(int(change["change_id"]))
             if proposed_concepts:
-                import re
-
-                active_blocks = connection.execute(
-                    """SELECT id, legacy_id, source_text FROM blocks
-                       WHERE source_edition_id=(SELECT id FROM source_editions WHERE active=1)"""
-                ).fetchall()
                 for concept_id in sorted(proposed_concepts):
                     concept = connection.execute(
                         """SELECT id, canonical_source, default_target, locked
@@ -10698,12 +10692,21 @@ class V4Database:
                     ).fetchone()
                     if concept is None or not concept["default_target"]:
                         continue
-                    pattern = re.compile(
-                        rf"\b{re.escape(concept['canonical_source'])}\b", re.I
+                    affected_blocks = int(
+                        connection.execute(
+                            """SELECT COUNT(DISTINCT occurrence.block_id)
+                               FROM form_occurrences occurrence
+                               JOIN concept_lexemes ownership
+                                 ON ownership.lexeme_id=occurrence.lexeme_id
+                                AND ownership.retired_version IS NULL
+                               JOIN blocks block ON block.id=occurrence.block_id
+                               JOIN source_editions edition
+                                 ON edition.id=block.source_edition_id
+                                AND edition.active=1
+                               WHERE ownership.concept_id=?""",
+                            (concept_id,),
+                        ).fetchone()[0]
                     )
-                    affected = [
-                        row for row in active_blocks if pattern.search(row["source_text"])
-                    ]
                     targets = {
                         row["target"]
                         for row in connection.execute(
@@ -10721,7 +10724,11 @@ class V4Database:
                             concept["canonical_source"]
                         ) and candidate.get("tgt"):
                             targets.add(str(candidate["tgt"]))
-                    high_impact = len(affected) >= 3 or len(targets) > 1 or bool(concept["locked"])
+                    high_impact = (
+                        affected_blocks >= 3
+                        or len(targets) > 1
+                        or bool(concept["locked"])
+                    )
                     if not high_impact:
                         continue
                     evidence_payload = [
@@ -10738,7 +10745,7 @@ class V4Database:
                     task_payload = {
                         "source": concept["canonical_source"],
                         "target": concept["default_target"],
-                        "affected_blocks": len(affected),
+                        "affected_blocks": affected_blocks,
                         "target_conflict": len(targets) > 1,
                         "evidence": evidence_payload,
                     }

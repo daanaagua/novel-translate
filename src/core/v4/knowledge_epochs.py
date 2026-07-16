@@ -8,8 +8,12 @@ from dataclasses import dataclass
 from typing import Any, Mapping, Optional, Sequence
 
 from .database import FrozenRenderBundle, V4Database
-from .models import TranslationOutcome, V4BlockStatus
+from .matcher import MultiFormMatcher
+from .models import FormOccurrence, TranslationOutcome, V4BlockStatus
 from .revalidation import RevalidationPlanner
+
+
+OCCURRENCE_BATCH_SIZE = 1_000
 
 
 def _canonical(value: Any) -> str:
@@ -186,6 +190,65 @@ class KnowledgeEpochCoordinator:
             for entry in staged
         )
 
+    def _ensure_term_forms(
+        self, staged: Sequence[Mapping[str, Any]]
+    ) -> dict[str, str]:
+        forms = sorted(
+            {
+                str(proposal.get("src") or "").strip()
+                for entry in staged
+                for proposal in entry.get("term_proposals") or ()
+                if isinstance(proposal, Mapping)
+                and str(proposal.get("src") or "").strip()
+            },
+            key=lambda value: (value.casefold(), value),
+        )
+        if not forms:
+            return {}
+        with self.database.transaction() as connection:
+            return {
+                form: self.database.ensure_lexeme(form, connection=connection)
+                for form in forms
+            }
+
+    def backfill_form_occurrences(self, forms: Mapping[str, str]) -> int:
+        """Scan every active source block once and idempotently batch occurrences."""
+
+        if not isinstance(forms, Mapping):
+            raise TypeError("forms must be a mapping from source form to lexeme id")
+        normalized = {
+            str(form).strip(): str(lexeme_id).strip()
+            for form, lexeme_id in forms.items()
+            if str(form).strip() and str(lexeme_id).strip()
+        }
+        if not normalized:
+            return 0
+        matcher = MultiFormMatcher.compile(
+            {form: (lexeme_id,) for form, lexeme_id in normalized.items()}
+        )
+        inserted = 0
+        batch: list[FormOccurrence] = []
+        for block in self.database.list_blocks():
+            for lexeme_id, source_form, start, end in matcher.finditer(
+                block.source_text
+            ):
+                batch.append(
+                    FormOccurrence(
+                        lexeme_id=lexeme_id,
+                        block_id=block.id,
+                        start_offset=start,
+                        end_offset=end,
+                        source_form=source_form,
+                        source_hash=block.source_hash,
+                    )
+                )
+                if len(batch) == OCCURRENCE_BATCH_SIZE:
+                    inserted += self.database.record_form_occurrences(batch)
+                    batch.clear()
+        if batch:
+            inserted += self.database.record_form_occurrences(batch)
+        return inserted
+
     def _result_from_state(
         self, raw: Mapping[str, Any], *, reused: bool
     ) -> EpochCheckpointResult:
@@ -235,6 +298,9 @@ class KnowledgeEpochCoordinator:
         proposal_version: Optional[int] = None
         applied = False
         if staged and not capped:
+            proposed_forms = self._ensure_term_forms(staged)
+            if proposed_forms:
+                self.backfill_form_occurrences(proposed_forms)
             proposal_result = self.database.commit_translation_proposals(
                 run_id,
                 self._restore_outcomes(staged),
