@@ -4652,6 +4652,75 @@ class V4Database:
                 (status, utc_now(), error, run_id),
             )
 
+    def load_knowledge_epoch_state(self, run_id: str) -> Dict[str, Any]:
+        with closing(self.connect()) as connection:
+            row = connection.execute(
+                "SELECT config_json FROM runs WHERE id=?", (run_id,)
+            ).fetchone()
+        if row is None:
+            raise ValueError(f"unknown translation run: {run_id}")
+        try:
+            config = json.loads(str(row["config_json"] or "{}"))
+        except json.JSONDecodeError as exc:
+            raise ValueError("translation run config is invalid") from exc
+        if not isinstance(config, dict):
+            raise ValueError("translation run config must be a mapping")
+        state = config.get("knowledge_epoch_state") or {}
+        if not isinstance(state, dict):
+            raise ValueError("knowledge epoch state must be a mapping")
+        return deepcopy(state)
+
+    def save_knowledge_epoch_state(
+        self,
+        run_id: str,
+        state: Mapping[str, Any],
+        *,
+        knowledge_version: Optional[int] = None,
+    ) -> None:
+        with self.transaction() as connection:
+            row = connection.execute(
+                "SELECT config_json, knowledge_version FROM runs WHERE id=?", (run_id,)
+            ).fetchone()
+            if row is None:
+                raise ValueError(f"unknown translation run: {run_id}")
+            try:
+                config = json.loads(str(row["config_json"] or "{}"))
+            except json.JSONDecodeError as exc:
+                raise ValueError("translation run config is invalid") from exc
+            if not isinstance(config, dict):
+                raise ValueError("translation run config must be a mapping")
+            version = (
+                int(knowledge_version)
+                if knowledge_version is not None
+                else int(row["knowledge_version"])
+            )
+            if connection.execute(
+                "SELECT 1 FROM knowledge_versions WHERE id=?", (version,)
+            ).fetchone() is None:
+                raise ValueError(f"unknown knowledge version: {version}")
+            config["knowledge_epoch_state"] = deepcopy(dict(state))
+            connection.execute(
+                "UPDATE runs SET knowledge_version=?, config_json=? WHERE id=?",
+                (
+                    version,
+                    json.dumps(config, ensure_ascii=False, sort_keys=True),
+                    run_id,
+                ),
+            )
+
+    def knowledge_change_ids_after(self, knowledge_version: int) -> List[int]:
+        if type(knowledge_version) is not int or knowledge_version < 0:
+            raise ValueError("knowledge_version must be a non-negative integer")
+        with closing(self.connect()) as connection:
+            return [
+                int(row[0])
+                for row in connection.execute(
+                    """SELECT id FROM knowledge_changes
+                       WHERE knowledge_version>? ORDER BY knowledge_version, id""",
+                    (knowledge_version,),
+                )
+            ]
+
     def fail_run_for_invalid_snapshot(
         self,
         run_id: str,
@@ -9942,49 +10011,24 @@ class V4Database:
         force_revalidate: bool = False,
         context_block_ids: Optional[Sequence[str]] = None,
     ) -> tuple[str, bool]:
-        """Finalize a translation run against knowledge read in the same write txn."""
+        """Finalize after validating that the current knowledge snapshot is readable."""
 
         with self.transaction() as connection:
-            # Preserve the historical validation/read hook before rendering.
             self._concept_snapshot_from_connection(connection)
             snapshot = self._render_snapshot_from_connection(connection)
             index = FrozenRenderIndex.compile(snapshot, self.target_snapshot_signature)
-            render_signature = index.signature
-            if context_block_ids is None:
-                current_signature = render_signature
-            else:
-                version = int(
-                    connection.execute(
-                        "SELECT MAX(id) FROM knowledge_versions"
-                    ).fetchone()[0]
-                )
-                contexts = self._rendering_contexts_for_blocks_from_connection(
+            if context_block_ids is not None:
+                self._rendering_contexts_for_blocks_from_connection(
                     connection, context_block_ids
                 )
-                claims, prior_evidence = (
-                    self._frozen_context_knowledge_from_connection(
-                        connection, context_block_ids, index
-                    )
+                self._frozen_context_knowledge_from_connection(
+                    connection, context_block_ids, index
                 )
-                current_signature = self._render_bundle_signature(
-                    version,
-                    render_signature,
-                    contexts,
-                    claims,
-                    prior_evidence,
-                )
-            stale = force_revalidate or current_signature != expected_signature
-            persisted_status = (
-                "completed_with_errors" if stale else desired_status
-            )
-            persisted_error = error
-            if stale:
-                persisted_error = persisted_error or "frozen knowledge changed during run"
             connection.execute(
                 "UPDATE runs SET status=?, finished_at=?, error=? WHERE id=?",
-                (persisted_status, utc_now(), persisted_error, run_id),
+                (desired_status, utc_now(), error, run_id),
             )
-            return persisted_status, stale
+            return desired_status, False
 
     def invalidate_translation_run(self, run_id: str) -> int:
         """Legacy no-op; revalidation requires explicit knowledge change IDs."""
@@ -10122,7 +10166,12 @@ class V4Database:
                     raise ValueError("translation run bundle config must be a mapping")
                 has_frozen_version = "frozen_knowledge_version" in run_config
                 has_bundle_signature = "target_snapshot_signature" in run_config
-                if has_frozen_version or has_bundle_signature:
+                epoch_mode = bool(run_config.get("knowledge_epoch_mode"))
+                if epoch_mode and has_bundle_signature:
+                    raise ValueError(
+                        "knowledge epoch runs may not use a global target signature"
+                    )
+                if not epoch_mode and (has_frozen_version or has_bundle_signature):
                     if not (has_frozen_version and has_bundle_signature):
                         raise ValueError("translation run frozen bundle config is incomplete")
                     try:

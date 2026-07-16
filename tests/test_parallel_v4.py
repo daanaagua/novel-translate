@@ -918,6 +918,7 @@ class ParallelV4Tests(unittest.TestCase):
                 max_workers=1,
                 enable_polish=False,
                 decision_mode="interactive",
+                pause_on_review=True,
             ),
         ).run()
         self.assertEqual(first["status"], "paused_for_review")

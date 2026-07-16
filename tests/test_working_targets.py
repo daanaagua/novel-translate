@@ -11,6 +11,7 @@ from src.core.translator import TranslationConfig, TranslationEngine
 from src.core.v4.context import ContextBuilder
 from src.core.v4.database import KnowledgeSnapshotError, V4Database
 from src.core.v4.models import (
+    RenderingMatchSnapshot,
     TranslationOutcome,
     V4BlockStatus,
     WorkingTargetDecision,
@@ -1049,6 +1050,15 @@ def test_serial_translator_filters_empty_glossary_arrows_and_rules(tmp_path):
     assert "Severian -> 塞万里安" in prompts
 
 
+def test_epoch_config_normalizes_legacy_unattended_and_requires_explicit_pause():
+    legacy = V4PipelineConfig(decision_mode="unattended")
+
+    assert legacy.decision_mode == "auto"
+    assert legacy.pause_on_review is False
+    assert legacy.unattended_failure_policy == "finish_with_warnings"
+    assert legacy.max_knowledge_epochs == 3
+
+
 class RecordingPipeline(V4TranslationPipeline):
     def __init__(self, *args, change_target=None, **kwargs):
         super().__init__(*args, **kwargs)
@@ -1063,19 +1073,40 @@ class RecordingPipeline(V4TranslationPipeline):
         self.seen.append((knowledge_version, targets))
         if self.change_target and len(self.seen) == 1:
             self.database.apply_working_target_decisions([self.change_target])
-        return [
-            TranslationOutcome(
-                block=block,
-                knowledge_version=knowledge_version,
-                status=V4BlockStatus.COMPLETED.value,
-                draft_translation="译稿完整。",
-                final_translation="译稿完整。",
+        outcomes = []
+        for block in island.blocks:
+            contexts = self._active_render_bundle.contexts_by_block.get(block.id, ())
+            matches = concept_snapshot.matched_renderings(
+                block.source_text,
+                block_id=block.id,
+                occurrence_contexts=list(contexts),
             )
-            for block in island.blocks
-        ]
+            outcomes.append(
+                TranslationOutcome(
+                    block=block,
+                    knowledge_version=knowledge_version,
+                    status=V4BlockStatus.COMPLETED.value,
+                    draft_translation="译稿完整。",
+                    final_translation="译稿完整。",
+                    matched_renderings=tuple(
+                        RenderingMatchSnapshot(
+                            lexeme_id=match.lexeme_id,
+                            concept_id=match.concept_id,
+                            matched_form=match.matched_form,
+                            start_offset=match.start_offset,
+                            end_offset=match.end_offset,
+                            rendered_target=match.rendered_target,
+                            applied_rule_ids=tuple(match.applied_rule_ids),
+                            dependency_fingerprint=match.dependency_fingerprint,
+                        )
+                        for match in matches
+                    ),
+                )
+            )
+        return outcomes
 
 
-def test_all_islands_keep_one_frozen_target_snapshot_and_version(tmp_path, monkeypatch):
+def test_epoch_without_changes_reuses_one_frozen_snapshot(tmp_path, monkeypatch):
     database = _database(
         tmp_path, ["Severian waited long enough.", "Severian returned home."]
     )
@@ -1116,7 +1147,7 @@ def test_all_islands_keep_one_frozen_target_snapshot_and_version(tmp_path, monke
     assert len(pipeline.seen) == 2
     assert pipeline.seen[0][0] == pipeline.seen[1][0]
     assert pipeline.seen[0][1] == pipeline.seen[1][1] == ["塞万里安"]
-    assert bumps["count"] == 2
+    assert bumps["count"] == 0
     assert freezes["count"] == 1
     with closing(database.connect()) as connection:
         run = connection.execute(
@@ -1126,7 +1157,8 @@ def test_all_islands_keep_one_frozen_target_snapshot_and_version(tmp_path, monke
     config = json.loads(run["config_json"])
     assert run["knowledge_version"] == result["frozen_knowledge_version"]
     assert config["frozen_knowledge_version"] == result["frozen_knowledge_version"]
-    assert config["target_snapshot_signature"]
+    assert config["knowledge_epoch_mode"] is True
+    assert "target_snapshot_signature" not in config
 
 
 def test_freeze_reads_version_and_targets_from_one_sqlite_snapshot(tmp_path, monkeypatch):
@@ -1161,7 +1193,7 @@ def test_freeze_reads_version_and_targets_from_one_sqlite_snapshot(tmp_path, mon
     assert database.concepts_for_text("Severian")[0]["default_target"] == "新译名"
 
 
-def test_midrun_target_change_stops_before_mixing_without_mutating_block_status(tmp_path):
+def test_midrun_target_change_commits_all_blocks_and_plans_only_dependent_block(tmp_path):
     database = _database(
         tmp_path, ["Severian waited long enough.", "Severian returned home."]
     )
@@ -1183,18 +1215,17 @@ def test_midrun_target_change_stops_before_mixing_without_mutating_block_status(
 
     result = pipeline.run()
 
-    assert result["status"] == "completed_with_errors"
-    assert result["knowledge_stale"] is True
-    assert len(pipeline.seen) == 1
+    assert result["status"] == "completed"
+    assert result["knowledge_stale"] is False
+    assert len(pipeline.seen) == 2
     assert pipeline.seen[0][1] == ["塞万里安"]
-    assert [block.status for block in database.list_blocks()] == ["completed", "ready"]
-    assert set(database.active_translations()) == {"block_000"}
+    assert pipeline.seen[1][1] == ["塞维利安"]
+    assert [block.status for block in database.list_blocks()] == ["completed", "completed"]
+    assert set(database.active_translations()) == {"block_000", "block_001"}
     assert database.active_translations()["block_000"]["status"] == "completed"
-    planned = _plan_newer_changes_for_active_translation(database)
-    assert planned["planned"] == 1
     assert database.status_summary()["needs_revalidate"] == 1
     assert database.active_translations()["block_000"]["status"] == "completed"
-    assert [block.status for block in database.list_blocks()] == ["completed", "ready"]
+    assert [block.status for block in database.list_blocks()] == ["completed", "completed"]
     with closing(database.connect()) as connection:
         assert connection.execute(
             "SELECT COUNT(*) FROM revalidation_tasks WHERE status='pending'"
@@ -1204,7 +1235,41 @@ def test_midrun_target_change_stops_before_mixing_without_mutating_block_status(
         ).fetchone()[0] == result["status"]
 
 
-def test_atomic_finalizer_reports_a_last_moment_knowledge_race(tmp_path, monkeypatch):
+def test_midrun_unrelated_target_change_commits_both_blocks_without_task(tmp_path):
+    database = _database(tmp_path, ["Severian waited.", "Archon spoke."])
+    blocks = database.list_blocks()
+    severian = _seed_concept(database, "Severian", blocks=[blocks[0]])
+    archon = _seed_concept(database, "Archon", blocks=[blocks[1]])
+    database.apply_working_target_decisions(
+        [
+            {"concept_id": severian, "target": "塞万里安", "rules": []},
+            {"concept_id": archon, "target": "执政官", "rules": []},
+        ]
+    )
+    pipeline = RecordingPipeline(
+        database,
+        lambda: None,
+        change_target={"concept_id": archon, "target": "总督", "rules": []},
+        config=V4PipelineConfig(
+            island_size=1,
+            initial_workers=1,
+            max_workers=1,
+            enable_polish=False,
+        ),
+    )
+
+    result = pipeline.run()
+
+    assert result["status"] == "completed"
+    assert result["knowledge_stale"] is False
+    assert len(pipeline.seen) == 2
+    assert pipeline.seen[0][1] == ["塞万里安"]
+    assert pipeline.seen[1][1] == ["总督"]
+    assert set(database.active_translations()) == {"block_000", "block_001"}
+    assert database.status_summary()["needs_revalidate"] == 0
+
+
+def test_epoch_finalizer_plans_a_last_moment_block_dependency_change(tmp_path, monkeypatch):
     database = _database(tmp_path, ["Severian waited long enough."])
     concept_id = _seed_concept(database, "Severian")
     database.apply_working_target_decisions(
@@ -1234,12 +1299,10 @@ def test_atomic_finalizer_reports_a_last_moment_knowledge_race(tmp_path, monkeyp
 
     result = pipeline.run()
 
-    assert result["status"] == "completed_with_errors"
-    assert result["knowledge_stale"] is True
+    assert result["status"] == "completed"
+    assert result["knowledge_stale"] is False
     assert database.get_block_by_identifier("block_000").status == "completed"
     assert database.active_translations()["block_000"]["status"] == "completed"
-    planned = _plan_newer_changes_for_active_translation(database)
-    assert planned["planned"] == 1
     assert database.status_summary()["needs_revalidate"] == 1
     assert database.get_block_by_identifier("block_000").status == "completed"
     assert database.active_translations()["block_000"]["status"] == "completed"

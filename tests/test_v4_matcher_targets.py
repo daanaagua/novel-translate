@@ -1094,7 +1094,7 @@ def test_bad_rule_json_raises_typed_snapshot_error(tmp_path):
     assert error.value.rule_id == "broken-rule"
 
 
-def test_atomic_finish_detects_changed_signature_and_rolls_back_on_failure(
+def test_atomic_finish_validates_snapshot_without_global_invalidation_and_rolls_back(
     tmp_path, monkeypatch
 ):
     db = _db(tmp_path, ["Archon spoke."])
@@ -1155,8 +1155,8 @@ def test_atomic_finish_detects_changed_signature_and_rolls_back_on_failure(
     status, knowledge_stale = db.finish_translation_run_atomically(
         "finish-run", signature, "completed"
     )
-    assert status == "completed_with_errors"
-    assert knowledge_stale is True
+    assert status == "completed"
+    assert knowledge_stale is False
     assert db.active_translations()[block.id]["status"] == "completed"
     assert db.get_block_by_identifier(block.id).status == "completed"
     planned = RevalidationPlanner(db).plan(change_ids)

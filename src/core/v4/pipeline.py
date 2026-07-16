@@ -8,7 +8,7 @@ import re
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
-from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence
+from typing import Any, Callable, Dict, List, Literal, Mapping, Optional, Sequence
 from uuid import uuid4
 
 from ...agents.glossary_manager import GlossaryManager
@@ -24,6 +24,7 @@ from ..schemas import (
 from ..translator import TranslationConfig, TranslationEngine
 from .context import ContextBuilder, ContextOverflow
 from .database import FrozenRenderBundle, KnowledgeSnapshotError, V4Database
+from .knowledge_epochs import KnowledgeEpochCoordinator
 from .matcher import FrozenRenderIndex
 from .models import (
     ClaimDependencySnapshot,
@@ -45,7 +46,10 @@ class V4PipelineConfig:
     max_attempts: int = 2
     max_blocks: Optional[int] = None
     include_block_ids: tuple[str, ...] = ()
-    decision_mode: str = "unattended"
+    decision_mode: Literal["auto", "interactive"] = "auto"
+    pause_on_review: bool = False
+    unattended_failure_policy: Literal["finish_with_warnings"] = "finish_with_warnings"
+    max_knowledge_epochs: int = 3
     enable_polish: bool = True
     enable_semantic_mapper: bool = False
     semantic_temperature: float = 0.0
@@ -61,8 +65,14 @@ class V4PipelineConfig:
     force: bool = False
 
     def __post_init__(self) -> None:
-        if self.decision_mode not in {"interactive", "unattended"}:
-            raise ValueError("decision_mode 必须是 interactive 或 unattended")
+        if self.decision_mode == "unattended":
+            self.decision_mode = "auto"
+        if self.decision_mode not in {"auto", "interactive"}:
+            raise ValueError("decision_mode 必须是 auto 或 interactive")
+        if self.unattended_failure_policy != "finish_with_warnings":
+            raise ValueError("unattended_failure_policy 必须是 finish_with_warnings")
+        if type(self.max_knowledge_epochs) is not int or self.max_knowledge_epochs < 1:
+            raise ValueError("max_knowledge_epochs 必须是正整数")
         if self.audit_mode not in {"full", "response", "minimal"}:
             raise ValueError("audit_mode 必须是 full、response 或 minimal")
         self.island_size = max(1, self.island_size)
@@ -809,17 +819,26 @@ class V4TranslationPipeline:
         islands = self._make_islands(candidates, self.config.island_size)
         run_id = f"translate_{uuid4().hex}"
         run_config = dict(self.config.__dict__)
+        run_config["knowledge_epoch_mode"] = True
         workers = min(self.config.initial_workers, self.config.max_workers)
         completed = warnings = failed = manual = 0
         paused = False
         knowledge_stale = False
         change_ids: set[int] = set()
+        deferred_proposals = 0
         cursor = 0
+        epoch_coordinator = KnowledgeEpochCoordinator(
+            self.database,
+            [block.id for block in candidates],
+            max_knowledge_epochs=self.config.max_knowledge_epochs,
+            decision_mode=self.config.decision_mode,
+            pause_on_review=self.config.pause_on_review,
+        )
         try:
-            render_bundle = self.database.freeze_render_bundle(
-                [block.id for block in candidates]
-            )
-            knowledge_version = render_bundle.knowledge_version
+            epoch = epoch_coordinator.freeze()
+            render_bundle = epoch.render_bundle
+            knowledge_version = epoch.knowledge_version
+            initial_knowledge_version = knowledge_version
             concept_snapshot = render_bundle.index
             target_signature = render_bundle.signature
             self._active_render_bundle = render_bundle
@@ -838,10 +857,12 @@ class V4TranslationPipeline:
                 "final_workers": workers,
                 "knowledge_stale": False,
                 "frozen_knowledge_version": None,
+                "knowledge_epoch": None,
+                "deferred_proposals": 0,
                 "change_ids": [],
             }
         run_config["frozen_knowledge_version"] = knowledge_version
-        run_config["target_snapshot_signature"] = target_signature
+        run_config["initial_knowledge_epoch"] = epoch.ordinal
         run_config["render_context_block_ids"] = list(render_bundle.block_ids)
         self.database.start_run(
             run_id,
@@ -870,20 +891,10 @@ class V4TranslationPipeline:
                     wave_outcomes,
                     audit_mode=self.config.audit_mode,
                 )
-                proposal_result = self.database.commit_translation_proposals(
-                    run_id,
-                    wave_outcomes,
-                    enqueue_review=self.config.decision_mode == "interactive",
-                    return_change_ids=True,
-                )
-                if isinstance(proposal_result, dict):
-                    proposal_version = proposal_result["knowledge_version"]
-                    change_ids.update(
-                        int(value) for value in proposal_result["change_ids"]
-                    )
-                else:
-                    # Preserve compatibility with injected/legacy scalar writers.
-                    proposal_version = proposal_result
+                epoch_coordinator.stage(run_id, wave_outcomes)
+                checkpoint = epoch_coordinator.checkpoint(run_id)
+                change_ids.update(checkpoint.change_ids)
+                deferred_proposals = checkpoint.deferred_proposals
                 completed += sum(o.status == V4BlockStatus.COMPLETED.value for o in wave_outcomes)
                 warnings += sum(
                     o.status == V4BlockStatus.COMPLETED_WITH_WARNINGS.value
@@ -907,13 +918,13 @@ class V4TranslationPipeline:
                 elif workers < self.config.max_workers:
                     workers += 1
                 cursor += len(wave)
-                current_signature = self.database.render_bundle_signature(
-                    render_bundle.block_ids
-                )
-                if current_signature != target_signature:
-                    knowledge_stale = True
-                    break
-                if self.config.decision_mode == "interactive" and proposal_version is not None:
+                epoch = checkpoint.epoch
+                render_bundle = epoch.render_bundle
+                knowledge_version = epoch.knowledge_version
+                concept_snapshot = render_bundle.index
+                target_signature = render_bundle.signature
+                self._active_render_bundle = render_bundle
+                if checkpoint.paused:
                     paused = True
                     break
             desired_status = "paused_for_review" if paused else (
@@ -928,6 +939,13 @@ class V4TranslationPipeline:
                     context_block_ids=render_bundle.block_ids,
                 )
             )
+            final_checkpoint = epoch_coordinator.checkpoint(run_id)
+            change_ids.update(final_checkpoint.change_ids)
+            deferred_proposals = final_checkpoint.deferred_proposals
+            epoch = final_checkpoint.epoch
+            if final_checkpoint.paused and status != "paused_for_review":
+                status = "paused_for_review"
+                self.database.finish_run(run_id, status)
             knowledge_stale = knowledge_stale or finalized_knowledge_stale
         except KnowledgeSnapshotError as exc:
             self.database.fail_run_for_invalid_snapshot(
@@ -947,6 +965,8 @@ class V4TranslationPipeline:
             "remaining_islands": max(0, len(islands) - cursor),
             "final_workers": workers,
             "knowledge_stale": knowledge_stale,
-            "frozen_knowledge_version": knowledge_version,
+            "frozen_knowledge_version": initial_knowledge_version,
+            "knowledge_epoch": epoch.ordinal,
+            "deferred_proposals": deferred_proposals,
             "change_ids": sorted(change_ids),
         }
