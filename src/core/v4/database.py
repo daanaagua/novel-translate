@@ -7,13 +7,14 @@ import heapq
 import json
 import math
 import re
+import secrets
 import sqlite3
 import unicodedata
 import uuid
 from copy import deepcopy
 from contextlib import closing, contextmanager
 from dataclasses import dataclass, replace
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from threading import RLock
 from types import MappingProxyType
@@ -29,6 +30,7 @@ from .models import (
     ClaimDependencySnapshot,
     FormOccurrence,
     RenderingMatchSnapshot,
+    RevalidationClaim,
     ScanOutcome,
     TranslationOutcome,
     V4Block,
@@ -11246,6 +11248,715 @@ class V4Database:
                 (status, utc_now(), annotation_id),
             )
             return {"id": annotation_id, "status": status}
+
+    @staticmethod
+    def _revalidation_canonical(value: Any) -> str:
+        return json.dumps(
+            value, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+        )
+
+    @classmethod
+    def _revalidation_base_result(cls, raw: Any) -> Dict[str, Any]:
+        try:
+            result = json.loads(str(raw or "{}"))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            raise ValueError("revalidation task result is invalid JSON") from None
+        if not isinstance(result, dict):
+            raise ValueError("revalidation task result must be an object")
+        result.pop("_lease", None)
+        return result
+
+    @staticmethod
+    def _revalidation_summary(value: Any) -> Dict[str, Any]:
+        """Keep only render-effective, bounded target/rule fields."""
+        if not isinstance(value, dict):
+            return {}
+        allowed = {
+            "default_target",
+            "working_target",
+            "verified_target",
+            "target",
+            "targets",
+            "rules",
+            "locked",
+            "scope",
+            "prompt_effective",
+            "statement",
+        }
+        result: Dict[str, Any] = {}
+        for key in sorted(allowed & set(value)):
+            item = value[key]
+            if isinstance(item, str):
+                result[key] = item[:1024]
+            elif isinstance(item, (bool, int, float)) or item is None:
+                result[key] = item
+            elif isinstance(item, list):
+                bounded = []
+                for entry in item[:32]:
+                    if isinstance(entry, dict):
+                        bounded.append(
+                            {
+                                str(k)[:64]: (
+                                    str(v)[:1024]
+                                    if not isinstance(v, (bool, int, float))
+                                    else v
+                                )
+                                for k, v in list(sorted(entry.items()))[:16]
+                            }
+                        )
+                    elif isinstance(entry, (str, bool, int, float)):
+                        bounded.append(entry[:1024] if isinstance(entry, str) else entry)
+                result[key] = bounded
+        return result
+
+    @staticmethod
+    def _revalidation_spans(raw: Any, source_length: int) -> List[Dict[str, int]]:
+        try:
+            values = json.loads(str(raw or "[]"))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return []
+        spans: set[tuple[int, int]] = set()
+        if isinstance(values, list):
+            for value in values[:128]:
+                if (
+                    isinstance(value, list)
+                    and len(value) == 2
+                    and type(value[0]) is int
+                    and type(value[1]) is int
+                    and 0 <= value[0] < value[1] <= source_length
+                ):
+                    spans.add((value[0], value[1]))
+        return [{"start": start, "end": end} for start, end in sorted(spans)]
+
+    def _revalidation_payload(
+        self, connection: sqlite3.Connection, task: sqlite3.Row
+    ) -> tuple[Dict[str, Any], Dict[str, Any]]:
+        current = connection.execute(
+            """SELECT tv.*, b.source_text, b.source_hash, b.block_type,
+                      b.source_edition_id, edition.active source_edition_active
+               FROM translation_versions tv
+               JOIN blocks b ON b.id=tv.block_id
+               JOIN source_editions edition ON edition.id=b.source_edition_id
+               WHERE tv.id=? AND tv.block_id=?""",
+            (task["translation_id"], task["block_id"]),
+        ).fetchone()
+        if current is None or int(current["active"]) != 1:
+            raise ValueError("revalidation translation is no longer active")
+        if str(current["pipeline"]) != "parallel_v4" or int(
+            current["source_edition_active"]
+        ) != 1:
+            raise ValueError("revalidation translation is outside the active source")
+        base = self._revalidation_base_result(task["result_json"])
+        change_ids = base.get("change_ids")
+        if not isinstance(change_ids, list) or not change_ids:
+            raise ValueError("revalidation task has no bounded change set")
+        rows: Dict[int, sqlite3.Row] = {}
+        placeholders = ",".join("?" for _ in change_ids)
+        for row in connection.execute(
+            f"""SELECT * FROM knowledge_changes
+                 WHERE id IN ({placeholders}) ORDER BY id""",
+            tuple(change_ids),
+        ).fetchall():
+            rows[int(row["id"])] = row
+        if set(rows) != set(change_ids):
+            raise ValueError("revalidation task references unknown changes")
+        dependencies = connection.execute(
+            "SELECT * FROM dependencies WHERE translation_id=? ORDER BY id",
+            (task["translation_id"],),
+        ).fetchall()
+        source_text = str(current["source_text"])
+        reason_by_id = {
+            int(reason["change_id"]): reason
+            for reason in base.get("reasons", [])
+            if isinstance(reason, dict) and type(reason.get("change_id")) is int
+        }
+        subject_aliases: Dict[tuple[str, str], str] = {}
+        cases: List[Dict[str, Any]] = []
+        for ordinal, change_id in enumerate(change_ids[:64], 1):
+            row = rows[int(change_id)]
+            try:
+                change_payload = json.loads(str(row["payload_json"] or "{}"))
+            except (TypeError, ValueError, json.JSONDecodeError):
+                change_payload = {}
+            if not isinstance(change_payload, dict):
+                change_payload = {}
+            reason = reason_by_id.get(int(change_id), {})
+            raw_subjects = reason.get("subjects", [])
+            if not raw_subjects:
+                raw_subjects = [
+                    {
+                        "subject_type": str(row["subject_type"]),
+                        "subject_id": str(row["subject_id"]),
+                    }
+                ]
+            subjects = []
+            spans: set[tuple[int, int]] = set()
+            for raw_subject in raw_subjects[:128]:
+                if not isinstance(raw_subject, dict):
+                    continue
+                subject = (
+                    str(raw_subject.get("subject_type") or "")[:64],
+                    str(raw_subject.get("subject_id") or "")[:256],
+                )
+                if not all(subject):
+                    continue
+                alias = subject_aliases.setdefault(
+                    subject, f"S{len(subject_aliases) + 1:03d}"
+                )
+                subjects.append(
+                    {"subject_alias": alias, "subject_type": subject[0]}
+                )
+                for dependency in dependencies:
+                    if (
+                        str(dependency["dependency_type"]) == subject[0]
+                        and str(dependency["dependency_id"]) == subject[1]
+                    ):
+                        for span in self._revalidation_spans(
+                            dependency["source_spans_json"], len(source_text)
+                        ):
+                            spans.add((span["start"], span["end"]))
+            cases.append(
+                {
+                    "case_alias": f"C{ordinal:03d}",
+                    "impact_level": int(row["impact_level"]),
+                    "change_kind": str(row["change_kind"])[:128],
+                    "reason": str(change_payload.get("reason") or "")[:512],
+                    "subjects": subjects,
+                    "spans": [
+                        {"start": start, "end": end}
+                        for start, end in sorted(spans)
+                    ],
+                    "old": self._revalidation_summary(change_payload.get("old")),
+                    "new": self._revalidation_summary(change_payload.get("new")),
+                }
+            )
+        payload = {
+            "task_alias": "T001",
+            "coverage_complete": len(change_ids) <= 64,
+            "omitted_case_count": max(0, len(change_ids) - 64),
+            "impact_level": int(task["impact_level"]),
+            "from_knowledge_version": int(task["from_knowledge_version"]),
+            "to_knowledge_version": int(task["to_knowledge_version"]),
+            "block": {
+                "source_text": source_text,
+                "source_hash": str(current["source_hash"]),
+                "block_type": str(current["block_type"]),
+            },
+            "active_translation": {
+                "text": str(current["final_translation"]),
+                "knowledge_version": int(current["knowledge_version"]),
+            },
+            "cases": cases,
+        }
+        snapshot = {
+            "task_id": str(task["id"]),
+            "translation_id": int(task["translation_id"]),
+            "block_id": str(task["block_id"]),
+            "from_knowledge_version": int(task["from_knowledge_version"]),
+            "to_knowledge_version": int(task["to_knowledge_version"]),
+            "change_set_hash": str(task["change_set_hash"]),
+            "impact_level": int(task["impact_level"]),
+            "base_result_hash": hashlib.sha256(
+                self._revalidation_canonical(base).encode("utf-8")
+            ).hexdigest(),
+            "translation_hash": hashlib.sha256(
+                str(current["final_translation"]).encode("utf-8")
+            ).hexdigest(),
+            "source_hash": str(current["source_hash"]),
+        }
+        return payload, snapshot
+
+    @staticmethod
+    def _freeze_revalidation(value: Any) -> Any:
+        if isinstance(value, dict):
+            return MappingProxyType(
+                {
+                    str(key): V4Database._freeze_revalidation(item)
+                    for key, item in value.items()
+                }
+            )
+        if isinstance(value, list):
+            return tuple(V4Database._freeze_revalidation(item) for item in value)
+        return value
+
+    @staticmethod
+    def _lease_is_expired(lease: Any, now: datetime) -> bool:
+        if not isinstance(lease, dict):
+            return True
+        try:
+            expires = datetime.fromisoformat(str(lease["expires_at"]))
+        except (KeyError, TypeError, ValueError):
+            return True
+        if expires.tzinfo is None:
+            expires = expires.replace(tzinfo=timezone.utc)
+        return expires <= now
+
+    def _requeue_expired_revalidation_tasks(
+        self, connection: sqlite3.Connection, now: datetime
+    ) -> int:
+        count = 0
+        for row in connection.execute(
+            "SELECT id, result_json FROM revalidation_tasks WHERE status='validating'"
+        ).fetchall():
+            try:
+                result = json.loads(str(row["result_json"] or "{}"))
+            except (TypeError, ValueError, json.JSONDecodeError):
+                result = {}
+            lease = result.get("_lease") if isinstance(result, dict) else None
+            if not self._lease_is_expired(lease, now):
+                continue
+            if not isinstance(result, dict):
+                result = {}
+            result.pop("_lease", None)
+            cursor = connection.execute(
+                """UPDATE revalidation_tasks
+                   SET status='pending', action='', result_json=?, error=NULL,
+                       resolved_at=NULL, replacement_translation_id=NULL
+                   WHERE id=? AND status='validating'""",
+                (self._revalidation_canonical(result), row["id"]),
+            )
+            count += int(cursor.rowcount)
+        return count
+
+    def requeue_expired_revalidation_tasks(self) -> int:
+        with self.transaction() as connection:
+            return self._requeue_expired_revalidation_tasks(
+                connection, datetime.now(timezone.utc)
+            )
+
+    def claim_revalidation_task(
+        self,
+        owner: str,
+        lease_seconds: int = 300,
+        exclude_task_ids: Sequence[str] = (),
+    ) -> Optional[RevalidationClaim]:
+        owner = str(owner).strip()
+        if not owner or len(owner) > 128:
+            raise ValueError("revalidation lease owner is invalid")
+        if type(lease_seconds) is not int or not 1 <= lease_seconds <= 86_400:
+            raise ValueError("revalidation lease_seconds is invalid")
+        excluded = tuple(str(value) for value in exclude_task_ids)
+        claim_data: Optional[tuple[Any, ...]] = None
+        with self.transaction() as connection:
+            now = datetime.now(timezone.utc)
+            self._requeue_expired_revalidation_tasks(connection, now)
+            sql = "SELECT * FROM revalidation_tasks WHERE status='pending'"
+            params: List[Any] = []
+            if excluded:
+                sql += f" AND id NOT IN ({','.join('?' for _ in excluded)})"
+                params.extend(excluded)
+            sql += " ORDER BY impact_level DESC, created_at, id LIMIT 1"
+            task = connection.execute(sql, tuple(params)).fetchone()
+            if task is None:
+                return None
+            payload, snapshot = self._revalidation_payload(connection, task)
+            payload_bytes = self._revalidation_canonical(payload).encode("utf-8")
+            if len(payload_bytes) > 64 * 1024:
+                payload = {
+                    "task_alias": "T001",
+                    "impact_level": int(task["impact_level"]),
+                    "coverage_complete": False,
+                    "coverage_error": "validator_payload_byte_budget",
+                    "cases": [],
+                }
+                payload_bytes = self._revalidation_canonical(payload).encode("utf-8")
+            payload_hash = hashlib.sha256(payload_bytes).hexdigest()
+            snapshot_hash = hashlib.sha256(
+                self._revalidation_canonical(snapshot).encode("utf-8")
+            ).hexdigest()
+            token = secrets.token_urlsafe(32)
+            expires_at = (now + timedelta(seconds=lease_seconds)).isoformat()
+            result = self._revalidation_base_result(task["result_json"])
+            result["_lease"] = {
+                "owner": owner,
+                "expires_at": expires_at,
+                "token_hash": hashlib.sha256(token.encode("utf-8")).hexdigest(),
+                "payload_hash": payload_hash,
+                "snapshot_hash": snapshot_hash,
+                "snapshot": snapshot,
+            }
+            cursor = connection.execute(
+                """UPDATE revalidation_tasks
+                   SET status='validating', attempts=attempts+1, result_json=?
+                   WHERE id=? AND status='pending'""",
+                (self._revalidation_canonical(result), task["id"]),
+            )
+            if cursor.rowcount != 1:
+                return None
+            claim_data = (
+                str(task["id"]),
+                token,
+                owner,
+                expires_at,
+                snapshot,
+                payload,
+                payload_bytes,
+                payload_hash,
+            )
+        assert claim_data is not None
+        return RevalidationClaim(
+            task_id=claim_data[0],
+            lease_token=claim_data[1],
+            owner=claim_data[2],
+            expires_at=claim_data[3],
+            task_snapshot=self._freeze_revalidation(claim_data[4]),
+            payload=self._freeze_revalidation(claim_data[5]),
+            payload_bytes=claim_data[6],
+            payload_hash=claim_data[7],
+        )
+
+    def _validated_revalidation_lease(
+        self,
+        connection: sqlite3.Connection,
+        claim: RevalidationClaim,
+    ) -> tuple[sqlite3.Row, Dict[str, Any], Optional[str]]:
+        task = connection.execute(
+            "SELECT * FROM revalidation_tasks WHERE id=?", (claim.task_id,)
+        ).fetchone()
+        if task is None or str(task["status"]) != "validating":
+            raise ValueError("revalidation lease is not active")
+        try:
+            stored = json.loads(str(task["result_json"] or "{}"))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            raise ValueError("revalidation lease state is invalid") from None
+        lease = stored.get("_lease") if isinstance(stored, dict) else None
+        token_hash = hashlib.sha256(claim.lease_token.encode("utf-8")).hexdigest()
+        if (
+            not isinstance(lease, dict)
+            or str(lease.get("owner")) != claim.owner
+            or not secrets.compare_digest(str(lease.get("token_hash") or ""), token_hash)
+            or self._lease_is_expired(lease, datetime.now(timezone.utc))
+        ):
+            raise ValueError("revalidation lease token, owner, or expiry is invalid")
+        if str(lease.get("payload_hash")) != claim.payload_hash:
+            return task, stored, "revalidation lease payload changed"
+        try:
+            _, current_snapshot = self._revalidation_payload(connection, task)
+        except ValueError as exc:
+            return task, stored, str(exc)
+        current_hash = hashlib.sha256(
+            self._revalidation_canonical(current_snapshot).encode("utf-8")
+        ).hexdigest()
+        if current_hash != str(lease.get("snapshot_hash")):
+            return task, stored, "revalidation lease snapshot changed"
+        return task, stored, None
+
+    def _record_revalidation_audits(
+        self,
+        connection: sqlite3.Connection,
+        task: sqlite3.Row,
+        run_id: Optional[str],
+        audits: Sequence[Mapping[str, Any]],
+    ) -> None:
+        for audit in audits:
+            self.record_audit_call(
+                run_id=run_id,  # type: ignore[arg-type]
+                block_id=str(task["block_id"]),
+                purpose=str(audit.get("purpose") or "revalidate"),
+                model=str(audit.get("model") or "unknown")[:256],
+                knowledge_version=int(task["to_knowledge_version"]),
+                request=dict(audit.get("request") or {}),
+                raw_response=str(audit.get("raw_response") or "")[:16_384],
+                parsed=(dict(audit["parsed"]) if isinstance(audit.get("parsed"), Mapping) else None),
+                accepted=bool(audit.get("accepted")),
+                attempts=max(1, int(audit.get("attempts") or 1)),
+                elapsed_ms=max(0, int(audit.get("elapsed_ms") or 0)),
+                error=(str(audit.get("error"))[:1024] if audit.get("error") else None),
+                connection=connection,
+                archive_payload=False,
+            )
+
+    @staticmethod
+    def _revalidation_target(summary: Any) -> str:
+        if not isinstance(summary, dict):
+            return ""
+        for key in ("verified_target", "working_target", "default_target", "target"):
+            target = str(summary.get(key) or "").strip()
+            if target:
+                return target
+        rules = summary.get("rules")
+        if isinstance(rules, list):
+            for rule in rules:
+                if isinstance(rule, dict) and str(rule.get("target") or "").strip():
+                    return str(rule["target"]).strip()
+        return ""
+
+    def commit_revalidation_resolution(
+        self,
+        claim: RevalidationClaim,
+        *,
+        status: str,
+        action: str,
+        result: Mapping[str, Any],
+        outcome: Optional[TranslationOutcome] = None,
+        audits: Sequence[Mapping[str, Any]] = (),
+        run_id: Optional[str] = None,
+    ) -> Optional[int]:
+        allowed = {
+            "resolved_noop",
+            "resolved_patch",
+            "resolved_retranslate",
+            "completed_with_warning",
+        }
+        if status not in allowed:
+            raise ValueError("invalid revalidation terminal status")
+        if status == "resolved_patch" and outcome is None:
+            raise ValueError("resolved_patch requires a full translation outcome")
+        if status != "resolved_patch" and outcome is not None:
+            raise ValueError("only resolved_patch may insert a translation outcome")
+        stale_error: Optional[str] = None
+        replacement_id: Optional[int] = None
+        with self.transaction() as connection:
+            task, stored, stale_error = self._validated_revalidation_lease(
+                connection, claim
+            )
+            if stale_error:
+                stored.pop("_lease", None)
+                connection.execute(
+                    """UPDATE revalidation_tasks
+                       SET status='pending', action='', result_json=?, error=?,
+                           resolved_at=NULL, replacement_translation_id=NULL
+                       WHERE id=? AND status='validating'""",
+                    (
+                        self._revalidation_canonical(stored),
+                        stale_error[:1024],
+                        claim.task_id,
+                    ),
+                )
+            else:
+                self._record_revalidation_audits(
+                    connection,
+                    task,
+                    run_id,
+                    tuple(audits) + tuple(outcome.audit_calls if outcome else ()),
+                )
+                if outcome is not None:
+                    if (
+                        outcome.block.id != str(task["block_id"])
+                        or outcome.knowledge_version != int(task["to_knowledge_version"])
+                        or outcome.status
+                        not in {
+                            V4BlockStatus.COMPLETED.value,
+                            V4BlockStatus.COMPLETED_WITH_WARNINGS.value,
+                        }
+                        or not outcome.final_translation.strip()
+                    ):
+                        raise ValueError("revalidation patch outcome is inconsistent")
+                    previous = connection.execute(
+                        """SELECT * FROM translation_versions
+                           WHERE id=? AND block_id=? AND pipeline='parallel_v4'
+                             AND active=1""",
+                        (task["translation_id"], task["block_id"]),
+                    ).fetchone()
+                    if previous is None:
+                        raise ValueError("revalidation patch active translation changed")
+                    cursor = connection.execute(
+                        """INSERT INTO translation_versions(
+                               block_id, pipeline, run_id, knowledge_version, status,
+                               draft_translation, final_translation, analysis,
+                               semantic_obligations, memory_summary, warnings_json,
+                               active, created_at)
+                           VALUES(?, 'parallel_v4', ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?)""",
+                        (
+                            task["block_id"],
+                            run_id,
+                            task["to_knowledge_version"],
+                            outcome.status,
+                            outcome.draft_translation or outcome.final_translation,
+                            outcome.final_translation,
+                            outcome.analysis,
+                            outcome.semantic_obligations,
+                            outcome.memory_summary,
+                            json.dumps(outcome.warnings, ensure_ascii=False),
+                            utc_now(),
+                        ),
+                    )
+                    replacement_id = int(cursor.lastrowid)
+                    base = self._revalidation_base_result(task["result_json"])
+                    change_ids = tuple(int(value) for value in base.get("change_ids", ()))
+                    changes: Dict[tuple[str, str], sqlite3.Row] = {}
+                    changes_by_id: Dict[int, sqlite3.Row] = {}
+                    if change_ids:
+                        placeholders = ",".join("?" for _ in change_ids)
+                        for row in connection.execute(
+                            f"SELECT * FROM knowledge_changes WHERE id IN ({placeholders})",
+                            change_ids,
+                        ).fetchall():
+                            changes_by_id[int(row["id"])] = row
+                            changes[(str(row["subject_type"]), str(row["subject_id"]))] = row
+                    inserted_dependencies: set[tuple[str, str]] = set()
+                    for dependency in connection.execute(
+                        "SELECT * FROM dependencies WHERE translation_id=? ORDER BY id",
+                        (task["translation_id"],),
+                    ).fetchall():
+                        change = changes.get(
+                            (
+                                str(dependency["dependency_type"]),
+                                str(dependency["dependency_id"]),
+                            )
+                        )
+                        fingerprint = str(dependency["dependency_fingerprint"] or "")
+                        rendered_target = str(dependency["rendered_target"] or "")
+                        if change is not None:
+                            fingerprint = str(change["new_fingerprint"] or "")
+                            try:
+                                change_payload = json.loads(str(change["payload_json"] or "{}"))
+                            except (TypeError, ValueError, json.JSONDecodeError):
+                                change_payload = {}
+                            target = self._revalidation_target(
+                                change_payload.get("new") if isinstance(change_payload, dict) else {}
+                            )
+                            if target:
+                                rendered_target = target
+                        connection.execute(
+                            """INSERT INTO dependencies(
+                                   translation_id, dependency_type, dependency_id,
+                                   knowledge_version, dependency_fingerprint,
+                                   matched_form, occurrence_count, rendered_target,
+                                   applied_rule_ids_json, source_spans_json)
+                               VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                            (
+                                replacement_id,
+                                dependency["dependency_type"],
+                                dependency["dependency_id"],
+                                task["to_knowledge_version"],
+                                fingerprint,
+                                dependency["matched_form"],
+                                dependency["occurrence_count"],
+                                rendered_target,
+                                dependency["applied_rule_ids_json"],
+                                dependency["source_spans_json"],
+                            ),
+                        )
+                        inserted_dependencies.add(
+                            (
+                                str(dependency["dependency_type"]),
+                                str(dependency["dependency_id"]),
+                            )
+                        )
+                    frozen_payload = json.loads(claim.payload_bytes.decode("utf-8"))
+                    source_text = str(frozen_payload["block"]["source_text"])
+                    reasons = {
+                        int(reason["change_id"]): reason
+                        for reason in base.get("reasons", ())
+                        if isinstance(reason, dict)
+                        and type(reason.get("change_id")) is int
+                    }
+                    cases = frozen_payload.get("cases") or []
+                    for ordinal, change_id in enumerate(change_ids):
+                        change = changes_by_id.get(change_id)
+                        if change is None:
+                            raise ValueError("revalidation patch change set drifted")
+                        case = cases[ordinal] if ordinal < len(cases) else {}
+                        spans = case.get("spans") if isinstance(case, dict) else []
+                        normalized_spans = [
+                            [int(span["start"]), int(span["end"])]
+                            for span in (spans or ())
+                            if isinstance(span, dict)
+                            and type(span.get("start")) is int
+                            and type(span.get("end")) is int
+                            and 0 <= span["start"] < span["end"] <= len(source_text)
+                        ]
+                        reason = reasons.get(change_id, {})
+                        subjects = reason.get("subjects") or [
+                            {
+                                "subject_type": change["subject_type"],
+                                "subject_id": change["subject_id"],
+                            }
+                        ]
+                        try:
+                            change_payload = json.loads(str(change["payload_json"] or "{}"))
+                        except (TypeError, ValueError, json.JSONDecodeError):
+                            change_payload = {}
+                        rendered_target = self._revalidation_target(
+                            change_payload.get("new")
+                            if isinstance(change_payload, dict)
+                            else {}
+                        )
+                        for subject in subjects:
+                            if not isinstance(subject, dict):
+                                continue
+                            key = (
+                                str(subject.get("subject_type") or ""),
+                                str(subject.get("subject_id") or ""),
+                            )
+                            if not all(key) or key in inserted_dependencies:
+                                continue
+                            matched_form = (
+                                source_text[normalized_spans[0][0] : normalized_spans[0][1]]
+                                if normalized_spans
+                                else ""
+                            )
+                            connection.execute(
+                                """INSERT INTO dependencies(
+                                       translation_id, dependency_type, dependency_id,
+                                       knowledge_version, dependency_fingerprint,
+                                       matched_form, occurrence_count, rendered_target,
+                                       applied_rule_ids_json, source_spans_json)
+                                   VALUES(?, ?, ?, ?, ?, ?, ?, ?, '[]', ?)""",
+                                (
+                                    replacement_id,
+                                    key[0],
+                                    key[1],
+                                    task["to_knowledge_version"],
+                                    change["new_fingerprint"],
+                                    matched_form,
+                                    len(normalized_spans),
+                                    rendered_target,
+                                    self._revalidation_canonical(normalized_spans),
+                                ),
+                            )
+                            inserted_dependencies.add(key)
+                    deactivated = connection.execute(
+                        """UPDATE translation_versions SET active=0
+                           WHERE id=? AND active=1""",
+                        (task["translation_id"],),
+                    )
+                    if deactivated.rowcount != 1:
+                        raise ValueError("revalidation patch lost active translation CAS")
+                    connection.execute(
+                        "UPDATE translation_versions SET active=1 WHERE id=? AND active=0",
+                        (replacement_id,),
+                    )
+                final_result = self._revalidation_base_result(task["result_json"])
+                final_result.update(dict(result))
+                final_result["payload_hash"] = claim.payload_hash
+                cursor = connection.execute(
+                    """UPDATE revalidation_tasks
+                       SET status=?, action=?, result_json=?,
+                           replacement_translation_id=?, error=NULL, resolved_at=?
+                       WHERE id=? AND status='validating'""",
+                    (
+                        status,
+                        action,
+                        self._revalidation_canonical(final_result),
+                        replacement_id,
+                        utc_now(),
+                        claim.task_id,
+                    ),
+                )
+                if cursor.rowcount != 1:
+                    raise ValueError("revalidation terminal commit lost lease CAS")
+        if stale_error:
+            raise ValueError(stale_error)
+        return replacement_id
+
+    def fail_revalidation_task(
+        self,
+        claim: RevalidationClaim,
+        error: str,
+        *,
+        audits: Sequence[Mapping[str, Any]] = (),
+        run_id: Optional[str] = None,
+    ) -> None:
+        self.commit_revalidation_resolution(
+            claim,
+            status="resolved_retranslate",
+            action="retranslate",
+            result={"reason": "protocol_exhausted", "error": str(error)[:1024]},
+            audits=audits,
+            run_id=run_id,
+        )
 
     def request_repair(self, block_identifier: str, issues: Sequence[str]) -> str:
         block = self.get_block_by_identifier(block_identifier)

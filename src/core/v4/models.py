@@ -4,9 +4,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Annotated, Any, Dict, List, Literal, Optional
+from typing import Annotated, Any, Dict, List, Literal, Mapping, Optional
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import AliasChoices, BaseModel, ConfigDict, Field, field_validator, model_validator
 
 
 class V4BlockStatus(str, Enum):
@@ -188,6 +188,59 @@ class RepairResponse(StrictModel):
     repair_notes: List[str] = Field(default_factory=list, max_length=20)
 
 
+RevalidationTaskAlias = Annotated[str, Field(pattern=r"^T\d{3}$")]
+RevalidationCaseAlias = Annotated[str, Field(pattern=r"^C\d{3}$")]
+RevalidationSubjectAlias = Annotated[str, Field(pattern=r"^S\d{3}$")]
+
+
+class RevalidationSpan(StrictModel):
+    start: int = Field(ge=0)
+    end: int = Field(gt=0)
+
+    @model_validator(mode="after")
+    def _ordered(self) -> "RevalidationSpan":
+        if self.end <= self.start:
+            raise ValueError("revalidation span must be a non-empty half-open range")
+        return self
+
+
+class RevalidationResponse(StrictModel):
+    """One bounded validator answer resolved only through prompt-local aliases."""
+
+    task_alias: RevalidationTaskAlias = Field(
+        validation_alias=AliasChoices("task_alias", "task")
+    )
+    case_aliases: List[RevalidationCaseAlias] = Field(
+        min_length=1,
+        max_length=64,
+        validation_alias=AliasChoices("case_aliases", "cases"),
+    )
+    action: Literal["no_effect", "patch_required", "retranslate", "uncertain"]
+    spans: List[RevalidationSpan] = Field(default_factory=list, max_length=128)
+    subject_aliases: List[RevalidationSubjectAlias] = Field(
+        default_factory=list,
+        max_length=128,
+        validation_alias=AliasChoices("subject_aliases", "subjects"),
+    )
+    confidence: float = Field(ge=0.0, le=1.0)
+    rationale: str = Field(min_length=1, max_length=600)
+
+    @field_validator("case_aliases", "subject_aliases")
+    @classmethod
+    def _aliases_are_unique(cls, value: List[str]) -> List[str]:
+        if len(value) != len(set(value)):
+            raise ValueError("revalidation aliases must be unique")
+        return value
+
+    @field_validator("rationale")
+    @classmethod
+    def _bounded_rationale_is_not_blank(cls, value: str) -> str:
+        rationale = value.strip()
+        if not rationale:
+            raise ValueError("revalidation rationale cannot be blank")
+        return rationale
+
+
 @dataclass(frozen=True)
 class V4Block:
     id: str
@@ -366,6 +419,23 @@ class TranslationOutcome:
     attempts: int = 1
     elapsed_ms: int = 0
     error: Optional[str] = None
+
+
+@dataclass(frozen=True)
+class RevalidationClaim:
+    """Immutable lease plus the exact canonical payload shown to validators."""
+
+    task_id: str
+    lease_token: str
+    owner: str
+    expires_at: str
+    task_snapshot: Mapping[str, Any]
+    payload: Mapping[str, Any]
+    payload_bytes: bytes
+    payload_hash: str
+
+    def __getitem__(self, key: str) -> Any:
+        return getattr(self, key)
 
 
 @dataclass(frozen=True)

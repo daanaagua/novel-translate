@@ -5,12 +5,18 @@ from __future__ import annotations
 import hashlib
 import json
 import sqlite3
+import time
 import unicodedata
+import uuid
 from collections.abc import Sequence
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Callable, Mapping, Optional
+
+from pydantic import ValidationError
 
 from .database import V4Database, utc_now
+from .models import RevalidationClaim, RevalidationResponse, V4BlockStatus
+from .repairer import V4Repairer
 
 
 MAX_CHANGE_IDS = 1024
@@ -22,6 +28,15 @@ _MAX_PAYLOAD_IDS = 64
 _MAX_SUBJECT_ID_CHARS = 256
 _MAX_RESULT_SUBJECTS = 128
 _MAX_RESULT_REASONS = MAX_CHANGE_IDS
+_MAX_AUDIT_RAW_CHARS = 16_384
+
+
+REVALIDATION_SYSTEM = """You validate one frozen stale-translation task.
+Use only the supplied block source, active translation, old/new effective targets and
+rules, numeric half-open spans, change reasons, and impact levels. Return exactly one
+JSON object with task, cases, action, optional spans/subjects, confidence, rationale.
+action must be no_effect, patch_required, retranslate, or uncertain. Do not use or
+request book-wide knowledge, evidence, or adjacent blocks."""
 
 
 class PlanningBudgetError(ValueError):
@@ -913,3 +928,388 @@ class RevalidationPlanner:
             "source_hash": candidate.source_hash,
         }
         return _canonical_json(payload)
+
+
+class RevalidationProtocolError(ValueError):
+    """A validator answer cannot be mapped to the frozen bounded payload."""
+
+
+class RevalidationRunner:
+    """Claim, validate, optionally repair, and atomically resolve stale translations."""
+
+    def __init__(
+        self,
+        database: V4Database,
+        validator_factory: Optional[Callable[[], Any]] = None,
+        *,
+        validator_factories: Optional[Sequence[Callable[[], Any]]] = None,
+        repairer: Optional[V4Repairer] = None,
+        max_attempts: int = 2,
+        lease_seconds: int = 300,
+        owner: Optional[str] = None,
+    ):
+        if not isinstance(database, V4Database):
+            raise TypeError("database must be a V4Database")
+        if validator_factories is not None and validator_factory is not None:
+            raise ValueError("provide validator_factory or validator_factories, not both")
+        factories = tuple(validator_factories or ())
+        if validator_factory is not None:
+            factories = (validator_factory,)
+        if any(not callable(factory) for factory in factories):
+            raise TypeError("validator factories must be callable")
+        if type(max_attempts) is not int or max_attempts < 1:
+            raise ValueError("max_attempts must be a positive integer")
+        self.database = database
+        self.validator_factories = factories
+        self.repairer = repairer
+        self.max_attempts = max_attempts
+        self.lease_seconds = lease_seconds
+        self.owner = owner or f"revalidation-{uuid.uuid4().hex}"
+
+    @staticmethod
+    def _model_name(client: Any) -> str:
+        try:
+            return str(client.get_model("revalidate"))[:256]
+        except Exception:
+            return type(client).__name__[:256]
+
+    @staticmethod
+    def _validate_coverage(
+        response: RevalidationResponse, payload: Mapping[str, Any]
+    ) -> None:
+        if response.task_alias != str(payload.get("task_alias")):
+            raise RevalidationProtocolError("validator returned an unknown task alias")
+        cases = payload.get("cases")
+        if not isinstance(cases, list):
+            raise RevalidationProtocolError("frozen validator cases are invalid")
+        expected_cases = {
+            str(case.get("case_alias"))
+            for case in cases
+            if isinstance(case, dict)
+        }
+        if set(response.case_aliases) != expected_cases:
+            raise RevalidationProtocolError(
+                "validator case aliases do not cover the frozen task"
+            )
+        legal_subjects: set[str] = set()
+        legal_spans: set[tuple[int, int]] = set()
+        source_text = str((payload.get("block") or {}).get("source_text") or "")
+        for case in cases:
+            if not isinstance(case, dict):
+                continue
+            for subject in case.get("subjects") or ():
+                if isinstance(subject, dict):
+                    legal_subjects.add(str(subject.get("subject_alias") or ""))
+            for span in case.get("spans") or ():
+                if (
+                    isinstance(span, dict)
+                    and type(span.get("start")) is int
+                    and type(span.get("end")) is int
+                ):
+                    legal_spans.add((int(span["start"]), int(span["end"])))
+        if not set(response.subject_aliases).issubset(legal_subjects):
+            raise RevalidationProtocolError("validator returned an unknown subject alias")
+        response_spans = {(span.start, span.end) for span in response.spans}
+        if not response_spans.issubset(legal_spans):
+            raise RevalidationProtocolError("validator returned a span outside coverage")
+        if any(not 0 <= start < end <= len(source_text) for start, end in response_spans):
+            raise RevalidationProtocolError("validator returned an invalid source span")
+
+    def _validate_side(
+        self,
+        client: Any,
+        claim: RevalidationClaim,
+    ) -> tuple[Optional[RevalidationResponse], list[dict[str, Any]]]:
+        payload_text = claim.payload_bytes.decode("utf-8")
+        base_messages = [
+            {"role": "system", "content": REVALIDATION_SYSTEM},
+            {"role": "user", "content": payload_text},
+        ]
+        audits: list[dict[str, Any]] = []
+        last_error = ""
+        for attempt in range(1, self.max_attempts + 1):
+            messages = list(base_messages)
+            if last_error:
+                messages.append(
+                    {
+                        "role": "user",
+                        "content": (
+                            "The previous JSON failed strict validation. Return the complete "
+                            f"corrected answer. Error: {last_error[:600]}"
+                        ),
+                    }
+                )
+            raw = ""
+            started = time.perf_counter()
+            try:
+                raw = str(
+                    client.chat(
+                        messages=messages,
+                        purpose="revalidate",
+                        temperature=0.0,
+                        max_tokens=1200,
+                        json_mode=True,
+                        stream=False,
+                    )
+                )
+                response = RevalidationResponse.model_validate_json(raw)
+                payload = json.loads(payload_text)
+                self._validate_coverage(response, payload)
+                audits.append(
+                    {
+                        "purpose": "revalidate",
+                        "model": self._model_name(client),
+                        "request": {
+                            "messages": messages,
+                            "json_mode": True,
+                            "payload_sha256": claim.payload_hash,
+                        },
+                        "raw_response": raw[:_MAX_AUDIT_RAW_CHARS],
+                        "parsed": response.model_dump(mode="json"),
+                        "accepted": True,
+                        "attempts": attempt,
+                        "elapsed_ms": int((time.perf_counter() - started) * 1000),
+                        "error": None,
+                    }
+                )
+                return response, audits
+            except (ValidationError, RevalidationProtocolError, ValueError, Exception) as exc:
+                last_error = str(exc)[:1024]
+                audits.append(
+                    {
+                        "purpose": "revalidate",
+                        "model": self._model_name(client),
+                        "request": {
+                            "messages": messages,
+                            "json_mode": True,
+                            "payload_sha256": claim.payload_hash,
+                        },
+                        "raw_response": raw[:_MAX_AUDIT_RAW_CHARS],
+                        "parsed": None,
+                        "accepted": False,
+                        "attempts": attempt,
+                        "elapsed_ms": int((time.perf_counter() - started) * 1000),
+                        "error": last_error,
+                    }
+                )
+        return None, audits
+
+    def _factories_for_impact(self, impact: int) -> tuple[Callable[[], Any], ...]:
+        required = 2 if impact == 2 else 1
+        if not self.validator_factories:
+            return ()
+        if required == 1:
+            return self.validator_factories[:1]
+        if len(self.validator_factories) >= 2:
+            return self.validator_factories[:2]
+        return (self.validator_factories[0], self.validator_factories[0])
+
+    def run(self, max_tasks: Optional[int] = None) -> Dict[str, int]:
+        if max_tasks is not None and (type(max_tasks) is not int or max_tasks < 0):
+            raise ValueError("max_tasks must be a non-negative integer or None")
+        summary = {
+            "claimed": 0,
+            "noop": 0,
+            "patched": 0,
+            "retranslate": 0,
+            "protocol_failures": 0,
+            "conflicts": 0,
+        }
+        if max_tasks == 0:
+            return summary
+        run_id = f"revalidation_{uuid.uuid4().hex}"
+        self.database.start_run(
+            run_id,
+            "revalidation",
+            {
+                "max_tasks": max_tasks,
+                "max_attempts": self.max_attempts,
+                "lease_seconds": self.lease_seconds,
+            },
+        )
+        processed: set[str] = set()
+        try:
+            while max_tasks is None or summary["claimed"] < max_tasks:
+                claim = self.database.claim_revalidation_task(
+                    self.owner,
+                    lease_seconds=self.lease_seconds,
+                    exclude_task_ids=tuple(processed),
+                )
+                if claim is None:
+                    break
+                processed.add(claim.task_id)
+                summary["claimed"] += 1
+                impact = int(claim.task_snapshot["impact_level"])
+                audits: list[dict[str, Any]] = []
+                if impact >= 3:
+                    self.database.commit_revalidation_resolution(
+                        claim,
+                        status="resolved_retranslate",
+                        action="retranslate",
+                        result={"reason": "impact_level_3"},
+                        audits=audits,
+                        run_id=run_id,
+                    )
+                    summary["retranslate"] += 1
+                    continue
+                frozen_payload = json.loads(claim.payload_bytes.decode("utf-8"))
+                if not bool(frozen_payload.get("coverage_complete", True)):
+                    summary["protocol_failures"] += 1
+                    audits.append(
+                        {
+                            "purpose": "revalidate",
+                            "model": "none",
+                            "request": {"payload_sha256": claim.payload_hash},
+                            "raw_response": "",
+                            "parsed": None,
+                            "accepted": False,
+                            "attempts": 1,
+                            "elapsed_ms": 0,
+                            "error": str(
+                                frozen_payload.get("coverage_error")
+                                or "validator case coverage exceeds bound"
+                            ),
+                        }
+                    )
+                    self.database.fail_revalidation_task(
+                        claim,
+                        "bounded validator payload cannot cover the full task",
+                        audits=audits,
+                        run_id=run_id,
+                    )
+                    summary["retranslate"] += 1
+                    continue
+                factories = self._factories_for_impact(impact)
+                if len(factories) < (2 if impact == 2 else 1):
+                    summary["protocol_failures"] += 1
+                    self.database.fail_revalidation_task(
+                        claim,
+                        "independent validator factory is unavailable",
+                        audits=audits,
+                        run_id=run_id,
+                    )
+                    summary["retranslate"] += 1
+                    continue
+                responses: list[Optional[RevalidationResponse]] = []
+                clients: list[Any] = []
+                factory_error = ""
+                for factory in factories:
+                    try:
+                        clients.append(factory())
+                    except Exception as exc:
+                        factory_error = str(exc)[:1024]
+                        break
+                if factory_error or (
+                    impact == 2 and len(clients) == 2 and clients[0] is clients[1]
+                ):
+                    summary["protocol_failures"] += 1
+                    self.database.fail_revalidation_task(
+                        claim,
+                        factory_error or "impact-2 validators shared one client instance",
+                        audits=audits,
+                        run_id=run_id,
+                    )
+                    summary["retranslate"] += 1
+                    continue
+                for client in clients:
+                    response, side_audits = self._validate_side(client, claim)
+                    responses.append(response)
+                    audits.extend(side_audits)
+                if any(response is None for response in responses):
+                    summary["protocol_failures"] += 1
+                    self.database.fail_revalidation_task(
+                        claim,
+                        "validator protocol attempts exhausted",
+                        audits=audits,
+                        run_id=run_id,
+                    )
+                    summary["retranslate"] += 1
+                    continue
+                actions = [response.action for response in responses if response]
+                if len(set(actions)) > 1:
+                    summary["conflicts"] += 1
+                if impact == 1:
+                    decision = actions[0]
+                elif actions == ["no_effect", "no_effect"]:
+                    decision = "no_effect"
+                elif actions == ["patch_required", "patch_required"]:
+                    decision = "patch_required"
+                else:
+                    decision = "retranslate"
+                result = {
+                    "validator_actions": actions,
+                    "decisions": [
+                        response.model_dump(mode="json")
+                        for response in responses
+                        if response is not None
+                    ],
+                }
+                if decision == "no_effect":
+                    self.database.commit_revalidation_resolution(
+                        claim,
+                        status="resolved_noop",
+                        action="no_effect",
+                        result=result,
+                        audits=audits,
+                        run_id=run_id,
+                    )
+                    summary["noop"] += 1
+                    continue
+                if decision != "patch_required" or self.repairer is None:
+                    self.database.commit_revalidation_resolution(
+                        claim,
+                        status="resolved_retranslate",
+                        action="retranslate",
+                        result={**result, "reason": "validation_matrix"},
+                        audits=audits,
+                        run_id=run_id,
+                    )
+                    summary["retranslate"] += 1
+                    continue
+                payload = json.loads(claim.payload_bytes.decode("utf-8"))
+                block = self.database.get_block_by_identifier(
+                    str(claim.task_snapshot["block_id"])
+                )
+                outcome = self.repairer.repair_full_block(
+                    block,
+                    str(payload["active_translation"]["text"]),
+                    {"cases": payload["cases"]},
+                    issues=[
+                        f"{case['change_kind']}: {case['reason']}"
+                        for case in payload["cases"]
+                    ],
+                    knowledge_version=int(claim.task_snapshot["to_knowledge_version"]),
+                )
+                if outcome.status not in {
+                    V4BlockStatus.COMPLETED.value,
+                    V4BlockStatus.COMPLETED_WITH_WARNINGS.value,
+                }:
+                    self.database.commit_revalidation_resolution(
+                        claim,
+                        status="resolved_retranslate",
+                        action="retranslate",
+                        result={
+                            **result,
+                            "reason": "full_block_repair_failed",
+                            "error": str(outcome.error or "")[:1024],
+                        },
+                        audits=tuple(audits) + tuple(outcome.audit_calls),
+                        run_id=run_id,
+                    )
+                    summary["retranslate"] += 1
+                    continue
+                self.database.commit_revalidation_resolution(
+                    claim,
+                    status="resolved_patch",
+                    action="patch_required",
+                    result=result,
+                    outcome=outcome,
+                    audits=audits,
+                    run_id=run_id,
+                )
+                summary["patched"] += 1
+            self.database.finish_run(run_id, "completed")
+            return summary
+        except Exception as exc:
+            self.database.finish_run(run_id, "failed", str(exc)[:1024])
+            raise

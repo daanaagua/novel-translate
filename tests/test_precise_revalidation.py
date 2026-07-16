@@ -17,7 +17,9 @@ from src.core.v4.revalidation import (
     MAX_RESULT_BYTES,
     PlanningBudgetError,
     RevalidationPlanner,
+    RevalidationRunner,
 )
+from src.core.v4.repairer import V4Repairer
 import src.core.v4.models as v4_models
 from src.core.v4.coreference import cache_key, semantic_cache_key
 from src.core.v4.models import (
@@ -2774,3 +2776,217 @@ def test_revalidation_scale_uses_bounded_index_queries_for_ten_thousand_occurren
     assert len(statements) < 80
     assert database.path.stat().st_size <= before_size + 4096
     assert all(block.status == "ready" for block in database.list_blocks())
+
+
+class _Task11LLM:
+    def __init__(self, responses):
+        self.responses = list(responses)
+        self.requests = []
+
+    def chat(self, **kwargs):
+        self.requests.append(kwargs["messages"])
+        response = self.responses.pop(0)
+        if isinstance(response, Exception):
+            raise response
+        return response
+
+    def get_model(self, purpose):
+        return f"task11-{purpose}"
+
+
+def _task11_response(action):
+    return json.dumps(
+        {
+            "task": "T001",
+            "cases": ["C001"],
+            "action": action,
+            "confidence": 0.9,
+            "rationale": "bounded test rationale",
+        }
+    )
+
+
+def _task11_task(database, *, impact=1, target="新译名"):
+    translation_id = _insert_revalidation_translation(
+        database,
+        "block-0",
+        dependency=("lexeme", "lexeme-task11", "old-fingerprint"),
+    )
+    with database.transaction() as connection:
+        connection.execute(
+            """UPDATE translation_versions
+               SET draft_translation='旧译名在这里', final_translation='旧译名在这里'
+               WHERE id=?""",
+            (translation_id,),
+        )
+        connection.execute(
+            """UPDATE dependencies
+               SET rendered_target='旧译名', occurrence_count=1
+               WHERE translation_id=?""",
+            (translation_id,),
+        )
+    change_id = _insert_revalidation_change(
+        database,
+        subject_id="lexeme-task11",
+        impact=impact,
+        payload={
+            "old": {"working_target": "旧译名", "rules": []},
+            "new": {"working_target": target, "rules": []},
+            "reason": "working target changed",
+        },
+    )
+    assert RevalidationPlanner(database).plan([change_id])["planned"] == 1
+    return translation_id
+
+
+def test_task11_validation_matrix_and_independent_frozen_payloads(tmp_path):
+    database = _database(tmp_path, ["Alpha"])
+    _task11_task(database, impact=2)
+    left = _Task11LLM([_task11_response("no_effect")])
+    right = _Task11LLM([_task11_response("no_effect")])
+    summary = RevalidationRunner(
+        database,
+        validator_factories=(lambda: left, lambda: right),
+        max_attempts=1,
+    ).run()
+    assert summary == {
+        "claimed": 1,
+        "noop": 1,
+        "patched": 0,
+        "retranslate": 0,
+        "protocol_failures": 0,
+        "conflicts": 0,
+    }
+    assert left.requests[0][1]["content"] == right.requests[0][1]["content"]
+    with closing(database.connect()) as connection:
+        task = connection.execute("SELECT * FROM revalidation_tasks").fetchone()
+        assert task["status"] == "resolved_noop"
+        assert connection.execute(
+            "SELECT COUNT(*) FROM translation_versions"
+        ).fetchone()[0] == 1
+
+
+def test_task11_protocol_exhaustion_escalates_without_human_queue(tmp_path):
+    database = _database(tmp_path, ["Alpha"])
+    _task11_task(database, impact=2)
+    invalid = _Task11LLM(["{}", "{}"])
+    other = _Task11LLM([_task11_response("patch_required")])
+    summary = RevalidationRunner(
+        database,
+        validator_factories=(lambda: invalid, lambda: other),
+        max_attempts=2,
+    ).run()
+    assert summary["retranslate"] == 1
+    assert summary["protocol_failures"] == 1
+    with closing(database.connect()) as connection:
+        task = connection.execute("SELECT status, action FROM revalidation_tasks").fetchone()
+        assert tuple(task) == ("resolved_retranslate", "retranslate")
+        assert connection.execute("SELECT COUNT(*) FROM human_queue").fetchone()[0] == 0
+
+
+def test_task11_full_block_repair_validates_structure_and_target_hits(tmp_path):
+    database = _database(tmp_path, ["Alpha\n\nBeta"])
+    block = database.get_block_by_identifier("block-0")
+    bad = _Task11LLM(
+        [json.dumps({"paragraphs": ["只有一段"], "repair_notes": []})]
+    )
+    failed = V4Repairer(database, lambda: bad, max_attempts=1).repair_full_block(
+        block,
+        "旧译名在这里\n\n第二段旧译文",
+        {"required_targets": ["新译名"]},
+        issues=["replace stale target"],
+        knowledge_version=database.current_knowledge_version(),
+    )
+    assert failed.status == "failed_retryable"
+    good = _Task11LLM(
+        [
+            json.dumps(
+                {
+                    "paragraphs": ["新译名在这里", "第二段完整译文"],
+                    "repair_notes": ["updated target"],
+                }
+            )
+        ]
+    )
+    repaired = V4Repairer(database, lambda: good, max_attempts=1).repair_full_block(
+        block,
+        "旧译名在这里\n\n第二段旧译文",
+        {"required_targets": ["新译名"]},
+        issues=["replace stale target"],
+        knowledge_version=database.current_knowledge_version(),
+    )
+    assert repaired.status == "completed"
+    assert repaired.final_translation == "新译名在这里\n\n第二段完整译文"
+    assert repaired.audit_calls[-1]["accepted"] is True
+
+
+def test_task11_patch_commit_preserves_precise_dependencies(tmp_path):
+    database = _database(tmp_path, ["Alpha"])
+    old_translation = _task11_task(database, impact=1)
+    validator = _Task11LLM([_task11_response("patch_required")])
+    repair = _Task11LLM(
+        [json.dumps({"paragraphs": ["新译名完整译文"], "repair_notes": []})]
+    )
+    summary = RevalidationRunner(
+        database,
+        validator_factories=(lambda: validator,),
+        repairer=V4Repairer(database, lambda: repair, max_attempts=1),
+        max_attempts=1,
+    ).run()
+    assert summary["patched"] == 1
+    with closing(database.connect()) as connection:
+        versions = connection.execute(
+            "SELECT id, active FROM translation_versions ORDER BY id"
+        ).fetchall()
+        assert [(row["id"], row["active"]) for row in versions] == [
+            (old_translation, 0),
+            (versions[1]["id"], 1),
+        ]
+        dependency = connection.execute(
+            "SELECT * FROM dependencies WHERE translation_id=?",
+            (versions[1]["id"],),
+        ).fetchone()
+        assert dependency["dependency_fingerprint"] == "new-fingerprint"
+        assert dependency["rendered_target"] == "新译名"
+        task = connection.execute("SELECT * FROM revalidation_tasks").fetchone()
+        assert task["status"] == "resolved_patch"
+        assert task["replacement_translation_id"] == versions[1]["id"]
+
+
+def test_task11_lease_cas_expiry_and_completed_rerun(tmp_path):
+    database = _database(tmp_path, ["Alpha"])
+    _task11_task(database, impact=1)
+    claim = database.claim_revalidation_task("worker-a", lease_seconds=60)
+    assert claim is not None
+    assert database.claim_revalidation_task("worker-b", lease_seconds=60) is None
+    with database.transaction() as connection:
+        row = connection.execute("SELECT result_json FROM revalidation_tasks").fetchone()
+        result = json.loads(row["result_json"])
+        result["_lease"]["expires_at"] = "2000-01-01T00:00:00+00:00"
+        connection.execute(
+            "UPDATE revalidation_tasks SET result_json=?",
+            (json.dumps(result, sort_keys=True, separators=(",", ":")),),
+        )
+    assert database.requeue_expired_revalidation_tasks() == 1
+    replacement = database.claim_revalidation_task("worker-b", lease_seconds=60)
+    assert replacement is not None
+    assert replacement.lease_token != claim.lease_token
+    with pytest.raises(ValueError, match="lease"):
+        database.commit_revalidation_resolution(
+            claim,
+            status="resolved_noop",
+            action="no_effect",
+            result={"reason": "old lease"},
+        )
+    database.commit_revalidation_resolution(
+        replacement,
+        status="resolved_noop",
+        action="no_effect",
+        result={"reason": "fresh lease"},
+    )
+    model = _Task11LLM([_task11_response("no_effect")])
+    summary = RevalidationRunner(
+        database, validator_factories=(lambda: model,), max_attempts=1
+    ).run()
+    assert summary["claimed"] == 0
+    assert model.requests == []

@@ -2,16 +2,18 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 import time
+from collections.abc import Mapping, Sequence
 from typing import Any, Callable, Dict, List, Optional
 from uuid import uuid4
 
 from ..translator import TranslationEngine
 from .context import ContextBuilder
 from .database import V4Database
-from .models import RepairResponse
+from .models import RepairResponse, TranslationOutcome, V4Block, V4BlockStatus
 from .validation import V4Validator
 
 
@@ -53,6 +55,224 @@ class V4Repairer:
         if text.endswith("```"):
             text = text[:-3]
         return text.strip()
+
+    @staticmethod
+    def _model_name(client: Any) -> str:
+        try:
+            return str(client.get_model("repair"))[:256]
+        except Exception:
+            return type(client).__name__[:256]
+
+    @staticmethod
+    def _required_target_groups(constraints: Mapping[str, Any]) -> List[List[str]]:
+        explicit = constraints.get("required_targets")
+        if isinstance(explicit, Sequence) and not isinstance(explicit, (str, bytes)):
+            targets = [str(value).strip() for value in explicit if str(value).strip()]
+            return [[target] for target in targets[:64]]
+        groups: List[List[str]] = []
+        cases = constraints.get("cases")
+        if not isinstance(cases, Sequence) or isinstance(cases, (str, bytes)):
+            return groups
+        for case in cases[:64]:
+            if not isinstance(case, Mapping):
+                continue
+            new = case.get("new")
+            if not isinstance(new, Mapping):
+                continue
+            candidates: List[str] = []
+            for key in ("verified_target", "working_target", "default_target", "target"):
+                target = str(new.get(key) or "").strip()
+                if target and target not in candidates:
+                    candidates.append(target)
+            raw_targets = new.get("targets")
+            if isinstance(raw_targets, Sequence) and not isinstance(
+                raw_targets, (str, bytes)
+            ):
+                for value in raw_targets[:32]:
+                    target = str(value).strip()
+                    if target and target not in candidates:
+                        candidates.append(target)
+            rules = new.get("rules")
+            if isinstance(rules, Sequence) and not isinstance(rules, (str, bytes)):
+                for rule in rules[:32]:
+                    if isinstance(rule, Mapping):
+                        target = str(rule.get("target") or "").strip()
+                        if target and target not in candidates:
+                            candidates.append(target)
+            if candidates:
+                groups.append(candidates[:32])
+        return groups
+
+    def repair_full_block(
+        self,
+        block: V4Block,
+        current_translation: str,
+        constraints: Mapping[str, Any],
+        issues: Optional[Sequence[str]] = None,
+        knowledge_version: Optional[int] = None,
+    ) -> TranslationOutcome:
+        """Return a validated complete replacement without writing database state."""
+        if not isinstance(block, V4Block):
+            raise TypeError("block must be a V4Block")
+        if not current_translation.strip():
+            raise ValueError("current_translation cannot be empty")
+        if not isinstance(constraints, Mapping):
+            raise TypeError("constraints must be a mapping")
+        source_paragraphs = split_paragraphs(block.source_text)
+        current_paragraphs = split_paragraphs(current_translation)
+        if len(current_paragraphs) != len(source_paragraphs):
+            raise ValueError("current translation paragraph structure is invalid")
+        version = (
+            self.database.current_knowledge_version()
+            if knowledge_version is None
+            else int(knowledge_version)
+        )
+        bounded_issues = [str(value)[:512] for value in (issues or ())][:64]
+        request = {
+            "block": {
+                "source_text": block.source_text,
+                "source_hash": block.source_hash,
+                "block_type": block.block_type,
+            },
+            "active_translation": current_translation,
+            "constraints": dict(constraints),
+            "issues": bounded_issues,
+        }
+        request_text = json.dumps(
+            request, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+        )
+        if len(request_text.encode("utf-8")) > 64 * 1024:
+            raise ValueError("full-block repair request exceeds byte budget")
+        base_messages = [
+            {"role": "system", "content": REPAIR_SYSTEM},
+            {"role": "user", "content": request_text},
+        ]
+        required_groups = self._required_target_groups(constraints)
+        llm = self.llm_factory()
+        audits: List[Dict[str, Any]] = []
+        last_error: Optional[str] = None
+        started = time.perf_counter()
+        for attempt in range(1, self.max_attempts + 1):
+            messages = list(base_messages)
+            if last_error:
+                messages.append(
+                    {
+                        "role": "user",
+                        "content": (
+                            "The previous JSON failed strict full-block validation. "
+                            f"Return the complete corrected JSON. Error: {last_error[:600]}"
+                        ),
+                    }
+                )
+            raw = ""
+            attempt_started = time.perf_counter()
+            try:
+                raw = str(
+                    llm.chat(
+                        messages=messages,
+                        purpose="repair",
+                        temperature=0.0,
+                        max_tokens=self.max_tokens,
+                        json_mode=True,
+                        stream=False,
+                    )
+                )
+                parsed = RepairResponse.model_validate_json(self._clean_json(raw))
+                if len(parsed.paragraphs) != len(source_paragraphs):
+                    raise ValueError("full-block repair paragraph count changed")
+                if any(not paragraph.strip() for paragraph in parsed.paragraphs):
+                    raise ValueError("full-block repair contains an empty paragraph")
+                final_translation = "\n\n".join(
+                    paragraph.strip() for paragraph in parsed.paragraphs
+                )
+                if V4Validator._has_wrapper(final_translation):
+                    raise ValueError("full-block repair contains a structural wrapper")
+                problems = TranslationEngine._translation_shape_problems(
+                    block.source_text,
+                    final_translation,
+                    stage="full-block repair",
+                    min_length_ratio=0.15,
+                )
+                problems.extend(
+                    TranslationEngine._translation_shape_problems(
+                        current_translation,
+                        final_translation,
+                        stage="full-block repair stabilization",
+                        min_length_ratio=0.15,
+                    )
+                )
+                if problems:
+                    raise ValueError("; ".join(problems))
+                missing = [
+                    group for group in required_groups
+                    if not any(target in final_translation for target in group)
+                ]
+                if missing:
+                    raise ValueError(
+                        "full-block repair misses required target: " + missing[0][0]
+                    )
+                audit = {
+                    "purpose": "revalidation_repair",
+                    "model": self._model_name(llm),
+                    "request": {
+                        "messages": messages,
+                        "json_mode": True,
+                        "payload_sha256": hashlib.sha256(
+                            request_text.encode("utf-8")
+                        ).hexdigest(),
+                    },
+                    "raw_response": raw[:16_384],
+                    "parsed": parsed.model_dump(mode="json"),
+                    "accepted": True,
+                    "attempts": attempt,
+                    "elapsed_ms": int((time.perf_counter() - attempt_started) * 1000),
+                    "error": None,
+                }
+                audits.append(audit)
+                return TranslationOutcome(
+                    block=block,
+                    knowledge_version=version,
+                    status=V4BlockStatus.COMPLETED.value,
+                    draft_translation=final_translation,
+                    final_translation=final_translation,
+                    audit_calls=audits,
+                    attempts=attempt,
+                    elapsed_ms=int((time.perf_counter() - started) * 1000),
+                )
+            except Exception as exc:
+                last_error = str(exc)[:1024]
+                audits.append(
+                    {
+                        "purpose": "revalidation_repair",
+                        "model": self._model_name(llm),
+                        "request": {
+                            "messages": messages,
+                            "json_mode": True,
+                            "payload_sha256": hashlib.sha256(
+                                request_text.encode("utf-8")
+                            ).hexdigest(),
+                        },
+                        "raw_response": raw[:16_384],
+                        "parsed": None,
+                        "accepted": False,
+                        "attempts": attempt,
+                        "elapsed_ms": int(
+                            (time.perf_counter() - attempt_started) * 1000
+                        ),
+                        "error": last_error,
+                    }
+                )
+        return TranslationOutcome(
+            block=block,
+            knowledge_version=version,
+            status=V4BlockStatus.FAILED_RETRYABLE.value,
+            draft_translation=current_translation,
+            final_translation=current_translation,
+            audit_calls=audits,
+            attempts=self.max_attempts,
+            elapsed_ms=int((time.perf_counter() - started) * 1000),
+            error=last_error or "full-block repair protocol exhausted",
+        )
 
     def _repair_one(self, task: Dict[str, Any], run_id: str) -> bool:
         detail = self.database.get_review_block(task["block_id"])
