@@ -4721,6 +4721,27 @@ class V4Database:
                 )
             ]
 
+    def knowledge_change_ids_between(
+        self, after_version: int, through_version: int
+    ) -> List[int]:
+        if (
+            type(after_version) is not int
+            or type(through_version) is not int
+            or after_version < 0
+            or through_version < after_version
+        ):
+            raise ValueError("knowledge change version bounds are invalid")
+        with closing(self.connect()) as connection:
+            return [
+                int(row[0])
+                for row in connection.execute(
+                    """SELECT id FROM knowledge_changes
+                       WHERE knowledge_version>? AND knowledge_version<=?
+                       ORDER BY knowledge_version, id""",
+                    (after_version, through_version),
+                )
+            ]
+
     def fail_run_for_invalid_snapshot(
         self,
         run_id: str,

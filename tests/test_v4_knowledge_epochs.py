@@ -3,7 +3,11 @@ from contextlib import closing
 
 from src.core.v4.database import V4Database
 from src.core.v4.knowledge_epochs import KnowledgeEpochCoordinator
-from src.core.v4.models import TranslationOutcome, V4BlockStatus
+from src.core.v4.models import (
+    RenderingMatchSnapshot,
+    TranslationOutcome,
+    V4BlockStatus,
+)
 
 
 def _database(tmp_path):
@@ -43,6 +47,50 @@ def _outcome(database, source, target):
             {"src": source, "tgt": target, "type": "person", "context": block.source_text}
         ],
     )
+
+
+def _seed_active_translation(database):
+    concept_id = database.import_legacy_concept("Alpha", "", "person", "test")
+    database.apply_working_target_decisions(
+        [{"concept_id": concept_id, "target": "旧译名", "rules": []}]
+    )
+    block = database.get_block_by_identifier("block-0")
+    bundle = database.freeze_render_bundle([block.id])
+    matches = bundle.index.matched_renderings(
+        block.source_text,
+        block_id=block.id,
+        occurrence_contexts=list(bundle.contexts_by_block[block.id]),
+    )
+    assert matches
+    run_id = "seed-translation"
+    database.start_run(run_id, "translate", {}, knowledge_version=bundle.knowledge_version)
+    database.commit_translation_batch(
+        run_id,
+        [
+            TranslationOutcome(
+                block=block,
+                knowledge_version=bundle.knowledge_version,
+                status=V4BlockStatus.COMPLETED.value,
+                draft_translation="旧译名出现。",
+                final_translation="旧译名出现。",
+                matched_renderings=tuple(
+                    RenderingMatchSnapshot(
+                        lexeme_id=match.lexeme_id,
+                        concept_id=match.concept_id,
+                        matched_form=match.matched_form,
+                        start_offset=match.start_offset,
+                        end_offset=match.end_offset,
+                        rendered_target=match.rendered_target,
+                        applied_rule_ids=tuple(match.applied_rule_ids),
+                        dependency_fingerprint=match.dependency_fingerprint,
+                    )
+                    for match in matches
+                ),
+            )
+        ],
+    )
+    database.finish_run(run_id, "completed")
+    return concept_id
 
 
 def test_epoch_checkpoint_is_persisted_idempotent_and_bounded(tmp_path, monkeypatch):
@@ -122,3 +170,42 @@ def test_epoch_checkpoint_only_pauses_when_both_flags_are_explicit(tmp_path):
         assert connection.execute(
             "SELECT COUNT(*) FROM human_queue WHERE kind='translation_proposal'"
         ).fetchone()[0] == 1
+
+
+def test_epoch_checkpoint_does_not_advance_high_water_past_a_concurrent_change(
+    tmp_path, monkeypatch
+):
+    database = _database(tmp_path)
+    concept_id = _seed_active_translation(database)
+    run_id = "high-water-race"
+    database.start_run(run_id, "translate", {"knowledge_epoch_mode": True})
+    coordinator = KnowledgeEpochCoordinator(database, ["block-0"])
+    coordinator.freeze()
+    original_scan = database.knowledge_change_ids_after
+    inserted = {"done": False}
+
+    def change_after_first_scan(version):
+        found = original_scan(version)
+        if not inserted["done"]:
+            inserted["done"] = True
+            database.apply_working_target_decisions(
+                [{"concept_id": concept_id, "target": "新译名", "rules": []}]
+            )
+        return found
+
+    monkeypatch.setattr(database, "knowledge_change_ids_after", change_after_first_scan)
+
+    result = coordinator.checkpoint(run_id)
+
+    with closing(database.connect()) as connection:
+        change_id = int(
+            connection.execute(
+                "SELECT MAX(id) FROM knowledge_changes"
+            ).fetchone()[0]
+        )
+    assert result.change_ids == (change_id,)
+    assert result.planned_tasks == 1
+    assert database.status_summary()["needs_revalidate"] == 1
+    repeated = coordinator.checkpoint(run_id)
+    assert repeated.reused is True
+    assert repeated.change_ids == (change_id,)

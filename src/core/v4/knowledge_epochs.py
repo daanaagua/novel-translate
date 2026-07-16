@@ -251,17 +251,20 @@ class KnowledgeEpochCoordinator:
                 proposal_version = int(proposal_result)
             applied = proposal_version is not None
 
-        change_ids = tuple(sorted(set(external_change_ids + proposal_change_ids)))
+        final_high_water = self.database.current_knowledge_version()
+        bounded_change_ids = self.database.knowledge_change_ids_between(
+            base_version, final_high_water
+        )
+        change_ids = tuple(sorted(set(bounded_change_ids + proposal_change_ids)))
         planned_tasks = 0
         if change_ids:
             planned_tasks = int(RevalidationPlanner(self.database).plan(change_ids)["planned"])
-        current_version = self.database.current_knowledge_version()
-        advanced = current_version > base_version
+        advanced = final_high_water > base_version
         if advanced:
             state["ordinal"] = min(
                 self.max_knowledge_epochs - 1, int(state["ordinal"]) + 1
             )
-        state["base_knowledge_version"] = current_version
+        state["base_knowledge_version"] = final_high_water
         if not capped:
             state["seen_entry_hashes"] = sorted(
                 set(str(value) for value in state["seen_entry_hashes"])
@@ -293,6 +296,6 @@ class KnowledgeEpochCoordinator:
         if advanced:
             self._epoch = None
         self.database.save_knowledge_epoch_state(
-            run_id, state, knowledge_version=current_version
+            run_id, state, knowledge_version=final_high_water
         )
         return self._result_from_state(raw_result, reused=False)
