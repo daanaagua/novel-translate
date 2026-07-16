@@ -110,6 +110,11 @@ MAX_DEPENDENCY_DISTINCT_VALUES = 256
 MAX_FROZEN_CLAIMS = 256
 MAX_FROZEN_CLAIM_BYTES = 128 * 1024
 MAX_FROZEN_CLAIMS_PER_BLOCK = 128
+MAX_FROZEN_CLAIM_ID_CHARS = 256
+MAX_FROZEN_CLAIM_KIND_CHARS = 64
+MAX_FROZEN_CLAIM_STATUS_CHARS = 32
+MAX_FROZEN_CLAIM_SCOPE_CHARS = 32
+MAX_FROZEN_CLAIM_TEXT_CHARS = 4_096
 MAX_PRIOR_CONCEPTS_PER_BLOCK = 128
 MAX_PRIOR_CONCEPT_PAIRS = 4096
 MAX_PRIOR_CANDIDATES_PER_CONCEPT = 8
@@ -292,36 +297,23 @@ def _render_semantic_summary(
             state.get("accepted", str(state.get("status") or "") == "verified")
         )
         kind = str(state.get("kind") or "") if exists else ""
+        prompt_effective = bool(
+            active and accepted and kind == "translation_constraint"
+        )
+        if not prompt_effective:
+            return {"prompt_effective": False}
         return {
-            "subject_type": "claim",
-            "subject_id": subject_id,
-            "exists": exists,
-            "active": active,
-            "accepted": accepted,
-            "prompt_effective": bool(
-                accepted and kind == "translation_constraint"
-            ),
-            "kind": kind,
-            "statement": str(state.get("statement") or "") if exists else "",
-            "subject_form": str(state.get("subject_form") or "") if exists else "",
-            "scope": str(state.get("scope") or "") if exists else "",
-            "reveal_global_index": (
-                int(state.get("reveal_global_index") or 0) if exists else None
-            ),
+            "prompt_effective": True,
+            "statement": str(state.get("statement") or ""),
+            "subject_form": str(state.get("subject_form") or ""),
+            "scope": str(state.get("scope") or ""),
+            "reveal_global_index": int(state.get("reveal_global_index") or 0),
             "reveal_boundary": bool(
-                exists
-                and (
-                    state.get("reveal_boundary")
-                    or kind == "reveal_boundary"
-                )
+                state.get("reveal_boundary") or kind == "reveal_boundary"
             ),
-            "locked": bool(exists and state.get("locked")),
+            "locked": bool(state.get("locked")),
             "high_impact_constraint": bool(
-                exists
-                and (
-                    state.get("high_impact_constraint")
-                    or state.get("high_impact")
-                )
+                state.get("high_impact_constraint") or state.get("high_impact")
             ),
         }
     retired = bool(state.get("retired"))
@@ -397,9 +389,24 @@ def render_fingerprint(
         raise ValueError("render fingerprint subject_id cannot be empty")
     if not isinstance(state, Mapping):
         raise TypeError("render fingerprint state must be a mapping")
-    _validate_render_value(state)
-    summary = _render_semantic_summary(subject_type.strip(), subject_id.strip(), state)
-    raw = json.dumps(summary, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    normalized_subject_type = subject_type.strip()
+    normalized_subject_id = subject_id.strip()
+    if normalized_subject_type != "claim":
+        _validate_render_value(state)
+    summary = _render_semantic_summary(
+        normalized_subject_type, normalized_subject_id, state
+    )
+    _validate_render_value(summary)
+    raw = json.dumps(
+        {
+            "subject_type": normalized_subject_type,
+            "subject_id": normalized_subject_id,
+            "semantic": summary,
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
     if len(raw.encode("utf-8")) > _RENDER_MAX_INPUT_BYTES:
         raise ValueError("effective render summary exceeds size limit")
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
@@ -414,8 +421,8 @@ def _derive_render_change(
     if old_summary == new_summary:
         return "metadata", 0
     if (
-        old_summary.get("subject_type") == "claim"
-        or new_summary.get("subject_type") == "claim"
+        "prompt_effective" in old_summary
+        or "prompt_effective" in new_summary
     ):
         high_impact = any(
             bool(summary.get(key))
@@ -4238,20 +4245,27 @@ class V4Database:
         new_fingerprint = render_fingerprint(subject_type, subject_id, new_state)
         old_summary = _render_semantic_summary(subject_type, subject_id, old_state)
         new_summary = _render_semantic_summary(subject_type, subject_id, new_state)
-        raw_old = json.dumps(
-            _canonical_render_value(old_state),
-            ensure_ascii=False,
-            sort_keys=True,
-            separators=(",", ":"),
-        )
-        raw_new = json.dumps(
-            _canonical_render_value(new_state),
-            ensure_ascii=False,
-            sort_keys=True,
-            separators=(",", ":"),
-        )
         semantic_changed = old_fingerprint != new_fingerprint
-        metadata_changed = raw_old != raw_new
+        metadata_changed = False
+        ineffective_claim = (
+            subject_type == "claim"
+            and not bool(old_summary.get("prompt_effective"))
+            and not bool(new_summary.get("prompt_effective"))
+        )
+        if not semantic_changed and record_metadata and not ineffective_claim:
+            raw_old = json.dumps(
+                _canonical_render_value(old_state),
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            raw_new = json.dumps(
+                _canonical_render_value(new_state),
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            metadata_changed = raw_old != raw_new
         version = knowledge_version
         if version is not None:
             version = int(version)
@@ -9523,14 +9537,33 @@ class V4Database:
 
         maximum_reveal = max(int(row["global_index"]) for row in block_rows)
         claim_rows = connection.execute(
-            """SELECT * FROM claims
+            """SELECT SUBSTR(id, 1, ?) id, LENGTH(id) id_length,
+                      SUBSTR(kind, 1, ?) kind, LENGTH(kind) kind_length,
+                      SUBSTR(statement, 1, ?) statement,
+                      LENGTH(statement) statement_length,
+                      SUBSTR(subject_form, 1, ?) subject_form,
+                      LENGTH(subject_form) subject_form_length,
+                      SUBSTR(status, 1, ?) status, LENGTH(status) status_length,
+                      SUBSTR(scope, 1, ?) scope, LENGTH(scope) scope_length,
+                      confidence, reveal_global_index, high_impact, locked,
+                      retired_version
+               FROM claims
                WHERE retired_version IS NULL
                  AND kind='translation_constraint'
                  AND status='verified'
                  AND reveal_global_index<=?
                ORDER BY locked DESC, confidence DESC, id
                LIMIT ?""",
-            (maximum_reveal, MAX_FROZEN_CLAIMS + 1),
+            (
+                MAX_FROZEN_CLAIM_ID_CHARS + 1,
+                MAX_FROZEN_CLAIM_KIND_CHARS + 1,
+                MAX_FROZEN_CLAIM_TEXT_CHARS + 1,
+                MAX_FROZEN_CLAIM_TEXT_CHARS + 1,
+                MAX_FROZEN_CLAIM_STATUS_CHARS + 1,
+                MAX_FROZEN_CLAIM_SCOPE_CHARS + 1,
+                maximum_reveal,
+                MAX_FROZEN_CLAIMS + 1,
+            ),
         ).fetchall()
         if len(claim_rows) > MAX_FROZEN_CLAIMS:
             raise KnowledgeSnapshotError(
@@ -9539,6 +9572,19 @@ class V4Database:
         claim_payloads: Dict[str, Dict[str, Any]] = {}
         claim_bytes = 0
         for row in claim_rows:
+            for field, limit in (
+                ("id", MAX_FROZEN_CLAIM_ID_CHARS),
+                ("kind", MAX_FROZEN_CLAIM_KIND_CHARS),
+                ("statement", MAX_FROZEN_CLAIM_TEXT_CHARS),
+                ("subject_form", MAX_FROZEN_CLAIM_TEXT_CHARS),
+                ("status", MAX_FROZEN_CLAIM_STATUS_CHARS),
+                ("scope", MAX_FROZEN_CLAIM_SCOPE_CHARS),
+            ):
+                if int(row[f"{field}_length"]) > limit:
+                    raise KnowledgeSnapshotError(
+                        "claims",
+                        f"claim {field} exceeds {limit} characters",
+                    )
             claim_id = str(row["id"])
             state = self._claim_state_from_row(row)
             payload = {

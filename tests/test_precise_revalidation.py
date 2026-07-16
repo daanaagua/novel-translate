@@ -1,6 +1,7 @@
 import hashlib
 import json
 import re
+import sqlite3
 from contextlib import closing, contextmanager
 from dataclasses import replace
 
@@ -248,6 +249,113 @@ def test_claim_fingerprint_tracks_prompt_semantics_but_not_metadata():
     assert render_fingerprint("claim", "claim-1", base) != render_fingerprint(
         "claim", "claim-1", {**base, "accepted": False}
     )
+
+
+def test_non_prompt_claims_share_one_semantic_state_and_create_has_no_render_impact(
+    tmp_path,
+):
+    inactive_states = (
+        {},
+        {
+            "exists": True,
+            "active": True,
+            "accepted": False,
+            "kind": "translation_constraint",
+            "statement": "P" * 200_000,
+            "subject_form": "Archon",
+            "scope": "book",
+            "reveal_global_index": 999,
+            "locked": True,
+            "high_impact_constraint": True,
+        },
+        {
+            "exists": True,
+            "active": False,
+            "accepted": True,
+            "kind": "translation_constraint",
+            "statement": "RETIRED CONTENT B",
+            "subject_form": "Other",
+            "scope": "occurrence",
+            "reveal_global_index": 1,
+            "locked": True,
+            "high_impact_constraint": True,
+        },
+    )
+    fingerprints = {
+        render_fingerprint("claim", "claim-inactive", state)
+        for state in inactive_states
+    }
+    assert len(fingerprints) == 1
+
+    database = _database(tmp_path, ["Archon spoke."])
+    claim_id = database.create_claim(
+        kind="translation_constraint",
+        statement="PROPOSED CONTENT A",
+        reveal_global_index=0,
+        subject_form="Archon",
+        high_impact=True,
+    )
+    block = database.list_blocks()[0]
+    frozen = database.freeze_render_bundle([block.id])
+    assert frozen.claims_by_block[block.id] == ()
+    with closing(database.connect()) as connection:
+        changes = connection.execute(
+            """SELECT change_kind, impact_level FROM knowledge_changes
+               WHERE subject_type='claim' AND subject_id=?""",
+            (claim_id,),
+        ).fetchall()
+    assert [tuple(row) for row in changes] in ([], [("metadata", 0)])
+
+
+def test_frozen_claim_query_never_materializes_unbounded_text(tmp_path, monkeypatch):
+    database = _database(tmp_path, ["Archon spoke."])
+    version = database.current_knowledge_version()
+    oversized = "x" * 200_000
+    with database.transaction() as connection:
+        connection.execute(
+            """INSERT INTO claims(
+                   id, kind, statement, subject_form, status, scope, confidence,
+                   reveal_global_index, high_impact, locked, created_version, created_at
+               ) VALUES(
+                   'oversized-claim', 'translation_constraint', ?, 'Archon',
+                   'verified', 'book', 1.0, 0, 0, 1, ?, 'now'
+               )""",
+            (oversized, version),
+        )
+
+    traced_sql = []
+    materialized_lengths = []
+    original_connect = database.connect
+
+    def monitored_connect():
+        connection = original_connect()
+        connection.set_trace_callback(traced_sql.append)
+
+        def bounded_row_factory(cursor, values):
+            columns = [item[0] for item in cursor.description]
+            row = dict(zip(columns, values))
+            if "statement_length" in row:
+                materialized_lengths.append(
+                    (len(row["statement"]), int(row["statement_length"]))
+                )
+            return sqlite3.Row(cursor, values)
+
+        connection.row_factory = bounded_row_factory
+        return connection
+
+    monkeypatch.setattr(database, "connect", monitored_connect)
+    block = database.list_blocks()[0]
+    with pytest.raises(KnowledgeSnapshotError, match="claim statement"):
+        database.freeze_render_bundle([block.id])
+
+    assert materialized_lengths == [(4097, len(oversized))]
+    claim_select = next(
+        sql
+        for sql in traced_sql
+        if "FROM claims" in sql and "translation_constraint" in sql
+    )
+    assert "SELECT *" not in claim_select.upper()
+    assert "SUBSTR(statement" in claim_select
 
 
 def test_claim_create_verify_and_human_resolution_record_semantic_changes(tmp_path):
