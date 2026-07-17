@@ -30,6 +30,7 @@ class TermCategory(str, Enum):
     ITEM = "item"                 # 物品
     CONCEPT = "concept"           # 概念/术语
     UNIT = "unit"                 # 计量单位
+    ROLE = "role"                 # 职业、身份或制度性角色
 
 
 # ============================================================

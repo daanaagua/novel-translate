@@ -24,6 +24,21 @@ SCHEMA_VERSION = 9
 
 
 SCHEMA9_SQL = """
+CREATE TABLE IF NOT EXISTS term_profiles (
+    subject_type TEXT NOT NULL CHECK(subject_type IN ('lexeme', 'concept')),
+    subject_id TEXT NOT NULL,
+    semantic_core TEXT NOT NULL DEFAULT '',
+    contrast_sources_json TEXT NOT NULL DEFAULT '[]',
+    status TEXT NOT NULL DEFAULT 'provisional',
+    locked INTEGER NOT NULL DEFAULT 0 CHECK(locked IN (0, 1)),
+    created_version INTEGER NOT NULL REFERENCES knowledge_versions(id),
+    retired_version INTEGER REFERENCES knowledge_versions(id),
+    created_at TEXT NOT NULL,
+    PRIMARY KEY(subject_type, subject_id, created_version)
+);
+CREATE INDEX IF NOT EXISTS idx_term_profiles_active
+    ON term_profiles(subject_type, subject_id, retired_version, created_version);
+
 CREATE TABLE IF NOT EXISTS source_structure (
     block_id TEXT PRIMARY KEY REFERENCES blocks(id) ON DELETE CASCADE,
     structure_json TEXT NOT NULL DEFAULT '{}',
@@ -210,6 +225,7 @@ REVALIDATION_COLUMNS = {
 
 
 REQUIRED_TABLES = {
+    "term_profiles",
     "source_structure",
     "memory_versions",
     "narrative_memories",

@@ -52,16 +52,20 @@ class SchemaAwareTargetLLM:
         normalized = " ".join(text.lower().split())
         template = (
             '{"decisions":[{"concept_id":"q01","working_target":"示例译名",'
+            '"semantic_core":"非剧透的核心含义",'
+            '"contrast_sources":["executioner"],'
             '"rules":[{"condition":{"discourse_function":"vocative"},'
             '"target":"阁下"}],"confidence":0.95}]}'
         )
         return all(
             (
-                "exactly these four keys" in normalized,
+                "exactly these six keys" in normalized,
                 template in normalized,
                 "each rule object has exactly these two keys" in normalized,
                 "concept_id" in normalized,
                 "working_target" in normalized,
+                "semantic_core" in normalized,
+                "contrast_sources" in normalized,
                 "rules" in normalized,
                 "condition" in normalized,
                 "target" in normalized,
@@ -97,6 +101,8 @@ class SchemaAwareTargetLLM:
             {
                 "concept_id": "Q01",
                 "working_target": "示例译名",
+                "semantic_core": "非剧透的核心含义",
+                "contrast_sources": ["executioner"],
                 "rules": [
                     {
                         "condition": {"discourse_function": "vocative"},
@@ -198,7 +204,14 @@ def _seed_concept(database, source, *, kind="person", blocks=None):
 
 
 def _response(*decisions):
-    return json.dumps({"decisions": list(decisions)}, ensure_ascii=False)
+    normalized = []
+    for decision in decisions:
+        item = dict(decision)
+        item.setdefault("semantic_core", "词汇的非剧透核心含义。")
+        item.setdefault("contrast_sources", [])
+        item.setdefault("rules", [])
+        normalized.append(item)
+    return json.dumps({"decisions": normalized}, ensure_ascii=False)
 
 
 def test_working_targets_default_to_lexeme_subject_and_keep_concept_override_empty(
@@ -266,6 +279,186 @@ def test_working_targets_default_to_lexeme_subject_and_keep_concept_override_emp
     assert repeated["changed"] == 0
 
 
+def test_target_candidate_recovers_role_kind_and_unselected_exact_contexts(tmp_path):
+    database = _database(
+        tmp_path,
+        [
+            "I am a torturer.",
+            "The torturer waited.",
+            "The torturer's apprentice returned.",
+        ],
+    )
+    lexeme_id = database.ensure_lexeme("torturer")
+    blocks = database.list_blocks()
+    with database.transaction() as connection:
+        version = connection.execute(
+            "SELECT MAX(id) FROM knowledge_versions"
+        ).fetchone()[0]
+        for index, block in enumerate(blocks[:2]):
+            evidence_id = connection.execute(
+                """INSERT INTO evidence(
+                       block_id, paragraph_id, kind, source_form, evidence_quote,
+                       payload_json, confidence, extractor, created_at)
+                   VALUES(?, 'P000', 'test', 'torturer', 'torturer', '{}',
+                          1.0, 'test', 'now')""",
+                (block.id,),
+            ).lastrowid
+            mention_id = connection.execute(
+                """INSERT INTO mentions(
+                       block_id, paragraph_id, source_form, normalized_form,
+                       discourse_function, lexeme_id, concept_id, evidence_id)
+                   VALUES(?, 'P000', 'torturer', 'torturer', 'referential',
+                          ?, NULL, ?)""",
+                (block.id, lexeme_id, evidence_id),
+            ).lastrowid
+            if index == 0:
+                connection.execute(
+                    """INSERT INTO concept_type_observations(
+                           concept_id, lexeme_id, mention_id, evidence_id, kind,
+                           confidence, source, created_version, created_at)
+                       VALUES(NULL, ?, ?, ?, 'role', 0.96,
+                              'candidate_adjudication', ?, 'now')""",
+                    (lexeme_id, mention_id, evidence_id, version),
+                )
+        third = blocks[2]
+        start = third.source_text.index("torturer")
+        connection.execute(
+            """INSERT INTO lexical_candidates(
+                   id, block_id, paragraph_id, start_offset, end_offset,
+                   original_text, normalized_text, left_context, right_context,
+                   extraction_reason, book_frequency, model_status, selected,
+                   created_at, updated_at, risk_flags_json, resolution_status)
+               VALUES('candidate-extra-context', ?, 'P000', ?, ?,
+                      'torturer', 'torturer', 'The', 'apprentice returned',
+                      'rare_or_repeated', 96, 'rejected', 0, 'now', 'now',
+                      '[]', 'rejected')""",
+            (third.id, start, start + len("torturer")),
+        )
+
+    candidate = database.working_target_candidates()[0]
+
+    assert candidate["subject_id"] == lexeme_id
+    assert candidate["kind"] == "role"
+    assert any("apprentice returned" in context for context in candidate["contexts"])
+
+    database.apply_working_target_decisions(
+        [
+            {
+                "subject_type": "lexeme",
+                "subject_id": lexeme_id,
+                "target": "拷问官",
+                "semantic_core": "以拷问为正式职业身份的人。",
+                "contrast_sources": ["executioner"],
+                "rules": [],
+            }
+        ]
+    )
+    bundle = database.freeze_render_bundle([blocks[0].id])
+    rendered_lexeme = bundle.index.get_lexeme(lexeme_id)
+    assert rendered_lexeme["kind"] == "role"
+
+    glossary = V4TranslationPipeline(database, lambda: None)._glossary_for(
+        blocks[:1],
+        concept_snapshot=bundle.index,
+        rendering_contexts_by_block=bundle.contexts_by_block,
+    )
+    assert glossary.glossary.items[0].category == TermCategory.ROLE
+    assert "[职业身份]" in TranslationEngine._render_glossary_term(
+        glossary.glossary.items[0]
+    )
+
+
+def test_target_contexts_keep_a_later_explicit_lexical_contrast(tmp_path):
+    database = _database(
+        tmp_path,
+        [
+            "The torturer entered the room.",
+            "I am a torturer.",
+            "The torturer opened the door.",
+            (
+                "I was no carnifex, but a journeyman of the torturers' guild. "
+                "The city had sent for an executioner, a headsman."
+            ),
+            "The torturer returned before dawn.",
+            "No more do I, Torturer. No more does anyone.",
+        ],
+    )
+    _seed_concept(database, "torturer", kind="role")
+
+    contexts = database.working_target_candidates()[0]["contexts"]
+
+    assert len(contexts) == 4
+    assert any(
+        "no carnifex" in context
+        and "executioner" in context
+        and "headsman" in context
+        for context in contexts
+    )
+    assert any("No more do I, Torturer." in context for context in contexts)
+
+
+def test_role_target_absorbs_an_observed_safe_plural_form(tmp_path):
+    database = _database(
+        tmp_path,
+        ["I am a torturer.", "The torturers gathered in the tower."],
+    )
+    concept_id = _seed_concept(
+        database,
+        "torturer",
+        kind="role",
+        blocks=database.list_blocks()[:1],
+    )
+    with database.transaction() as connection:
+        lexeme_id = connection.execute(
+            "SELECT primary_lexeme_id FROM concepts WHERE id=?",
+            (concept_id,),
+        ).fetchone()[0]
+        block = database.list_blocks()[1]
+        start = block.source_text.index("torturers")
+        connection.execute(
+            """INSERT INTO lexical_candidates(
+                   id, block_id, paragraph_id, start_offset, end_offset,
+                   original_text, normalized_text, left_context, right_context,
+                   extraction_reason, book_frequency, model_status, selected,
+                   created_at, updated_at, risk_flags_json, resolution_status)
+               VALUES('candidate-observed-plural', ?, 'P000', ?, ?,
+                      'torturers', 'torturers', 'The', 'gathered in the tower',
+                      'rare_or_repeated', 12, 'rejected', 0, 'now', 'now',
+                      '[]', 'rejected')""",
+            (block.id, start, start + len("torturers")),
+        )
+
+    database.apply_working_target_decisions(
+        [
+            {
+                "subject_type": "lexeme",
+                "subject_id": lexeme_id,
+                "concept_id": concept_id,
+                "target": "刑讯者",
+                "semantic_core": "专司拷问以获取口供或实施惩罚的人。",
+                "contrast_sources": ["executioner"],
+                "rules": [],
+            }
+        ]
+    )
+
+    with closing(database.connect()) as connection:
+        forms = connection.execute(
+            """SELECT form, normalized_form, grammar_json
+               FROM source_forms WHERE lexeme_id=?
+               ORDER BY normalized_form""",
+            (lexeme_id,),
+        ).fetchall()
+    assert ("torturers", "torturers") in {
+        (row["form"], row["normalized_form"]) for row in forms
+    }
+    matched = database.freeze_translation_knowledge()[1].matched_renderings(
+        "The torturers gathered."
+    )
+    assert len(matched) == 1
+    assert matched[0].rendered_target == "刑讯者"
+
+
 def test_explicit_concept_override_requires_reliable_different_evidence(tmp_path):
     database = _database(tmp_path, ["Archon spoke.", "The Archon waited."])
     concept_id = _seed_concept(database, "Archon", kind="title")
@@ -331,6 +524,8 @@ def test_target_resolver_preserves_legacy_wire_alias_but_emits_lexeme_subject(tm
                     {
                         "concept_id": "Q01",
                         "working_target": "塞万里安",
+                        "semantic_core": "人物姓名。",
+                        "contrast_sources": [],
                         "rules": [],
                         "confidence": 0.99,
                     }
@@ -348,6 +543,7 @@ def test_target_resolver_preserves_legacy_wire_alias_but_emits_lexeme_subject(tm
             "lexeme_id": candidate["lexeme_id"],
             "concept_id": concept_id,
             "target": "塞万里安",
+            "semantic_core": "人物姓名。",
             "rules": [],
             "confidence": 0.99,
         }
@@ -359,6 +555,8 @@ def test_working_target_models_are_strict_and_bounded():
     decision = WorkingTargetDecision(
         concept_id="Q01",
         working_target="塞万里安",
+        semantic_core="人物姓名。",
+        contrast_sources=[],
         rules=[rule],
         confidence=0.9,
     )
@@ -385,6 +583,19 @@ def test_working_target_models_are_strict_and_bounded():
         WorkingTargetResponse.model_validate(
             {"decisions": [], "unexpected": True}
         )
+    with pytest.raises(ValidationError):
+        WorkingTargetResponse.model_validate(
+            {
+                "decisions": [
+                    {
+                        "concept_id": "Q01",
+                        "working_target": "塞万里安",
+                        "rules": [],
+                        "confidence": 0.9,
+                    }
+                ]
+            }
+        )
 
 
 def test_target_initial_and_retry_prompts_repeat_the_exact_nested_protocol():
@@ -409,6 +620,8 @@ def test_target_initial_and_retry_prompts_repeat_the_exact_nested_protocol():
         {
             "concept_id": "stable-concept-id",
             "target": "示例译名",
+            "semantic_core": "非剧透的核心含义",
+            "contrast_sources": ["executioner"],
             "rules": [
                 {
                     "condition": {"discourse_function": "vocative"},
@@ -421,6 +634,160 @@ def test_target_initial_and_retry_prompts_repeat_the_exact_nested_protocol():
     assert len(llm.calls) == 2
     assert SchemaAwareTargetLLM.has_contract(llm.calls[0]["messages"][0]["content"])
     assert SchemaAwareTargetLLM.has_contract(llm.calls[1]["messages"][-1]["content"])
+    system = " ".join(llm.calls[0]["messages"][0]["content"].lower().split())
+    assert "institutional profession" in system
+    assert "generic action noun" in system
+    assert "idiomatic chinese occupational title" in system
+    assert "simplified chinese" in system
+    assert "nearby proper nouns" in system
+    assert "non-authoritative stylistic evidence" in system
+
+
+def test_target_payload_keeps_three_baselines_for_distinct_register_contexts():
+    _aliases, payload = TargetResolver._aliased_batch(
+        [
+            {
+                "concept_id": "stable-concept-id",
+                "source": "torturer",
+                "kind": "role",
+                "contexts": [
+                    "a torturer waited",
+                    "I am a torturer",
+                    "Master Torturer?",
+                    "not an executioner",
+                ],
+                "baseline_translations": [
+                    "一名拷问官在等待。",
+                    "我是拷问官。",
+                    "拷问官大人？",
+                ],
+            }
+        ]
+    )
+
+    assert payload["concepts"][0]["baseline_translations"] == [
+        "一名拷问官在等待。",
+        "我是拷问官。",
+        "拷问官大人？",
+    ]
+
+
+def test_role_vocative_rule_is_recovered_from_aligned_baseline_wording():
+    response = _response(
+        {
+            "concept_id": "Q01",
+            "working_target": "拷问官",
+            "semantic_core": "执行拷问和刑罚的人。",
+            "contrast_sources": ["executioner"],
+            "rules": [],
+            "confidence": 0.95,
+        }
+    )
+    llm = FakeTargetLLM([response, response])
+    resolver = TargetResolver(object(), llm, max_attempts=1)
+
+    decisions, error = resolver._call_batch(
+        [
+            {
+                "concept_id": "stable-concept-id",
+                "source": "torturer",
+                "kind": "role",
+                "contexts": [
+                    "I am a torturer.",
+                    "What is your name, Master Torturer?",
+                ],
+                "baseline_translations": [
+                    "我是拷问官。",
+                    "你叫什么名字，拷问官大人？",
+                ],
+            }
+        ]
+    )
+
+    assert error == ""
+    assert decisions[0]["rules"] == [
+        {
+            "condition": {"discourse_function": "vocative"},
+            "target": "拷问官大人",
+        }
+    ]
+
+
+def test_target_resolver_retries_semantic_core_with_unlicensed_story_name():
+    llm = FakeTargetLLM(
+        [
+            _response(
+                {
+                    "concept_id": "Q01",
+                    "working_target": "拷问士",
+                    "semantic_core": "正式刑讯职业，亦称为 Vodalarius。",
+                    "contrast_sources": ["executioner"],
+                    "confidence": 0.9,
+                }
+            ),
+            _response(
+                {
+                    "concept_id": "Q01",
+                    "working_target": "刽子手",
+                    "semantic_core": "以刑讯、拷问为职责的正式职业身份。",
+                    "contrast_sources": [],
+                    "confidence": 0.92,
+                }
+            ),
+            _response(
+                {
+                    "concept_id": "Q01",
+                    "working_target": "刑讯者",
+                    "semantic_core": "专司拷问以获取口供或实施惩罚的人。",
+                    "contrast_sources": ["executioner", "headsman", "carnifex"],
+                    "rules": [
+                        {
+                            "condition": {"discourse_function": "vocative"},
+                            "target": "刑讯官",
+                        }
+                    ],
+                    "confidence": 0.95,
+                }
+            ),
+        ]
+    )
+    resolver = TargetResolver(object(), llm, max_attempts=2)
+
+    decisions, error = resolver._call_batch(
+        [
+            {
+                "concept_id": "stable-concept-id",
+                "source": "torturer",
+                "kind": "role",
+                "contexts": [
+                    "I am a torturer. I am also a Vodalarius.",
+                    "the torturer's apprentice",
+                ],
+            }
+        ]
+    )
+
+    assert error == ""
+    assert decisions[0]["target"] == "刑讯者"
+    assert decisions[0]["semantic_core"] == "专司拷问以获取口供或实施惩罚的人。"
+    assert decisions[0]["contrast_sources"] == [
+        "executioner",
+        "headsman",
+        "carnifex",
+    ]
+    assert decisions[0]["rules"] == [
+        {
+            "condition": {"discourse_function": "vocative"},
+            "target": "刑讯官",
+        }
+    ]
+    assert len(llm.calls) == 3
+    assert "Vodalarius" in llm.calls[1]["messages"][-1]["content"]
+    review_system = " ".join(
+        llm.calls[2]["messages"][0]["content"].lower().split()
+    )
+    assert "independent bilingual lexicographic" in review_system
+    assert "discourse_function" in review_system
 
 
 def test_target_retry_keeps_validation_detail_beyond_the_first_500_characters():
@@ -536,7 +903,7 @@ def test_resolver_assigns_one_working_target_to_four_occurrences(tmp_path):
     assert len(payload["concepts"]) == 1
     assert payload["concepts"][0]["concept_id"] == "Q01"
     assert concept_id not in llm.calls[0]["messages"][-1]["content"]
-    assert len(payload["concepts"][0]["contexts"]) == 3
+    assert len(payload["concepts"][0]["contexts"]) <= 4
     assert len(payload["concepts"][0]["baseline_translations"]) <= 2
 
 
@@ -816,7 +1183,7 @@ def test_resolver_batches_at_24_and_bounds_context_and_baseline_payloads(tmp_pat
     payloads = [json.loads(call["messages"][-1]["content"]) for call in llm.calls]
     assert [len(payload["concepts"]) for payload in payloads] == [24, 1]
     assert all(
-        len(item["contexts"]) <= 3 and len(item["baseline_translations"]) <= 2
+        len(item["contexts"]) <= 4 and len(item["baseline_translations"]) <= 3
         for payload in payloads
         for item in payload["concepts"]
     )
@@ -858,6 +1225,114 @@ def test_rules_render_cleanly_and_working_apply_is_idempotent(tmp_path):
     assert glossary.glossary.items[0].default_target == "执政官"
     assert glossary.glossary.items[0].status == TermStatus.WORKING
     assert glossary.glossary.items[0].rules[0].target == "阁下"
+
+
+def test_working_target_profile_is_atomic_idempotent_and_rendered(tmp_path):
+    database = _database(
+        tmp_path,
+        [
+            "I am a torturer.",
+            "The torturer spoke.",
+            "The torturer returned.",
+        ],
+    )
+    concept_id = _seed_concept(database, "torturer", kind="role")
+    lexeme_id = database.working_target_candidates()[0]["lexeme_id"]
+    decision = {
+        "subject_type": "lexeme",
+        "subject_id": lexeme_id,
+        "concept_id": concept_id,
+        "target": "拷问者",
+        "semantic_core": "行会职业身份；不自动等同于执行死刑者。",
+        "contrast_sources": ["executioner", "headsman", "carnifex"],
+        "rules": [
+            {
+                "condition": {"discourse_function": "vocative"},
+                "target": "拷问官",
+            }
+        ],
+    }
+
+    first = database.apply_working_target_decisions([decision])
+    version = database.current_knowledge_version()
+    repeated = database.apply_working_target_decisions([decision])
+
+    assert first["changed"] == 1
+    assert repeated["changed"] == 0
+    assert repeated["knowledge_version"] is None
+    assert database.current_knowledge_version() == version
+
+    with closing(database.connect()) as connection:
+        profile = connection.execute(
+            """SELECT semantic_core, contrast_sources_json
+               FROM term_profiles
+               WHERE subject_type='lexeme' AND subject_id=?
+                 AND retired_version IS NULL""",
+            (lexeme_id,),
+        ).fetchone()
+    assert tuple(profile) == (
+        "行会职业身份；不自动等同于执行死刑者。",
+        '["carnifex","executioner","headsman"]',
+    )
+
+    snapshot = database.render_snapshot()
+    lexeme = next(item for item in snapshot if item["lexeme_id"] == lexeme_id)
+    assert lexeme["term_profile"] == {
+        "semantic_core": "行会职业身份；不自动等同于执行死刑者。",
+        "contrast_sources": ["carnifex", "executioner", "headsman"],
+        "status": "provisional",
+        "locked": False,
+    }
+
+    concept = database.concepts_for_text("A torturer waited.")[0]
+    rendered = ContextBuilder._render_concepts([concept])
+    assert "语义边界: 行会职业身份；不自动等同于执行死刑者。" in rendered
+    assert "须与以下原文词保持区别: carnifex、executioner、headsman" in rendered
+
+    glossary = V4TranslationPipeline(database, lambda: None)._glossary_for(
+        database.list_blocks()[:1]
+    )
+    description = glossary.glossary.items[0].description
+    assert "行会职业身份；不自动等同于执行死刑者。" in description
+    assert "carnifex、executioner、headsman" in description
+
+
+def test_profile_only_change_records_render_change_for_revalidation(tmp_path):
+    database = _database(
+        tmp_path,
+        ["I am a torturer.", "The torturer returned."],
+    )
+    concept_id = _seed_concept(database, "torturer", kind="role")
+    lexeme_id = database.working_target_candidates()[0]["lexeme_id"]
+    base = {
+        "subject_type": "lexeme",
+        "subject_id": lexeme_id,
+        "concept_id": concept_id,
+        "target": "拷问官",
+        "semantic_core": "以刑讯、拷问为职责的正式职业身份。",
+        "contrast_sources": ["executioner"],
+        "rules": [],
+    }
+    database.apply_working_target_decisions([base])
+
+    changed = database.apply_working_target_decisions(
+        [
+            {
+                **base,
+                "semantic_core": "以刑讯、审问为职责的正式职业身份；不是刽子手。",
+            }
+        ]
+    )
+
+    assert changed["changed"] == 1
+    assert len(changed["change_ids"]) == 1
+    with closing(database.connect()) as connection:
+        row = connection.execute(
+            """SELECT subject_type, subject_id, change_kind
+               FROM knowledge_changes WHERE id=?""",
+            (changed["change_ids"][0],),
+        ).fetchone()
+    assert tuple(row) == ("lexeme", lexeme_id, "term_profile")
 
 
 def test_empty_effective_target_is_context_only_and_never_a_glossary_item(tmp_path):
@@ -1024,6 +1499,14 @@ def test_serial_translator_filters_empty_glossary_arrows_and_rules(tmp_path):
                 category=TermCategory.PERSON,
                 status=TermStatus.VERIFIED,
             ),
+            GlossaryItem(
+                id="role",
+                src="torturer",
+                default_target="拷问官",
+                category=TermCategory.ROLE,
+                status=TermStatus.WORKING,
+                description="负责审讯和施刑的职业；区别于 executioner。",
+            ),
         ]
     )
     manager._build_patterns()
@@ -1034,9 +1517,10 @@ def test_serial_translator_filters_empty_glossary_arrows_and_rules(tmp_path):
         config=TranslationConfig(enable_polish=True),
     )
 
-    engine._draft_translate("Archon spoke to Severian and Thecla.")
+    engine._draft_translate("Archon spoke to Severian, Thecla, and a torturer.")
     engine._polish_translate(
-        "Archon spoke to Severian and Thecla.", "执政官向塞万里安与泰克拉发言。"
+        "Archon spoke to Severian, Thecla, and a torturer.",
+        "执政官向塞万里安、泰克拉与一名拷问官发言。",
     )
 
     prompts = "\n".join(call["messages"][0]["content"] for call in llm.calls)
@@ -1048,6 +1532,8 @@ def test_serial_translator_filters_empty_glossary_arrows_and_rules(tmp_path):
     assert "人工核验硬约束" in prompts
     assert "本轮全书工作译名，必须统一使用，仅明确rendering rule可覆盖；不代表人工核验" in prompts
     assert "Severian -> 塞万里安" in prompts
+    assert "职业身份条目允许按中文句法补足群体、行会或敬称关系" in prompts
+    assert "[职业身份] torturer -> 拷问官" in prompts
 
 
 def test_epoch_config_normalizes_legacy_unattended_and_requires_explicit_pause():

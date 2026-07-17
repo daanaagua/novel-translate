@@ -72,6 +72,17 @@ class FakeTranslationLLM:
         return generator() if stream else payload
 
 
+class BrokenTranslationLLM:
+    def get_model(self, purpose):
+        return f"broken-{purpose}"
+
+    def chat(self, *, stream=False, **_kwargs):
+        def generator():
+            yield ("content", "this is not a structured translation response")
+
+        return generator() if stream else "this is not a structured translation response"
+
+
 class FakePreparationLLM:
     def get_model(self, purpose):
         return f"fake-{purpose}"
@@ -380,6 +391,47 @@ class ParallelV4Tests(unittest.TestCase):
         self.assertEqual(result["status"], "completed")
         self.assertEqual(len(calls), 1)
         self.assertEqual(len(calls[0]), 5)
+
+    def test_failed_draft_does_not_emit_term_missing_warnings(self):
+        block = self.add_blocks(["Archon spoke."], status="ready")[0]
+        concept_id = self.database.import_legacy_concept(
+            "Archon", "", "title", "office"
+        )
+        self.database.apply_working_target_decisions(
+            [
+                {
+                    "concept_id": concept_id,
+                    "target": "执政官",
+                    "semantic_core": "正式政治职衔。",
+                    "contrast_sources": [],
+                    "rules": [],
+                }
+            ]
+        )
+        pipeline = V4TranslationPipeline(
+            self.database,
+            lambda: BrokenTranslationLLM(),
+            config=V4PipelineConfig(
+                island_size=1,
+                initial_workers=1,
+                max_workers=1,
+                max_attempts=1,
+                enable_polish=False,
+                enable_semantic_mapper=False,
+            ),
+        )
+
+        result = pipeline.run()
+
+        self.assertEqual(result["failed_retryable"], 1)
+        with closing(self.database.connect()) as connection:
+            stored = connection.execute(
+                """SELECT status, warnings_json FROM translation_versions
+                   WHERE block_id=? AND pipeline='parallel_v4' AND active=1""",
+                (block.id,),
+            ).fetchone()
+        self.assertEqual(stored["status"], "failed_retryable")
+        self.assertEqual(json.loads(stored["warnings_json"]), [])
 
     def test_glossary_items_and_visible_characters_are_hard_bounded(self):
         source = " ".join(f"Name{index}" for index in range(500))

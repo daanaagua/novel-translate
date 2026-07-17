@@ -1266,3 +1266,173 @@ git diff --check
 git add tests/test_v4_storage_scale.py tests/test_narrative_pipeline.py docs/superpowers/specs/2026-07-16-narrative-memory-dynamic-translation-design.md
 git commit -m "test: verify narrative workflow end to end"
 ```
+
+## 任务 12：实现 token 预算投影和动态风格锚点
+
+**文件：**
+- 创建：`src/core/v4/prompt_projection.py`
+- 修改：`src/core/v4/models.py`
+- 修改：`src/core/v4/context.py`
+- 修改：`src/core/v4/narrative_memory.py`
+- 修改：`src/core/v4/pipeline.py`
+- 修改：`src/core/translator.py`
+- 修改：`config/prompts.yaml`
+- 修改：`config/config.example.yaml`
+- 修改：`main.py`
+- 创建：`tests/test_prompt_projection.py`
+- 修改：`tests/test_narrative_pipeline.py`
+- 修改：`tests/test_parallel_v4.py`
+
+- [x] **步骤 1：为预算优先级和确定性裁剪编写失败测试**
+
+测试必须证明：完整原文和硬约束永不被裁剪；相同输入产生相同投影；软预算不足
+时按边际效用移除可选项；仅必需材料超过硬预算时抛出可识别的人工处理异常；
+结果记录每部分的估算 token、进入的阶段和裁剪原因。
+
+```python
+def test_projection_drops_optional_anchor_before_required_semantics():
+    policy = PromptBudgetPolicy(draft_soft_tokens=80, reserve_ratio=0.20)
+    result = PromptProjector(policy).project(
+        stage="draft",
+        sections=(
+            PromptSection("source", "source", priority=0, required=True),
+            PromptSection("semantic", "must keep", priority=0, required=True),
+            PromptSection("style_anchor", "example " * 200, priority=4),
+        ),
+    )
+    assert "semantic" in result.included_section_ids
+    assert "style_anchor" in result.dropped_section_ids
+```
+
+- [x] **步骤 2：运行预算测试并确认因缺少投影器而失败**
+
+运行：
+
+```powershell
+& 'D:\llm\小说翻译\.venv\Scripts\python.exe' -m pytest tests/test_prompt_projection.py -q
+```
+
+预期：FAIL，`PromptBudgetPolicy`、`PromptSection` 或 `PromptProjector` 尚不存在。
+
+- [x] **步骤 3：实现无外部依赖的保守 token 估算和预算投影器**
+
+实现不可变的 `PromptBudgetPolicy`、`PromptSection`、`PromptProjection` 和
+`PromptBudgetOverflow`。优先使用调用方提供的精确 token 计数器；缺失时使用版本化
+保守估算器，对中文、英文、数字和标记分别计数，并保留 20% 余量。默认值：初译
+软预算 6,000、润色软预算 8,000；绝对字符护栏仍由 `max_context_chars` 执行。
+
+可选项以 `(marginal_utility, priority, stable_id)` 确定性排序；不是按字符串尾部截断。
+必需项超过硬预算时抛出 `PromptBudgetOverflow`。
+
+- [x] **步骤 4：为最小风格投影和锚点门控编写失败测试**
+
+测试必须覆盖：任意长 `style_delta` 只能投影成受控字段和 20–60 token 的一行提示；
+初译永远不接收中文例文；润色只有在位置、质量、文本类型和相似度门槛均满足时才
+获得至多一个 120–300 token 双语锚点；锚点不得来自未来、失败/回退译文或自身
+派生链；当前原文风格信号充分时锚点为空。
+
+```python
+def test_draft_projection_never_contains_bilingual_anchor():
+    material = projector.build_style_material(
+        stage="draft", style_state=state, anchor_candidates=[candidate]
+    )
+    assert material.anchor is None
+    assert estimate_tokens(material.directive) <= 60
+```
+
+- [x] **步骤 5：运行风格测试并确认因缺少门控而失败**
+
+运行步骤 2 的命令；预期新增用例 FAIL，现有实现会直接序列化完整 style state，且
+没有位置/质量/谱系门控。
+
+- [x] **步骤 6：实现最小风格状态和动态锚点选择**
+
+`style_delta` 只允许更新受控的叙事距离、语域、措辞密度、句法密度、节奏、对话
+习惯和文本类型字段；完整状态保存在 SQLite，提示投影只生成一行非事实性指导。
+
+锚点候选从当前位置之前已通过完整性校验的活动译文及其英文原文构建，保存来源
+块、质量、适用特征、父锚点和校准版本。选择器以位置合法性为硬门，按文本类型、
+叙述层、语域、句法特征相似度减去重复使用和谱系惩罚；效用不为正则不选择。
+模型只收到选中锚点的短双语正文，不收到评分、数据库 ID 或内部元数据。
+
+- [x] **步骤 7：为初译/润色分离投影编写失败的集成测试**
+
+捕获模型请求并断言：初译包含完整原文、硬语义和最小风格状态，但没有
+`<style_anchor>`、旧译基线或重复全书摘要要求；润色包含完整原文和初稿，按预算
+可带一个锚点；低效用锚点和基线不发送；审计记录估算 token 和裁剪决策。
+
+- [x] **步骤 8：接入两层翻译、配置和审计**
+
+`ContextPacket` 保留旧 `rendered` 兼容字段，同时增加结构化 section 统计、初译投影、
+润色基础投影、最小风格提示、可选锚点和裁剪记录。`TranslationEngine` 分别接收两层
+上下文，不再将同一 `memory_context` 原样复制给两个阶段。删除生产 prompt 中必须
+生成 1,200 字滚动摘要的要求，但兼容解析旧模型输出。
+
+配置增加：
+
+```yaml
+parallel_v4:
+  draft_input_soft_tokens: 6000
+  polish_input_soft_tokens: 8000
+  prompt_reserve_ratio: 0.20
+  style_directive_max_tokens: 60
+  style_anchor_max_tokens: 300
+  enable_style_anchors: true
+```
+
+模型配置的输出 `max_tokens` 保持安全上限含义。CLI 配置加载必须向
+`V4PipelineConfig` 传递上述字段。
+
+- [x] **步骤 9：运行定向测试并修复回归**
+
+```powershell
+& 'D:\llm\小说翻译\.venv\Scripts\python.exe' -m pytest `
+  tests/test_prompt_projection.py `
+  tests/test_narrative_pipeline.py `
+  tests/test_parallel_v4.py -q
+```
+
+预期：全部 PASS；既有不启用锚点的调用保持兼容。
+
+- [x] **步骤 10：运行完整回归和静态检查**
+
+```powershell
+& 'D:\llm\小说翻译\.venv\Scripts\python.exe' -m pytest tests --ignore=tests/test_foila_logic.py -q
+& 'D:\llm\小说翻译\.venv\Scripts\python.exe' -m compileall src main.py
+git diff --check
+```
+
+实际：最终重跑为 `665 passed, 8 subtests passed`；compileall 成功；`git diff --check`
+退出码为 0，仅显示工作树既有的 CRLF 提示。
+
+- [x] **步骤 11：记录三类真实文本的实测预算**
+
+在一个普通叙事块、一个术语密集块和一个包含对话的块上记录初译/润色各部分估算
+token、裁剪项和最终请求大小。不得调用付费模型作为单元测试条件。
+
+使用 `projects/new_sun_term_profile_trial` 中已有原文、知识库和活动初稿只读测量；
+预算显示的是预留 20% 后的可用量（初译 4,800，润色 6,400）：
+
+| 类型 | 真实块 | 原文 token | 词形命中/引号 | 初译输入 | 润色输入 | 裁剪 |
+|---|---|---:|---:|---:|---:|---|
+| 普通叙事 | `v01_ch04_001` | 1,051 | 17 / 2 | 3,920 / 4,800 | 5,272 / 6,400 | 无 |
+| 术语密集 | `v01_ch02_000` | 959 | 30 / 0 | 4,343 / 4,800 | 5,685 / 6,400 | 无 |
+| 对话密集 | `v01_ch07_001` | 1,057 | 23 / 28 | 4,401 / 4,800 | 6,013 / 6,400 | 无 |
+
+三次测量均把实际 system prompt、完整原文、结构化上下文和已有活动初稿计入，
+没有调用模型。术语密集和对话密集块接近可用软预算但仍留在绝对字符护栏内。
+
+- [x] **步骤 12：在确认工作树提交边界后提交**
+
+用户已确认先做完整验证，再将当前功能分支中前序 schema 9/10 与本任务的连续改动
+作为同一集成边界提交并合并到 `main`。
+
+```powershell
+git add docs/superpowers/specs/2026-07-16-narrative-memory-dynamic-translation-design.md `
+  docs/superpowers/plans/2026-07-16-narrative-memory-dynamic-translation.md `
+  src/core/v4/prompt_projection.py src/core/v4/models.py src/core/v4/context.py `
+  src/core/v4/narrative_memory.py src/core/v4/pipeline.py src/core/translator.py `
+  config/prompts.yaml config/config.example.yaml main.py `
+  tests/test_prompt_projection.py tests/test_narrative_pipeline.py tests/test_parallel_v4.py
+git commit -m "feat: budget translation prompts and gate style anchors"
+```

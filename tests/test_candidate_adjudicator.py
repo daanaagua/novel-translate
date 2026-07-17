@@ -87,6 +87,7 @@ class SchemaAwareFakeLLM:
                         "work",
                         "artwork",
                         "personification",
+                        "role",
                         "unknown_named_entity",
                     )
                 ),
@@ -242,6 +243,18 @@ def user_payload(request):
 
 
 def test_strict_response_contract_rejects_extra_fields_and_illegal_values():
+    role = AdjudicationDecision.model_validate(
+        {
+            "cluster_id": "K01",
+            "verdict": "promote",
+            "selected_ids": ["K01A"],
+            "entity_kind": "role",
+            "confidence": 0.98,
+            "reason": "recurring translation-sensitive profession",
+        }
+    )
+    assert role.entity_kind == "role"
+
     with pytest.raises(ValidationError):
         AdjudicationDecision.model_validate(
             {
@@ -267,6 +280,35 @@ def test_strict_response_contract_rejects_extra_fields_and_illegal_values():
                 ]
             }
         )
+
+
+def test_semantic_gate_keeps_translation_sensitive_recurring_roles():
+    source = "The torturer waited. Another torturer entered."
+    item = cluster(
+        "cluster-role",
+        [candidate("candidate-role", source, 4, 12)],
+        affected_blocks=2,
+    )
+    llm = FakeLLM(
+        [
+            response(
+                entity_kind="role",
+                confidence=0.97,
+                reason="recurring profession with book-wide terminology",
+            )
+        ]
+    )
+
+    result = V4Adjudicator(llm, max_attempts=1).adjudicate(
+        batch(item), {"block-1": source}
+    )
+
+    assert result[0].entity_kind == "role"
+    system = llm.requests[0]["messages"][0]["content"].lower()
+    assert "recurring roles" in system
+    assert "profession" in system
+    assert "common noun" in system
+    assert "not by itself a reason to reject" in system
 
 
 def test_initial_and_retry_prompts_repeat_the_complete_canonical_protocol():

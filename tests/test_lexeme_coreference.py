@@ -1581,6 +1581,60 @@ def test_merge_concept_redirect_moves_active_associations_and_preserves_history(
     assert database.read_audit_payload(old_audit)["raw_response"] == "old concept evidence"
 
 
+def test_merge_concepts_transfers_active_term_profile_to_canonical(tmp_path):
+    database, _, _, _, _, decision_id = _prepare_authorized_merge(tmp_path)
+    canonical_id, old_id = "concept-a", "concept-b"
+    with database.transaction() as connection:
+        version = connection.execute(
+            "SELECT MAX(id) FROM knowledge_versions"
+        ).fetchone()[0]
+        connection.execute(
+            """INSERT INTO term_profiles(
+                   subject_type, subject_id, semantic_core,
+                   contrast_sources_json, status, locked,
+                   created_version, created_at)
+               VALUES('concept', ?, ?, ?, 'verified', 1, ?, 'now')""",
+            (
+                old_id,
+                "以刑讯、拷问为职责的正式职业身份。",
+                json.dumps(["executioner", "headsman"]),
+                version,
+            ),
+        )
+
+    result = database.merge_concepts(
+        [old_id, canonical_id],
+        reason="same identity",
+        decision_id=decision_id,
+    )
+
+    assert result["canonical_id"] == canonical_id
+    with closing(database.connect()) as connection:
+        active = connection.execute(
+            """SELECT subject_id, semantic_core, contrast_sources_json,
+                      status, locked, created_version
+               FROM term_profiles
+               WHERE subject_type='concept' AND retired_version IS NULL"""
+        ).fetchall()
+        retired_old = connection.execute(
+            """SELECT retired_version FROM term_profiles
+               WHERE subject_type='concept' AND subject_id=?
+               ORDER BY created_version DESC LIMIT 1""",
+            (old_id,),
+        ).fetchone()[0]
+    assert [tuple(row) for row in active] == [
+        (
+            canonical_id,
+            "以刑讯、拷问为职责的正式职业身份。",
+            '["executioner","headsman"]',
+            "verified",
+            1,
+            result["knowledge_version"],
+        )
+    ]
+    assert retired_old == result["knowledge_version"]
+
+
 def test_merge_concept_redirect_combines_dependency_evidence_and_identical_rules(tmp_path):
     database, _, _, _, _, decision_id = _prepare_authorized_merge(tmp_path)
     canonical_id, old_id = "concept-a", "concept-b"

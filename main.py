@@ -655,6 +655,24 @@ def cmd_translate_v4(args):
             getattr(args, "max_narrative_context_chars", None)
             or int(settings.get("max_narrative_context_chars", 6000))
         ),
+        draft_input_soft_tokens=int(
+            settings.get("draft_input_soft_tokens", 6000)
+        ),
+        polish_input_soft_tokens=int(
+            settings.get("polish_input_soft_tokens", 8000)
+        ),
+        prompt_reserve_ratio=float(
+            settings.get("prompt_reserve_ratio", 0.20)
+        ),
+        style_directive_max_tokens=int(
+            settings.get("style_directive_max_tokens", 60)
+        ),
+        style_anchor_max_tokens=int(
+            settings.get("style_anchor_max_tokens", 300)
+        ),
+        enable_style_anchors=bool(
+            settings.get("enable_style_anchors", True)
+        ),
         draft_temperature=float(draft.get("temperature", 0.1)),
         draft_max_tokens=int(draft.get("max_tokens", 6144)),
         polish_temperature=float(polish.get("temperature", 0.2)),
@@ -698,6 +716,24 @@ def _build_narrative_pipeline(project, args):
             ),
             max_narrative_context_chars=int(
                 settings.get("max_narrative_context_chars", 6000)
+            ),
+            draft_input_soft_tokens=int(
+                settings.get("draft_input_soft_tokens", 6000)
+            ),
+            polish_input_soft_tokens=int(
+                settings.get("polish_input_soft_tokens", 8000)
+            ),
+            prompt_reserve_ratio=float(
+                settings.get("prompt_reserve_ratio", 0.20)
+            ),
+            style_directive_max_tokens=int(
+                settings.get("style_directive_max_tokens", 60)
+            ),
+            style_anchor_max_tokens=int(
+                settings.get("style_anchor_max_tokens", 300)
+            ),
+            enable_style_anchors=bool(
+                settings.get("enable_style_anchors", True)
             ),
             max_workers=int(settings.get("max_workers", 4)),
             audit_mode=settings.get("audit_mode", "full"),
@@ -805,6 +841,24 @@ def cmd_revalidate_v4(args):
                 ),
                 max_narrative_context_chars=int(
                     settings.get("max_narrative_context_chars", 6000)
+                ),
+                draft_input_soft_tokens=int(
+                    settings.get("draft_input_soft_tokens", 6000)
+                ),
+                polish_input_soft_tokens=int(
+                    settings.get("polish_input_soft_tokens", 8000)
+                ),
+                prompt_reserve_ratio=float(
+                    settings.get("prompt_reserve_ratio", 0.20)
+                ),
+                style_directive_max_tokens=int(
+                    settings.get("style_directive_max_tokens", 60)
+                ),
+                style_anchor_max_tokens=int(
+                    settings.get("style_anchor_max_tokens", 300)
+                ),
+                enable_style_anchors=bool(
+                    settings.get("enable_style_anchors", True)
                 ),
             ),
         )

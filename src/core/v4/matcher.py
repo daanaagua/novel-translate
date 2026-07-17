@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import unicodedata
 from collections import deque
 from copy import deepcopy
@@ -893,6 +894,36 @@ class FrozenRenderIndex(Sequence[Mapping[str, Any]]):
                     },
                 }
             )
+            left = text[:start].rstrip()
+            right = text[end:].lstrip()
+            master_prefix = re.search(
+                r"\b(?:master|mistress|lord|lady|sir|madam|doctor|captain)$",
+                left,
+                re.IGNORECASE,
+            )
+            comma_address = left.endswith(",") and (
+                not right or right[0] in ",.!?;:"
+            )
+            leading_address = (
+                not left
+                or left[-1] in "“\"'‘(["
+            ) and bool(right) and right[0] in ",.!?;:"
+            if master_prefix or comma_address or leading_address:
+                occurrence_context["discourse_function"] = "vocative"
+                occurrence_context["usage"] = "direct_address"
+            else:
+                self_identification = re.search(
+                    r"\b(?:i am|i'm|call me)\s+(?:an?\s+)?$",
+                    left,
+                    re.IGNORECASE,
+                )
+                if self_identification:
+                    occurrence_context.setdefault(
+                        "usage", "self_identification"
+                    )
+            if matched_form.casefold().endswith("s"):
+                occurrence_context.setdefault("grammatical_number", "plural")
+                occurrence_context.setdefault("usage", "group_reference")
             occurrence_mention = (
                 specific_context.get("mention")
                 if specific_context is not None
@@ -1005,6 +1036,11 @@ class FrozenRenderIndex(Sequence[Mapping[str, Any]]):
                             or []
                         )
                         + list((selected or {}).get("rules", []) or [])
+                    ),
+                    "term_profile": deepcopy(
+                        (selected or {}).get("term_profile")
+                        or lexeme.get("term_profile")
+                        or {}
                     ),
                 }
             )

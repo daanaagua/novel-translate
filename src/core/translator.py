@@ -25,6 +25,13 @@ class TranslationConfig:
     glossary_mode: str = "auto" 
     strict_response_parsing: bool = False
     persist_discoveries: bool = True
+    draft_input_soft_tokens: int = 6000
+    polish_input_soft_tokens: int = 8000
+    prompt_reserve_ratio: float = 0.20
+    style_directive_max_tokens: int = 60
+    style_anchor_max_tokens: int = 300
+    enable_style_anchors: bool = True
+    max_context_chars: int = 24000
 
 
 
@@ -249,6 +256,7 @@ class TranslationEngine:
         stream_callback: Optional[callable] = None,
         comparison_reference: Optional[str] = None,
         semantic_obligations_hint: Optional[str] = None,
+        prompt_context: Optional[Any] = None,
     ) -> TextChunk:
         """
         翻译单个文本块 (新版流式逻辑)
@@ -266,11 +274,58 @@ class TranslationEngine:
             if stream_callback: stream_callback("draft_start", "")
             
             # 准备 Prompt 上下文
+            draft_projected_context = None
+            draft_system_prompt = None
+            if prompt_context is not None:
+                from .v4.prompt_projection import PromptSection
+
+                draft_sections = tuple(
+                    getattr(prompt_context, "draft_sections", ()) or ()
+                )
+                if draft_sections:
+                    draft_system_prompt = self._projected_draft_system_prompt()
+                    draft_sections = (
+                        PromptSection(
+                            "draft_system_prompt",
+                            draft_system_prompt,
+                            priority=0,
+                            required=True,
+                            render=False,
+                        ),
+                        *draft_sections,
+                    )
+                    if semantic_obligations_hint:
+                        draft_sections = (
+                            *draft_sections,
+                            PromptSection(
+                                "semantic_obligations_hint",
+                                "<semantic_obligations_hint>\n"
+                                f"{semantic_obligations_hint}\n"
+                                "</semantic_obligations_hint>",
+                                priority=0,
+                                required=True,
+                            ),
+                        )
+                    prompt_context.draft_projection = (
+                        self._prompt_projector().project(
+                            stage="draft",
+                            sections=draft_sections,
+                            max_chars=self.config.max_context_chars,
+                        )
+                    )
+                projection = getattr(
+                    prompt_context, "draft_projection", None
+                )
+                if projection is not None:
+                    draft_projected_context = projection.rendered
+
             draft_response_generator = self._draft_translate(
                 source_text=chunk.source_text,
                 memory_context=memory_context or previous_summary,
                 previous_chunk_text=previous_chunk_text,
                 semantic_obligations_hint=semantic_obligations_hint,
+                projected_context=draft_projected_context,
+                system_prompt_override=draft_system_prompt,
             )
             
             # 流式解析 Accumulator
@@ -332,10 +387,7 @@ class TranslationEngine:
                 )
                 style_delta = response_data.get("style_delta") or {}
                 chunk.style_delta = (
-                    {
-                        str(key)[:64]: str(value)[:256]
-                        for key, value in style_delta.items()
-                    }
+                    self._sanitize_style_delta(style_delta)
                     if isinstance(style_delta, dict)
                     else {}
                 )
@@ -372,12 +424,80 @@ class TranslationEngine:
                 chunk.status = ChunkStatus.POLISHING
                 if stream_callback: stream_callback("polish_start", "")
                 
+                polish_projected_context = None
+                polish_system_prompt = None
+                if prompt_context is not None:
+                    from .v4.prompt_projection import PromptSection
+
+                    polish_sections = list(
+                        getattr(prompt_context, "polish_sections", ()) or ()
+                    )
+                    if polish_sections:
+                        polish_system_prompt = (
+                            self._projected_polish_system_prompt()
+                        )
+                        polish_sections.insert(
+                            0,
+                            PromptSection(
+                                "polish_system_prompt",
+                                polish_system_prompt,
+                                priority=0,
+                                required=True,
+                                render=False,
+                            ),
+                        )
+                        polish_sections.extend(
+                            [
+                                PromptSection(
+                                    "draft_translation",
+                                    "<layer_one_translation>\n"
+                                    f"{chunk.draft_translation}\n"
+                                    "</layer_one_translation>",
+                                    priority=0,
+                                    required=True,
+                                ),
+                                PromptSection(
+                                    "semantic_obligations",
+                                    "<semantic_obligations>\n"
+                                    f"{chunk.semantic_obligations or '（无特殊语义义务）'}\n"
+                                    "</semantic_obligations>",
+                                    priority=0,
+                                    required=True,
+                                ),
+                            ]
+                        )
+                        if comparison_reference:
+                            polish_sections.append(
+                                PromptSection(
+                                    "comparison_reference",
+                                    "<comparison_reference>\n"
+                                    f"{comparison_reference}\n"
+                                    "</comparison_reference>\n"
+                                    "旧译文只用于逐句查漏和比较措辞，"
+                                    "英文原文是唯一事实依据。",
+                                    priority=4,
+                                    marginal_utility=0.35,
+                                )
+                            )
+                        prompt_context.polish_projection = (
+                            self._prompt_projector().project(
+                                stage="polish",
+                                sections=tuple(polish_sections),
+                                max_chars=self.config.max_context_chars,
+                            )
+                        )
+                        polish_projected_context = (
+                            prompt_context.polish_projection.rendered
+                        )
+
                 polish_gen = self._polish_translate(
                     source_text=chunk.source_text,
                     draft_translation=chunk.draft_translation,
                     semantic_obligations=chunk.semantic_obligations or "",
                     memory_context=memory_context or previous_summary or "",
                     comparison_reference=comparison_reference or "",
+                    projected_context=polish_projected_context,
+                    system_prompt_override=polish_system_prompt,
                 )
                 
                 # 消费润色流
@@ -416,6 +536,8 @@ class TranslationEngine:
                         memory_context=memory_context or previous_summary or "",
                         comparison_reference=comparison_reference or "",
                         retry_reason="；".join(polish_problems),
+                        projected_context=polish_projected_context,
+                        system_prompt_override=polish_system_prompt,
                     )
                     retry_text = ""
                     for item in retry_gen:
@@ -484,6 +606,10 @@ class TranslationEngine:
             self._last_chunk_translation = chunk.final_translation
             
         except Exception as e:
+            from .v4.prompt_projection import PromptBudgetOverflow
+
+            if isinstance(e, PromptBudgetOverflow):
+                raise
             chunk.status = ChunkStatus.FAILED
             chunk.error_message = str(e)
             # 重新抛出以便上层知晓
@@ -703,7 +829,10 @@ class TranslationEngine:
     def _render_glossary_term(term: Any) -> str:
         src = str(term.src).strip()
         target = str(term.default_target).strip()
-        lines = [f"- {src} -> {target}"]
+        category = getattr(term, "category", None)
+        category_value = str(getattr(category, "value", category) or "")
+        role_prefix = "[职业身份] " if category_value == "role" else ""
+        lines = [f"- {role_prefix}{src} -> {target}"]
         if getattr(term, "description", None):
             lines.append(f"  说明: {term.description}")
         for rule in getattr(term, "rules", []) or []:
@@ -714,6 +843,56 @@ class TranslationEngine:
             lines.append(f"  - 若 {condition}: 译为 「{rule_target}」")
         return "\n".join(lines)
 
+    def _prompt_projector(self) -> Any:
+        from .v4.prompt_projection import PromptBudgetPolicy, PromptProjector
+
+        return PromptProjector(
+            PromptBudgetPolicy(
+                draft_soft_tokens=self.config.draft_input_soft_tokens,
+                polish_soft_tokens=self.config.polish_input_soft_tokens,
+                reserve_ratio=self.config.prompt_reserve_ratio,
+                style_directive_max_tokens=(
+                    self.config.style_directive_max_tokens
+                ),
+                style_anchor_max_tokens=self.config.style_anchor_max_tokens,
+                enable_style_anchors=self.config.enable_style_anchors,
+            )
+        )
+
+    @staticmethod
+    def _sanitize_style_delta(style_delta: Dict[str, Any]) -> Dict[str, str]:
+        from .v4.prompt_projection import sanitize_style_delta
+
+        return sanitize_style_delta(style_delta)
+
+    def _projected_draft_system_prompt(self) -> str:
+        """Render the exact compact system prompt used with V4 projections."""
+
+        template = self.prompts.get("draft", {}).get(
+            "system", self._default_draft_system()
+        )
+        return template.format(
+            glossary_rules=(
+                "（术语约束已由本轮结构化上下文提供，不在系统提示中重复。）"
+            ),
+            entity_context="",
+        )
+
+    def _projected_polish_system_prompt(self) -> str:
+        """Render the exact compact polish system prompt for budgeting."""
+
+        template = self.prompts.get("polish", {}).get(
+            "system", self._default_polish_system()
+        )
+        return template.format(
+            glossary_rules=(
+                "（术语约束已由本轮结构化上下文提供，不在系统提示中重复。）"
+            ),
+            style_reference=(
+                self.config.style_reference or "（动态风格状态见本轮上下文。）"
+            ),
+        )
+
     def _draft_translate(
         self,
         source_text: str,
@@ -721,6 +900,8 @@ class TranslationEngine:
         previous_chunk_text: Optional[str] = None,
         logic_analysis: Any = None, # Keep for compatibility signature, unused
         semantic_obligations_hint: Optional[str] = None,
+        projected_context: Optional[str] = None,
+        system_prompt_override: Optional[str] = None,
     ) -> Any:
         """
         直译阶段 (Logic-Aware + Memory-Augmented)
@@ -751,6 +932,9 @@ class TranslationEngine:
         if working_terms:
             glossary_parts.append(
                 "【本轮全书工作译名，必须统一使用，仅明确rendering rule可覆盖；不代表人工核验】\n"
+                "职业身份条目允许按中文句法补足群体、行会或敬称关系，并重组周围介词；"
+                "不得把“在某职业群体中成长”机械写成“在某官职中成长”，"
+                "也不得把英文敬称与中文职业名堆叠成生硬的“某官大师”。\n"
                 + "\n".join(self._render_glossary_term(term) for term in working_terms)
             )
         if pending_terms:
@@ -773,21 +957,23 @@ class TranslationEngine:
             glossary_rules=glossary_rules,
             entity_context=entity_context
         )
+        if system_prompt_override is not None:
+            system_prompt = system_prompt_override
         
         # 构建 User Prompt (采用结构化 Context 注入)
-        user_content = ""
+        user_content = projected_context or ""
         
         # 1. 注入全书滚动摘要和最近块衔接
-        if memory_context:
+        if not projected_context and memory_context:
             user_content += f"<memory_context>\n{memory_context}\n</memory_context>\n\n"
             
         # 2. 注入 Text Context (上一段原文，防止割裂)
-        if previous_chunk_text:
+        if not projected_context and previous_chunk_text:
             # 取最后 200 字符作为衔接参考
             context_snippet = previous_chunk_text[-200:] if len(previous_chunk_text) > 200 else previous_chunk_text
             user_content += f"<immediate_context>\n...{context_snippet}\n</immediate_context>\n\n"
 
-        if semantic_obligations_hint:
+        if not projected_context and semantic_obligations_hint:
             user_content += (
                 "<semantic_obligations_hint>\n"
                 f"{semantic_obligations_hint}\n"
@@ -797,7 +983,8 @@ class TranslationEngine:
             )
         
         # 3. 注入当前文本
-        user_content += f"<text_to_translate>\n{source_text}\n</text_to_translate>"
+        if not projected_context:
+            user_content += f"<text_to_translate>\n{source_text}\n</text_to_translate>"
         
         messages = [
             {"role": "system", "content": system_prompt},
@@ -821,6 +1008,8 @@ class TranslationEngine:
         memory_context: str = "",
         comparison_reference: str = "",
         retry_reason: str = "",
+        projected_context: Optional[str] = None,
+        system_prompt_override: Optional[str] = None,
     ) -> Any:
         """
         润色阶段
@@ -852,6 +1041,9 @@ class TranslationEngine:
         if working_terms:
             glossary_parts.append(
                 "【本轮全书工作译名，必须统一使用，仅明确rendering rule可覆盖；不代表人工核验】\n"
+                "职业身份条目允许按中文句法补足群体、行会或敬称关系，并重组周围介词；"
+                "不得把“在某职业群体中成长”机械写成“在某官职中成长”，"
+                "也不得把英文敬称与中文职业名堆叠成生硬的“某官大师”。\n"
                 + "\n".join(self._render_glossary_term(term) for term in working_terms)
             )
         if pending_terms:
@@ -864,6 +1056,8 @@ class TranslationEngine:
             style_reference=self.config.style_reference or "(无特定风格参考)",
             glossary_rules=glossary_rules,
         )
+        if system_prompt_override is not None:
+            system_prompt = system_prompt_override
         
         # 构建 User Prompt
         user_template = self.prompts.get("polish", {}).get("user", 
@@ -872,13 +1066,13 @@ class TranslationEngine:
             "\n\n## 旧译文对照\n{comparison_reference}"
             "\n\n旧译文只用于逐句查漏和比较措辞，英文原文是唯一事实依据。"
             "请综合两稿各自较好的部分，输出最终译文。")
-        user_prompt = user_template.format(
-            source_text=source_text,
-            draft_translation=draft_translation,
-            semantic_obligations=semantic_obligations or "（无特殊语义义务）",
-            memory_context=memory_context,
-            comparison_reference=comparison_reference or "（无旧译文对照）",
-        )
+        user_prompt = projected_context or user_template.format(
+                source_text=source_text,
+                draft_translation=draft_translation,
+                semantic_obligations=semantic_obligations or "（无特殊语义义务）",
+                memory_context=memory_context,
+                comparison_reference=comparison_reference or "（无旧译文对照）",
+            )
         if retry_reason:
             paragraph_count = len([
                 part for part in __import__("re").split(

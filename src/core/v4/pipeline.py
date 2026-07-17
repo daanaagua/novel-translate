@@ -49,7 +49,13 @@ from .narrative_scheduler import (
     NarrativeScheduler,
     NarrativeSignals,
 )
+from .prompt_projection import (
+    PromptBudgetOverflow,
+    PromptBudgetPolicy,
+    PromptProjection,
+)
 from .semantic_mapper import SemanticMapper, SemanticMapperConfig
+from .term_validator import TermConsistencyValidator
 
 
 @dataclass
@@ -82,6 +88,12 @@ class V4PipelineConfig:
     polish_max_tokens: int = 6144
     style_reference: Optional[str] = None
     use_baseline_reference: bool = False
+    draft_input_soft_tokens: int = 6000
+    polish_input_soft_tokens: int = 8000
+    prompt_reserve_ratio: float = 0.20
+    style_directive_max_tokens: int = 60
+    style_anchor_max_tokens: int = 300
+    enable_style_anchors: bool = True
     audit_mode: str = "full"
     force: bool = False
 
@@ -106,6 +118,16 @@ class V4PipelineConfig:
         self.premap_max_attempts = max(1, self.premap_max_attempts)
         self.max_narrative_context_chars = max(
             256, self.max_narrative_context_chars
+        )
+        self.draft_input_soft_tokens = max(256, self.draft_input_soft_tokens)
+        self.polish_input_soft_tokens = max(256, self.polish_input_soft_tokens)
+        if not 0.0 <= self.prompt_reserve_ratio < 1.0:
+            raise ValueError("prompt_reserve_ratio 必须在 [0, 1) 范围内")
+        self.style_directive_max_tokens = max(
+            20, min(60, self.style_directive_max_tokens)
+        )
+        self.style_anchor_max_tokens = max(
+            120, min(300, self.style_anchor_max_tokens)
         )
         self.include_block_ids = tuple(dict.fromkeys(self.include_block_ids))
 
@@ -208,7 +230,20 @@ class V4TranslationPipeline:
         self.llm_factory = llm_factory
         self.prompts = prompts or {}
         self.config = config or V4PipelineConfig()
-        self.context_builder = ContextBuilder(database, self.config.max_context_chars)
+        self.context_builder = ContextBuilder(
+            database,
+            self.config.max_context_chars,
+            budget_policy=PromptBudgetPolicy(
+                draft_soft_tokens=self.config.draft_input_soft_tokens,
+                polish_soft_tokens=self.config.polish_input_soft_tokens,
+                reserve_ratio=self.config.prompt_reserve_ratio,
+                style_directive_max_tokens=(
+                    self.config.style_directive_max_tokens
+                ),
+                style_anchor_max_tokens=self.config.style_anchor_max_tokens,
+                enable_style_anchors=self.config.enable_style_anchors,
+            ),
+        )
         self.narrative_store = NarrativeMemoryStore(database)
         self.narrative_scheduler = NarrativeScheduler(
             max_workers=self.config.max_workers
@@ -343,9 +378,33 @@ class V4TranslationPipeline:
                         base_description = str(
                             concept.get("description") or ""
                         ).strip()
+                        term_profile = (
+                            concept.get("term_profile")
+                            or lexeme.get("term_profile")
+                            or {}
+                        )
+                        semantic_core = str(
+                            term_profile.get("semantic_core") or ""
+                        ).strip()
+                        contrast_sources = [
+                            str(value).strip()
+                            for value in term_profile.get("contrast_sources") or []
+                            if str(value).strip()
+                        ]
+                        contrast_note = (
+                            "须与原文词保持区别: "
+                            + "、".join(contrast_sources)
+                            if contrast_sources
+                            else ""
+                        )
                         description = " ".join(
                             value
-                            for value in (base_description, location_note)
+                            for value in (
+                                base_description,
+                                semantic_core,
+                                contrast_note,
+                                location_note,
+                            )
                             if value
                         ) or None
                         item_id = (
@@ -357,7 +416,11 @@ class V4TranslationPipeline:
                                 src=source or str(lexeme.get("source") or ""),
                                 default_target=target,
                                 category=self._category(
-                                    str(concept.get("kind") or "concept")
+                                    str(
+                                        concept.get("kind")
+                                        or lexeme.get("kind")
+                                        or "concept"
+                                    )
                                 ),
                                 status=status,
                                 description=description,
@@ -456,6 +519,27 @@ class V4TranslationPipeline:
                 if concept.get("target_strength") == "working"
                 else TermStatus.PENDING
             )
+            profile = concept.get("term_profile") or {}
+            semantic_core = str(profile.get("semantic_core") or "").strip()
+            contrast_sources = [
+                str(value).strip()
+                for value in profile.get("contrast_sources") or []
+                if str(value).strip()
+            ]
+            description = " ".join(
+                value
+                for value in (
+                    str(concept.get("description") or "").strip(),
+                    semantic_core,
+                    (
+                        "须与原文词保持区别: "
+                        + "、".join(contrast_sources)
+                        if contrast_sources
+                        else ""
+                    ),
+                )
+                if value
+            ) or None
             items.append(
                 GlossaryItem(
                     id=concept["id"],
@@ -463,7 +547,7 @@ class V4TranslationPipeline:
                     default_target=target,
                     category=self._category(concept.get("kind") or "concept"),
                     status=status,
-                    description=concept.get("description") or None,
+                    description=description,
                     rules=rules,
                 )
             )
@@ -501,6 +585,13 @@ class V4TranslationPipeline:
             glossary_mode="manual",
             strict_response_parsing=True,
             persist_discoveries=False,
+            draft_input_soft_tokens=self.config.draft_input_soft_tokens,
+            polish_input_soft_tokens=self.config.polish_input_soft_tokens,
+            prompt_reserve_ratio=self.config.prompt_reserve_ratio,
+            style_directive_max_tokens=self.config.style_directive_max_tokens,
+            style_anchor_max_tokens=self.config.style_anchor_max_tokens,
+            enable_style_anchors=self.config.enable_style_anchors,
+            max_context_chars=self.config.max_context_chars,
         )
 
     @staticmethod
@@ -515,6 +606,55 @@ class V4TranslationPipeline:
             )
             for relation in result.semantic_relations
         )
+
+    @staticmethod
+    def _source_style_confidence(result: NarrativePremapResult) -> float:
+        """Use only current-block premap evidence to suppress needless anchors."""
+
+        delta = result.discourse_delta
+        if (
+            not tuple(delta.style_signals or ())
+            or bool(getattr(result, "degraded", False))
+            or bool(getattr(delta, "premap_uncertain", False))
+        ):
+            return 0.0
+        confidence = delta.state_confidence
+        if confidence is None:
+            return 0.8
+        return min(1.0, max(0.0, float(confidence)))
+
+    @staticmethod
+    def _projection_audit(
+        projection: PromptProjection | None,
+    ) -> Dict[str, Any]:
+        if projection is None:
+            return {}
+        return {
+            "stage": projection.stage,
+            "estimated_tokens": projection.estimated_tokens,
+            "estimated_chars": projection.estimated_chars,
+            "budget_tokens": projection.budget_tokens,
+            "budget_chars": projection.budget_chars,
+            "reserve_ratio": projection.reserve_ratio,
+            "estimator_version": projection.estimator_version,
+            "included_section_ids": list(
+                projection.included_section_ids
+            ),
+            "dropped_section_ids": list(projection.dropped_section_ids),
+            "section_token_estimates": dict(
+                projection.section_token_estimates
+            ),
+            "decisions": {
+                stable_id: {
+                    "included": decision.included,
+                    "reason": decision.reason,
+                    "estimated_tokens": decision.estimated_tokens,
+                    "priority": decision.priority,
+                    "marginal_utility": decision.marginal_utility,
+                }
+                for stable_id, decision in projection.decisions.items()
+            },
+        }
 
     def _provisional_subjects(
         self, block: V4Block, prior_state: DiscourseState
@@ -1112,8 +1252,22 @@ class V4TranslationPipeline:
                     style_snapshot=self._active_style_snapshots.get(
                         block.id
                     ),
+                    style_anchor_candidates=(
+                        self.narrative_store.style_anchor_candidates_before(
+                            block
+                        )
+                        if self.config.enable_style_anchors
+                        else ()
+                    ),
+                    source_style_confidence=(
+                        self._source_style_confidence(
+                            narrative_context.result
+                        )
+                        if narrative_context is not None
+                        else 0.0
+                    ),
                 )
-            except ContextOverflow as exc:
+            except (ContextOverflow, PromptBudgetOverflow) as exc:
                 outcomes.append(
                     TranslationOutcome(
                         block=block,
@@ -1134,26 +1288,6 @@ class V4TranslationPipeline:
                 reference = self.database.comparison_reference_for_block(block.id)
                 if reference:
                     comparison_reference = str(reference.get("text") or "").strip()
-                if (
-                    comparison_reference
-                    and packet.required_chars + len(comparison_reference)
-                    > self.config.max_context_chars
-                ):
-                    outcomes.append(
-                        TranslationOutcome(
-                            block=block,
-                            knowledge_version=knowledge_version,
-                            status=V4BlockStatus.INCOMPLETE_REQUIRES_HUMAN.value,
-                            matched_concept_ids=list(packet.matched_concept_ids),
-                            matched_renderings=frozen_render_matches,
-                            error=(
-                                f"{block.id} 加入旧译文对照后必需上下文 "
-                                f"{packet.required_chars + len(comparison_reference)} 字符超过预算 "
-                                f"{self.config.max_context_chars}；需要人工处理"
-                            ),
-                        )
-                    )
-                    break
             result: Optional[TextChunk] = None
             attempts = 0
             semantic_obligations_hint = (
@@ -1199,29 +1333,94 @@ class V4TranslationPipeline:
                         )
                     )
                     break
+            prompt_budget_error: PromptBudgetOverflow | None = None
             for attempts in range(1, self.config.max_attempts + 1):
-                result = engine.translate_chunk(
-                    TextChunk(
-                        id=block.id,
-                        chapter_id=block.chapter_id,
-                        index=block.block_index,
-                        source_text=block.source_text,
-                        token_count=block.token_count,
-                    ),
-                    memory_context=packet.rendered,
-                    previous_summary=local_summary,
-                    previous_chunk_text=previous_source,
-                    comparison_reference=comparison_reference,
-                    semantic_obligations_hint=semantic_obligations_hint,
-                )
+                try:
+                    result = engine.translate_chunk(
+                        TextChunk(
+                            id=block.id,
+                            chapter_id=block.chapter_id,
+                            index=block.block_index,
+                            source_text=block.source_text,
+                            token_count=block.token_count,
+                        ),
+                        memory_context=packet.rendered,
+                        previous_summary=local_summary,
+                        previous_chunk_text=previous_source,
+                        comparison_reference=comparison_reference,
+                        semantic_obligations_hint=semantic_obligations_hint,
+                        prompt_context=packet,
+                    )
+                except PromptBudgetOverflow as exc:
+                    prompt_budget_error = exc
+                    break
                 if result.status in {ChunkStatus.COMPLETED, ChunkStatus.HUMAN_REVIEW}:
                     break
+            if prompt_budget_error is not None:
+                block_audits = [
+                    dict(call) for call in audited_llm.calls[call_start:]
+                ]
+                for call in block_audits:
+                    call["accepted"] = False
+                    if call.get("purpose") == "draft":
+                        request = dict(call.get("request") or {})
+                        request["prompt_projection"] = (
+                            self._projection_audit(packet.draft_projection)
+                        )
+                        call["request"] = request
+                    elif call.get("purpose") == "polish":
+                        request = dict(call.get("request") or {})
+                        request["prompt_projection"] = (
+                            self._projection_audit(packet.polish_projection)
+                        )
+                        call["request"] = request
+                outcomes.append(
+                    TranslationOutcome(
+                        block=block,
+                        knowledge_version=knowledge_version,
+                        memory_version=packet.memory_version,
+                        snapshot_id=packet.snapshot_id,
+                        context_hash=packet.context_hash,
+                        style_snapshot_id=packet.style_snapshot_id,
+                        style_anchor_id=packet.style_anchor_id or "",
+                        discourse_state_hash=packet.discourse_state_hash,
+                        status=(
+                            V4BlockStatus.INCOMPLETE_REQUIRES_HUMAN.value
+                        ),
+                        matched_concept_ids=list(packet.matched_concept_ids),
+                        matched_renderings=frozen_render_matches,
+                        audit_calls=block_audits,
+                        attempts=attempts,
+                        elapsed_ms=int(
+                            (time.perf_counter() - started) * 1000
+                        ),
+                        error=str(prompt_budget_error),
+                    )
+                )
+                break
             assert result is not None
             block_proposals = proposals[proposal_start:]
             term_proposals = [payload for kind, payload in block_proposals if kind == "term"]
             relation_proposals = [payload for kind, payload in block_proposals if kind == "relation"]
+            term_consistency_warnings: List[Dict[str, Any]] = []
+            if (
+                isinstance(concept_snapshot, FrozenRenderIndex)
+                and result.status
+                in {ChunkStatus.COMPLETED, ChunkStatus.HUMAN_REVIEW}
+                and bool((result.final_translation or "").strip())
+            ):
+                term_consistency_warnings = TermConsistencyValidator.validate(
+                    source_text=block.source_text,
+                    final_translation=result.final_translation or "",
+                    matches=frozen_render_matches,
+                    render_index=concept_snapshot,
+                )
             if result.status == ChunkStatus.COMPLETED:
-                status = V4BlockStatus.COMPLETED.value
+                status = (
+                    V4BlockStatus.COMPLETED_WITH_WARNINGS.value
+                    if term_consistency_warnings
+                    else V4BlockStatus.COMPLETED.value
+                )
             elif result.status == ChunkStatus.HUMAN_REVIEW:
                 status = V4BlockStatus.COMPLETED_WITH_WARNINGS.value
             else:
@@ -1231,6 +1430,18 @@ class V4TranslationPipeline:
                 call["accepted"] = False
             draft_audits = [call for call in block_audits if call.get("purpose") == "draft"]
             polish_audits = [call for call in block_audits if call.get("purpose") == "polish"]
+            if draft_audits:
+                draft_request = dict(draft_audits[-1].get("request") or {})
+                draft_request["prompt_projection"] = self._projection_audit(
+                    packet.draft_projection
+                )
+                draft_audits[-1]["request"] = draft_request
+            if polish_audits:
+                polish_request = dict(polish_audits[-1].get("request") or {})
+                polish_request["prompt_projection"] = self._projection_audit(
+                    packet.polish_projection
+                )
+                polish_audits[-1]["request"] = polish_request
             semantic_audits = [
                 call for call in block_audits if call.get("purpose") == "semantic"
             ]
@@ -1264,7 +1475,11 @@ class V4TranslationPipeline:
                 }
             quality_warnings: List[Any] = []
             warning_keys: set[str] = set()
-            for warning in list(result.quality_warnings) + render_constraint_warnings:
+            for warning in (
+                list(result.quality_warnings)
+                + render_constraint_warnings
+                + term_consistency_warnings
+            ):
                 key = json.dumps(
                     warning,
                     ensure_ascii=False,
@@ -1296,6 +1511,7 @@ class V4TranslationPipeline:
                 snapshot_id=packet.snapshot_id,
                 context_hash=packet.context_hash,
                 style_snapshot_id=packet.style_snapshot_id,
+                style_anchor_id=packet.style_anchor_id or "",
                 discourse_state_hash=packet.discourse_state_hash,
                 status=status,
                 draft_translation=result.draft_translation or "",

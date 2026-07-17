@@ -15,6 +15,12 @@ from .narrative_models import (
     SemanticRelation,
     render_narrative_memory,
 )
+from .prompt_projection import (
+    PromptBudgetPolicy,
+    PromptProjector,
+    PromptSection,
+    StyleAnchorCandidate,
+)
 
 
 class ContextOverflow(RuntimeError):
@@ -28,9 +34,17 @@ class ContextOverflow(RuntimeError):
 
 
 class ContextBuilder:
-    def __init__(self, database: V4Database, max_context_chars: int = 24000):
+    def __init__(
+        self,
+        database: V4Database,
+        max_context_chars: int = 24000,
+        budget_policy: PromptBudgetPolicy | None = None,
+    ):
         self.database = database
         self.max_context_chars = max_context_chars
+        self.prompt_projector = PromptProjector(
+            budget_policy or PromptBudgetPolicy()
+        )
 
     @staticmethod
     def _render_concepts(concepts: List[dict]) -> str:
@@ -52,6 +66,20 @@ class ContextBuilder:
             ]
             if concept.get("description"):
                 lines.append(f"  概念含义: {concept['description']}")
+            profile = concept.get("term_profile") or {}
+            semantic_core = str(profile.get("semantic_core") or "").strip()
+            if semantic_core:
+                lines.append(f"  语义边界: {semantic_core}")
+            contrast_sources = [
+                str(value).strip()
+                for value in profile.get("contrast_sources") or []
+                if str(value).strip()
+            ]
+            if contrast_sources:
+                lines.append(
+                    "  须与以下原文词保持区别: "
+                    + "、".join(contrast_sources)
+                )
             for rule in concept.get("rules", []):
                 condition = rule.get("condition") or {}
                 target = str(rule.get("target") or "").strip()
@@ -121,6 +149,8 @@ class ContextBuilder:
         semantic_relations: Sequence[SemanticRelation] = (),
         source_structure: Optional[Mapping[str, Any]] = None,
         style_snapshot: Optional[Mapping[str, Any]] = None,
+        style_anchor_candidates: Sequence[StyleAnchorCandidate] = (),
+        source_style_confidence: float = 0.0,
     ) -> ContextPacket:
         version = (
             knowledge_version
@@ -150,33 +180,109 @@ class ContextBuilder:
             raise ValueError(
                 "narrative snapshot and retrieval must be supplied together"
             )
-        parts = [
-            "<translation_constraints>",
-            "只使用当前位置可知的信息；不得根据后文推断身份、性别或谜底。",
-            "概念含义用于理解世界机制，不得把定义逐字扩写进正文；核心译名可按中文句法添加方位、所属、量词等成分。",
-            self._render_concepts(concepts),
-            "可用的保守翻译约束：",
-            *(f"- {claim['statement']}" for claim in claims),
-            "</translation_constraints>",
-            "<source_structure>",
-            json.dumps(
-                dict(source_structure or {}),
-                ensure_ascii=False,
-                sort_keys=True,
-                separators=(",", ":"),
+        style_state = dict((style_snapshot or {}).get("state") or {})
+        syntax_features = style_state.get("syntax_features") or ()
+        if isinstance(syntax_features, str):
+            syntax_features = (syntax_features,)
+        style_material = self.prompt_projector.build_style_material(
+            stage="polish",
+            style_state=style_state,
+            anchor_candidates=style_anchor_candidates,
+            current_global_index=block.global_index,
+            current_text_type=str(
+                style_state.get("text_type") or block.block_type or "prose"
             ),
-            "</source_structure>",
-            "<semantic_relations>",
-            self._render_semantic_relations(semantic_relations),
-            "</semantic_relations>",
+            current_narrative_layer=str(
+                style_state.get("narrative_layer") or ""
+            ),
+            current_register=str(style_state.get("register") or ""),
+            current_syntax_features=tuple(syntax_features),
+            current_source_style_confidence=source_style_confidence,
+        )
+        hard_concepts = [
+            concept
+            for concept in concepts
+            if str(concept.get("target_strength") or "") == "verified"
+            or bool(concept.get("rules"))
         ]
+        working_concepts = [
+            concept for concept in concepts if concept not in hard_concepts
+        ]
+        hard_constraints = "\n".join(
+            [
+                "<translation_constraints>",
+                "只使用当前位置可知的信息；不得根据后文推断身份、性别或谜底。",
+                "概念含义用于理解世界机制，不得把定义逐字扩写进正文；核心译名可按中文句法添加方位、所属、量词等成分。",
+                self._render_concepts(hard_concepts),
+                "可用的保守翻译约束：",
+                *(f"- {claim['statement']}" for claim in claims),
+                "</translation_constraints>",
+            ]
+        )
+        working_context = (
+            "<working_concepts>\n"
+            "以下工作概念仅用于一致性；当前英文语境优先：\n"
+            f"{self._render_concepts(working_concepts)}\n"
+            "</working_concepts>"
+            if working_concepts
+            else ""
+        )
+        constraints = "\n".join(
+            value for value in (hard_constraints, working_context) if value
+        )
+        structure = "\n".join(
+            [
+                "<source_structure>",
+                json.dumps(
+                    dict(source_structure or {}),
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ),
+                "</source_structure>",
+            ]
+        )
+        relations = "\n".join(
+            [
+                "<semantic_relations>",
+                self._render_semantic_relations(semantic_relations),
+                "</semantic_relations>",
+            ]
+        )
+        parts = [constraints, structure, relations]
+        sections: list[PromptSection] = [
+            PromptSection(
+                "source",
+                f"<text_to_translate>\n{block.source_text}\n</text_to_translate>",
+                priority=0,
+                required=True,
+            ),
+            PromptSection(
+                "constraints", hard_constraints, priority=0, required=True
+            ),
+            PromptSection("source_structure", structure, priority=0, required=True),
+            PromptSection("semantic_relations", relations, priority=0, required=True),
+        ]
+        if working_context:
+            sections.append(
+                PromptSection(
+                    "working_concepts",
+                    working_context,
+                    priority=1,
+                    marginal_utility=0.85,
+                )
+            )
         if narrative_snapshot is not None and narrative_retrieval is not None:
-            parts.extend(
+            narrative = "\n".join(
                 [
                     "<narrative_memory>",
                     "只使用当前位置已经开放的信息；保守提示不得被扩写成原文没有明说的事实。",
                     self._render_narrative_memory(narrative_retrieval),
                     "</narrative_memory>",
+                ]
+            )
+            discourse = "\n".join(
+                [
                     "<discourse_state>",
                     json.dumps(
                         narrative_snapshot.discourse_state.to_dict(),
@@ -187,31 +293,63 @@ class ContextBuilder:
                     "</discourse_state>",
                 ]
             )
-        if style_snapshot:
-            parts.extend(
+            parts.extend([narrative, discourse])
+            sections.extend(
                 [
-                    "<style_state>",
-                    json.dumps(
-                        dict(style_snapshot.get("state") or {}),
-                        ensure_ascii=False,
-                        sort_keys=True,
-                        separators=(",", ":"),
+                    PromptSection(
+                        "narrative_memory",
+                        narrative,
+                        priority=1,
+                        marginal_utility=0.95,
                     ),
-                    "</style_state>",
+                    PromptSection(
+                        "discourse_state",
+                        discourse,
+                        priority=1,
+                        marginal_utility=0.9,
+                    ),
                 ]
             )
-        parts.extend(
+        style_section = PromptSection(
+            "style_state",
+            f"<style_state>{style_material.directive}</style_state>",
+            priority=3,
+            marginal_utility=0.65,
+        )
+        parts.append(style_section.content)
+        sections.append(style_section)
+        prior = "\n".join(
             [
-            "<prior_concept_evidence>",
-            "以下是当前概念在当前位置之前的原文用例，只用于恢复已明示的机制和用法，不构成后文解释：",
-            self._render_prior_concept_evidence(prior_evidence),
-            "</prior_concept_evidence>",
+                "<prior_concept_evidence>",
+                "以下是当前概念在当前位置之前的原文用例，只用于恢复已明示的机制和用法，不构成后文解释：",
+                self._render_prior_concept_evidence(prior_evidence),
+                "</prior_concept_evidence>",
             ]
         )
+        parts.append(prior)
+        sections.append(
+            PromptSection(
+                "prior_concept_evidence",
+                prior,
+                priority=2,
+                marginal_utility=0.75,
+            )
+        )
         if local_summary:
-            parts.extend(["<island_summary>", local_summary, "</island_summary>"])
+            island_summary = (
+                f"<island_summary>\n{local_summary}\n</island_summary>"
+            )
+            parts.append(island_summary)
+            sections.append(
+                PromptSection(
+                    "island_summary",
+                    island_summary,
+                    priority=2,
+                    marginal_utility=0.55,
+                )
+            )
         if previous_source or previous_translation:
-            parts.extend(
+            previous = "\n".join(
                 [
                     "<island_previous>",
                     f"<source_tail>{previous_source[-800:]}</source_tail>",
@@ -219,10 +357,43 @@ class ContextBuilder:
                     "</island_previous>",
                 ]
             )
-        rendered = "\n".join(parts)
-        required_chars = len(block.source_text) + len(rendered)
+            parts.append(previous)
+            sections.append(
+                PromptSection(
+                    "island_previous",
+                    previous,
+                    priority=3,
+                    marginal_utility=0.45,
+                )
+            )
+        required_chars = sum(
+            len(section.content) for section in sections if section.required
+        )
         if required_chars > self.max_context_chars:
             raise ContextOverflow(block.id, required_chars, self.max_context_chars)
+        draft_sections = tuple(sections)
+        polish_sections = list(sections)
+        if style_material.anchor is not None:
+            polish_sections.append(
+                PromptSection(
+                    "style_anchor",
+                    style_material.anchor.rendered,
+                    priority=4,
+                    marginal_utility=0.45,
+                    dependency_ids=(style_material.anchor.anchor_id,),
+                )
+            )
+        draft_projection = self.prompt_projector.project(
+            stage="draft",
+            sections=draft_sections,
+            max_chars=self.max_context_chars,
+        )
+        polish_base_projection = self.prompt_projector.project(
+            stage="polish",
+            sections=tuple(polish_sections),
+            max_chars=self.max_context_chars,
+        )
+        rendered = draft_projection.rendered
         matched_rule_ids = sorted(
             {
                 str(rule.get("id") or "")
@@ -261,7 +432,13 @@ class ContextBuilder:
                         if narrative_snapshot is not None
                         else 1
                     ),
-                    "rendered": rendered,
+                    "draft_projection": draft_projection.rendered,
+                    "draft_included": draft_projection.included_section_ids,
+                    "draft_dropped": draft_projection.dropped_section_ids,
+                    "polish_projection": polish_base_projection.rendered,
+                    "polish_included": polish_base_projection.included_section_ids,
+                    "polish_dropped": polish_base_projection.dropped_section_ids,
+                    "estimator_version": draft_projection.estimator_version,
                 },
                 ensure_ascii=False,
                 sort_keys=True,
@@ -295,4 +472,25 @@ class ContextBuilder:
             ),
             discourse_state_hash=discourse_state_hash,
             context_hash=context_hash,
+            section_token_estimates=dict(
+                draft_projection.section_token_estimates
+            ),
+            draft_projection=draft_projection,
+            polish_base_projection=polish_base_projection,
+            draft_sections=draft_sections,
+            polish_sections=tuple(polish_sections),
+            dropped_optional_sections=list(
+                dict.fromkeys(
+                    [
+                        *draft_projection.dropped_section_ids,
+                        *polish_base_projection.dropped_section_ids,
+                    ]
+                )
+            ),
+            style_projection=style_material.directive,
+            style_anchor_id=(
+                style_material.anchor.anchor_id
+                if style_material.anchor is not None
+                else None
+            ),
         )

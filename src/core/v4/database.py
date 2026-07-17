@@ -73,6 +73,22 @@ def normalize_english_form(value: str) -> str:
     return normalized
 
 
+def _conservative_english_inflection_forms(value: str) -> set[str]:
+    """Return only mechanically safe single-word English noun forms."""
+
+    base = normalize_english_form(value)
+    if not re.fullmatch(r"[a-z][a-z-]{2,}", base):
+        return {base} if base else set()
+    forms = {base}
+    if re.search(r"[^aeiou]y$", base):
+        forms.add(f"{base[:-1]}ies")
+    elif base.endswith(("s", "x", "z", "ch", "sh")):
+        forms.add(f"{base}es")
+    else:
+        forms.add(f"{base}s")
+    return forms
+
+
 _RENDER_MAX_DEPTH = 12
 _RENDER_MAX_NODES = 2_048
 _RENDER_MAX_STRING_CHARS = 4_096
@@ -357,6 +373,25 @@ def _render_semantic_summary(
         "rules": [] if retired else rules,
         "forms": [] if retired else forms,
     }
+    profile = state.get("term_profile") or {}
+    if not retired and isinstance(profile, Mapping) and profile:
+        contrast_sources = profile.get("contrast_sources") or ()
+        if isinstance(contrast_sources, str):
+            contrast_sources = (contrast_sources,)
+        summary["term_profile"] = _canonical_render_value(
+            {
+                "semantic_core": str(profile.get("semantic_core") or ""),
+                "contrast_sources": sorted(
+                    {
+                        str(value)
+                        for value in contrast_sources
+                        if str(value)
+                    }
+                ),
+                "status": str(profile.get("status") or "provisional"),
+                "locked": bool(profile.get("locked")),
+            }
+        )
     if state.get("rendering_rules_sha256"):
         summary["rendering_rules_sha256"] = str(
             state["rendering_rules_sha256"]
@@ -467,6 +502,8 @@ def _derive_render_change(
         or old_summary.get("subject_type") != new_summary.get("subject_type")
     ):
         return "concept_redirect", 2
+    if old_summary.get("term_profile") != new_summary.get("term_profile"):
+        return "term_profile", 1
     return "target", 1
 
 
@@ -634,6 +671,7 @@ class _TranslationCommitSnapshot:
     snapshot_id: str
     context_hash: str
     style_snapshot_id: str
+    style_anchor_id: str
     discourse_state_hash: str
     status: str
     draft_translation: str
@@ -816,11 +854,13 @@ def _snapshot_translation_outcome(value: Any) -> _TranslationCommitSnapshot:
     snapshot_id = str(value.snapshot_id or "")
     context_hash = str(value.context_hash or "")
     style_snapshot_id = str(value.style_snapshot_id or "")
+    style_anchor_id = str(value.style_anchor_id or "")
     discourse_state_hash = str(value.discourse_state_hash or "")
     for label, raw_value, allow_empty in (
         ("snapshot_id", snapshot_id, True),
         ("context_hash", context_hash, True),
         ("style_snapshot_id", style_snapshot_id, True),
+        ("style_anchor_id", style_anchor_id, True),
         ("discourse_state_hash", discourse_state_hash, True),
     ):
         if len(raw_value) > 256:
@@ -855,6 +895,7 @@ def _snapshot_translation_outcome(value: Any) -> _TranslationCommitSnapshot:
         snapshot_id=snapshot_id,
         context_hash=context_hash,
         style_snapshot_id=style_snapshot_id,
+        style_anchor_id=style_anchor_id,
         discourse_state_hash=discourse_state_hash,
         status=str(value.status),
         draft_translation=str(value.draft_translation),
@@ -1613,7 +1654,42 @@ class V4Database:
                      )
                      SELECT c.*,
                             COALESCE(m.count, 0) AS mention_count,
-                            COALESCE(d.count, 0) AS dependency_count
+                            COALESCE(d.count, 0) AS dependency_count,
+                            (
+                                SELECT semantic_core FROM term_profiles tp
+                                WHERE tp.subject_type='concept'
+                                  AND tp.subject_id=c.id
+                                  AND tp.retired_version IS NULL
+                                ORDER BY tp.created_version DESC LIMIT 1
+                            ) AS profile_semantic_core,
+                            (
+                                SELECT contrast_sources_json FROM term_profiles tp
+                                WHERE tp.subject_type='concept'
+                                  AND tp.subject_id=c.id
+                                  AND tp.retired_version IS NULL
+                                ORDER BY tp.created_version DESC LIMIT 1
+                            ) AS profile_contrast_sources_json,
+                            (
+                                SELECT status FROM term_profiles tp
+                                WHERE tp.subject_type='concept'
+                                  AND tp.subject_id=c.id
+                                  AND tp.retired_version IS NULL
+                                ORDER BY tp.created_version DESC LIMIT 1
+                            ) AS profile_status,
+                            (
+                                SELECT locked FROM term_profiles tp
+                                WHERE tp.subject_type='concept'
+                                  AND tp.subject_id=c.id
+                                  AND tp.retired_version IS NULL
+                                ORDER BY tp.created_version DESC LIMIT 1
+                            ) AS profile_locked,
+                            (
+                                SELECT created_version FROM term_profiles tp
+                                WHERE tp.subject_type='concept'
+                                  AND tp.subject_id=c.id
+                                  AND tp.retired_version IS NULL
+                                ORDER BY tp.created_version DESC LIMIT 1
+                            ) AS profile_created_version
                      FROM concepts c
                      LEFT JOIN mention_counts m ON m.concept_id=c.id
                      LEFT JOIN dependency_counts d ON d.dependency_id=c.id
@@ -1779,6 +1855,94 @@ class V4Database:
                 f"merge concepts: {reason}", connection
             )
             now = utc_now()
+
+            active_profiles: list[dict[str, Any]] = []
+            for row in rows:
+                if row["profile_created_version"] is None:
+                    continue
+                active_profiles.append(
+                    {
+                        "subject_id": str(row["id"]),
+                        "semantic_core": str(
+                            row["profile_semantic_core"] or ""
+                        ).strip(),
+                        "contrast_sources": self._decoded_json_array(
+                            row["profile_contrast_sources_json"] or "[]",
+                            field="term profile contrast sources",
+                        ),
+                        "status": str(
+                            row["profile_status"] or "provisional"
+                        ),
+                        "locked": bool(row["profile_locked"]),
+                        "created_version": int(row["profile_created_version"]),
+                    }
+                )
+            if active_profiles:
+                canonical_profiles = [
+                    profile
+                    for profile in active_profiles
+                    if profile["subject_id"] == canonical_id
+                ]
+                preferred_profile = (
+                    canonical_profiles[0]
+                    if canonical_profiles
+                    else sorted(
+                        active_profiles,
+                        key=lambda profile: (
+                            -int(profile["locked"]),
+                            -int(profile["status"] == "verified"),
+                            -int(profile["created_version"]),
+                            profile["subject_id"],
+                        ),
+                    )[0]
+                )
+                merged_contrasts = sorted(
+                    {
+                        str(value).strip()
+                        for profile in active_profiles
+                        for value in profile["contrast_sources"]
+                        if str(value).strip()
+                    },
+                    key=str.casefold,
+                )
+                merged_status = (
+                    "verified"
+                    if any(
+                        profile["status"] == "verified"
+                        for profile in active_profiles
+                    )
+                    else preferred_profile["status"]
+                )
+                merged_locked = any(
+                    profile["locked"] for profile in active_profiles
+                )
+                connection.execute(
+                    f"""UPDATE term_profiles SET retired_version=?
+                         WHERE subject_type='concept'
+                           AND subject_id IN ({placeholders})
+                           AND retired_version IS NULL""",
+                    (version, *resolved_ids),
+                )
+                connection.execute(
+                    """INSERT INTO term_profiles(
+                           subject_type, subject_id, semantic_core,
+                           contrast_sources_json, status, locked,
+                           created_version, created_at)
+                       VALUES('concept', ?, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        canonical_id,
+                        preferred_profile["semantic_core"],
+                        json.dumps(
+                            merged_contrasts,
+                            ensure_ascii=False,
+                            separators=(",", ":"),
+                        ),
+                        merged_status,
+                        int(merged_locked),
+                        version,
+                        now,
+                    ),
+                )
 
             rule_rows = connection.execute(
                 f"""SELECT * FROM rendering_rules
@@ -4484,9 +4648,37 @@ class V4Database:
         row = connection.execute(
             f"""SELECT default_target, working_target, verified_target,
                        status, locked, {scope_expression}, {description_expression},
-                       retired_version
+                       retired_version,
+                       (
+                           SELECT semantic_core FROM term_profiles tp
+                           WHERE tp.subject_type=? AND tp.subject_id={table}.id
+                             AND tp.retired_version IS NULL
+                           ORDER BY tp.locked DESC, tp.created_version DESC
+                           LIMIT 1
+                       ) profile_semantic_core,
+                       (
+                           SELECT contrast_sources_json FROM term_profiles tp
+                           WHERE tp.subject_type=? AND tp.subject_id={table}.id
+                             AND tp.retired_version IS NULL
+                           ORDER BY tp.locked DESC, tp.created_version DESC
+                           LIMIT 1
+                       ) profile_contrast_sources_json,
+                       (
+                           SELECT status FROM term_profiles tp
+                           WHERE tp.subject_type=? AND tp.subject_id={table}.id
+                             AND tp.retired_version IS NULL
+                           ORDER BY tp.locked DESC, tp.created_version DESC
+                           LIMIT 1
+                       ) profile_status,
+                       (
+                           SELECT locked FROM term_profiles tp
+                           WHERE tp.subject_type=? AND tp.subject_id={table}.id
+                             AND tp.retired_version IS NULL
+                           ORDER BY tp.locked DESC, tp.created_version DESC
+                           LIMIT 1
+                       ) profile_locked
                   FROM {table} WHERE id=?""",
-            (subject_id,),
+            (subject_type, subject_type, subject_type, subject_type, subject_id),
         ).fetchone()
         if row is None:
             return {}
@@ -4499,6 +4691,24 @@ class V4Database:
             "scope": str(row["scope"] or "book"),
             "description": str(row["description"] or ""),
         }
+        try:
+            raw_contrasts = json.loads(
+                str(row["profile_contrast_sources_json"] or "[]")
+            )
+        except json.JSONDecodeError as exc:
+            raise ValueError("term profile contrast_sources_json is invalid") from exc
+        if not isinstance(raw_contrasts, list):
+            raise ValueError("term profile contrast_sources_json must be a list")
+        profile = {
+            "semantic_core": str(row["profile_semantic_core"] or "").strip(),
+            "contrast_sources": list(
+                self._normalized_contrast_sources(raw_contrasts)
+            ),
+            "status": str(row["profile_status"] or "provisional"),
+            "locked": bool(row["profile_locked"]),
+        }
+        if profile["semantic_core"] or profile["contrast_sources"]:
+            state["term_profile"] = profile
         subject_column = f"{subject_type}_id"
         all_rule_summaries: list[Dict[str, Any]] = []
         rule_digest = hashlib.sha256()
@@ -8421,18 +8631,81 @@ class V4Database:
             )
 
     @staticmethod
-    def _representative_paragraph(source_text: str, source_form: str) -> str:
-        import re
-
+    def _representative_paragraph(
+        source_text: str,
+        source_form: str,
+        *,
+        match_forms: Sequence[str] | None = None,
+    ) -> str:
         paragraphs = [
             part.strip()
             for part in re.split(r"\n\s*\n", source_text or "")
             if part.strip()
         ]
+        forms = list(match_forms or (source_form,))
         for paragraph in paragraphs:
-            if re.search(rf"(?<!\w){re.escape(source_form)}(?!\w)", paragraph, re.I):
+            if any(
+                re.search(
+                    rf"(?<!\w){re.escape(form)}(?!\w)",
+                    paragraph,
+                    re.I,
+                )
+                for form in forms
+            ):
                 return paragraph[:1200]
         return (paragraphs[0] if paragraphs else source_text)[:1200]
+
+    @staticmethod
+    def _target_context_signal(text: str) -> int:
+        normalized = f" {re.sub(r'\s+', ' ', text).casefold()} "
+        weighted_markers = (
+            (" no ", 4),
+            (" not ", 3),
+            (" rather ", 3),
+            (" but ", 2),
+            (" instead ", 2),
+            (" unlike ", 2),
+            (" different ", 2),
+            (" called ", 1),
+            (" means ", 1),
+            (" i am a ", 1),
+            (" are you a ", 1),
+        )
+        return sum(weight for marker, weight in weighted_markers if marker in normalized)
+
+    @staticmethod
+    def _target_definition_signal(
+        text: str, match_forms: Sequence[str]
+    ) -> int:
+        normalized = re.sub(r"\s+", " ", text).casefold()
+        speakers = r"(?:i am|i'm|are you|is he|is she|he is|she is)"
+        for form in match_forms:
+            if re.search(
+                rf"\b{speakers}\s+(?:an?\s+)?{re.escape(form.casefold())}\b",
+                normalized,
+            ):
+                return 1
+        return 0
+
+    @staticmethod
+    def _target_vocative_signal(
+        text: str, match_forms: Sequence[str]
+    ) -> int:
+        normalized = re.sub(r"\s+", " ", text)
+        for form in match_forms:
+            escaped = re.escape(form)
+            if re.search(
+                rf",\s*{escaped}\s*[,.:;!?]",
+                normalized,
+                re.IGNORECASE,
+            ) or re.search(
+                rf"\b(?:Master|Mistress|Lord|Lady|Sir|Madam|Doctor|Captain)"
+                rf"\s+{escaped}\b",
+                normalized,
+                re.IGNORECASE,
+            ):
+                return 1
+        return 0
 
     def working_target_candidates(self) -> List[Dict[str, Any]]:
         """Return active targetless lexemes that need one book-wide rendering."""
@@ -8441,7 +8714,19 @@ class V4Database:
             rows = connection.execute(
                 """SELECT l.id lexeme_id, l.canonical_form, l.default_target,
                           l.working_target, l.verified_target, l.status, l.locked,
-                          c.id concept_id, c.kind, c.description,
+                          c.id concept_id, c.description,
+                          COALESCE(
+                              c.kind,
+                              (
+                                  SELECT cto.kind
+                                  FROM concept_type_observations cto
+                                  WHERE cto.lexeme_id=l.id
+                                    AND cto.retired_version IS NULL
+                                  ORDER BY cto.confidence DESC, cto.id
+                                  LIMIT 1
+                              ),
+                              'concept'
+                          ) resolved_kind,
                           c.verified_target concept_verified_target,
                           c.locked concept_locked,
                           COUNT(m.id) mention_count,
@@ -8501,7 +8786,7 @@ class V4Database:
                         # Kept for old model/audit/queue readers.
                         "concept_id": concept_id,
                         "source": str(row["canonical_form"]),
-                        "kind": str(row["kind"] or "concept"),
+                        "kind": str(row["resolved_kind"] or "concept"),
                         "description": str(row["description"] or ""),
                         "contexts": [],
                         "context_block_ids": [],
@@ -8514,34 +8799,217 @@ class V4Database:
 
             lexeme_ids = [item["lexeme_id"] for item in candidates]
             placeholders = ",".join("?" for _ in lexeme_ids)
+            requested_forms: list[dict[str, str]] = []
+            for item in candidates:
+                forms = {normalize_english_form(item["source"])}
+                if str(item.get("kind") or "").casefold() == "role":
+                    forms.update(
+                        _conservative_english_inflection_forms(item["source"])
+                    )
+                requested_forms.extend(
+                    {
+                        "lexeme_id": item["lexeme_id"],
+                        "normalized_form": form,
+                    }
+                    for form in sorted(forms)
+                    if form
+                )
             context_rows = connection.execute(
-                f"""WITH ranked AS (
+                f"""WITH requested_forms AS (
+                           SELECT json_extract(value, '$.lexeme_id') lexeme_id,
+                                  json_extract(value, '$.normalized_form')
+                                      normalized_form
+                           FROM json_each(?)
+                       ),
+                       occurrence_blocks AS (
                            SELECT m.lexeme_id, b.id block_id, b.source_text,
-                                  b.global_index,
-                                  ROW_NUMBER() OVER (
-                                      PARTITION BY m.lexeme_id
-                                      ORDER BY b.global_index, b.id
-                                  ) occurrence_rank
+                                  b.global_index
                            FROM mentions m JOIN blocks b ON b.id=m.block_id
                            WHERE m.lexeme_id IN ({placeholders})
-                           GROUP BY m.lexeme_id, b.id
+                           UNION
+                           SELECT rf.lexeme_id, b.id block_id, b.source_text,
+                                  b.global_index
+                           FROM requested_forms rf
+                           JOIN lexical_candidates lc
+                             ON lower(lc.normalized_text)=rf.normalized_form
+                           JOIN blocks b ON b.id=lc.block_id
+                       ),
+                       scored AS (
+                           SELECT lexeme_id, block_id, source_text, global_index,
+                                  (
+                                      CASE WHEN lower(' ' || source_text || ' ')
+                                                LIKE '% no %'
+                                           THEN 4 ELSE 0 END
+                                      + CASE WHEN lower(' ' || source_text || ' ')
+                                                  LIKE '% not %'
+                                             THEN 3 ELSE 0 END
+                                      + CASE WHEN lower(source_text)
+                                                  LIKE '%rather%'
+                                             THEN 3 ELSE 0 END
+                                      + CASE WHEN lower(' ' || source_text || ' ')
+                                                  LIKE '% but %'
+                                             THEN 2 ELSE 0 END
+                                      + CASE WHEN lower(source_text)
+                                                  LIKE '%instead%'
+                                             THEN 2 ELSE 0 END
+                                      + CASE WHEN lower(source_text)
+                                                  LIKE '%unlike%'
+                                             THEN 2 ELSE 0 END
+                                      + CASE WHEN lower(source_text)
+                                                  LIKE '%different%'
+                                             THEN 2 ELSE 0 END
+                                      + CASE WHEN lower(source_text)
+                                                  LIKE '%called%'
+                                             THEN 1 ELSE 0 END
+                                      + CASE WHEN lower(source_text)
+                                                  LIKE '%means%'
+                                             THEN 1 ELSE 0 END
+                                      + CASE WHEN lower(source_text)
+                                                  LIKE '%i am a %'
+                                             THEN 1 ELSE 0 END
+                                      + CASE WHEN lower(source_text)
+                                                  LIKE '%are you a %'
+                                             THEN 1 ELSE 0 END
+                                  ) signal_score
+                           FROM occurrence_blocks
+                       ),
+                       ranked AS (
+                           SELECT lexeme_id, block_id, source_text, global_index,
+                                  signal_score,
+                                  ROW_NUMBER() OVER (
+                                      PARTITION BY lexeme_id
+                                      ORDER BY global_index, block_id
+                                  ) occurrence_rank,
+                                  ROW_NUMBER() OVER (
+                                      PARTITION BY lexeme_id
+                                      ORDER BY signal_score DESC,
+                                               global_index, block_id
+                                  ) signal_rank
+                           FROM scored
                        )
-                       SELECT lexeme_id, block_id, source_text, global_index
-                       FROM ranked WHERE occurrence_rank<=3
-                       ORDER BY lexeme_id, global_index, block_id""",
-                lexeme_ids,
+                       SELECT lexeme_id, block_id, source_text, global_index,
+                              signal_score, occurrence_rank, signal_rank
+                       FROM ranked
+                       WHERE occurrence_rank=1 OR signal_rank<=12
+                       ORDER BY lexeme_id,
+                                CASE WHEN occurrence_rank=1 THEN 0 ELSE 1 END,
+                                signal_score DESC, global_index, block_id""",
+                (
+                    json.dumps(
+                        requested_forms,
+                        ensure_ascii=False,
+                        separators=(",", ":"),
+                    ),
+                    *lexeme_ids,
+                ),
             ).fetchall()
             candidates_by_id = {
                 item["lexeme_id"]: item for item in candidates
             }
+            context_pool: dict[str, list[dict[str, Any]]] = {
+                lexeme_id: [] for lexeme_id in candidates_by_id
+            }
             for row in context_rows:
                 candidate = candidates_by_id[str(row["lexeme_id"])]
-                candidate["context_block_ids"].append(str(row["block_id"]))
-                candidate["contexts"].append(
-                    self._representative_paragraph(
-                        str(row["source_text"]), candidate["source"]
+                match_forms = (
+                    sorted(
+                        _conservative_english_inflection_forms(
+                            candidate["source"]
+                        )
                     )
+                    if str(candidate.get("kind") or "").casefold() == "role"
+                    else [candidate["source"]]
                 )
+                paragraph = self._representative_paragraph(
+                    str(row["source_text"]),
+                    candidate["source"],
+                    match_forms=match_forms,
+                )
+                context_pool[candidate["lexeme_id"]].append(
+                    {
+                        "block_id": str(row["block_id"]),
+                        "global_index": int(row["global_index"]),
+                        "paragraph": paragraph,
+                        "signal_score": self._target_context_signal(paragraph),
+                        "definition_score": self._target_definition_signal(
+                            paragraph, match_forms
+                        ),
+                        "vocative_score": self._target_vocative_signal(
+                            paragraph, match_forms
+                        ),
+                    }
+                )
+            for lexeme_id, pool in context_pool.items():
+                if not pool:
+                    continue
+                earliest = min(
+                    pool,
+                    key=lambda item: (
+                        item["global_index"],
+                        item["block_id"],
+                    ),
+                )
+                selected = [earliest]
+                seen_blocks = {earliest["block_id"]}
+                seen_paragraphs = {earliest["paragraph"]}
+                ranked_definition = sorted(
+                    pool,
+                    key=lambda value: (
+                        -int(value["definition_score"]),
+                        -int(value["signal_score"]),
+                        value["global_index"],
+                        value["block_id"],
+                    ),
+                )
+                if (
+                    ranked_definition
+                    and ranked_definition[0]["definition_score"]
+                ):
+                    item = ranked_definition[0]
+                    if item["block_id"] not in seen_blocks:
+                        selected.append(item)
+                        seen_blocks.add(item["block_id"])
+                        seen_paragraphs.add(item["paragraph"])
+                ranked_vocative = sorted(
+                    pool,
+                    key=lambda value: (
+                        -int(value["vocative_score"]),
+                        -int(value["signal_score"]),
+                        value["global_index"],
+                        value["block_id"],
+                    ),
+                )
+                if ranked_vocative and ranked_vocative[0]["vocative_score"]:
+                    item = ranked_vocative[0]
+                    if item["block_id"] not in seen_blocks:
+                        selected.append(item)
+                        seen_blocks.add(item["block_id"])
+                        seen_paragraphs.add(item["paragraph"])
+                for item in sorted(
+                    pool,
+                    key=lambda value: (
+                        -int(value["signal_score"]),
+                        value["global_index"],
+                        value["block_id"],
+                    ),
+                ):
+                    if (
+                        item["block_id"] in seen_blocks
+                        or item["paragraph"] in seen_paragraphs
+                    ):
+                        continue
+                    selected.append(item)
+                    seen_blocks.add(item["block_id"])
+                    seen_paragraphs.add(item["paragraph"])
+                    if len(selected) >= 4:
+                        break
+                candidate = candidates_by_id[lexeme_id]
+                candidate["context_block_ids"] = [
+                    item["block_id"] for item in selected
+                ]
+                candidate["contexts"] = [
+                    item["paragraph"] for item in selected
+                ]
 
             block_ids = list(
                 dict.fromkeys(
@@ -8617,7 +9085,7 @@ class V4Database:
                     text = references.get(block_id, "").strip()
                     if text and text not in baselines:
                         baselines.append(text[:1600])
-                    if len(baselines) >= 2:
+                    if len(baselines) >= 3:
                         break
                 candidate["baseline_translations"] = baselines
             return candidates
@@ -8709,6 +9177,58 @@ class V4Database:
             )
         return tuple(sorted(normalized))
 
+    @staticmethod
+    def _normalized_contrast_sources(values: Sequence[Any]) -> tuple[str, ...]:
+        by_key: Dict[str, str] = {}
+        for raw in values:
+            value = str(raw).strip()
+            if not value or len(value) > 120:
+                raise ValueError(
+                    "contrast sources must be non-empty and at most 120 characters"
+                )
+            by_key.setdefault(value.casefold(), value)
+        return tuple(by_key[key] for key in sorted(by_key))
+
+    @staticmethod
+    def _term_profile_from_row(row: Optional[sqlite3.Row]) -> Dict[str, Any]:
+        if row is None:
+            return {
+                "semantic_core": "",
+                "contrast_sources": [],
+                "status": "provisional",
+                "locked": False,
+            }
+        try:
+            raw_contrasts = json.loads(str(row["contrast_sources_json"] or "[]"))
+        except json.JSONDecodeError as exc:
+            raise ValueError("term profile contrast_sources_json is invalid") from exc
+        if not isinstance(raw_contrasts, list):
+            raise ValueError("term profile contrast_sources_json must be a list")
+        contrasts = list(V4Database._normalized_contrast_sources(raw_contrasts))
+        return {
+            "semantic_core": str(row["semantic_core"] or "").strip(),
+            "contrast_sources": contrasts,
+            "status": str(row["status"] or "provisional"),
+            "locked": bool(row["locked"]),
+        }
+
+    def _active_term_profile(
+        self,
+        connection: sqlite3.Connection,
+        subject_type: str,
+        subject_id: str,
+    ) -> Dict[str, Any]:
+        row = connection.execute(
+            """SELECT semantic_core, contrast_sources_json, status, locked
+               FROM term_profiles
+               WHERE subject_type=? AND subject_id=?
+                 AND retired_version IS NULL
+               ORDER BY locked DESC, created_version DESC
+               LIMIT 1""",
+            (subject_type, subject_id),
+        ).fetchone()
+        return self._term_profile_from_row(row)
+
     def _invalidate_working_target_dependents(
         self,
         connection: sqlite3.Connection,
@@ -8730,6 +9250,16 @@ class V4Database:
             if len(raw_rules) > 6:
                 raise ValueError("working targets allow at most six rendering rules")
             item = dict(decision)
+            item["semantic_core"] = str(
+                decision.get("semantic_core") or ""
+            ).strip()
+            if len(item["semantic_core"]) > 600:
+                raise ValueError("semantic_core must be at most 600 characters")
+            item["contrast_sources"] = list(
+                self._normalized_contrast_sources(
+                    list(decision.get("contrast_sources") or [])
+                )
+            )
             item["rules"] = [
                 WorkingTargetRule.model_validate(rule).model_dump()
                 for rule in raw_rules
@@ -8842,9 +9372,31 @@ class V4Database:
                     subject_type = "lexeme"
                     subject_id = raw_lexeme_id
                     row = connection.execute(
-                        """SELECT id, working_target, verified_target, locked
-                           FROM lexemes
-                           WHERE id=? AND retired_version IS NULL""",
+                        """SELECT l.id, l.working_target, l.verified_target,
+                                  l.locked, l.canonical_form,
+                                  COALESCE(
+                                      (
+                                          SELECT c.kind FROM concepts c
+                                          WHERE c.primary_lexeme_id=l.id
+                                            AND c.retired_version IS NULL
+                                          ORDER BY c.locked DESC,
+                                                   CASE WHEN c.status='verified'
+                                                        THEN 1 ELSE 0 END DESC,
+                                                   c.id
+                                          LIMIT 1
+                                      ),
+                                      (
+                                          SELECT cto.kind
+                                          FROM concept_type_observations cto
+                                          WHERE cto.lexeme_id=l.id
+                                            AND cto.retired_version IS NULL
+                                          ORDER BY cto.confidence DESC, cto.id
+                                          LIMIT 1
+                                      ),
+                                      'concept'
+                                  ) resolved_kind
+                           FROM lexemes l
+                           WHERE l.id=? AND l.retired_version IS NULL""",
                         (subject_id,),
                     ).fetchone()
                     queue_ids.add(subject_id)
@@ -8871,10 +9423,87 @@ class V4Database:
                         (subject_id,),
                     ).fetchall()
                 ]
+                existing_profile = self._active_term_profile(
+                    connection, subject_type, subject_id
+                )
+                semantic_core = str(decision.get("semantic_core") or "").strip()
+                contrast_sources = list(
+                    decision.get("contrast_sources") or []
+                )
+                if existing_profile["locked"]:
+                    semantic_core = str(existing_profile["semantic_core"])
+                    contrast_sources = list(
+                        existing_profile["contrast_sources"]
+                    )
+                observed_forms: list[dict[str, str]] = []
+                if (
+                    subject_type == "lexeme"
+                    and str(row["resolved_kind"] or "").casefold() == "role"
+                ):
+                    base_form = normalize_english_form(
+                        str(row["canonical_form"] or "")
+                    )
+                    variant_forms = sorted(
+                        _conservative_english_inflection_forms(base_form)
+                        - {base_form}
+                    )
+                    if variant_forms:
+                        variant_placeholders = ",".join(
+                            "?" for _ in variant_forms
+                        )
+                        existing_forms = {
+                            str(item["normalized_form"])
+                            for item in connection.execute(
+                                """SELECT normalized_form FROM source_forms
+                                   WHERE lexeme_id=?""",
+                                (subject_id,),
+                            ).fetchall()
+                        }
+                        occupied_forms = {
+                            str(item["normalized_form"])
+                            for item in connection.execute(
+                                f"""SELECT normalized_form FROM lexemes
+                                     WHERE normalized_form IN (
+                                         {variant_placeholders}
+                                     )
+                                       AND id!=? AND retired_version IS NULL""",
+                                (*variant_forms, subject_id),
+                            ).fetchall()
+                        }
+                        for item in connection.execute(
+                            f"""SELECT original_text, normalized_text
+                                 FROM lexical_candidates
+                                 WHERE lower(normalized_text) IN (
+                                     {variant_placeholders}
+                                 )
+                                 ORDER BY lower(normalized_text), id""",
+                            variant_forms,
+                        ).fetchall():
+                            normalized_form = normalize_english_form(
+                                str(item["normalized_text"] or "")
+                            )
+                            if (
+                                normalized_form in existing_forms
+                                or normalized_form in occupied_forms
+                                or normalized_form
+                                not in set(variant_forms)
+                            ):
+                                continue
+                            observed_forms.append(
+                                {
+                                    "form": str(item["original_text"]),
+                                    "normalized_form": normalized_form,
+                                }
+                            )
+                            existing_forms.add(normalized_form)
                 if (
                     str(row["working_target"] or "") == target
                     and self._normalized_working_rules(existing_rules)
                     == self._normalized_working_rules(rules)
+                    and str(existing_profile["semantic_core"]) == semantic_core
+                    and list(existing_profile["contrast_sources"])
+                    == contrast_sources
+                    and not observed_forms
                 ):
                     continue
                 changed.append(
@@ -8882,6 +9511,10 @@ class V4Database:
                         **subject_ref,
                         "legacy_concept_id": legacy_concept_id,
                         "target": target,
+                        "semantic_core": semantic_core,
+                        "contrast_sources": contrast_sources,
+                        "profile_locked": bool(existing_profile["locked"]),
+                        "observed_forms": observed_forms,
                         "rules": rules,
                         "old_state": self._render_state_for_subject(
                             connection, subject_type, subject_id
@@ -8942,6 +9575,28 @@ class V4Database:
                             subject_id,
                         ),
                     )
+                if subject_type == "lexeme":
+                    connection.executemany(
+                        """INSERT OR IGNORE INTO source_forms(
+                               lexeme_id, form, normalized_form, grammar_json)
+                           VALUES(?, ?, ?, ?)""",
+                        [
+                            (
+                                subject_id,
+                                form["form"],
+                                form["normalized_form"],
+                                json.dumps(
+                                    {
+                                        "inferred": "safe_english_inflection",
+                                        "observed": True,
+                                    },
+                                    ensure_ascii=False,
+                                    separators=(",", ":"),
+                                ),
+                            )
+                            for form in decision["observed_forms"]
+                        ],
+                    )
                 connection.execute(
                     f"""UPDATE rendering_rules SET retired_version=?
                        WHERE {subject_column}=? AND retired_version IS NULL AND locked=0""",
@@ -8975,14 +9630,48 @@ class V4Database:
                             utc_now(),
                         ),
                     )
+                if not decision["profile_locked"]:
+                    connection.execute(
+                        """UPDATE term_profiles SET retired_version=?
+                           WHERE subject_type=? AND subject_id=?
+                             AND retired_version IS NULL AND locked=0""",
+                        (version, subject_type, subject_id),
+                    )
+                    if (
+                        decision["semantic_core"]
+                        or decision["contrast_sources"]
+                    ):
+                        connection.execute(
+                            """INSERT INTO term_profiles(
+                                   subject_type, subject_id, semantic_core,
+                                   contrast_sources_json, status, locked,
+                                   created_version, created_at
+                               ) VALUES(?, ?, ?, ?, 'provisional', 0, ?, ?)""",
+                            (
+                                subject_type,
+                                subject_id,
+                                decision["semantic_core"],
+                                json.dumps(
+                                    decision["contrast_sources"],
+                                    ensure_ascii=False,
+                                    separators=(",", ":"),
+                                ),
+                                version,
+                                utc_now(),
+                            ),
+                        )
                 new_state = self._render_state_for_subject(
                     connection, subject_type, subject_id
                 )
-                change_kind = (
-                    "rendering_rule"
-                    if decision["old_state"].get("rules") != new_state.get("rules")
-                    else "target"
-                )
+                if decision["old_state"].get("rules") != new_state.get("rules"):
+                    change_kind = "rendering_rule"
+                elif (
+                    decision["old_state"].get("working_target")
+                    != new_state.get("working_target")
+                ):
+                    change_kind = "target"
+                else:
+                    change_kind = "term_profile"
                 change = self.record_render_change(
                     connection,
                     subject_type=subject_type,
@@ -9127,6 +9816,25 @@ class V4Database:
             """SELECT l.id, l.language, l.normalized_form, l.canonical_form,
                       l.default_target, l.working_target, l.verified_target,
                       l.status, l.locked, l.created_version, l.created_at,
+                      COALESCE(
+                          (
+                              SELECT cto.kind
+                              FROM concept_type_observations cto
+                              WHERE cto.lexeme_id=l.id
+                                AND cto.retired_version IS NULL
+                              ORDER BY
+                                  CASE cto.source
+                                      WHEN 'human' THEN 0
+                                      WHEN 'verified' THEN 1
+                                      ELSE 2
+                                  END,
+                                  cto.confidence DESC,
+                                  cto.created_version DESC,
+                                  cto.id DESC
+                              LIMIT 1
+                          ),
+                          'concept'
+                      ) resolved_kind,
                       sf.form, sf.normalized_form source_normalized_form
                FROM lexemes l
                LEFT JOIN source_forms sf ON sf.lexeme_id=l.id
@@ -9146,6 +9854,7 @@ class V4Database:
                     "language": str(row["language"]),
                     "normalized_form": str(row["normalized_form"]),
                     "source": str(row["canonical_form"]),
+                    "kind": str(row["resolved_kind"] or "concept"),
                     "forms": [],
                     "default_target": str(row["default_target"] or "").strip(),
                     "working_target": str(row["working_target"] or "").strip(),
@@ -9165,6 +9874,22 @@ class V4Database:
                 item["forms"].append(form)
         if not lexemes:
             return []
+
+        term_profiles: Dict[tuple[str, str], Dict[str, Any]] = {}
+        for row in connection.execute(
+            """SELECT subject_type, subject_id, semantic_core,
+                      contrast_sources_json, status, locked
+               FROM term_profiles
+               WHERE retired_version IS NULL
+               ORDER BY subject_type, subject_id, locked DESC,
+                        created_version DESC"""
+        ).fetchall():
+            key = (str(row["subject_type"]), str(row["subject_id"]))
+            term_profiles.setdefault(key, self._term_profile_from_row(row))
+        for lexeme_id, lexeme in lexemes.items():
+            profile = term_profiles.get(("lexeme", lexeme_id))
+            if profile is not None:
+                lexeme["term_profile"] = profile
 
         concept_rows = connection.execute(
             """SELECT c.id, c.kind, c.canonical_source, c.default_target,
@@ -9272,6 +9997,9 @@ class V4Database:
                 "redirect_source_ids": [],
                 "rules": [],
             }
+            profile = term_profiles.get(("concept", str(row["id"])))
+            if profile is not None:
+                concept["term_profile"] = profile
             lexemes[lexeme_id]["concepts"].append(concept)
             concepts_by_id.setdefault(str(row["id"]), []).append(concept)
 
@@ -10647,6 +11375,23 @@ class V4Database:
                             memory_id,
                             outcome.knowledge_version,
                             fingerprint,
+                            "",
+                            0,
+                            "",
+                            "[]",
+                            "[]",
+                        )
+                    )
+                if outcome.style_anchor_id:
+                    dependency_rows.append(
+                        (
+                            translation_id,
+                            "style_anchor",
+                            outcome.style_anchor_id,
+                            outcome.knowledge_version,
+                            hashlib.sha256(
+                                outcome.style_anchor_id.encode("utf-8")
+                            ).hexdigest(),
                             "",
                             0,
                             "",

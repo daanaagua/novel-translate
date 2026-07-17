@@ -76,6 +76,12 @@ parallel_v4:
   premap_max_tokens: 6144
   premap_max_attempts: 2
   max_narrative_context_chars: 6000
+  draft_input_soft_tokens: 6000
+  polish_input_soft_tokens: 8000
+  prompt_reserve_ratio: 0.20
+  style_directive_max_tokens: 60
+  style_anchor_max_tokens: 300
+  enable_style_anchors: true
   use_baseline_reference: false
   audit_mode: "full"
 

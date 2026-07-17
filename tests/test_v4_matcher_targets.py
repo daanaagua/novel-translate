@@ -178,6 +178,35 @@ def test_frozen_render_index_applies_six_layers_and_locked_conditions_exactly():
     assert _compile_render(no_target).matched_renderings("Archon")[0].rendered_target == ""
 
 
+def test_matcher_infers_vocative_from_local_punctuation_and_master_prefix():
+    snapshot = _render_snapshot(
+        concept_verified="",
+        lexeme_verified="",
+        concept_working="拷问官",
+        lexeme_working="",
+    )
+    snapshot[0]["concepts"][0]["rules"] = [
+        {
+            "id": "vocative-role",
+            "condition": {"discourse_function": "vocative"},
+            "target": "拷问官阁下",
+            "priority": 100,
+            "status": "provisional",
+            "locked": False,
+            "created_version": 3,
+        }
+    ]
+    index = _compile_render(snapshot)
+
+    direct = index.matched_renderings("No more do I, Archon.")[0]
+    titled = index.matched_renderings("What is your name, Master Archon?")[0]
+    ordinary = index.matched_renderings("The Archon waited.")[0]
+
+    assert direct.rendered_target == "拷问官阁下"
+    assert titled.rendered_target == "拷问官阁下"
+    assert ordinary.rendered_target == "拷问官"
+
+
 def test_render_matches_preserve_offsets_identity_uncertain_fallback_and_fingerprint():
     snapshot = _render_snapshot(concept_verified="", lexeme_verified="")
     index = _compile_render(snapshot)

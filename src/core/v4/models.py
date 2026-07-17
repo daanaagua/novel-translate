@@ -111,6 +111,7 @@ class AdjudicationDecision(StrictModel):
         "work",
         "artwork",
         "personification",
+        "role",
         "unknown_named_entity",
     ]
     confidence: float = Field(ge=0.0, le=1.0)
@@ -149,7 +150,9 @@ class WorkingTargetRule(StrictModel):
 class WorkingTargetDecision(StrictModel):
     concept_id: str = Field(pattern=r"^Q(?:0[1-9]|1\d|2[0-4])$")
     working_target: str = Field(min_length=1, max_length=200)
-    rules: List[WorkingTargetRule] = Field(default_factory=list, max_length=6)
+    semantic_core: str = Field(min_length=1, max_length=600)
+    contrast_sources: List[str] = Field(max_length=12)
+    rules: List[WorkingTargetRule] = Field(max_length=6)
     confidence: float = Field(ge=0.0, le=1.0)
 
     @field_validator("working_target")
@@ -160,9 +163,32 @@ class WorkingTargetDecision(StrictModel):
             raise ValueError("working target cannot be empty")
         return target
 
+    @field_validator("semantic_core")
+    @classmethod
+    def _semantic_core_is_trimmed(cls, value: str) -> str:
+        semantic_core = value.strip()
+        if not semantic_core:
+            raise ValueError("semantic core cannot be empty")
+        return semantic_core
+
+    @field_validator("contrast_sources")
+    @classmethod
+    def _contrast_sources_are_bounded(cls, value: List[str]) -> List[str]:
+        normalized: List[str] = []
+        seen: set[str] = set()
+        for raw in value:
+            item = str(raw).strip()
+            if not item or len(item) > 120:
+                raise ValueError("contrast sources must be non-empty and at most 120 characters")
+            key = item.casefold()
+            if key not in seen:
+                seen.add(key)
+                normalized.append(item)
+        return normalized
+
 
 class WorkingTargetResponse(StrictModel):
-    decisions: List[WorkingTargetDecision] = Field(default_factory=list, max_length=24)
+    decisions: List[WorkingTargetDecision] = Field(max_length=24)
 
 
 class CoreferenceVote(StrictModel):
@@ -383,6 +409,15 @@ class ContextPacket:
     style_snapshot_id: str = ""
     discourse_state_hash: str = ""
     context_hash: str = ""
+    section_token_estimates: Dict[str, int] = field(default_factory=dict)
+    draft_projection: Any = None
+    polish_base_projection: Any = None
+    polish_projection: Any = None
+    draft_sections: tuple[Any, ...] = ()
+    polish_sections: tuple[Any, ...] = ()
+    dropped_optional_sections: List[str] = field(default_factory=list)
+    style_projection: str = ""
+    style_anchor_id: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -424,6 +459,7 @@ class TranslationOutcome:
     snapshot_id: str = ""
     context_hash: str = ""
     style_snapshot_id: str = ""
+    style_anchor_id: str = ""
     discourse_state_hash: str = ""
     draft_translation: str = ""
     final_translation: str = ""

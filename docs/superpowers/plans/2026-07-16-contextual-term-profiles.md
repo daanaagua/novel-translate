@@ -15,7 +15,7 @@
 - 修改 `src/core/v4/models.py`：扩充裁决和工作译名响应模型。
 - 修改 `src/core/v4/adjudicator.py`：允许反复职业/身份普通名词。
 - 修改 `src/core/v4/target_resolver.py`：生成语义边界与对照词。
-- 修改 `src/core/v4/database.py`：持久化、冻结并读取术语档案。
+- 修改 `src/core/v4/database.py`：持久化、冻结并读取术语档案，挑选高信息语境并吸收安全职业复数。
 - 修改 `src/core/v4/context.py`：渲染档案约束。
 - 修改 `src/core/v4/pipeline.py`：术语说明注入和译后核验接入。
 - 创建 `src/core/v4/term_validator.py`：纯本地译后术语检查。
@@ -25,11 +25,11 @@
 
 ### 任务 1：候选裁决支持 recurring role
 
-- [ ] **步骤 1：编写失败测试**
+- [x] **步骤 1：编写失败测试**
 
 在 `tests/test_candidate_adjudicator.py` 中断言 `entity_kind="role"` 可以通过严格模型，并断言系统提示词明确普通职业名词在需要全书协调时不得仅因 `common noun` 被拒绝。
 
-- [ ] **步骤 2：运行测试验证失败**
+- [x] **步骤 2：运行测试验证失败**
 
 运行：
 
@@ -39,11 +39,11 @@ pytest tests/test_candidate_adjudicator.py -q
 
 预期：`role` 模型校验失败或提示词断言失败。
 
-- [ ] **步骤 3：最少实现**
+- [x] **步骤 3：最少实现**
 
 在 `models.py` 的 `AdjudicationDecision.entity_kind` 增加 `role`；更新 `ADJUDICATION_PROTOCOL` 与 `ADJUDICATION_SYSTEM`，区分 translation-sensitive recurring roles 与普通无约束名词。
 
-- [ ] **步骤 4：运行测试验证通过**
+- [x] **步骤 4：运行测试验证通过**
 
 ```powershell
 pytest tests/test_candidate_adjudicator.py -q
@@ -51,7 +51,7 @@ pytest tests/test_candidate_adjudicator.py -q
 
 ### 任务 2：持久化并注入术语档案
 
-- [ ] **步骤 1：编写失败测试**
+- [x] **步骤 1：编写失败测试**
 
 在 `tests/test_working_targets.py` 中增加：
 
@@ -81,13 +81,13 @@ def test_working_target_profile_is_atomic_idempotent_and_rendered(tmp_path):
 - `render_snapshot()` 包含 `term_profile`；
 - `ContextBuilder` 和翻译 glossary 说明包含语义边界及对照词。
 
-- [ ] **步骤 2：运行测试验证失败**
+- [x] **步骤 2：运行测试验证失败**
 
 ```powershell
 pytest tests/test_working_targets.py -q
 ```
 
-- [ ] **步骤 3：最少实现**
+- [x] **步骤 3：最少实现**
 
 扩充 `WorkingTargetDecision`：
 
@@ -117,7 +117,7 @@ CREATE TABLE IF NOT EXISTS term_profiles (
 
 `_render_snapshot_from_connection()` 将档案附着到 lexeme/concept；`ContextBuilder` 与 `_glossary_for()` 渲染语义边界和对照词。
 
-- [ ] **步骤 4：运行测试验证通过**
+- [x] **步骤 4：运行测试验证通过**
 
 ```powershell
 pytest tests/test_working_targets.py -q
@@ -125,7 +125,7 @@ pytest tests/test_working_targets.py -q
 
 ### 任务 3：译后术语一致性核验
 
-- [ ] **步骤 1：编写失败测试**
+- [x] **步骤 1：编写失败测试**
 
 创建 `tests/test_term_validator.py`，覆盖：
 
@@ -140,19 +140,19 @@ def test_warns_when_translation_uses_no_allowed_target():
     assert warnings[0]["kind"] == "term_target_missing"
 ```
 
-以及两个互为对照的术语被解析为同一中文目标时产生 `term_contrast_collision`。
+以及两个互为对照的术语被配置为同一中文目标时产生 `term_contrast_target_collision`。
 
-- [ ] **步骤 2：运行测试验证失败**
+- [x] **步骤 2：运行测试验证失败**
 
 ```powershell
 pytest tests/test_term_validator.py -q
 ```
 
-- [ ] **步骤 3：最少实现**
+- [x] **步骤 3：最少实现**
 
 创建 `term_validator.py`，只使用冻结快照、命中记录和最终译文做确定性检查。在 `pipeline.py` 中把警告并入 `quality_warnings`；存在术语警告且原状态为 `completed` 时改为 `completed_with_warnings`。
 
-- [ ] **步骤 4：运行定向测试**
+- [x] **步骤 4：运行定向测试**
 
 ```powershell
 pytest tests/test_term_validator.py tests/test_working_targets.py tests/test_candidate_adjudicator.py -q
@@ -160,28 +160,32 @@ pytest tests/test_term_validator.py tests/test_working_targets.py tests/test_can
 
 ### 任务 4：回归验证与《新日之书》试跑
 
-- [ ] **步骤 1：运行 V4 核心测试**
+- [x] **步骤 1：运行 V4 核心测试**
 
 ```powershell
 pytest tests/test_candidate_adjudicator.py tests/test_working_targets.py tests/test_v4_matcher_targets.py tests/test_narrative_pipeline.py tests/test_term_validator.py -q
 ```
 
-- [ ] **步骤 2：运行全量测试**
+- [x] **步骤 2：运行全量测试**
 
 ```powershell
-pytest -q
+$tests = Get-ChildItem tests -Filter 'test_*.py' |
+  Where-Object { $_.Name -ne 'test_foila_logic.py' } |
+  ForEach-Object { $_.FullName }
+python -m pytest @tests -q
 ```
 
-- [ ] **步骤 3：重建独立试验项目**
+- [x] **步骤 3：重建独立试验项目**
 
-复制现有 pilot 配置到新的项目目录，不覆盖旧数据库；扫描并裁决包含第一、二章的文本块，解析工作译名后翻译前几个块。
+使用独立项目 `projects/new_sun_term_profile_trial`。扫描前七块，并定向补扫包含
+`no carnifex / executioner / headsman` 的后文块；导入旧译 DOCX 作为非权威措辞证据。
 
-- [ ] **步骤 4：检查试跑证据**
+- [x] **步骤 4：检查试跑证据**
 
 查询 SQLite 并确认：
 
-- `torturer/torturers` 至少一个词形被提升为 `role`；
-- 存在工作译名和术语档案；
-- 第一章译文不再出现无规则的“刽子手的学徒”；
-- 若模型仍拒绝或使用未允许译名，系统产生结构化警告而不是静默漂移。
-
+- `torturer` 被提升为 `role`，观察到的 `torturers` 安全并入同一 lexeme；
+- 档案明确区别 `carnifex / executioner / headsman`；
+- 无旧译证据时 Flash 暴露“拷刑者”的中文措辞弱点；
+- 导入旧译后目标解析选择“拷问官”；
+- 强制重翻自称块得到“我是个拷问官……我是拷问官的学徒”，且无术语警告。

@@ -24,6 +24,7 @@ from .narrative_models import (
     SemanticRelation,
     render_narrative_memory,
 )
+from .prompt_projection import StyleAnchorCandidate, sanitize_style_delta
 
 
 MAX_VISIBLE_MEMORIES = 512
@@ -581,20 +582,7 @@ class NarrativeMemoryStore:
         state = dict((previous or {}).get("state") or {})
         if not isinstance(delta, Mapping):
             raise TypeError("style delta must be a mapping")
-        for raw_key, raw_value in list(delta.items())[:32]:
-            key = str(raw_key).strip()
-            if not key or len(key) > 64:
-                continue
-            if raw_value is None or str(raw_value).strip() == "":
-                continue
-            if not isinstance(raw_value, (str, bool, int, float)):
-                continue
-            value = (
-                str(raw_value).strip()[:512]
-                if isinstance(raw_value, str)
-                else raw_value
-            )
-            state[key] = value
+        state.update(sanitize_style_delta(delta))
         if previous is not None and state == previous["state"]:
             return previous
         if not state:
@@ -633,6 +621,165 @@ class NarrativeMemoryStore:
             "state": state,
             "state_hash": state_hash,
         }
+
+    def style_anchor_candidates_before(
+        self,
+        block: V4Block,
+        *,
+        limit: int = 24,
+    ) -> list[StyleAnchorCandidate]:
+        """Derive auditable anchors from existing active translation rows.
+
+        Metadata is intentionally projected from append-only translation,
+        dependency, block and style-snapshot rows, avoiding a schema migration.
+        """
+
+        bounded_limit = max(1, min(128, int(limit)))
+        with closing(self.database.connect()) as connection:
+            translation_columns = {
+                str(row["name"])
+                for row in connection.execute(
+                    "PRAGMA table_info(translation_versions)"
+                ).fetchall()
+            }
+            validation_expr = (
+                "t.validation_status"
+                if "validation_status" in translation_columns
+                else "'clean'"
+            )
+            style_expr = (
+                "t.style_snapshot_id"
+                if "style_snapshot_id" in translation_columns
+                else "NULL"
+            )
+            rows = connection.execute(
+                f"""SELECT t.id AS translation_id, t.block_id,
+                            t.final_translation, t.draft_translation,
+                            t.warnings_json, t.status,
+                            {validation_expr} AS validation_status,
+                            {style_expr} AS style_snapshot_id,
+                            b.global_index, b.block_type, b.source_text
+                     FROM translation_versions AS t
+                     JOIN blocks AS b ON b.id=t.block_id
+                     WHERE t.pipeline='parallel_v4'
+                       AND t.active=1
+                       AND b.source_edition_id=?
+                       AND b.global_index<?
+                       AND t.status IN ('completed', 'completed_with_warnings')
+                     ORDER BY b.global_index DESC, t.id DESC
+                     LIMIT ?""",
+                (
+                    block.source_edition_id,
+                    block.global_index,
+                    bounded_limit,
+                ),
+            ).fetchall()
+            candidates: list[StyleAnchorCandidate] = []
+            for row in rows:
+                source_text = str(row["source_text"] or "").strip()
+                target_text = str(row["final_translation"] or "").strip()
+                if not source_text or not target_text:
+                    continue
+                try:
+                    warnings = json.loads(str(row["warnings_json"] or "[]"))
+                except json.JSONDecodeError:
+                    warnings = ["invalid warning payload"]
+                warning_text = _canonical_json(warnings)
+                fallback = "回退" in warning_text or "fallback" in warning_text.lower()
+                integrity_passed = str(row["validation_status"]) == "clean"
+                if not integrity_passed or fallback:
+                    continue
+                style = self.load_style_snapshot(
+                    str(row["style_snapshot_id"] or ""),
+                    connection=connection,
+                )
+                style_state = dict((style or {}).get("state") or {})
+                anchor_id = f"translation:{int(row['translation_id'])}"
+                parent_anchor_id = self._style_anchor_parent(
+                    connection, int(row["translation_id"])
+                )
+                ancestors = self._style_anchor_ancestors(
+                    connection, parent_anchor_id
+                )
+                syntax = style_state.get("syntax_features") or ()
+                if isinstance(syntax, str):
+                    syntax = (syntax,)
+                candidates.append(
+                    StyleAnchorCandidate(
+                        anchor_id=anchor_id,
+                        source_block_id=str(row["block_id"]),
+                        source_global_index=int(row["global_index"]),
+                        source_text=source_text,
+                        target_text=target_text,
+                        quality_score=1.0 if not warnings else 0.85,
+                        integrity_passed=True,
+                        active=True,
+                        fallback=False,
+                        text_type=str(
+                            style_state.get("text_type")
+                            or row["block_type"]
+                            or "prose"
+                        ),
+                        narrative_layer=str(
+                            style_state.get("narrative_layer") or ""
+                        ),
+                        register=str(style_state.get("register") or ""),
+                        syntax_features=tuple(str(value) for value in syntax),
+                        usage_count=self._style_anchor_usage_count(
+                            connection, anchor_id
+                        ),
+                        parent_anchor_id=parent_anchor_id,
+                        ancestor_anchor_ids=ancestors,
+                        calibration_version="translation-anchor-v1",
+                    )
+                )
+        return candidates
+
+    @staticmethod
+    def _style_anchor_parent(
+        connection: sqlite3.Connection,
+        translation_id: int,
+    ) -> str:
+        row = connection.execute(
+            """SELECT dependency_id FROM dependencies
+               WHERE translation_id=? AND dependency_type='style_anchor'
+               ORDER BY id DESC LIMIT 1""",
+            (translation_id,),
+        ).fetchone()
+        return str(row["dependency_id"] or "") if row is not None else ""
+
+    @classmethod
+    def _style_anchor_ancestors(
+        cls,
+        connection: sqlite3.Connection,
+        parent_anchor_id: str,
+    ) -> tuple[str, ...]:
+        ancestors: list[str] = []
+        current = str(parent_anchor_id or "")
+        for _ in range(16):
+            if not current or current in ancestors:
+                break
+            ancestors.append(current)
+            if not current.startswith("translation:"):
+                break
+            try:
+                translation_id = int(current.split(":", 1)[1])
+            except ValueError:
+                break
+            current = cls._style_anchor_parent(connection, translation_id)
+        return tuple(ancestors)
+
+    @staticmethod
+    def _style_anchor_usage_count(
+        connection: sqlite3.Connection,
+        anchor_id: str,
+    ) -> int:
+        row = connection.execute(
+            """SELECT COUNT(*) AS count FROM dependencies
+               WHERE dependency_type='style_anchor' AND dependency_id=?""",
+            (anchor_id,),
+        ).fetchone()
+        return int(row["count"] if row is not None else 0)
 
     def inspect(
         self,

@@ -23,7 +23,7 @@ Do not omit "reason"; use an empty string when no explanation is needed.
 Allowed "verdict" values: "promote", "reject", "split", "supersede", "defer".
 Allowed "entity_kind" values: "person", "place", "organization", "group",
 "item", "concept", "unit", "title", "event", "species", "technology", "work",
-"artwork", "personification", "unknown_named_entity".
+"artwork", "personification", "role", "unknown_named_entity".
 Selection rules:
 - promote: selected_ids has exactly one local Kxx[A-D] alias.
 - reject/defer: selected_ids is [].
@@ -44,10 +44,15 @@ schema commentary, or any keys other than the canonical keys above.
 
 
 ADJUDICATION_SYSTEM = f"""You adjudicate bounded lexical candidate spans.
-Promote only genuine named entities or fictional terms that need a stable translation across the book.
-Reject ordinary verbs, ordinary nouns, function words, and fragment noise.
+Promote genuine named entities, fictional terms, and recurring roles, professions,
+social ranks, or institutional identities that need a stable translation across
+the book. Being a common noun is not by itself a reason to reject a candidate:
+use entity_kind "role" when an otherwise ordinary occupational or identity noun
+has recurring book-specific translation consequences.
+Reject ordinary verbs, ordinary nouns with no book-wide translation consequence,
+function words, and fragment noise.
 Treat weak evidence conservatively: when a candidate is not clearly a recurring
-named entity or fictional term, defer.
+named entity, fictional term, or translation-sensitive role, defer.
 Be conservative: extraction merely proposes spans and does not prove termhood.
 
 {ADJUDICATION_PROTOCOL}"""
