@@ -35,9 +35,17 @@ export interface BlockTranslation {
   text: string;
 }
 
+export interface TranslationMemoryCandidate {
+  kind: string;
+  subjectForms: string[];
+  fact: string;
+  confidence: number;
+}
+
 export interface TranslationCandidate {
   translations: BlockTranslation[];
   notes: string[];
+  memoryCandidates?: TranslationMemoryCandidate[];
   repaired: boolean;
 }
 
@@ -52,6 +60,10 @@ function copyTranslation(candidate: TranslationCandidate): TranslationCandidate 
   return {
     translations: candidate.translations.map((item) => ({ ...item })),
     notes: [...candidate.notes],
+    memoryCandidates: candidate.memoryCandidates?.map((item) => ({
+      ...item,
+      subjectForms: [...item.subjectForms],
+    })),
     repaired: candidate.repaired,
   };
 }

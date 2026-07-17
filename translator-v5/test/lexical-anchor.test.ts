@@ -9,20 +9,21 @@ import {
 
 import {
   collectRepeatedAnchorCandidates,
+  collectWindowAnchorCandidates,
   LexicalAnchorer,
 } from "../src/agents/lexical-anchorer.js";
 import { PiRuntime } from "../src/agents/pi-runtime.js";
 import type { StableTerm, V4Block } from "../src/domain/types.js";
 import { BudgetLedger } from "../src/kernel/budget.js";
 
-function block(text: string): V4Block {
+function block(text: string, index = 1): V4Block {
   return {
-    id: "block-1",
+    id: `block-${index}`,
     legacyId: null,
     chapterId: "chapter",
     chapterTitle: "Fixture",
-    globalIndex: 1,
-    blockIndex: 0,
+    globalIndex: index,
+    blockIndex: index,
     sourceText: text,
     sourceHash: "hash",
     tokenCount: 20,
@@ -48,6 +49,18 @@ test("candidate extraction keeps repeated unknown titles but removes established
   assert.deepEqual(candidates.map((candidate) => candidate.sourceForm), [
     "Conciliator",
   ]);
+  assert.equal(candidates[0]?.contexts.length, 2);
+});
+
+test("window anchor candidates use whole-book concordance without reconsidering contextual decisions", () => {
+  const target = [block("Smoky arrived at Edgewood.", 0)];
+  const corpus = [
+    ...target,
+    block("Later Smoky returned to Edgewood.", 1),
+    block("Edgewood remained on no map.", 2),
+  ];
+  const candidates = collectWindowAnchorCandidates(target, corpus, [], ["Edgewood"]);
+  assert.deepEqual(candidates.map((item) => item.sourceForm), ["Smoky"]);
   assert.equal(candidates[0]?.contexts.length, 2);
 });
 

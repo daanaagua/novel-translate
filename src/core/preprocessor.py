@@ -26,7 +26,7 @@ class TextPreprocessor:
     
     # 卷/书标题模式 (针对多卷本合集)
     VOLUME_PATTERNS = [
-        r'^BOOK\s+[IVXLC]+',                    # BOOK I
+        r'^BOOK\s+(?:\d+|[IVXLC]+|ONE|TWO|THREE|FOUR|FIVE|SIX|SEVEN|EIGHT|NINE|TEN|ELEVEN|TWELVE)\s*$',
         r'^THE\s+SHADOW\s+OF\s+THE\s+TORTURER', # 第一卷
         r'^THE\s+CLAW\s+OF\s+THE\s+CONCILIATOR', # 第二卷
         r'^THE\s+SWORD\s+OF\s+THE\s+LICTOR',     # 第三卷
@@ -183,6 +183,7 @@ class TextPreprocessor:
             if pre_content:
                 chapters.append((f"{vol_id}_pre", "Preamble", pre_content))
                 
+        id_occurrences = {}
         for i, match in enumerate(matches):
             title = match.group().strip()
             start = match.end()
@@ -200,7 +201,10 @@ class TextPreprocessor:
                     clean_title = title.replace('CHAPTER','').replace('Chapter','').strip().upper()
                     idx = roman_map.get(clean_title, i + 1)
                 
-                ch_id = f"{vol_id}_ch{idx:02d}"
+                base_id = f"{vol_id}_ch{idx:02d}"
+                occurrence = id_occurrences.get(base_id, 0) + 1
+                id_occurrences[base_id] = occurrence
+                ch_id = base_id if occurrence == 1 else f"{base_id}_{occurrence:02d}"
                 chapters.append((ch_id, title, content))
         return chapters
 

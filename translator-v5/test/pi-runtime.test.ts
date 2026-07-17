@@ -160,6 +160,28 @@ test("Pi refuses a pre-aborted session before a model call", async () => {
   assert.equal(faux.state.callCount, 0);
 });
 
+test("Pi surfaces provider errors instead of misclassifying them as human review", async () => {
+  const faux = fauxProvider();
+  faux.setResponses([
+    fauxAssistantMessage([], {
+      stopReason: "error",
+      errorMessage: "401: authentication failed for fixture credential",
+    }),
+  ]);
+
+  await assert.rejects(
+    new PiRuntime().run({
+      systemPrompt: "Use the tools.",
+      prompt: "Translate the fixture.",
+      phase: "translation",
+      model: faux.getModel(),
+      tools: [],
+      budget: new BudgetLedger(),
+    }, streamFrom(faux)),
+    /authentication failed/i,
+  );
+});
+
 test("DeepSeek model metadata carries compatibility controls but no API key", () => {
   const secret = "fixture-secret-must-not-serialize";
   const model = createDeepSeekModel({

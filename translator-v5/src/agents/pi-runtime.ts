@@ -66,6 +66,10 @@ export interface PiToolError {
   message: string;
 }
 
+export class ModelProviderError extends Error {
+  override readonly name = "ModelProviderError";
+}
+
 export interface PiRunResult {
   modelCalls: number;
   toolNames: string[];
@@ -262,6 +266,11 @@ export class PiRuntime {
 
     const messages = [...agent.state.messages];
     const lastAssistant = messages.findLast(assistant);
+    if (lastAssistant?.stopReason === "error") {
+      throw new ModelProviderError(
+        `model provider error: ${lastAssistant.errorMessage ?? "unknown provider failure"}`,
+      );
+    }
     return {
       modelCalls,
       toolNames,
