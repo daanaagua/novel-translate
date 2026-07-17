@@ -410,7 +410,7 @@ git commit -m "feat: expose bounded translation capabilities"
 - 创建：`translator-v5/src/agents/pi-runtime.ts`
 - 测试：`translator-v5/test/pi-runtime.test.ts`
 
-- [ ] **步骤 1：用 Pi faux provider 编写真实工具循环失败测试**
+- [x] **步骤 1：用 Pi faux provider 编写真实工具循环失败测试**
 
 ```ts
 test("Pi executes an allowlisted tool and stops on terminating submit", async () => {
@@ -424,12 +424,12 @@ test("Pi executes an allowlisted tool and stops on terminating submit", async ()
 });
 ```
 
-- [ ] **步骤 2：运行测试确认失败**
+- [x] **步骤 2：运行测试确认失败**
 
 运行：`npm test -- --test-name-pattern="Pi executes"`  
 预期：FAIL。
 
-- [ ] **步骤 3：实现 Pi runtime**
+- [x] **步骤 3：实现 Pi runtime**
 
 使用 `Agent` 而非低层 `agentLoop`，以便 `beforeToolCall` 成为执行屏障：
 
@@ -445,7 +445,7 @@ const agent = new Agent({
 
 event subscriber 统计 `turn_start` 为模型调用，记录 usage、工具、耗时和 stop reason。
 
-- [ ] **步骤 4：实现 DeepSeek OpenAI-compatible streamFn**
+- [x] **步骤 4：实现 DeepSeek OpenAI-compatible streamFn**
 
 创建 `Model<"openai-completions">`：
 
@@ -470,12 +470,12 @@ event subscriber 统计 `turn_start` 为模型调用，记录 usage、工具、�
 `streamFn` 通过 `openAICompletionsApi` 或直接 `streamSimple` 注入运行时 key，不把
 key 写入 Agent state、event log 或错误正文。
 
-- [ ] **步骤 5：测试 abort、非法工具阻止和 usage 统计**
+- [x] **步骤 5：测试 abort、非法工具阻止和 usage 统计**
 
 运行：`npm test && npm run typecheck`  
 预期：PASS。
 
-- [ ] **步骤 6：Commit**
+- [x] **步骤 6：Commit**
 
 ```bash
 git add translator-v5/src/agents/pi-runtime.ts translator-v5/test/pi-runtime.test.ts
