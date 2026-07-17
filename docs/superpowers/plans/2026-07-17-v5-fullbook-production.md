@@ -17,11 +17,11 @@
 - 创建：`translator-v5/src/fullbook/types.ts`
 - 测试：`translator-v5/test/window-planner.test.ts`
 
-- [ ] 先写测试：窗口不跨章节、受 token/block 上限约束、ID 对相同输入稳定，过大单块独立成窗。
-- [ ] 运行 `npm test -- --test-name-pattern="window plan"`，确认因模块不存在而失败。
-- [ ] 实现 `planBookWindows(blocks, options)` 和纯函数 `nextConcurrency(history, limits)`；默认热身 2、最大并发 2，风险结果降为 1。
-- [ ] 重跑定向测试与 `npm run typecheck`。
-- [ ] Commit：`feat: plan bounded full-book windows`。
+- [x] 先写测试：窗口不跨章节、受 token/block 上限约束、ID 对相同输入稳定，过大单块独立成窗。
+- [x] 运行 `npm test -- --test-name-pattern="window plan"`，确认因模块不存在而失败。
+- [x] 实现 `planBookWindows(blocks, options)` 和纯函数 `nextConcurrency(history, limits)`；默认热身 2、最大并发 2，风险结果降为 1。
+- [x] 重跑定向测试与 `npm run typecheck`。
+- [x] Commit：`feat: plan bounded full-book windows`。
 
 ### 任务 2：事务工作库与恢复
 
@@ -99,4 +99,3 @@
 - [ ] 运行严格校验；生成内部 TXT/EPUB 抽查版。
 - [ ] 报告速度、调用量、预算峰值、修复/人工队列、锚点和记忆样例，以及是否建议启动全书。
 - [ ] 运行 `git diff --check`、V5 全测、typecheck 和 Python 正式测试；再决定合并到 main。
-
