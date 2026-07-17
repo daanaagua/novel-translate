@@ -28,6 +28,16 @@ test("rejects the ninth research tool call without running it", () => {
   assert.equal(budget.remaining("researchToolCalls"), 0);
 });
 
+test("multi-counter budget reservations fail atomically", () => {
+  const budget = new BudgetLedger({ modelCalls: 2, researchTurns: 0 });
+  assert.throws(
+    () => budget.consumeMany({ modelCalls: 1, researchTurns: 1 }),
+    BudgetExceeded,
+  );
+  assert.equal(budget.remaining("modelCalls"), 2);
+  assert.equal(budget.remaining("researchTurns"), 0);
+});
+
 test("capability registry rejects generic shell and filesystem tools", () => {
   const forbiddenTool: KernelTool<Record<string, never>, string> = {
     name: "bash",

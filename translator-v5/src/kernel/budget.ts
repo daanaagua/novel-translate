@@ -48,14 +48,29 @@ export class BudgetLedger {
   }
 
   public consume(counter: BudgetCounter, amount: number): void {
-    if (!Number.isFinite(amount) || amount < 0) {
-      throw new Error(`invalid budget amount for ${counter}: ${amount}`);
+    this.consumeMany({ [counter]: amount });
+  }
+
+  public consumeMany(
+    amounts: Partial<Record<BudgetCounter, number>>,
+  ): void {
+    const reservations: Array<[BudgetCounter, number]> = [];
+    for (const [rawCounter, amount] of Object.entries(amounts)) {
+      const counter = rawCounter as BudgetCounter;
+      if (!Number.isFinite(amount) || (amount as number) < 0) {
+        throw new Error(`invalid budget amount for ${counter}: ${amount}`);
+      }
+      reservations.push([counter, amount as number]);
     }
-    const requestedTotal = this.consumed[counter] + amount;
-    if (requestedTotal > this.limits[counter]) {
-      throw new BudgetExceeded(counter, this.limits[counter], requestedTotal);
+    for (const [counter, amount] of reservations) {
+      const requestedTotal = this.consumed[counter] + amount;
+      if (requestedTotal > this.limits[counter]) {
+        throw new BudgetExceeded(counter, this.limits[counter], requestedTotal);
+      }
     }
-    this.consumed[counter] = requestedTotal;
+    for (const [counter, amount] of reservations) {
+      this.consumed[counter] += amount;
+    }
   }
 
   public remaining(counter: BudgetCounter): number {

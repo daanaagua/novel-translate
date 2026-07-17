@@ -29,7 +29,7 @@ function block(globalIndex: number, sourceText: string): V4Block {
 function question(): ResearchQuestion {
   return {
     questionId: "q1",
-    kind: "identity",
+    kind: "entity_identity",
     prompt: "Is this the same Typhon?",
     subjectIds: ["typhon"],
     channel: "narrative_before_target",

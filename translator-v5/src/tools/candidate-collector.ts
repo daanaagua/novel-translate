@@ -6,7 +6,21 @@ export interface ResearchQuestion {
   prompt: string;
   subjectIds: string[];
   channel: VisibilityChannel;
+  impact?: "high" | "medium" | "low";
+  mandatory?: boolean;
 }
+
+export const ALLOWED_QUESTION_KINDS = [
+  "entity_identity",
+  "entity_relation",
+  "term_sense",
+  "coreference",
+  "narrative_visibility",
+  "discourse_role",
+  "local_continuity",
+] as const;
+
+export type QuestionKind = typeof ALLOWED_QUESTION_KINDS[number];
 
 export interface ResolutionCandidate {
   questionId: string;
@@ -70,6 +84,9 @@ export class CandidateCollector {
   }
 
   addResolution(candidate: ResolutionCandidate): void {
+    if (this.#resolutions.some((item) => item.questionId === candidate.questionId)) {
+      throw new Error(`duplicate resolution: ${candidate.questionId}`);
+    }
     this.#resolutions.push(copyResolution(candidate));
   }
 

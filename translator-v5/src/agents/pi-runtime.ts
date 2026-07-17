@@ -191,8 +191,10 @@ export class PiRuntime {
     const unsubscribe = agent.subscribe((event) => {
       switch (event.type) {
         case "turn_start":
-          spec.budget.consume("modelCalls", 1);
-          spec.budget.consume(turnCounter(spec.phase), 1);
+          spec.budget.consumeMany({
+            modelCalls: 1,
+            [turnCounter(spec.phase)]: 1,
+          });
           modelCalls += 1;
           eventLog.append("model", { phase: spec.phase, modelCalls });
           break;

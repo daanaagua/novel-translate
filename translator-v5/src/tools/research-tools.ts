@@ -7,6 +7,7 @@ import { EvidenceIndex } from "../index/evidence-index.js";
 import { BudgetLedger } from "../kernel/budget.js";
 import {
   CandidateCollector,
+  ALLOWED_QUESTION_KINDS,
   type ResearchQuestion,
   type ResolutionCandidate,
 } from "./candidate-collector.js";
@@ -96,6 +97,7 @@ export class ResearchTools {
       });
     }
     if (options.questions !== undefined) {
+      this.#validateQuestions(options.questions);
       this.#registerQuestions(options.questions);
       this.#collector.addQuestions(options.questions);
     }
@@ -275,6 +277,12 @@ export class ResearchTools {
           prompt: Type.String(),
           subjectIds: Type.Array(Type.String()),
           channel: VisibilitySchema,
+          impact: Type.Optional(Type.Union([
+            Type.Literal("high"),
+            Type.Literal("medium"),
+            Type.Literal("low"),
+          ])),
+          mandatory: Type.Optional(Type.Boolean()),
         })) }),
         execute: (args, signal) => this.submitQuestions(
           args as { questions: ResearchQuestion[] },
@@ -400,8 +408,8 @@ export class ResearchTools {
   }
 
   #validateQuestions(questions: readonly ResearchQuestion[]): void {
-    if (!Array.isArray(questions) || questions.length === 0 || questions.length > 12) {
-      throw new TypeError("questions must contain 1 to 12 entries");
+    if (!Array.isArray(questions) || questions.length > 12) {
+      throw new TypeError("questions must contain at most 12 entries");
     }
     const seen = new Set<string>();
     for (const question of questions) {
@@ -410,6 +418,11 @@ export class ResearchTools {
       }
       seen.add(question.questionId);
       validChannel(question.channel);
+      if (!ALLOWED_QUESTION_KINDS.includes(
+        question.kind as typeof ALLOWED_QUESTION_KINDS[number],
+      )) {
+        throw new Error(`unsupported question kind: ${question.kind}`);
+      }
       this.#termsForSubjects(question.subjectIds);
     }
   }
@@ -451,5 +464,27 @@ export class ResearchTools {
   #wasIssued(evidenceId: string, channel: VisibilityChannel): boolean {
     return (this.#issuedEvidence.get(evidenceId) ?? [])
       .some((item) => item.channel === channel);
+  }
+
+  issuedEvidence(): EvidenceHit[] {
+    const unique = new Map<string, EvidenceHit>();
+    for (const records of this.#issuedEvidence.values()) {
+      for (const record of records) {
+        const key = `${record.hit.evidenceId}\0${record.channel}`;
+        unique.set(key, { ...record.hit, channel: record.channel });
+      }
+    }
+    return [...unique.values()].sort((left, right) =>
+      left.globalIndex - right.globalIndex
+      || left.paragraphIndex - right.paragraphIndex
+      || left.evidenceId.localeCompare(right.evidenceId),
+    );
+  }
+
+  subjects(): SubjectRef[] {
+    return [...this.#subjects.values()].map((subject) => ({
+      subjectId: subject.subjectId,
+      forms: [...subject.forms],
+    }));
   }
 }

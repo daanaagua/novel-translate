@@ -492,7 +492,7 @@ git commit -m "feat: run bounded pi sessions"
 - 创建：`translator-v5/src/domain/provisional-snapshot.ts`
 - 测试：`translator-v5/test/research-agent.test.ts`
 
-- [ ] **步骤 1：编写 scripted Pi 研究测试**
+- [x] **步骤 1：编写 scripted Pi 研究测试**
 
 ```ts
 test("research agent refines Typhon/Piaton evidence without prefix scanning", async () => {
@@ -508,12 +508,12 @@ test("research agent refines Typhon/Piaton evidence without prefix scanning", as
 });
 ```
 
-- [ ] **步骤 2：运行测试确认失败**
+- [x] **步骤 2：运行测试确认失败**
 
 运行：`npm test -- --test-name-pattern="refines Typhon"`  
 预期：FAIL。
 
-- [ ] **步骤 3：实现 Question Scout 提示和提交门**
+- [x] **步骤 3：实现 Question Scout 提示和提交门**
 
 Scout 必须通过 `submit_questions`，问题类型限于：
 
@@ -524,24 +524,24 @@ narrative_visibility, discourse_role, local_continuity
 
 Kernel 自动加入未解析目标专名对应的强制问题；Scout 不能删除强制问题。
 
-- [ ] **步骤 4：实现 Evidence Resolver 与停止规则**
+- [x] **步骤 4：实现 Evidence Resolver 与停止规则**
 
 Resolver 只看到问题、已知 subject IDs、工具说明和剩余预算。`finish_research` 前
 每个高影响问题必须处于 `resolved` 或 `unresolved`。达到三 turn 或预算时由 Kernel
 强制结束并填充 unresolved。
 
-- [ ] **步骤 5：构建 provisional snapshot**
+- [x] **步骤 5：构建 provisional snapshot**
 
 快照包含问题、判断、证据、通道、目标范围、覆盖范围、未决项、source hashes、
 protocol/model hash。`translator_global` 判断进入单独的 translator facts，不进入
 narrative-visible facts。
 
-- [ ] **步骤 6：运行测试和类型检查**
+- [x] **步骤 6：运行测试和类型检查**
 
 运行：`npm test && npm run typecheck`  
 预期：PASS。
 
-- [ ] **步骤 7：Commit**
+- [x] **步骤 7：Commit**
 
 ```bash
 git add translator-v5/src/agents/question-scout.ts translator-v5/src/agents/evidence-resolver.ts translator-v5/src/domain/provisional-snapshot.ts translator-v5/test/research-agent.test.ts
