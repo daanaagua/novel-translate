@@ -45,4 +45,10 @@ session-*.md
 streamlit
 test.txt
 log.txt
+
+# V5 TypeScript pilot
+translator-v5/node_modules/
+translator-v5/dist/
+translator-v5/.pilot/
+translator-v5/coverage/
 用于测试的模型.txt

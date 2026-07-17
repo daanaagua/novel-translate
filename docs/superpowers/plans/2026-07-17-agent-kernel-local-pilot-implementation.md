@@ -80,7 +80,7 @@ TypeBox、YAML、DeepSeek OpenAI-compatible endpoint。
 - 创建：`translator-v5/src/config.ts`
 - 测试：`translator-v5/test/config.test.ts`
 
-- [ ] **步骤 1：编写失败的配置测试**
+- [x] **步骤 1：编写失败的配置测试**
 
 ```ts
 import assert from "node:assert/strict";
@@ -96,12 +96,12 @@ test("loads the selected DeepSeek role without exposing the key in JSON", () => 
 });
 ```
 
-- [ ] **步骤 2：运行测试确认失败**
+- [x] **步骤 2：运行测试确认失败**
 
 运行：`cd translator-v5 && npm test -- --test-name-pattern="loads the selected"`  
 预期：FAIL，`src/config.ts` 不存在。
 
-- [ ] **步骤 3：创建 package/tsconfig 并安装锁定依赖**
+- [x] **步骤 3：创建 package/tsconfig 并安装锁定依赖**
 
 `package.json` 必须包含：
 
@@ -128,7 +128,7 @@ test("loads the selected DeepSeek role without exposing the key in JSON", () => 
 
 运行：`npm install --ignore-scripts`。提交 `package-lock.json`。
 
-- [ ] **步骤 4：实现脱敏配置加载器**
+- [x] **步骤 4：实现脱敏配置加载器**
 
 ```ts
 export interface PilotModelConfig {
@@ -145,12 +145,12 @@ export interface PilotModelConfig {
 配置只从显式路径读取。`toJSON()` 不得包含 key；event log 禁止接收包含
 `apiKeyForRuntime` 返回值的对象。
 
-- [ ] **步骤 5：运行测试和类型检查**
+- [x] **步骤 5：运行测试和类型检查**
 
 运行：`npm test && npm run typecheck`  
 预期：PASS。
 
-- [ ] **步骤 6：Commit**
+- [x] **步骤 6：Commit**
 
 ```bash
 git add .gitignore translator-v5
