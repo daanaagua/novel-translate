@@ -83,7 +83,7 @@
 - [x] 运行 `python -m pytest tests/test_v5_exporter.py -q` 确认失败。
 - [x] 实现 `V5BookExporter`，只读 V5 store，并复用 `BookExporter` 的 EPUB 生成代码。
 - [x] 增加 `python main.py export-v5 BOOK_ID [--allow-incomplete] [--output-dir]`。
-- [ ] 重跑定向测试和 Python 正式回归。
+- [x] 重跑定向测试和 Python 正式回归。
 - [x] Commit：`feat: export v5 translations to txt and epub`。
 
 ### 任务 6：Little, Big 冷启动验收
@@ -97,5 +97,5 @@
 - [x] 运行 `book preflight`，记录章节、blocks、windows、tokens、source fingerprint 和异常字符警告。
 - [x] 用 Flash 跑三个窗口；在第二次实测中模拟停止并恢复，核对已完成窗口模型调用没有增加。
 - [x] 运行严格校验；生成内部 TXT/EPUB 抽查版。
-- [ ] 报告速度、调用量、预算峰值、修复/人工队列、锚点和记忆样例，以及是否建议启动全书。
-- [ ] 运行 `git diff --check`、V5 全测、typecheck 和 Python 正式测试；再决定合并到 main。
+- [x] 报告速度、调用量、预算峰值、修复/人工队列、锚点和记忆样例，以及是否建议启动全书。
+- [x] 运行 `git diff --check`、V5 全测、typecheck 和 Python 正式测试；再决定合并到 main。
