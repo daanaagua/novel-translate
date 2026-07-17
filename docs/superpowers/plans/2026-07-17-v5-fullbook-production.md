@@ -29,12 +29,12 @@
 - 创建：`translator-v5/src/storage/book-store.ts`
 - 测试：`translator-v5/test/book-store.test.ts`
 
-- [ ] 先写测试：初始化计划、原子提交译文/锚点/记忆/尾部、重开后跳过已完成块、`running` 恢复、source fingerprint 不匹配时拒绝。
-- [ ] 运行定向测试确认失败。
-- [ ] 建立版本化 `v5_book_schema=1`；实现 `initializePlan`、`claimWindow`、`commitWindow`、`failWindow`、`resumeState`、`statusSummary` 和只读导出查询。
-- [ ] 使用真实临时 SQLite 验证事务回滚，禁止用纯 mock 代替。
-- [ ] 重跑定向测试与类型检查。
-- [ ] Commit：`feat: persist resumable v5 book state`。
+- [x] 先写测试：初始化计划、原子提交译文/锚点/记忆/尾部、重开后跳过已完成块、`running` 恢复、source fingerprint 不匹配时拒绝。
+- [x] 运行定向测试确认失败。
+- [x] 建立版本化 `v5_book_schema=1`；实现 `initializePlan`、`claimWindow`、`commitWindow`、`failWindow`、初始化恢复、`statusSummary` 和只读导出查询。
+- [x] 使用真实临时 SQLite 验证事务回滚，禁止用纯 mock 代替。
+- [x] 重跑定向测试与类型检查。
+- [x] Commit：`feat: persist resumable v5 book state`。
 
 ### 任务 3：共享上下文、窗级内核与持久记忆投影
 
