@@ -149,7 +149,7 @@ test("cold preview completes five blocks without narrative reads", async () => {
         fauxToolCall("finalize_translation", {
           translations: ids.map((blockId) => ({
             blockId,
-            text: `这是文本块 ${blockId} 的完整中文译文，保留了原文中的叙事与对话。`,
+            text: "这是对应文本块的完整中文译文，保留了原文中的叙事与对话。",
           })),
           notes: [],
         }),

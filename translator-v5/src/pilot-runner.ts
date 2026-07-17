@@ -11,6 +11,7 @@ import { QuestionScout } from "./agents/question-scout.js";
 import {
   mapWithConcurrency,
   splitIntoChapterIslands,
+  trimExactBoundaryOverlaps,
   Translator,
   type TranslationOutcome,
 } from "./agents/translator.js";
@@ -304,11 +305,12 @@ export async function runPilot(options: RunPilotOptions): Promise<PilotResult> {
     adapter = new V4ReadAdapter(options.dbPath);
     const allBlocks = adapter.loadBlocks();
     const targetByIndex = new Map(allBlocks.map((block) => [block.globalIndex, block]));
-    const targetBlocks = indexes.map((index) => targetByIndex.get(index))
+    const rawTargetBlocks = indexes.map((index) => targetByIndex.get(index))
       .filter((block): block is V4Block => block !== undefined);
-    if (targetBlocks.length !== indexes.length) {
-      throw new Error(`requested ${indexes.length} blocks but found ${targetBlocks.length}`);
+    if (rawTargetBlocks.length !== indexes.length) {
+      throw new Error(`requested ${indexes.length} blocks but found ${rawTargetBlocks.length}`);
     }
+    const targetBlocks = trimExactBoundaryOverlaps(rawTargetBlocks);
     const stableTerms = adapter.loadStableTerms();
     evidenceIndex = EvidenceIndex.fromBlocks(allBlocks);
     state.transition("indexed");
@@ -422,7 +424,7 @@ export async function runPilot(options: RunPilotOptions): Promise<PilotResult> {
     const consumed = budget.snapshot();
     const metrics: PilotMetrics = {
       targetBlocks: targetBlocks.length,
-      sourceChars: targetBlocks.reduce((total, block) => total + block.sourceText.length, 0),
+      sourceChars: rawTargetBlocks.reduce((total, block) => total + block.sourceText.length, 0),
       translations: translations.length,
       narrativeTableReads: 0,
       modelCalls: consumed.modelCalls,

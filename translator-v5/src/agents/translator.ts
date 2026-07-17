@@ -54,6 +54,71 @@ export interface TranslationOutcome {
   humanRequired: boolean;
 }
 
+function paragraphs(text: string): string[] {
+  return text
+    .split(/(?:\r?\n)[\t ]*(?:\r?\n)+/u)
+    .map((paragraph) => paragraph.trim())
+    .filter(Boolean);
+}
+
+function sameParagraph(left: string, right: string): boolean {
+  return left.replace(/\s+/gu, " ").trim() === right.replace(/\s+/gu, " ").trim();
+}
+
+/** Removes exact paragraph overlap introduced by context-bearing V4 block boundaries. */
+export function trimExactBoundaryOverlaps(
+  sourceBlocks: readonly V4Block[],
+): V4Block[] {
+  const result: V4Block[] = [];
+  for (const sourceBlock of sourceBlocks) {
+    const block = { ...sourceBlock };
+    const previous = result.at(-1);
+    if (previous !== undefined) {
+      const previousParagraphs = paragraphs(previous.sourceText);
+      const currentParagraphs = paragraphs(block.sourceText);
+      const maximum = Math.min(previousParagraphs.length, currentParagraphs.length);
+      let overlap = 0;
+      for (let count = maximum; count >= 1; count -= 1) {
+        const previousSuffix = previousParagraphs.slice(-count);
+        const currentPrefix = currentParagraphs.slice(0, count);
+        if (previousSuffix.every((paragraph, index) =>
+          sameParagraph(paragraph, currentPrefix[index] as string))) {
+          overlap = count;
+          break;
+        }
+      }
+      if (overlap > 0) {
+        block.sourceText = currentParagraphs.slice(overlap).join("\n\n");
+      }
+    }
+    result.push(block);
+  }
+  return result;
+}
+
+export function normalizeCandidateTypography(
+  candidate: TranslationCandidate,
+  styleState: StyleState,
+): TranslationCandidate {
+  const useCurlyQuotes = styleState.dialogueQuotes
+    ?.toLocaleLowerCase()
+    .includes("curly") ?? false;
+  return {
+    ...candidate,
+    notes: [...candidate.notes],
+    translations: candidate.translations.map((translation) => ({
+      ...translation,
+      text: useCurlyQuotes
+        ? translation.text
+          .replaceAll("「", "“")
+          .replaceAll("」", "”")
+          .replaceAll("『", "“")
+          .replaceAll("』", "”")
+        : translation.text,
+    })),
+  };
+}
+
 export function splitIntoChapterIslands(
   sourceBlocks: readonly V4Block[],
 ): TranslationIsland[] {
@@ -136,6 +201,7 @@ export class Translator {
         "Translate the complete source island into polished, accurate Chinese literary prose.",
         "Preserve meaning, ambiguity, paragraph structure, voice, and all block boundaries.",
         "Use translator-global facts only to disambiguate wording; do not add facts unavailable to the narrator.",
+        "Do not leave ordinary source-language prose words untranslated unless the stable terminology explicitly preserves them.",
         "Use typed tools only. Submit every block exactly once with finalize_translation.",
       ].join("\n"),
       prompt: initialPrompt,
@@ -150,10 +216,17 @@ export class Translator {
       deadlineMs: input.deadlineMs,
     }, input.streamFn);
 
+    const allowedLatinTokens = terms.flatMap((term) =>
+      [...term.target.matchAll(/[A-Za-z][A-Za-z'-]+/gu)].map((match) => match[0]),
+    );
     let candidate = input.collector.translations().slice(before).at(-1);
+    if (candidate !== undefined) {
+      candidate = normalizeCandidateTypography(candidate, input.styleState);
+    }
     let validation = this.#validator.validate(
       input.island.blocks,
       candidate ?? emptyCandidate(),
+      { allowedLatinTokens },
     );
     let repair: RepairOutcome | undefined;
     if (!validation.valid && candidate !== undefined) {
@@ -170,8 +243,12 @@ export class Translator {
         deadlineMs: input.deadlineMs,
       });
       if (repair.candidate !== undefined) {
-        candidate = repair.candidate;
-        validation = this.#validator.validate(input.island.blocks, candidate);
+        candidate = normalizeCandidateTypography(repair.candidate, input.styleState);
+        validation = this.#validator.validate(
+          input.island.blocks,
+          candidate,
+          { allowedLatinTokens },
+        );
       }
     }
     return {

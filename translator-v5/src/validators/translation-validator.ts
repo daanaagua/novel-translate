@@ -7,6 +7,10 @@ export interface TranslationValidation {
   failures: ValidationFailure[];
 }
 
+export interface TranslationValidationPolicy {
+  allowedLatinTokens?: readonly string[];
+}
+
 function paragraphCount(text: string): number {
   return text
     .split(/(?:\r?\n)[\t ]*(?:\r?\n)+/u)
@@ -31,6 +35,7 @@ export class TranslationValidator {
   validate(
     blocks: readonly V4Block[],
     candidate: TranslationCandidate,
+    policy: TranslationValidationPolicy = {},
   ): TranslationValidation {
     const failures: ValidationFailure[] = [];
     const expectedIds = blocks.map((block) => block.id);
@@ -48,6 +53,8 @@ export class TranslationValidator {
     }
 
     const blockById = new Map(blocks.map((block) => [block.id, block]));
+    const allowedLatin = new Set((policy.allowedLatinTokens ?? [])
+      .map((token) => token.toLocaleLowerCase()));
     let sourceLength = 0;
     let targetLength = 0;
     for (const translation of candidate.translations) {
@@ -66,6 +73,17 @@ export class TranslationValidator {
           code: "system_json_leak",
           blockId: translation.blockId,
           message: "translation contains system/tool protocol material",
+          repairable: true,
+        });
+      }
+      const untranslated = [...translation.text.matchAll(/[A-Za-z][A-Za-z'-]+/gu)]
+        .map((match) => match[0].toLocaleLowerCase())
+        .filter((token) => !allowedLatin.has(token));
+      if (untranslated.length > 0) {
+        failures.push({
+          code: "untranslated_latin",
+          blockId: translation.blockId,
+          message: `unexpected Latin prose tokens: ${[...new Set(untranslated)].join(", ")}`,
           repairable: true,
         });
       }

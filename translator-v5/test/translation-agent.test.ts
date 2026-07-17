@@ -9,7 +9,9 @@ import {
 
 import { PiRuntime } from "../src/agents/pi-runtime.js";
 import {
+  normalizeCandidateTypography,
   splitIntoChapterIslands,
+  trimExactBoundaryOverlaps,
   Translator,
 } from "../src/agents/translator.js";
 import type { ProvisionalSnapshot } from "../src/domain/provisional-snapshot.js";
@@ -135,6 +137,28 @@ test("deterministic validator rejects missing blocks and leaked system JSON", ()
   assert.equal(result.valid, false);
   assert.ok(result.failures.some((failure) => failure.code === "block_set_mismatch"));
   assert.ok(result.failures.some((failure) => failure.code === "system_json_leak"));
+});
+
+test("exact paragraph overlap is removed before adjacent blocks are translated", () => {
+  const first = chapterBlock(0, "First paragraph.\n\nShared boundary paragraph.");
+  const second = chapterBlock(1, "Shared boundary paragraph.\n\nNext paragraph.");
+  const trimmed = trimExactBoundaryOverlaps([first, second]);
+  assert.equal(trimmed[0]?.sourceText, first.sourceText);
+  assert.equal(trimmed[1]?.sourceText, "Next paragraph.");
+});
+
+test("typography is normalized and untranslated prose words are rejected", () => {
+  const block = chapterBlock(0, "The sailors looked up.");
+  const normalized = normalizeCandidateTypography({
+    translations: [{ blockId: block.id, text: "「sailors 抬头望去。」" }],
+    notes: [],
+    repaired: false,
+  }, { dialogueQuotes: "Chinese curly double quotes" });
+  assert.equal(normalized.translations[0]?.text, "“sailors 抬头望去。”");
+  const validation = new TranslationValidator().validate([block], normalized);
+  assert.ok(validation.failures.some((failure) =>
+    failure.code === "untranslated_latin"),
+  );
 });
 
 test("one repair pass can replace an invalid island candidate", async () => {
