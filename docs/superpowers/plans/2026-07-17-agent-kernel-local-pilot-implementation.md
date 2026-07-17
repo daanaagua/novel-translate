@@ -334,7 +334,7 @@ git commit -m "feat: index bounded source evidence"
 - 创建：`translator-v5/src/tools/repair-tools.ts`
 - 测试：`translator-v5/test/tools.test.ts`
 
-- [ ] **步骤 1：编写非法 ID、未来泄漏和预算失败测试**
+- [x] **步骤 1：编写非法 ID、未来泄漏和预算失败测试**
 
 ```ts
 test("submit_resolution rejects evidence outside the query channel", async () => {
@@ -355,12 +355,12 @@ test("invented subject ids are rejected before search", async () => {
 });
 ```
 
-- [ ] **步骤 2：运行测试确认失败**
+- [x] **步骤 2：运行测试确认失败**
 
 运行：`npm test -- --test-name-pattern="visibility violation|invented subject"`  
 预期：FAIL。
 
-- [ ] **步骤 3：用 TypeBox 定义 allowlist tools**
+- [x] **步骤 3：用 TypeBox 定义 allowlist tools**
 
 工具包括：
 
@@ -385,17 +385,17 @@ submit_repaired_translation
 每个 tool execute 先通过 Kernel 校验和 budget consume；所有 evidence 返回值裁剪到
 工具与总预算上限。
 
-- [ ] **步骤 4：实现写候选而非写活动状态**
+- [x] **步骤 4：实现写候选而非写活动状态**
 
 `submit_resolution/finalize_translation/submit_repaired_translation` 只写当前 run 的
 内存 candidate collector。Kernel 在 Agent 结束后验证并决定是否提交 pilot store。
 
-- [ ] **步骤 5：运行测试和类型检查**
+- [x] **步骤 5：运行测试和类型检查**
 
 运行：`npm test && npm run typecheck`  
 预期：PASS。
 
-- [ ] **步骤 6：Commit**
+- [x] **步骤 6：Commit**
 
 ```bash
 git add translator-v5/src/tools translator-v5/test/tools.test.ts
