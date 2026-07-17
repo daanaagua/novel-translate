@@ -46,13 +46,13 @@
 - 测试：`translator-v5/test/book-context.test.ts`
 - 测试：`translator-v5/test/memory-projection.test.ts`
 
-- [ ] 先写测试：一本书只构建一次证据索引；未知形式只从当前窗触发但 concordance 可取全书；已存 contextual 决定不重复；未来 narrative 事实不可见；尾部最多 1,600 字符。
-- [ ] 运行定向测试确认失败。
-- [ ] 实现 `BookContext.open/close`，持有只读 adapter、全部 blocks、稳定术语和单一 EvidenceIndex。
-- [ ] 将词汇锚定移到窗级研究之前；加入全书 concordance 但不向翻译提示暴露非目标全文。
-- [ ] 把 Pilot 主体抽成 `runTranslationWindow`，允许注入额外术语、已有锚点、投影事实、style state 与 previous tail；`runPilot` 变成兼容包装器。
-- [ ] 重跑现有 Pilot 回归、定向测试和类型检查。
-- [ ] Commit：`refactor: share bounded v5 window kernel`。
+- [x] 先写测试：一本书只构建一次证据索引；未知形式只从当前窗触发但 concordance 可取全书；已存 contextual 决定不重复；未来 narrative 事实不可见；尾部最多 1,600 字符。
+- [x] 运行定向测试确认失败。
+- [x] 实现 `BookContext.open/close`，持有只读 adapter、全部 blocks、稳定术语和单一 EvidenceIndex。
+- [x] 将词汇锚定移到窗级研究之前；加入全书 concordance 但不向翻译提示暴露非目标全文。
+- [x] 把 Pilot 主体抽成 `runTranslationWindow`，允许注入额外术语、已有锚点、投影事实、style state 与 previous tail；`runPilot` 变成兼容包装器。
+- [x] 重跑现有 Pilot 回归、定向测试和类型检查。
+- [x] Commit：`refactor: share bounded v5 window kernel`。
 
 ### 任务 4：全书 Runner、重试与 CLI
 

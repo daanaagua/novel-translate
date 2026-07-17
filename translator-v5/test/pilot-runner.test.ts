@@ -18,6 +18,7 @@ import {
 } from "@earendil-works/pi-ai";
 
 import { runPilot } from "../src/pilot-runner.js";
+import { BookContext } from "../src/fullbook/book-context.js";
 
 function createPilotFixture(path: string): void {
   const database = new DatabaseSync(path);
@@ -191,6 +192,106 @@ test("cold preview completes five blocks without narrative reads", async () => {
     assert.equal(audit.includes("reasoning_content"), false);
     assert.equal(audit.includes("Typhon and Piaton once shared"), false);
   } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("shared context reuses lexical decisions, bounded tail, and visible memory", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "v5-shared-window-"));
+  const databasePath = join(directory, "book.db");
+  createPilotFixture(databasePath);
+  const database = new DatabaseSync(databasePath);
+  database.prepare(`UPDATE blocks SET source_text=?, source_hash=? WHERE global_index=219`).run(
+    "Smoky stood beside Typhon and listened.",
+    "hash-smoky-219",
+  );
+  database.prepare(`UPDATE blocks SET source_text=?, source_hash=? WHERE global_index=220`).run(
+    "Smoky answered Typhon without hesitation.",
+    "hash-smoky-220",
+  );
+  database.close();
+  const context = BookContext.open(databasePath);
+  try {
+    const firstFaux = fauxProvider();
+    firstFaux.setResponses([
+      fauxAssistantMessage(fauxToolCall("submit_lexical_anchors", {
+        anchors: [{
+          sourceForm: "Smoky",
+          target: "斯莫基",
+          mode: "stable",
+          confidence: 0.97,
+        }],
+      }), { stopReason: "toolUse" }),
+      fauxAssistantMessage(
+        fauxToolCall("submit_questions", { questions: [] }),
+        { stopReason: "toolUse" },
+      ),
+      fauxAssistantMessage(fauxToolCall("finalize_translation", {
+        translations: [{
+          blockId: "v06_ch07_001",
+          text: "斯莫基站在提丰身旁，静静听着。",
+        }],
+        notes: [],
+      }), { stopReason: "toolUse" }),
+    ]);
+    const first = await runPilot({
+      dbPath: databasePath,
+      context,
+      outputDir: join(directory, "first"),
+      globalIndexes: [219],
+      model: firstFaux.getModel(),
+      streamFn: firstFaux.provider.streamSimple.bind(firstFaux.provider),
+      hardDeadlineMs: 30_000,
+    });
+    assert.equal(first.audit.lexicalAnchors[0]?.sourceForm, "Smoky");
+
+    const secondFaux = fauxProvider();
+    secondFaux.setResponses([
+      fauxAssistantMessage(
+        fauxToolCall("submit_questions", { questions: [] }),
+        { stopReason: "toolUse" },
+      ),
+      (agentContext: Context) => {
+        const prompt = userText(agentContext);
+        assert.match(prompt, /上一窗尾部/u);
+        assert.match(prompt, /Typhon is a single continuing subject/u);
+        return fauxAssistantMessage(fauxToolCall("finalize_translation", {
+          translations: [{
+            blockId: "v06_ch08_000",
+            text: "斯莫基毫不迟疑地回答了提丰。",
+          }],
+          notes: [],
+        }), { stopReason: "toolUse" });
+      },
+    ]);
+    const second = await runPilot({
+      dbPath: databasePath,
+      context,
+      outputDir: join(directory, "second"),
+      globalIndexes: [220],
+      model: secondFaux.getModel(),
+      streamFn: secondFaux.provider.streamSimple.bind(secondFaux.provider),
+      persistedAnchors: first.audit.lexicalAnchors,
+      persistedNarrativeMemories: [{
+        questionId: "q-typhon-persisted",
+        kind: "entity_identity",
+        subjectIds: ["typhon"],
+        verdict: "Typhon is a single continuing subject.",
+        confidence: 0.96,
+        channel: "translator_global",
+        visibleFromGlobalIndex: 0,
+        evidenceIds: ["ev-typhon"],
+      }],
+      previousActiveTail: "上一窗尾部",
+      hardDeadlineMs: 30_000,
+    });
+    assert.equal(second.audit.lexicalAnchors.length, 0);
+    assert.deepEqual(
+      second.snapshot.translatorFacts.map((item) => item.questionId),
+      ["q-typhon-persisted"],
+    );
+  } finally {
+    context.close();
     rmSync(directory, { recursive: true, force: true });
   }
 });

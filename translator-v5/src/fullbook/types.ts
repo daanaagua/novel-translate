@@ -34,3 +34,14 @@ export interface AdaptiveConcurrencyOptions {
   maxConcurrency: number;
   budgetRiskRatio?: number;
 }
+
+export interface NarrativeMemoryRecord {
+  questionId: string;
+  kind: string;
+  subjectIds: string[];
+  verdict: string;
+  confidence: number;
+  channel: "narrative_before_target" | "translator_global";
+  visibleFromGlobalIndex: number;
+  evidenceIds: string[];
+}

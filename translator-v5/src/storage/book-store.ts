@@ -4,7 +4,11 @@ import { DatabaseSync, type StatementSync } from "node:sqlite";
 
 import type { LexicalAnchor } from "../agents/lexical-anchorer.js";
 import type { V4Block, VisibilityChannel } from "../domain/types.js";
-import type { BookWindowPlan, BookWindowStatus } from "../fullbook/types.js";
+import type {
+  BookWindowPlan,
+  BookWindowStatus,
+  NarrativeMemoryRecord,
+} from "../fullbook/types.js";
 
 const SCHEMA_VERSION = "1";
 
@@ -23,17 +27,6 @@ export interface PersistedWindow extends BookWindowPlan {
   budget: Record<string, number>;
   warnings: string[];
   lastError: string;
-}
-
-export interface NarrativeMemoryRecord {
-  questionId: string;
-  kind: string;
-  subjectIds: string[];
-  verdict: string;
-  confidence: number;
-  channel: VisibilityChannel;
-  visibleFromGlobalIndex: number;
-  evidenceIds: string[];
 }
 
 export interface WindowCommitInput {

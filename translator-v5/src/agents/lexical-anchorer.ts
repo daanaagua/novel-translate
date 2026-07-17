@@ -116,6 +116,61 @@ export function collectRepeatedAnchorCandidates(
     }));
 }
 
+/**
+ * Finds forms that occur in the current window, but builds their compact
+ * translator-global concordance from the whole source corpus. A prior stable
+ * or contextual decision suppresses reconsideration.
+ */
+export function collectWindowAnchorCandidates(
+  targetBlocks: readonly V4Block[],
+  corpusBlocks: readonly V4Block[],
+  stableTerms: readonly StableTerm[],
+  decidedSourceForms: readonly string[] = [],
+): AnchorCandidate[] {
+  const established = new Set([
+    ...stableTerms.flatMap((term) => [term.sourceForm, term.canonicalSource]),
+    ...decidedSourceForms,
+  ].map((form) => form.replace(/[’']s$/u, "").toLocaleLowerCase()));
+  const targets = new Map<string, string>();
+  for (const block of targetBlocks) {
+    for (const match of block.sourceText.matchAll(/\b[A-Z][A-Za-z'’-]{2,}\b/gu)) {
+      const sourceForm = match[0].replace(/[’']s$/u, "");
+      const key = sourceForm.toLocaleLowerCase();
+      if (!COMMON_CAPITALIZED.has(key) && !established.has(key)) {
+        targets.set(key, sourceForm);
+      }
+    }
+  }
+  const found = new Map<string, { count: number; contexts: Set<string> }>();
+  for (const block of corpusBlocks) {
+    for (const match of block.sourceText.matchAll(/\b[A-Z][A-Za-z'’-]{2,}\b/gu)) {
+      const key = match[0].replace(/[’']s$/u, "").toLocaleLowerCase();
+      if (!targets.has(key)) {
+        continue;
+      }
+      const record = found.get(key) ?? { count: 0, contexts: new Set<string>() };
+      record.count += 1;
+      if (record.contexts.size < 3) {
+        const context = compactContext(block.sourceText, match.index);
+        if (context.length > 0) {
+          record.contexts.add(context);
+        }
+      }
+      found.set(key, record);
+    }
+  }
+  return [...found.entries()]
+    .filter(([, record]) => record.count >= 2)
+    .sort((left, right) =>
+      right[1].count - left[1].count
+      || (targets.get(left[0]) as string).localeCompare(targets.get(right[0]) as string))
+    .slice(0, 12)
+    .map(([key, record]) => ({
+      sourceForm: targets.get(key) as string,
+      contexts: [...record.contexts],
+    }));
+}
+
 export class LexicalAnchorer {
   constructor(private readonly runtime: PiRuntime) {}
 
@@ -201,7 +256,7 @@ export class LexicalAnchorer {
   }
 }
 
-function anchorAsTerm(anchor: LexicalAnchor): StableTerm {
+export function anchorAsTerm(anchor: LexicalAnchor): StableTerm {
   const id = createHash("sha256")
     .update(`${anchor.sourceForm}\0${anchor.target}`)
     .digest("hex")

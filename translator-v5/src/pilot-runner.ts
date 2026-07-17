@@ -7,7 +7,8 @@ import type { Model } from "@earendil-works/pi-ai";
 
 import { EvidenceResolver, type ResearchOutcome } from "./agents/evidence-resolver.js";
 import {
-  collectRepeatedAnchorCandidates,
+  collectWindowAnchorCandidates,
+  anchorAsTerm,
   LexicalAnchorer,
   type LexicalAnchor,
   type LexicalAnchorOutcome,
@@ -26,7 +27,13 @@ import {
   type ProvisionalSnapshot,
 } from "./domain/provisional-snapshot.js";
 import type { RunStatus, StableTerm, V4Block } from "./domain/types.js";
-import { EvidenceIndex } from "./index/evidence-index.js";
+import { BookContext } from "./fullbook/book-context.js";
+import {
+  boundedActiveTail,
+  mergeProjectedMemories,
+  projectNarrativeMemories,
+} from "./fullbook/memory-projection.js";
+import type { NarrativeMemoryRecord } from "./fullbook/types.js";
 import { BudgetLedger } from "./kernel/budget.js";
 import { MemoryEventLog } from "./kernel/event-log.js";
 import { RunLease } from "./kernel/run-lease.js";
@@ -40,6 +47,7 @@ import { PilotStore, type PilotArtifactPaths } from "./storage/pilot-store.js";
 import { V4ReadAdapter } from "./storage/v4-read-adapter.js";
 import { CandidateCollector } from "./tools/candidate-collector.js";
 import { ResearchTools, type SubjectRef } from "./tools/research-tools.js";
+import type { StyleState } from "./tools/translation-tools.js";
 
 const SOFT_DEADLINE_MS = 15 * 60 * 1000;
 const DEFAULT_HARD_DEADLINE_MS = 30 * 60 * 1000;
@@ -151,6 +159,11 @@ export interface RunPilotOptions {
   hardDeadlineMs?: number;
   protocolVersion?: string;
   outputPrefix?: string;
+  context?: BookContext;
+  persistedAnchors?: readonly LexicalAnchor[];
+  persistedNarrativeMemories?: readonly NarrativeMemoryRecord[];
+  previousActiveTail?: string;
+  styleState?: StyleState;
 }
 
 export interface PilotResult {
@@ -252,7 +265,9 @@ function runKey(options: RunPilotOptions, indexes: readonly number[]): string {
     .slice(0, 20);
 }
 
-export async function runPilot(options: RunPilotOptions): Promise<PilotResult> {
+export async function runTranslationWindow(
+  options: RunPilotOptions,
+): Promise<PilotResult> {
   const indexes = normalizeIndexes(options.globalIndexes);
   const hardDeadlineMs = options.hardDeadlineMs ?? DEFAULT_HARD_DEADLINE_MS;
   const concurrency = options.translationConcurrency ?? 2;
@@ -270,13 +285,13 @@ export async function runPilot(options: RunPilotOptions): Promise<PilotResult> {
   const lease = RunLease.acquire(leasePath, runKey(options, indexes));
   const controller = new AbortController();
   const deadline = setTimeout(() => controller.abort(new Error("pilot hard deadline exceeded")), hardDeadlineMs);
-  let adapter: V4ReadAdapter | undefined;
-  let evidenceIndex: EvidenceIndex | undefined;
+  const ownsContext = options.context === undefined;
+  let context = options.context;
   let result: PilotResult | undefined;
 
   try {
-    adapter = new V4ReadAdapter(options.dbPath);
-    const allBlocks = adapter.loadBlocks();
+    context ??= BookContext.open(options.dbPath);
+    const allBlocks = context.blocks;
     const targetByIndex = new Map(allBlocks.map((block) => [block.globalIndex, block]));
     const rawTargetBlocks = indexes.map((index) => targetByIndex.get(index))
       .filter((block): block is V4Block => block !== undefined);
@@ -284,11 +299,47 @@ export async function runPilot(options: RunPilotOptions): Promise<PilotResult> {
       throw new Error(`requested ${indexes.length} blocks but found ${rawTargetBlocks.length}`);
     }
     const targetBlocks = trimExactBoundaryOverlaps(rawTargetBlocks);
-    const stableTerms = adapter.loadStableTerms();
-    evidenceIndex = EvidenceIndex.fromBlocks(allBlocks);
+    const persistedAnchors = options.persistedAnchors ?? [];
+    const stableTerms = [
+      ...context.stableTerms,
+      ...persistedAnchors
+        .filter((anchor) =>
+          anchor.mode === "stable"
+          && anchor.confidence >= 0.85
+          && anchor.target.trim().length > 0)
+        .map(anchorAsTerm),
+    ];
     state.transition("indexed");
 
-    const subjectCatalog = buildSubjects(stableTerms, targetBlocks);
+    const anchorCandidates = collectWindowAnchorCandidates(
+      targetBlocks,
+      allBlocks,
+      stableTerms,
+      persistedAnchors.map((anchor) => anchor.sourceForm),
+    );
+    let lexicalAnchoring: LexicalAnchorOutcome | undefined;
+    let activeTerms = stableTerms;
+    if (anchorCandidates.length > 0) {
+      try {
+        lexicalAnchoring = await new LexicalAnchorer(runtime).run({
+          candidates: anchorCandidates,
+          stableTerms,
+          model: options.model,
+          streamFn: options.streamFn,
+          budget,
+          signal: controller.signal,
+        });
+        activeTerms = [...stableTerms, ...lexicalAnchoring.terms];
+        if (lexicalAnchoring.anchors.length !== anchorCandidates.length) {
+          degradedReasons.push("run-local lexical anchor finalization was incomplete");
+        }
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        degradedReasons.push(`lexical anchor fallback: ${message}`);
+      }
+    }
+
+    const subjectCatalog = buildSubjects(activeTerms, targetBlocks);
     const mandatory = QuestionScout.forcedQuestionsForUnresolvedNames(
       subjectCatalog.unresolved,
     );
@@ -300,11 +351,11 @@ export async function runPilot(options: RunPilotOptions): Promise<PilotResult> {
     });
     const researchTools = new ResearchTools({
       budget,
-      evidenceIndex,
+      evidenceIndex: context.evidenceIndex,
       targetGlobalIndex: Math.min(...indexes),
       targetBlockIndexes: indexes,
       subjects: subjectCatalog.subjects,
-      stableTerms,
+      stableTerms: activeTerms,
       questions: scout.mandatoryQuestions(),
       collector,
     });
@@ -342,31 +393,16 @@ export async function runPilot(options: RunPilotOptions): Promise<PilotResult> {
         evidence: researchTools.issuedEvidence(),
       });
     }
+    snapshot = mergeProjectedMemories(
+      snapshot,
+      projectNarrativeMemories(
+        options.persistedNarrativeMemories ?? [],
+        targetBlocks,
+        subjectCatalog.subjects,
+      ),
+    );
     state.transition("researched");
     state.transition("translating");
-
-    const anchorCandidates = collectRepeatedAnchorCandidates(targetBlocks, stableTerms);
-    let lexicalAnchoring: LexicalAnchorOutcome | undefined;
-    let activeTerms = stableTerms;
-    if (anchorCandidates.length > 0) {
-      try {
-        lexicalAnchoring = await new LexicalAnchorer(runtime).run({
-          candidates: anchorCandidates,
-          stableTerms,
-          model: options.model,
-          streamFn: options.streamFn,
-          budget,
-          signal: controller.signal,
-        });
-        activeTerms = [...stableTerms, ...lexicalAnchoring.terms];
-        if (lexicalAnchoring.anchors.length !== anchorCandidates.length) {
-          degradedReasons.push("run-local lexical anchor finalization was incomplete");
-        }
-      } catch (error) {
-        const message = error instanceof Error ? error.message : String(error);
-        degradedReasons.push(`lexical anchor fallback: ${message}`);
-      }
-    }
 
     const translator = new Translator(runtime);
     const islands = splitIntoChapterIslands(targetBlocks);
@@ -381,12 +417,12 @@ export async function runPilot(options: RunPilotOptions): Promise<PilotResult> {
         collector: new CandidateCollector(),
         stableTerms: activeTerms,
         snapshot,
-        styleState: {
+        styleState: options.styleState ?? {
           register: "literary, precise, restrained",
           dialogueQuotes: "Chinese curly double quotes",
           paragraphPolicy: "preserve source paragraph boundaries",
         },
-        previousActiveTail: "",
+        previousActiveTail: boundedActiveTail(options.previousActiveTail ?? ""),
         signal: controller.signal,
       }),
     );
@@ -497,8 +533,9 @@ export async function runPilot(options: RunPilotOptions): Promise<PilotResult> {
     throw error;
   } finally {
     clearTimeout(deadline);
-    evidenceIndex?.close();
-    adapter?.close();
+    if (ownsContext) {
+      context?.close();
+    }
     lease.release();
     if (result !== undefined) {
       result.metrics.leaseReleased = true;
@@ -506,4 +543,9 @@ export async function runPilot(options: RunPilotOptions): Promise<PilotResult> {
   }
 
   return result as PilotResult;
+}
+
+/** Backward-compatible local-preview entry point. */
+export async function runPilot(options: RunPilotOptions): Promise<PilotResult> {
+  return runTranslationWindow(options);
 }
