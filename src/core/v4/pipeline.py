@@ -1172,8 +1172,6 @@ class V4TranslationPipeline:
                     TranslationOutcome(
                         block=block,
                         knowledge_version=knowledge_version,
-                        memory_version=narrative_context.snapshot.memory_version,
-                        snapshot_id=narrative_context.snapshot.id,
                         status=V4BlockStatus.INCOMPLETE_REQUIRES_HUMAN.value,
                         error=narrative_context.error,
                     )

@@ -260,6 +260,67 @@ def test_context_includes_semantics_memory_discourse_and_exact_dependencies(
     assert packet.context_hash
 
 
+def test_narrative_context_overflow_commits_without_claiming_snapshot_use(
+    tmp_path,
+):
+    from src.core.v4.models import Island, V4BlockStatus
+    from src.core.v4.narrative_memory import NarrativeMemoryStore
+    from src.core.v4.pipeline import V4TranslationPipeline
+
+    database = V4Database(tmp_path / "book")
+    edition = database.ensure_source_edition(
+        "raw", "normalized", "test", "source.txt"
+    )
+    database.upsert_blocks(
+        edition,
+        [
+            {
+                "id": "overflow-block",
+                "legacy_id": "v01_ch01_000",
+                "chapter_id": "ch01",
+                "chapter_title": "I",
+                "chapter_index": 0,
+                "block_index": 0,
+                "global_index": 0,
+                "block_type": "prose",
+                "source_text": "A required narrative context is too large.",
+                "source_hash": "overflow-source-hash",
+                "token_count": 8,
+                "status": "ready",
+            }
+        ],
+    )
+    block = database.list_blocks()[0]
+    snapshot = NarrativeMemoryStore(database).build_snapshot(
+        block,
+        knowledge_version=database.current_knowledge_version(),
+        discourse_state=DiscourseState(viewpoint_holder="narrator"),
+    )
+    pipeline = V4TranslationPipeline(database, lambda: object())
+    pipeline._active_narrative_contexts = {
+        block.id: SimpleNamespace(
+            snapshot=snapshot,
+            error="required narrative context exceeds budget",
+        )
+    }
+
+    outcome = pipeline._translate_island(
+        Island(id="overflow-island", blocks=[block]),
+        database.current_knowledge_version(),
+    )[0]
+
+    assert outcome.status == V4BlockStatus.INCOMPLETE_REQUIRES_HUMAN.value
+    assert outcome.snapshot_id == ""
+    assert outcome.context_hash == ""
+    assert outcome.discourse_state_hash == ""
+    run_id = "overflow-run"
+    database.start_run(run_id, "translate", {})
+    database.commit_translation_batch(run_id, [outcome])
+    assert database.active_translations("parallel_v4")[block.id]["status"] == (
+        V4BlockStatus.INCOMPLETE_REQUIRES_HUMAN.value
+    )
+
+
 def test_translation_supplemental_memory_requires_current_english_evidence():
     from src.core.translator import TranslationEngine
 
