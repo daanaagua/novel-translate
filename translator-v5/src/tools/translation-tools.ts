@@ -33,6 +33,7 @@ export class TranslationTools {
   readonly #stableTerms: readonly StableTerm[];
   readonly #resolvedEvidence: readonly ResolutionCandidate[];
   readonly #styleState: StyleState;
+  readonly #usedResolutionIds = new Set<string>();
 
   constructor(options: TranslationToolsOptions) {
     this.#budget = options.budget;
@@ -86,11 +87,13 @@ export class TranslationTools {
     assertNotAborted(signal);
     const ids = new Set(args.questionIds);
     this.#budget.consume("translationToolCalls", 1);
-    return {
-      resolutions: this.#resolvedEvidence
+    const resolutions = this.#resolvedEvidence
         .filter((item) => ids.size === 0 || ids.has(item.questionId))
-        .map((item) => ({ ...item, evidenceIds: [...item.evidenceIds] })),
-    };
+        .map((item) => ({ ...item, evidenceIds: [...item.evidenceIds] }));
+    for (const resolution of resolutions) {
+      this.#usedResolutionIds.add(resolution.questionId);
+    }
+    return { resolutions };
   }
 
   async inspectStyleState(
@@ -181,6 +184,10 @@ export class TranslationTools {
         ),
       },
     ];
+  }
+
+  usedResolutionIds(): string[] {
+    return [...this.#usedResolutionIds].sort();
   }
 
   #validateTranslations(

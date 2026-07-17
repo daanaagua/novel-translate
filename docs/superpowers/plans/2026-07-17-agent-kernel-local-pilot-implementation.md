@@ -558,7 +558,7 @@ git commit -m "feat: research local translation evidence"
 - 创建：`translator-v5/src/validators/translation-validator.ts`
 - 测试：`translator-v5/test/translation-agent.test.ts`
 
-- [ ] **步骤 1：编写按章节 island 翻译失败测试**
+- [x] **步骤 1：编写按章节 island 翻译失败测试**
 
 ```ts
 test("translation agent receives minimal context and may retrieve evidence", async () => {
@@ -574,12 +574,12 @@ test("translation agent receives minimal context and may retrieve evidence", asy
 });
 ```
 
-- [ ] **步骤 2：运行测试确认失败**
+- [x] **步骤 2：运行测试确认失败**
 
 运行：`npm test -- --test-name-pattern="minimal context"`  
 预期：FAIL。
 
-- [ ] **步骤 3：实现章节 island 与最小强制上下文**
+- [x] **步骤 3：实现章节 island 与最小强制上下文**
 
 目标五块按章节分为：
 
@@ -592,22 +592,22 @@ v06_ch09: global 222..223
 每个 island 的初始提示只含完整原文、结构、稳定术语、位置边界、上一活动尾部、
 高影响判断和工具说明。三组最多并发 2；同章内不拆分。
 
-- [ ] **步骤 4：实现候选提交与确定性校验**
+- [x] **步骤 4：实现候选提交与确定性校验**
 
 校验：目标 block ID 集合完全相等、无重复、译文非空、段落数量相容、输出总字符
 不异常缩短、没有泄漏系统 JSON。失败返回 typed failures，不切换候选状态。
 
-- [ ] **步骤 5：实现一次 Repair Agent**
+- [x] **步骤 5：实现一次 Repair Agent**
 
 Repair 只接收失败项、原文、失败候选和必要证据；必须通过
 `submit_repaired_translation` 返回完整受影响 island。第二次失败直接降级为人工处理。
 
-- [ ] **步骤 6：运行测试和类型检查**
+- [x] **步骤 6：运行测试和类型检查**
 
 运行：`npm test && npm run typecheck`  
 预期：PASS。
 
-- [ ] **步骤 7：Commit**
+- [x] **步骤 7：Commit**
 
 ```bash
 git add translator-v5/src/agents/translator.ts translator-v5/src/agents/repairer.ts translator-v5/src/validators translator-v5/test/translation-agent.test.ts
