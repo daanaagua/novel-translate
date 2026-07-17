@@ -27,6 +27,15 @@ interface RawConfig {
   };
 }
 
+interface OpenCodeAuthEntry {
+  type?: unknown;
+  key?: unknown;
+}
+
+interface LoadPilotConfigOptions {
+  apiKeyOverride?: string;
+}
+
 class LoadedPilotModelConfig implements PilotModelConfig {
   public constructor(
     public readonly provider: string,
@@ -63,6 +72,7 @@ function requireText(value: unknown, label: string): string {
 export function loadPilotConfig(
   configPath: string,
   role: string,
+  options: LoadPilotConfigOptions = {},
 ): PilotModelConfig {
   const raw = parse(readFileSync(configPath, "utf8")) as RawConfig;
   const provider = requireText(raw.llm?.active_provider, "llm.active_provider");
@@ -85,6 +95,23 @@ export function loadPilotConfig(
       providerConfig.request_options?.[role]?.reasoning_effort ?? "high",
       `request_options.${role}.reasoning_effort`,
     ),
-    requireText(providerConfig.api_key, `llm.providers.${provider}.api_key`),
+    options.apiKeyOverride === undefined
+      ? requireText(providerConfig.api_key, `llm.providers.${provider}.api_key`)
+      : requireText(options.apiKeyOverride, "apiKeyOverride"),
   );
+}
+
+export function loadOpenCodeApiKey(
+  authPath: string,
+  provider: string,
+): string {
+  const raw = JSON.parse(readFileSync(authPath, "utf8")) as Record<
+    string,
+    OpenCodeAuthEntry | undefined
+  >;
+  const entry = raw[provider];
+  if (entry === undefined || (entry.type !== "api" && entry.type !== "api_key")) {
+    throw new Error(`OpenCode auth has no API credential for provider: ${provider}`);
+  }
+  return requireText(entry.key, `OpenCode auth credential for ${provider}`);
 }

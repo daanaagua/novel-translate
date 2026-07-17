@@ -1,7 +1,7 @@
 import { resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 
-import { loadPilotConfig } from "./config.js";
+import { loadOpenCodeApiKey, loadPilotConfig } from "./config.js";
 import {
   createDeepSeekModel,
   createDeepSeekStreamFn,
@@ -14,6 +14,7 @@ interface CliOptions {
   output: string;
   globalIndexes: number[];
   preflightOnly: boolean;
+  openCodeAuth?: string;
 }
 
 function parseIndexes(value: string): number[] {
@@ -70,12 +71,23 @@ function parseArgs(argv: readonly string[]): CliOptions {
     output: requireValue("--output"),
     globalIndexes: parseIndexes(values.get("--global-index") ?? ""),
     preflightOnly,
+    ...(values.get("--opencode-auth") === undefined
+      ? {}
+      : { openCodeAuth: resolve(values.get("--opencode-auth") as string) }),
   };
 }
 
 export async function main(argv = process.argv.slice(2)): Promise<void> {
   const options = parseArgs(argv);
-  const config = loadPilotConfig(options.config, "draft");
+  const baseConfig = loadPilotConfig(options.config, "draft");
+  const config = options.openCodeAuth === undefined
+    ? baseConfig
+    : loadPilotConfig(options.config, "draft", {
+      apiKeyOverride: loadOpenCodeApiKey(
+        options.openCodeAuth,
+        baseConfig.provider,
+      ),
+    });
   const preflight = preflightPilot(options.db, options.globalIndexes);
   console.log(JSON.stringify({
     mode: "cold-preview",
