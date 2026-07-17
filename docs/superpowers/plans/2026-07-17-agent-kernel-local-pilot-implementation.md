@@ -249,7 +249,7 @@ git commit -m "feat: add bounded agent kernel"
 - 创建：`translator-v5/src/index/query-compiler.ts`
 - 测试：`translator-v5/test/evidence-index.test.ts`
 
-- [ ] **步骤 1：创建最小 SQLite fixture 并编写失败测试**
+- [x] **步骤 1：创建最小 SQLite fixture 并编写失败测试**
 
 ```ts
 test("narrative-before queries never return later evidence", () => {
@@ -270,12 +270,12 @@ test("cold adapter exposes no narrative table methods", () => {
 });
 ```
 
-- [ ] **步骤 2：运行测试确认失败**
+- [x] **步骤 2：运行测试确认失败**
 
 运行：`npm test -- --test-name-pattern="narrative-before|cold adapter"`  
 预期：FAIL。
 
-- [ ] **步骤 3：实现 read-only V4 adapter**
+- [x] **步骤 3：实现 read-only V4 adapter**
 
 仅允许以下查询：
 
@@ -290,7 +290,7 @@ ORDER BY global_index;
 `verified_target > working_target > default_target`；人工锁定项优先。代码中不出现
 `narrative_snapshots`、`narrative_memories`、`premap_results` 查询。
 
-- [ ] **步骤 4：实现段落 FTS5 索引和稳定 evidence ID**
+- [x] **步骤 4：实现段落 FTS5 索引和稳定 evidence ID**
 
 ```ts
 export interface EvidenceHit {
@@ -307,17 +307,17 @@ export interface EvidenceHit {
 ID 为 `sha256(blockId + paragraphIndex + normalizedQuote + sourceHash)` 的稳定前缀。
 FTS 仅保存源文段落和位置，不保存模型解释。
 
-- [ ] **步骤 5：实现受限查询编译器**
+- [x] **步骤 5：实现受限查询编译器**
 
 只支持 `mentions/cooccurrence/context/nearest`；拒绝原始 SQL 和任意表名。检索结果
 按通道过滤后再按 BM25、位置距离和稳定 tie-break 排序。
 
-- [ ] **步骤 6：运行测试和类型检查**
+- [x] **步骤 6：运行测试和类型检查**
 
 运行：`npm test && npm run typecheck`  
 预期：PASS。
 
-- [ ] **步骤 7：Commit**
+- [x] **步骤 7：Commit**
 
 ```bash
 git add translator-v5/src/storage translator-v5/src/index translator-v5/test/evidence-index.test.ts
