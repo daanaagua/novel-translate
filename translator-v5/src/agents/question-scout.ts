@@ -91,10 +91,10 @@ export class QuestionScout {
     ].join("\n\n");
   }
 
-  assertSubmissionGate(toolNames: readonly string[], questions: readonly ResearchQuestion[]): void {
-    if (!toolNames.includes("submit_questions")) {
-      throw new Error("question scout did not pass submit_questions gate");
-    }
+  assertSubmissionGate(
+    toolNames: readonly string[],
+    questions: readonly ResearchQuestion[],
+  ): boolean {
     this.#validateKinds(questions);
     const submittedIds = new Set(questions.map((question) => question.questionId));
     for (const mandatory of this.#mandatoryQuestions) {
@@ -102,6 +102,7 @@ export class QuestionScout {
         throw new Error(`mandatory question was removed: ${mandatory.questionId}`);
       }
     }
+    return toolNames.includes("submit_questions");
   }
 
   #validateKinds(questions: readonly ResearchQuestion[]): void {

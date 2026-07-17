@@ -34,6 +34,7 @@ export interface ResearchOutcome {
     researchToolCalls: number;
     modelCalls: number;
     unresolvedQuestions: number;
+    questionGatePassed: boolean;
   };
 }
 
@@ -61,7 +62,10 @@ export class EvidenceResolver {
     }, input.streamFn);
 
     const questions = input.collector.questions();
-    input.scout.assertSubmissionGate(run.toolNames, questions);
+    const questionGatePassed = input.scout.assertSubmissionGate(
+      run.toolNames,
+      questions,
+    );
     const resolvedIds = new Set(
       input.collector.resolutions().map((resolution) => resolution.questionId),
     );
@@ -96,6 +100,7 @@ export class EvidenceResolver {
         researchToolCalls: consumed.researchToolCalls,
         modelCalls: run.modelCalls,
         unresolvedQuestions: snapshot.unresolved.length,
+        questionGatePassed,
       },
     };
   }

@@ -192,3 +192,46 @@ test("mandatory questions survive scout submission and become unresolved when un
     index.close();
   }
 });
+
+test("resolver retains bounded results when optional question submission is skipped", async () => {
+  const targetBlock = sourceBlock(20, "Typhon raised his head.");
+  const index = EvidenceIndex.fromBlocks([targetBlock]);
+  const collector = new CandidateCollector();
+  const budget = new BudgetLedger();
+  const subjects = [{ subjectId: "typhon", forms: ["Typhon"] }];
+  const scout = new QuestionScout({
+    targetBlocks: [targetBlock],
+    subjects,
+    mandatoryQuestions: [],
+  });
+  const tools = new ResearchTools({
+    budget,
+    evidenceIndex: index,
+    targetGlobalIndex: 20,
+    subjects,
+    collector,
+  });
+  const faux = fauxProvider();
+  faux.setResponses([
+    fauxAssistantMessage(
+      fauxToolCall("finish_research", { unresolvedQuestionIds: [] }),
+      { stopReason: "toolUse" },
+    ),
+  ]);
+  try {
+    const outcome = await new EvidenceResolver(new PiRuntime()).run({
+      scout,
+      tools,
+      collector,
+      budget,
+      model: faux.getModel(),
+      streamFn: faux.provider.streamSimple.bind(faux.provider),
+      targetBlocks: [targetBlock],
+      protocolVersion: "v5-pilot-test",
+    });
+    assert.equal(outcome.metrics.questionGatePassed, false);
+    assert.equal(outcome.snapshot.coverage.completePrefix, false);
+  } finally {
+    index.close();
+  }
+});

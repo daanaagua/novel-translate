@@ -141,7 +141,9 @@ export class Translator {
       prompt: initialPrompt,
       phase: "translation",
       model: input.model,
-      tools: tools.specs(),
+      tools: tools.specs().filter((tool) =>
+        tool.name === "retrieve_resolved_evidence"
+        || tool.name === "finalize_translation"),
       budget: input.budget,
       terminateTools: ["finalize_translation"],
       signal: input.signal,

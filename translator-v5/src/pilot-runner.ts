@@ -224,21 +224,31 @@ function buildSubjects(
   }));
   const knownForms = new Set(subjects.flatMap((subject) => subject.forms)
     .map((form) => form.toLocaleLowerCase()));
+  for (const form of [...knownForms]) {
+    for (const component of form.split(/[^a-z]+/u).filter(Boolean)) {
+      knownForms.add(component);
+    }
+  }
   const commonCapitalized = new Set([
     "a", "an", "and", "as", "at", "but", "for", "from", "he", "her",
     "his", "i", "if", "in", "it", "its", "my", "no", "not", "of",
     "on", "or", "our", "she", "so", "that", "the", "their", "then",
     "there", "they", "this", "to", "we", "when", "where", "which",
-    "who", "with", "you",
+    "who", "with", "you", "ahead", "because", "little", "night", "one",
+    "only", "once", "time",
   ]);
   const unknownNames: SubjectRef[] = [];
   const seenUnknown = new Set<string>();
   const originalSource = targetBlocks.map((block) => block.sourceText).join("\n");
   for (const match of originalSource.matchAll(/\b[A-Z][A-Za-z'’-]{2,}\b/gu)) {
     const form = match[0];
-    const normalized = form.toLocaleLowerCase();
+    const normalized = form
+      .replace(/[’']s$/u, "")
+      .toLocaleLowerCase();
+    const before = originalSource.slice(0, match.index).trimEnd().at(-1);
+    const atSentenceStart = before === undefined || /[.!?]/u.test(before);
     if (knownForms.has(normalized) || commonCapitalized.has(normalized)
-      || seenUnknown.has(normalized)) {
+      || seenUnknown.has(normalized) || atSentenceStart) {
       continue;
     }
     seenUnknown.add(normalized);
@@ -338,6 +348,9 @@ export async function runPilot(options: RunPilotOptions): Promise<PilotResult> {
         signal: controller.signal,
       });
       snapshot = research.snapshot;
+      if (!research.metrics.questionGatePassed) {
+        degradedReasons.push("question scout skipped submit_questions gate; retained bounded evidence results");
+      }
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       degradedReasons.push(`research fallback: ${message}`);
