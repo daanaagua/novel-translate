@@ -43,6 +43,7 @@ const SEQUENTIAL_TOOLS = new Set([
   "finish_research",
   "finalize_translation",
   "submit_repaired_translation",
+  "submit_lexical_anchors",
 ]);
 
 export interface PiSessionSpec {
@@ -55,6 +56,7 @@ export interface PiSessionSpec {
   terminateTools?: readonly string[];
   signal?: AbortSignal;
   deadlineMs?: number;
+  maxTurns?: number;
   eventLog?: MemoryEventLog;
   thinkingLevel?: ThinkingLevel;
 }
@@ -73,6 +75,7 @@ export interface PiRunResult {
   stopReason: StopReason;
   messages: AgentMessage[];
   deadlineExceeded: boolean;
+  turnLimitReached: boolean;
 }
 
 function assistant(message: AgentMessage): message is AssistantMessage {
@@ -135,6 +138,11 @@ export class PiRuntime {
     )) {
       throw new TypeError("deadlineMs must be positive");
     }
+    if (spec.maxTurns !== undefined && (
+      !Number.isInteger(spec.maxTurns) || spec.maxTurns <= 0
+    )) {
+      throw new TypeError("maxTurns must be a positive integer");
+    }
 
     const registry = new CapabilityRegistry(asKernelTools(spec.tools));
     const specsByName = new Map(spec.tools.map((tool) => [tool.name, tool]));
@@ -150,6 +158,7 @@ export class PiRuntime {
     const toolErrors: PiToolError[] = [];
     let modelCalls = 0;
     let deadlineExceeded = false;
+    let turnLimitReached = false;
 
     const agent = new Agent({
       initialState: {
@@ -182,6 +191,10 @@ export class PiRuntime {
       afterToolCall: async ({ toolCall, isError }) => {
         eventLog.append("tool", { name: toolCall.name, isError });
         if (terminateTools.has(toolCall.name) && !isError) {
+          return { terminate: true };
+        }
+        if (spec.maxTurns !== undefined && modelCalls >= spec.maxTurns) {
+          turnLimitReached = true;
           return { terminate: true };
         }
         return undefined;
@@ -260,6 +273,7 @@ export class PiRuntime {
         : (lastAssistant?.stopReason ?? "stop"),
       messages,
       deadlineExceeded,
+      turnLimitReached,
     };
   }
 }

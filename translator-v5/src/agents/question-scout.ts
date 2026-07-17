@@ -64,6 +64,8 @@ export class QuestionScout {
       "Use only the supplied typed tools. Never request shell, files, SQL, or arbitrary browsing.",
       `Allowed question kinds: ${ALLOWED_QUESTION_KINDS.join(", ")}.`,
       "Your first action must call submit_questions for newly discovered translation-critical ambiguities.",
+      "Submit at most four additional questions; prefer zero. Ask only when the answer can materially change Chinese wording.",
+      "Do not ask for themes, literary allusions, authorial intent, or general lore that is unnecessary for this passage.",
       "Do not remove or redefine mandatory questions. Retrieve only evidence needed for those questions.",
       "Every high-impact question must end resolved with issued evidence or explicitly unresolved.",
       "translator_global evidence may guide translation but must never be stated as narrator-visible knowledge.",
@@ -87,7 +89,26 @@ export class QuestionScout {
       subjects,
       "MANDATORY QUESTIONS",
       mandatory,
-      "Begin by submitting only additional questions, then perform bounded evidence retrieval and finish.",
+      "Submit zero to four additional questions. Do not research here; a separate resolver receives accepted questions.",
+    ].join("\n\n");
+  }
+
+  resolverSearchPrompt(
+    questions: readonly ResearchQuestion[],
+    remainingToolCalls: number,
+    remainingEvidenceChars: number,
+  ): string {
+    return [
+      "REGISTERED QUESTIONS",
+      JSON.stringify(questions),
+      "KNOWN SUBJECT IDS",
+      this.#subjects.map((subject) =>
+        `${subject.subjectId}: ${subject.forms.join(" | ")}`,
+      ).join("\n"),
+      `REMAINING TOOL CALLS: ${remainingToolCalls}`,
+      `REMAINING OFF-TARGET EVIDENCE CHARACTERS: ${remainingEvidenceChars}`,
+      "SEARCH PHASE ONLY: perform at most six targeted lookup/search/context calls.",
+      "Do not submit resolutions in this phase. A separate finalizer receives every issued evidence record.",
     ].join("\n\n");
   }
 

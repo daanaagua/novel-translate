@@ -19,7 +19,9 @@ import {
 } from "../validators/translation-validator.js";
 import type { PiRunResult } from "./pi-runtime.js";
 import { PiRuntime } from "./pi-runtime.js";
-import { Repairer, type RepairOutcome } from "./repairer.js";
+import { Repairer } from "./repairer.js";
+
+const MIN_TRANSLATION_FACT_CONFIDENCE = 0.9;
 
 export interface TranslationIsland {
   islandId: string;
@@ -49,7 +51,7 @@ export interface TranslationOutcome {
   candidate?: TranslationCandidate;
   validation: TranslationValidation;
   run: PiRunResult;
-  repairRun?: PiRunResult;
+  repairRuns: PiRunResult[];
   repaired: boolean;
   humanRequired: boolean;
 }
@@ -110,6 +112,9 @@ export function normalizeCandidateTypography(
       ...translation,
       text: useCurlyQuotes
         ? translation.text
+          .replace(/(^|\r?\n)([\t ]*)[‛‟〝„]/gu, "$1$2“")
+          .replaceAll("〞", "”")
+          .replace(/"([^"\r\n]+)"/gu, "“$1”")
           .replaceAll("「", "“")
           .replaceAll("」", "”")
           .replaceAll("『", "“")
@@ -144,13 +149,15 @@ export function splitIntoChapterIslands(
 }
 
 function factsAsResolutions(snapshot: ProvisionalSnapshot): ResolutionCandidate[] {
-  return [...snapshot.narrativeFacts, ...snapshot.translatorFacts].map((fact) => ({
-    questionId: fact.questionId,
-    verdict: fact.verdict,
-    confidence: fact.confidence,
-    evidenceIds: [...fact.evidenceIds],
-    unresolved: "",
-  }));
+  return [...snapshot.narrativeFacts, ...snapshot.translatorFacts]
+    .filter((fact) => fact.confidence >= MIN_TRANSLATION_FACT_CONFIDENCE)
+    .map((fact) => ({
+      questionId: fact.questionId,
+      verdict: fact.verdict,
+      confidence: fact.confidence,
+      evidenceIds: [...fact.evidenceIds],
+      unresolved: "",
+    }));
 }
 
 function relevantTerms(
@@ -219,6 +226,9 @@ export class Translator {
     const allowedLatinTokens = terms.flatMap((term) =>
       [...term.target.matchAll(/[A-Za-z][A-Za-z'-]+/gu)].map((match) => match[0]),
     );
+    const requiredTerms = terms
+      .filter((term) => term.locked && term.conceptId.startsWith("run-anchor-"))
+      .map((term) => ({ sourceForm: term.sourceForm, target: term.target }));
     let candidate = input.collector.translations().slice(before).at(-1);
     if (candidate !== undefined) {
       candidate = normalizeCandidateTypography(candidate, input.styleState);
@@ -226,11 +236,15 @@ export class Translator {
     let validation = this.#validator.validate(
       input.island.blocks,
       candidate ?? emptyCandidate(),
-      { allowedLatinTokens },
+      { allowedLatinTokens, requiredTerms },
     );
-    let repair: RepairOutcome | undefined;
-    if (!validation.valid && candidate !== undefined) {
-      repair = await this.#repairer.repair({
+    const repairRuns: PiRunResult[] = [];
+    let repairAttempts = 0;
+    while (!validation.valid
+      && candidate !== undefined
+      && repairAttempts < 3
+      && input.budget.remaining("repairTurns") > 0) {
+      const repair = await this.#repairer.repair({
         blocks: input.island.blocks,
         failedCandidate: candidate,
         failures: validation.failures,
@@ -242,12 +256,14 @@ export class Translator {
         signal: input.signal,
         deadlineMs: input.deadlineMs,
       });
+      repairAttempts += 1;
+      repairRuns.push(repair.run);
       if (repair.candidate !== undefined) {
         candidate = normalizeCandidateTypography(repair.candidate, input.styleState);
         validation = this.#validator.validate(
           input.island.blocks,
           candidate,
-          { allowedLatinTokens },
+          { allowedLatinTokens, requiredTerms },
         );
       }
     }
@@ -258,7 +274,7 @@ export class Translator {
       candidate,
       validation,
       run,
-      repairRun: repair?.run,
+      repairRuns,
       repaired: candidate?.repaired ?? false,
       humanRequired: !validation.valid,
     };
@@ -269,7 +285,9 @@ export class Translator {
       .filter((question) => question.impact === "high" || question.mandatory)
       .map((question) => question.questionId));
     const facts = [...input.snapshot.narrativeFacts, ...input.snapshot.translatorFacts]
-      .filter((fact) => highImpactIds.has(fact.questionId));
+      .filter((fact) =>
+        highImpactIds.has(fact.questionId)
+        && fact.confidence >= MIN_TRANSLATION_FACT_CONFIDENCE);
     return [
       `ISLAND ${input.island.islandId}`,
       `CHAPTER ${input.island.chapterId} ${input.island.chapterTitle ?? ""}`,

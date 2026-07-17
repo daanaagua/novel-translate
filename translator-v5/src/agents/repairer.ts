@@ -57,26 +57,52 @@ export class Repairer {
         ...input.snapshot.narrativeFacts,
         ...input.snapshot.translatorFacts,
       ]),
-      "Submit one complete corrected island with submit_repaired_translation.",
+      "Submit only corrected or newly supplied blocks with submit_repaired_translation; the kernel merges the patch by block ID.",
     ].join("\n\n");
     const run = await this.runtime.run({
       systemPrompt: [
         "Repair a Chinese literary translation only for the typed validation failures.",
         "Preserve all unaffected meaning and paragraph structure.",
-        "Do not explain. Call submit_repaired_translation exactly once with the complete island.",
+        "Do not explain. Call submit_repaired_translation exactly once with the smallest sufficient block patch.",
       ].join("\n"),
       prompt,
       phase: "repair",
       model: input.model,
-      tools: tools.specs(),
+      tools: tools.specs().filter((tool) =>
+        tool.name === "submit_repaired_translation"),
       budget: input.budget,
       terminateTools: ["submit_repaired_translation"],
+      maxTurns: 1,
       signal: input.signal,
       deadlineMs: input.deadlineMs,
     }, input.streamFn);
+    const patch = input.collector.translations().slice(before).at(-1);
     return {
-      candidate: input.collector.translations().slice(before).at(-1),
+      candidate: patch === undefined
+        ? undefined
+        : mergeRepairPatch(input.blocks, input.failedCandidate, patch),
       run,
     };
   }
+}
+
+function mergeRepairPatch(
+  blocks: readonly V4Block[],
+  failedCandidate: TranslationCandidate,
+  patch: TranslationCandidate,
+): TranslationCandidate {
+  const originalById = new Map(
+    failedCandidate.translations.map((translation) => [translation.blockId, translation]),
+  );
+  const patchById = new Map(
+    patch.translations.map((translation) => [translation.blockId, translation]),
+  );
+  return {
+    translations: blocks.flatMap((block) => {
+      const translation = patchById.get(block.id) ?? originalById.get(block.id);
+      return translation === undefined ? [] : [{ ...translation }];
+    }),
+    notes: [...patch.notes],
+    repaired: true,
+  };
 }

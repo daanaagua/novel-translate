@@ -9,12 +9,12 @@ export type BudgetCounter =
 
 export const DEFAULT_BUDGET_LIMITS: Readonly<Record<BudgetCounter, number>> = {
   modelCalls: 20,
-  researchTurns: 3,
-  researchToolCalls: 8,
+  researchTurns: 7,
+  researchToolCalls: 10,
   evidenceChars: 12_000,
-  translationTurns: 9,
+  translationTurns: 10,
   translationToolCalls: 18,
-  repairTurns: 1,
+  repairTurns: 3,
 };
 
 export class BudgetExceeded extends Error {

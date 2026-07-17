@@ -6,6 +6,12 @@ import type { StreamFn } from "@earendil-works/pi-agent-core";
 import type { Model } from "@earendil-works/pi-ai";
 
 import { EvidenceResolver, type ResearchOutcome } from "./agents/evidence-resolver.js";
+import {
+  collectRepeatedAnchorCandidates,
+  LexicalAnchorer,
+  type LexicalAnchor,
+  type LexicalAnchorOutcome,
+} from "./agents/lexical-anchorer.js";
 import { PiRuntime } from "./agents/pi-runtime.js";
 import { QuestionScout } from "./agents/question-scout.js";
 import {
@@ -98,6 +104,7 @@ export interface PilotMetrics {
   offTargetEvidenceChars: number;
   researchToolCalls: number;
   translationToolCalls: number;
+  lexicalAnchors: number;
   wallTimeMs: number;
   softDeadlineMs: number;
   hardDeadlineMs: number;
@@ -117,8 +124,10 @@ export interface PilotAudit {
     sourceHashes: Record<string, string>;
   };
   snapshot: ProvisionalSnapshot;
+  lexicalAnchors: LexicalAnchor[];
   toolCalls: {
     research: string[];
+    lexicalAnchoring: string[];
     translation: Array<{ islandId: string; tools: string[]; repairTools: string[] }>;
   };
   validations: Array<{
@@ -223,48 +232,12 @@ function buildSubjects(
     subjectId,
     forms: [...value.forms].filter(Boolean),
   }));
-  const knownForms = new Set(subjects.flatMap((subject) => subject.forms)
-    .map((form) => form.toLocaleLowerCase()));
-  for (const form of [...knownForms]) {
-    for (const component of form.split(/[^a-z]+/u).filter(Boolean)) {
-      knownForms.add(component);
-    }
-  }
-  const commonCapitalized = new Set([
-    "a", "an", "and", "as", "at", "but", "for", "from", "he", "her",
-    "his", "i", "if", "in", "it", "its", "my", "no", "not", "of",
-    "on", "or", "our", "she", "so", "that", "the", "their", "then",
-    "there", "they", "this", "to", "we", "when", "where", "which",
-    "who", "with", "you", "ahead", "because", "little", "night", "one",
-    "only", "once", "time",
-  ]);
-  const unknownNames: SubjectRef[] = [];
-  const seenUnknown = new Set<string>();
-  const originalSource = targetBlocks.map((block) => block.sourceText).join("\n");
-  for (const match of originalSource.matchAll(/\b[A-Z][A-Za-z'’-]{2,}\b/gu)) {
-    const form = match[0];
-    const normalized = form
-      .replace(/[’']s$/u, "")
-      .toLocaleLowerCase();
-    const before = originalSource.slice(0, match.index).trimEnd().at(-1);
-    const atSentenceStart = before === undefined || /[.!?]/u.test(before);
-    if (knownForms.has(normalized) || commonCapitalized.has(normalized)
-      || seenUnknown.has(normalized) || atSentenceStart) {
-      continue;
-    }
-    seenUnknown.add(normalized);
-    unknownNames.push({
-      subjectId: `local-${createHash("sha256").update(normalized).digest("hex").slice(0, 12)}`,
-      forms: [form],
-    });
-    if (unknownNames.length >= 6) {
-      break;
-    }
-  }
-  subjects.push(...unknownNames);
   return {
     subjects,
-    unresolved: unknownNames,
+    // Unresolved proper names are supplied by the global lexical scan. Avoid
+    // guessing entityhood from capitalization: sentence-initial prose creates
+    // high-cost false positives in literary text.
+    unresolved: [],
   };
 }
 
@@ -372,6 +345,29 @@ export async function runPilot(options: RunPilotOptions): Promise<PilotResult> {
     state.transition("researched");
     state.transition("translating");
 
+    const anchorCandidates = collectRepeatedAnchorCandidates(targetBlocks, stableTerms);
+    let lexicalAnchoring: LexicalAnchorOutcome | undefined;
+    let activeTerms = stableTerms;
+    if (anchorCandidates.length > 0) {
+      try {
+        lexicalAnchoring = await new LexicalAnchorer(runtime).run({
+          candidates: anchorCandidates,
+          stableTerms,
+          model: options.model,
+          streamFn: options.streamFn,
+          budget,
+          signal: controller.signal,
+        });
+        activeTerms = [...stableTerms, ...lexicalAnchoring.terms];
+        if (lexicalAnchoring.anchors.length !== anchorCandidates.length) {
+          degradedReasons.push("run-local lexical anchor finalization was incomplete");
+        }
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        degradedReasons.push(`lexical anchor fallback: ${message}`);
+      }
+    }
+
     const translator = new Translator(runtime);
     const islands = splitIntoChapterIslands(targetBlocks);
     const translationOutcomes = await mapWithConcurrency(
@@ -383,7 +379,7 @@ export async function runPilot(options: RunPilotOptions): Promise<PilotResult> {
         streamFn: options.streamFn,
         budget,
         collector: new CandidateCollector(),
-        stableTerms,
+        stableTerms: activeTerms,
         snapshot,
         styleState: {
           register: "literary, precise, restrained",
@@ -431,6 +427,7 @@ export async function runPilot(options: RunPilotOptions): Promise<PilotResult> {
       offTargetEvidenceChars: consumed.evidenceChars,
       researchToolCalls: consumed.researchToolCalls,
       translationToolCalls: consumed.translationToolCalls,
+      lexicalAnchors: lexicalAnchoring?.terms.length ?? 0,
       wallTimeMs,
       softDeadlineMs: SOFT_DEADLINE_MS,
       hardDeadlineMs,
@@ -451,12 +448,14 @@ export async function runPilot(options: RunPilotOptions): Promise<PilotResult> {
         ),
       },
       snapshot,
+      lexicalAnchors: lexicalAnchoring?.anchors ?? [],
       toolCalls: {
         research: research?.run.toolNames ?? [],
+        lexicalAnchoring: lexicalAnchoring?.run.toolNames ?? [],
         translation: translationOutcomes.map((outcome) => ({
           islandId: outcome.island.islandId,
           tools: [...outcome.run.toolNames],
-          repairTools: [...(outcome.repairRun?.toolNames ?? [])],
+          repairTools: outcome.repairRuns.flatMap((run) => run.toolNames),
         })),
       },
       validations: translationOutcomes.map((outcome) => ({

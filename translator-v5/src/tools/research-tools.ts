@@ -48,6 +48,19 @@ const VisibilitySchema = Type.Union([
   Type.Literal("translator_global"),
 ]);
 
+const ResolutionSchema = Type.Object({
+  questionId: Type.String(),
+  verdict: Type.String(),
+  confidence: Type.Number({ minimum: 0, maximum: 1 }),
+  evidenceIds: Type.Array(Type.String()),
+  unresolved: Type.String(),
+});
+
+interface FinishResearchArgs {
+  resolutions?: ResolutionCandidate[];
+  unresolvedQuestionIds: string[];
+}
+
 function uniqueStrings(values: readonly string[], name: string): string[] {
   if (!Array.isArray(values) || values.length === 0) {
     throw new TypeError(`${name} must not be empty`);
@@ -228,6 +241,52 @@ export class ResearchTools {
     signal?: AbortSignal,
   ): Promise<{ accepted: true }> {
     assertNotAborted(signal);
+    this.#validateResolution(args);
+    this.#budget.consume("researchToolCalls", 1);
+    this.#collector.addResolution({ ...args, evidenceIds: [...args.evidenceIds] });
+    return { accepted: true };
+  }
+
+  async finishResearch(
+    args: FinishResearchArgs,
+    signal?: AbortSignal,
+  ): Promise<{ finished: true }> {
+    assertNotAborted(signal);
+    const resolutions = Array.isArray(args.resolutions) ? args.resolutions : [];
+    if (resolutions.length > 4) {
+      throw new TypeError("resolutions must contain at most 4 entries");
+    }
+    const resolutionIds = new Set<string>();
+    for (const resolution of resolutions) {
+      if (resolutionIds.has(resolution.questionId)) {
+        throw new Error(`duplicate resolution: ${resolution.questionId}`);
+      }
+      resolutionIds.add(resolution.questionId);
+      this.#validateResolution(resolution);
+    }
+    const ids = Array.isArray(args.unresolvedQuestionIds)
+      ? [...new Set(args.unresolvedQuestionIds)]
+      : [];
+    for (const id of ids) {
+      if (!this.#questions.has(id)) {
+        throw new Error(`unknown question: ${id}`);
+      }
+      if (resolutionIds.has(id)) {
+        throw new Error(`question cannot be both resolved and unresolved: ${id}`);
+      }
+    }
+    this.#budget.consume("researchToolCalls", 1);
+    for (const resolution of resolutions) {
+      this.#collector.addResolution({
+        ...resolution,
+        evidenceIds: [...resolution.evidenceIds],
+      });
+    }
+    this.#collector.finishResearch(ids);
+    return { finished: true };
+  }
+
+  #validateResolution(args: ResolutionCandidate): void {
     const question = this.#questions.get(args.questionId);
     if (question === undefined) {
       throw new Error(`unknown question: ${args.questionId}`);
@@ -241,27 +300,6 @@ export class ResearchTools {
         throw new Error(`evidence visibility violation: ${id}`);
       }
     }
-    this.#budget.consume("researchToolCalls", 1);
-    this.#collector.addResolution({ ...args, evidenceIds });
-    return { accepted: true };
-  }
-
-  async finishResearch(
-    args: { unresolvedQuestionIds: string[] },
-    signal?: AbortSignal,
-  ): Promise<{ finished: true }> {
-    assertNotAborted(signal);
-    const ids = Array.isArray(args.unresolvedQuestionIds)
-      ? [...new Set(args.unresolvedQuestionIds)]
-      : [];
-    for (const id of ids) {
-      if (!this.#questions.has(id)) {
-        throw new Error(`unknown question: ${id}`);
-      }
-    }
-    this.#budget.consume("researchToolCalls", 1);
-    this.#collector.finishResearch(ids);
-    return { finished: true };
   }
 
   specs(): TypedToolSpec[] {
@@ -283,7 +321,7 @@ export class ResearchTools {
             Type.Literal("low"),
           ])),
           mandatory: Type.Optional(Type.Boolean()),
-        })) }),
+        }), { maxItems: 4 }) }),
         execute: (args, signal) => this.submitQuestions(
           args as { questions: ResearchQuestion[] },
           signal,
@@ -368,13 +406,7 @@ export class ResearchTools {
         label: "Submit resolution",
         description: "Submit a provisional, evidence-bound answer to a registered question.",
         phase: "research",
-        parameters: Type.Object({
-          questionId: Type.String(),
-          verdict: Type.String(),
-          confidence: Type.Number({ minimum: 0, maximum: 1 }),
-          evidenceIds: Type.Array(Type.String()),
-          unresolved: Type.String(),
-        }),
+        parameters: ResolutionSchema,
         execute: (args, signal) => this.submitResolution(
           args as ResolutionCandidate,
           signal,
@@ -383,11 +415,14 @@ export class ResearchTools {
       {
         name: "finish_research",
         label: "Finish research",
-        description: "Terminate research and report any unresolved registered questions.",
+        description: "Atomically submit up to four evidence-bound resolutions, report unresolved questions, and terminate research.",
         phase: "research",
-        parameters: Type.Object({ unresolvedQuestionIds: Type.Array(Type.String()) }),
+        parameters: Type.Object({
+          resolutions: Type.Optional(Type.Array(ResolutionSchema, { maxItems: 4 })),
+          unresolvedQuestionIds: Type.Array(Type.String()),
+        }),
         execute: (args, signal) => this.finishResearch(
-          args as { unresolvedQuestionIds: string[] },
+          args as FinishResearchArgs,
           signal,
         ),
       },
@@ -408,8 +443,8 @@ export class ResearchTools {
   }
 
   #validateQuestions(questions: readonly ResearchQuestion[]): void {
-    if (!Array.isArray(questions) || questions.length > 12) {
-      throw new TypeError("questions must contain at most 12 entries");
+    if (!Array.isArray(questions) || questions.length > 4) {
+      throw new TypeError("questions must contain at most 4 entries");
     }
     const seen = new Set<string>();
     for (const question of questions) {

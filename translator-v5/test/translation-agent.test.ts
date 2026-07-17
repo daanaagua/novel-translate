@@ -120,6 +120,45 @@ test("translation agent receives minimal context and may retrieve evidence", asy
   assert.equal(outcome.humanRequired, false);
 });
 
+test("low-confidence research claims are withheld from translation", async () => {
+  const block = chapterBlock(0, "Typhon raised his head.");
+  const island = splitIntoChapterIslands([block])[0];
+  assert.ok(island);
+  const lowConfidence = snapshot();
+  lowConfidence.translatorFacts[0]!.confidence = 0.8;
+  const faux = fauxProvider();
+  faux.setResponses([
+    fauxAssistantMessage(
+      fauxToolCall("retrieve_resolved_evidence", {
+        questionIds: ["q-typhon-piaton"],
+      }),
+      { stopReason: "toolUse" },
+    ),
+    fauxAssistantMessage(
+      fauxToolCall("finalize_translation", {
+        translations: [{ blockId: block.id, text: "提丰抬起了头。" }],
+        notes: [],
+      }),
+      { stopReason: "toolUse" },
+    ),
+  ]);
+
+  const outcome = await new Translator(new PiRuntime()).translateIsland({
+    island,
+    model: faux.getModel(),
+    streamFn: faux.provider.streamSimple.bind(faux.provider),
+    budget: new BudgetLedger(),
+    collector: new CandidateCollector(),
+    stableTerms: [],
+    snapshot: lowConfidence,
+    styleState: { register: "literary" },
+    previousActiveTail: "",
+  });
+
+  assert.deepEqual(outcome.usedResolutionIds, []);
+  assert.equal(outcome.initialPrompt.includes("shared body with distinct control"), false);
+});
+
 test("deterministic validator rejects missing blocks and leaked system JSON", () => {
   const blocks = [
     chapterBlock(0, "Typhon raised his head and looked at Severian."),
@@ -158,6 +197,41 @@ test("typography is normalized and untranslated prose words are rejected", () =>
   const validation = new TranslationValidator().validate([block], normalized);
   assert.ok(validation.failures.some((failure) =>
     failure.code === "untranslated_latin"),
+  );
+});
+
+test("quote normalization and validation reject invented closing boundaries", () => {
+  const block = chapterBlock(0, "“What of Nessus?” he asked.");
+  const normalized = normalizeCandidateTypography({
+    translations: [{
+      blockId: block.id,
+      text: "\u201B它可以是你的衣袍。”\n\n\"你好，\"我说。\n\n“尼苏斯呢？”我冷得发抖。”",
+    }],
+    notes: [],
+    repaired: false,
+  }, { dialogueQuotes: "Chinese curly double quotes" });
+
+  assert.equal(normalized.translations[0]?.text.startsWith("“"), true);
+  assert.equal(normalized.translations[0]?.text.includes("“你好，”我说。"), true);
+  assert.equal(normalized.translations[0]?.text.includes('"'), false);
+  const validation = new TranslationValidator().validate([block], normalized);
+  assert.ok(validation.failures.some((failure) =>
+    failure.code === "quote_boundary_mismatch"),
+  );
+});
+
+test("run-local stable anchors are deterministic validation constraints", () => {
+  const block = chapterBlock(0, "Typhon opposed the Conciliator.");
+  const validation = new TranslationValidator().validate([block], {
+    translations: [{ blockId: block.id, text: "提丰曾是调解人的敌人。" }],
+    notes: [],
+    repaired: false,
+  }, {
+    requiredTerms: [{ sourceForm: "Conciliator", target: "和解者" }],
+  });
+
+  assert.ok(validation.failures.some((failure) =>
+    failure.code === "stable_term_mismatch"),
   );
 });
 
@@ -207,4 +281,100 @@ test("one repair pass can replace an invalid island candidate", async () => {
   assert.equal(outcome.validation.valid, true);
   assert.equal(outcome.humanRequired, false);
   assert.equal(outcome.candidate?.translations.length, 2);
+});
+
+test("a partial repair patch preserves unaffected island blocks", async () => {
+  const blocks = [
+    chapterBlock(0, "Typhon raised his monstrous head."),
+    chapterBlock(1, "Piaton's voice came from the same body."),
+  ];
+  const island = splitIntoChapterIslands(blocks)[0];
+  assert.ok(island);
+  const faux = fauxProvider();
+  faux.setResponses([
+    fauxAssistantMessage(
+      fauxToolCall("finalize_translation", {
+        translations: [
+          { blockId: "v06_ch08_000", text: "提丰抬起他那颗 monstrous 的头。" },
+          { blockId: "v06_ch08_001", text: "皮亚顿的声音从同一具身体里传来。" },
+        ],
+        notes: [],
+      }),
+      { stopReason: "toolUse" },
+    ),
+    fauxAssistantMessage(
+      fauxToolCall("submit_repaired_translation", {
+        translations: [
+          { blockId: "v06_ch08_000", text: "提丰抬起他那颗狰狞的头。" },
+        ],
+        notes: ["仅修复含未译英文的文本块"],
+      }),
+      { stopReason: "toolUse" },
+    ),
+  ]);
+
+  const outcome = await new Translator(new PiRuntime()).translateIsland({
+    island,
+    model: faux.getModel(),
+    streamFn: faux.provider.streamSimple.bind(faux.provider),
+    budget: new BudgetLedger(),
+    collector: new CandidateCollector(),
+    stableTerms: [],
+    snapshot: snapshot(),
+    styleState: { register: "literary" },
+    previousActiveTail: "",
+  });
+
+  assert.equal(outcome.validation.valid, true);
+  assert.equal(outcome.humanRequired, false);
+  assert.deepEqual(outcome.candidate?.translations, [
+    { blockId: "v06_ch08_000", text: "提丰抬起他那颗狰狞的头。" },
+    { blockId: "v06_ch08_001", text: "皮亚顿的声音从同一具身体里传来。" },
+  ]);
+});
+
+test("repair retries when a first patch introduces another deterministic failure", async () => {
+  const block = chapterBlock(0, "Typhon's voice became faint.");
+  const island = splitIntoChapterIslands([block])[0];
+  assert.ok(island);
+  const faux = fauxProvider();
+  faux.setResponses([
+    fauxAssistantMessage(
+      fauxToolCall("finalize_translation", {
+        translations: [{ blockId: block.id, text: "提丰的声音变得 faint。" }],
+        notes: [],
+      }),
+      { stopReason: "toolUse" },
+    ),
+    fauxAssistantMessage(
+      fauxToolCall("submit_repaired_translation", {
+        translations: [{ blockId: block.id, text: "提丰的声音依然 faint。" }],
+        notes: [],
+      }),
+      { stopReason: "toolUse" },
+    ),
+    fauxAssistantMessage(
+      fauxToolCall("submit_repaired_translation", {
+        translations: [{ blockId: block.id, text: "提丰的声音渐渐微弱。" }],
+        notes: [],
+      }),
+      { stopReason: "toolUse" },
+    ),
+  ]);
+
+  const outcome = await new Translator(new PiRuntime()).translateIsland({
+    island,
+    model: faux.getModel(),
+    streamFn: faux.provider.streamSimple.bind(faux.provider),
+    budget: new BudgetLedger(),
+    collector: new CandidateCollector(),
+    stableTerms: [],
+    snapshot: snapshot(),
+    styleState: { register: "literary" },
+    previousActiveTail: "",
+  });
+
+  assert.equal(outcome.validation.valid, true);
+  assert.equal(outcome.repairRuns.length, 2);
+  assert.equal(outcome.candidate?.translations[0]?.text, "提丰的声音渐渐微弱。");
 });

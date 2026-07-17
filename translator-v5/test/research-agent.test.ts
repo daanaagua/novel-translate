@@ -60,6 +60,7 @@ test("research agent refines Typhon/Piaton evidence without prefix scanning", as
     mandatoryQuestions: [],
   });
   const faux = fauxProvider();
+  let issuedEvidenceId = "";
   faux.setResponses([
     fauxAssistantMessage(
       fauxToolCall("submit_questions", {
@@ -95,16 +96,27 @@ test("research agent refines Typhon/Piaton evidence without prefix scanning", as
         hits: Array<{ evidenceId: string }>;
       };
       assert.ok(payload.hits[0]?.evidenceId);
-      return fauxAssistantMessage([
-        fauxToolCall("submit_resolution", {
-          questionId: "q-typhon-piaton",
-          verdict: "shared body with distinct control and voice",
-          confidence: 0.9,
-          evidenceIds: [payload.hits[0].evidenceId],
-          unresolved: "",
+      issuedEvidenceId = payload.hits[0].evidenceId;
+      return fauxAssistantMessage(
+        fauxToolCall("lookup_terms", { forms: ["Typhon", "Piaton"] }),
+        { stopReason: "toolUse" },
+      );
+    },
+    () => {
+      assert.ok(issuedEvidenceId);
+      return fauxAssistantMessage(
+        fauxToolCall("finish_research", {
+          resolutions: [{
+            questionId: "q-typhon-piaton",
+            verdict: "shared body with distinct control and voice",
+            confidence: 0.9,
+            evidenceIds: [issuedEvidenceId],
+            unresolved: "",
+          }],
+          unresolvedQuestionIds: [],
         }),
-        fauxToolCall("finish_research", { unresolvedQuestionIds: [] }),
-      ], { stopReason: "toolUse" });
+        { stopReason: "toolUse" },
+      );
     },
   ]);
 
@@ -126,11 +138,11 @@ test("research agent refines Typhon/Piaton evidence without prefix scanning", as
     assert.equal(outcome.snapshot.translatorFacts.length, 1);
     assert.equal(outcome.snapshot.unresolved.length, 0);
     assert.ok(outcome.metrics.offTargetEvidenceChars <= 12_000);
-    assert.equal(outcome.run.modelCalls, 3);
+    assert.equal(outcome.run.modelCalls, 4);
     assert.deepEqual(outcome.run.toolNames, [
       "submit_questions",
       "search_cooccurrence",
-      "submit_resolution",
+      "lookup_terms",
       "finish_research",
     ]);
   } finally {
@@ -165,7 +177,20 @@ test("mandatory questions survive scout submission and become unresolved when un
       { stopReason: "toolUse" },
     ),
     fauxAssistantMessage(
+      fauxToolCall("search_mentions", {
+        subjectIds: ["typhon"],
+        channel: "narrative_before_target",
+        limit: 2,
+      }),
+      { stopReason: "toolUse" },
+    ),
+    fauxAssistantMessage(
+      fauxToolCall("lookup_terms", { forms: ["Typhon"] }),
+      { stopReason: "toolUse" },
+    ),
+    fauxAssistantMessage(
       fauxToolCall("finish_research", {
+        resolutions: [],
         unresolvedQuestionIds: [mandatory[0]?.questionId],
       }),
       { stopReason: "toolUse" },
@@ -213,10 +238,7 @@ test("resolver retains bounded results when optional question submission is skip
   });
   const faux = fauxProvider();
   faux.setResponses([
-    fauxAssistantMessage(
-      fauxToolCall("finish_research", { unresolvedQuestionIds: [] }),
-      { stopReason: "toolUse" },
-    ),
+    fauxAssistantMessage("No additional questions."),
   ]);
   try {
     const outcome = await new EvidenceResolver(new PiRuntime()).run({

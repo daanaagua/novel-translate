@@ -99,6 +99,30 @@ test("invented subject ids are rejected before search", async () => {
   }
 });
 
+test("question submission is capped at four translation-critical uncertainties", async () => {
+  const index = EvidenceIndex.fromBlocks([block(10, "Typhon spoke.")]);
+  const tools = new ResearchTools({
+    budget: new BudgetLedger(),
+    evidenceIndex: index,
+    targetGlobalIndex: 20,
+    subjects: [{ subjectId: "typhon", forms: ["Typhon"] }],
+    collector: new CandidateCollector(),
+  });
+  try {
+    await assert.rejects(
+      tools.submitQuestions({
+        questions: Array.from({ length: 5 }, (_, index) => ({
+          ...question(),
+          questionId: `q${index}`,
+        })),
+      }),
+      /at most 4 entries/,
+    );
+  } finally {
+    index.close();
+  }
+});
+
 test("tool budgets are checked before a second research call executes", async () => {
   const index = EvidenceIndex.fromBlocks([block(10, "Typhon spoke.")]);
   const tools = new ResearchTools({

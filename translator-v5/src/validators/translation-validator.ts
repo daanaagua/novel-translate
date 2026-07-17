@@ -9,6 +9,7 @@ export interface TranslationValidation {
 
 export interface TranslationValidationPolicy {
   allowedLatinTokens?: readonly string[];
+  requiredTerms?: readonly { sourceForm: string; target: string }[];
 }
 
 function paragraphCount(text: string): number {
@@ -52,6 +53,31 @@ export class TranslationValidator {
       });
     }
 
+    const sourceText = blocks.map((block) => block.sourceText).join("\n");
+    const targetText = candidate.translations.map((item) => item.text).join("\n");
+    const sourceClosingExcess = Math.max(
+      0,
+      [...sourceText.matchAll(/”/gu)].length - [...sourceText.matchAll(/“/gu)].length,
+    );
+    const targetClosingExcess = Math.max(
+      0,
+      [...targetText.matchAll(/”/gu)].length - [...targetText.matchAll(/“/gu)].length,
+    );
+    if (targetClosingExcess > sourceClosingExcess) {
+      failures.push({
+        code: "quote_boundary_mismatch",
+        message: `target has ${targetClosingExcess} excess closing double quotes; source boundary allowance is ${sourceClosingExcess}`,
+        repairable: true,
+      });
+    }
+    if (/["‛‟〝〞„]/u.test(targetText)) {
+      failures.push({
+        code: "nonstandard_quote_glyph",
+        message: "translation contains nonstandard double-quote glyphs",
+        repairable: true,
+      });
+    }
+
     const blockById = new Map(blocks.map((block) => [block.id, block]));
     const allowedLatin = new Set((policy.allowedLatinTokens ?? [])
       .map((token) => token.toLocaleLowerCase()));
@@ -89,6 +115,18 @@ export class TranslationValidator {
       }
       if (source === undefined) {
         continue;
+      }
+      for (const term of policy.requiredTerms ?? []) {
+        if (source.sourceText.toLocaleLowerCase().includes(
+          term.sourceForm.toLocaleLowerCase(),
+        ) && !translation.text.includes(term.target)) {
+          failures.push({
+            code: "stable_term_mismatch",
+            blockId: translation.blockId,
+            message: `source form ${term.sourceForm} requires run-local target ${term.target}`,
+            repairable: true,
+          });
+        }
       }
       const sourceParagraphs = paragraphCount(source.sourceText);
       const targetParagraphs = paragraphCount(translation.text);

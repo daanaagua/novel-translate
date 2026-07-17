@@ -73,6 +73,39 @@ test("Pi executes an allowlisted tool and stops on terminating submit", async ()
   assert.ok(result.usage.totalTokens > 0);
 });
 
+test("Pi gracefully stops a nonterminal session at its local turn cap", async () => {
+  const faux = fauxProvider();
+  const tools: TypedToolSpec[] = [{
+    name: "search_mentions",
+    label: "Search mentions",
+    description: "Fixture search.",
+    phase: "research",
+    parameters: Type.Object({ subjectIds: Type.Array(Type.String()) }),
+    execute: async () => ({ hits: [] }),
+  }];
+  faux.setResponses([
+    fauxAssistantMessage(
+      fauxToolCall("search_mentions", { subjectIds: ["typhon"] }),
+      { stopReason: "toolUse" },
+    ),
+    fauxAssistantMessage("This second model turn must never start."),
+  ]);
+
+  const result = await new PiRuntime().run({
+    systemPrompt: "Search once.",
+    prompt: "Research Typhon.",
+    phase: "research",
+    model: faux.getModel(),
+    tools,
+    budget: new BudgetLedger(),
+    maxTurns: 1,
+  }, streamFrom(faux));
+
+  assert.equal(result.modelCalls, 1);
+  assert.equal(result.turnLimitReached, true);
+  assert.equal(faux.state.callCount, 1);
+});
+
 test("Pi never executes a tool outside its capability registry", async () => {
   const faux = fauxProvider();
   let executed = 0;
