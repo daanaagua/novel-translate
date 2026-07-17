@@ -625,7 +625,7 @@ git commit -m "feat: translate with on-demand pi tools"
 - 创建：`translator-v5/src/storage/pilot-store.ts`
 - 测试：`translator-v5/test/pilot-runner.test.ts`
 
-- [ ] **步骤 1：编写端到端 faux 失败测试**
+- [x] **步骤 1：编写端到端 faux 失败测试**
 
 ```ts
 test("cold preview completes five blocks without narrative reads", async () => {
@@ -641,12 +641,12 @@ test("cold preview completes five blocks without narrative reads", async () => {
 });
 ```
 
-- [ ] **步骤 2：运行测试确认失败**
+- [x] **步骤 2：运行测试确认失败**
 
 运行：`npm test -- --test-name-pattern="cold preview"`  
 预期：FAIL。
 
-- [ ] **步骤 3：实现单向状态机**
+- [x] **步骤 3：实现单向状态机**
 
 ```text
 created -> indexed -> researched -> translating -> validating
@@ -656,7 +656,7 @@ created -> indexed -> researched -> translating -> validating
 任何异常都必须完成 lease cleanup 和 event flush。相同 run key 有活动 lease 时禁止
 启动第二个模型 run。
 
-- [ ] **步骤 4：实现 CLI**
+- [x] **步骤 4：实现 CLI**
 
 ```powershell
 npm run pilot -- preview `
@@ -669,7 +669,7 @@ npm run pilot -- preview `
 CLI 启动前输出目标块数、目标字符、最大模型调用、最大证据字符和硬 deadline；不得
 输出 API key。
 
-- [ ] **步骤 5：实现输出**
+- [x] **步骤 5：实现输出**
 
 生成：
 
@@ -683,12 +683,12 @@ Typhon_v5_agent_metrics.json
 audit 包含问题、tool calls、evidence IDs、预算变化、校验和降级；不包含 API key、
 隐藏 reasoning 内容和完整非目标原文。
 
-- [ ] **步骤 6：运行全部 V5 测试和类型检查**
+- [x] **步骤 6：运行全部 V5 测试和类型检查**
 
 运行：`npm test && npm run typecheck`  
 预期：PASS。
 
-- [ ] **步骤 7：运行 Python 回归基线**
+- [x] **步骤 7：运行 Python 回归基线**
 
 运行：
 
@@ -698,7 +698,7 @@ audit 包含问题、tool calls、evidence IDs、预算变化、校验和降级�
 
 预期：`666 passed, 8 subtests passed`。
 
-- [ ] **步骤 8：Commit**
+- [x] **步骤 8：Commit**
 
 ```bash
 git add translator-v5
