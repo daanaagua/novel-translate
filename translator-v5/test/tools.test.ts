@@ -168,7 +168,7 @@ test("finalize_translation records a candidate without committing active state",
   assert.equal(commits, 0);
 });
 
-test("only the fifteen designed typed capabilities are exposed", () => {
+test("only the sixteen designed typed capabilities are exposed", () => {
   const target = block(20, "Typhon woke.");
   const index = EvidenceIndex.fromBlocks([target]);
   const budget = new BudgetLedger();
@@ -210,8 +210,9 @@ test("only the fifteen designed typed capabilities are exposed", () => {
         "get_required_context",
         "inspect_local_continuity",
         "retrieve_resolved_evidence",
-        "inspect_style_state",
-        "finalize_translation",
+      "inspect_style_state",
+      "request_translation_evidence",
+      "finalize_translation",
         "inspect_validation_failures",
         "submit_repaired_translation",
       ],

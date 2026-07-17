@@ -13,9 +13,9 @@ export interface WindowPlanOptions {
   protocolVersion?: string;
 }
 
-const DEFAULT_MAX_SOURCE_TOKENS = 7_000;
-const DEFAULT_MAX_BLOCKS = 6;
-const DEFAULT_PROTOCOL_VERSION = "v5-book-1";
+const DEFAULT_MAX_SOURCE_TOKENS = 2_600;
+const DEFAULT_MAX_BLOCKS = 3;
+const DEFAULT_PROTOCOL_VERSION = "v5-book-3";
 
 function positiveInteger(value: number, name: string): number {
   if (!Number.isSafeInteger(value) || value < 1) {

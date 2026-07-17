@@ -93,9 +93,9 @@
 - `projects/little_big/exports/translator_v5/`
 - `docs/superpowers/reports/2026-07-17-little-big-v5-cold-start.md`
 
-- [ ] 用 `main.py init little_big <source>` 与 `migrate-v4 little_big` 建立新项目；确认没有旧词表和旧译文。
-- [ ] 运行 `book preflight`，记录章节、blocks、windows、tokens、source fingerprint 和异常字符警告。
-- [ ] 用 Flash 跑三个窗口；在第二次实测中模拟停止并恢复，核对已完成窗口模型调用没有增加。
-- [ ] 运行严格校验；生成内部 TXT/EPUB 抽查版。
+- [x] 用 `main.py init little_big <source>` 与 `migrate-v4 little_big` 建立新项目；确认没有旧词表和旧译文。
+- [x] 运行 `book preflight`，记录章节、blocks、windows、tokens、source fingerprint 和异常字符警告。
+- [x] 用 Flash 跑三个窗口；在第二次实测中模拟停止并恢复，核对已完成窗口模型调用没有增加。
+- [x] 运行严格校验；生成内部 TXT/EPUB 抽查版。
 - [ ] 报告速度、调用量、预算峰值、修复/人工队列、锚点和记忆样例，以及是否建议启动全书。
 - [ ] 运行 `git diff --check`、V5 全测、typecheck 和 Python 正式测试；再决定合并到 main。

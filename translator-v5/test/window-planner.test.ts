@@ -60,6 +60,21 @@ test("window plan rejects duplicate or discontinuous global indexes", () => {
   );
 });
 
+test("production defaults keep model generations bounded", () => {
+  const windows = planBookWindows([
+    block(0, "ch1", 1_000),
+    block(1, "ch1", 1_000),
+    block(2, "ch1", 1_000),
+    block(3, "ch1", 1_000),
+  ]);
+
+  assert.deepEqual(
+    windows.map((window) => window.blockIds),
+    [["block-0", "block-1"], ["block-2", "block-3"]],
+  );
+  assert.ok(windows.every((window) => window.blockIds.length <= 3));
+});
+
 test("adaptive concurrency warms up, accelerates, and backs off on risk", () => {
   const clean = {
     status: "completed" as const,

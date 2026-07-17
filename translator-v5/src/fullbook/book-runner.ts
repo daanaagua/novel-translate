@@ -5,6 +5,7 @@ import type { StreamFn } from "@earendil-works/pi-agent-core";
 import type { Model } from "@earendil-works/pi-ai";
 
 import type { LexicalAnchor } from "../agents/lexical-anchorer.js";
+import { ModelProviderError } from "../agents/pi-runtime.js";
 import { DEFAULT_BUDGET_LIMITS } from "../kernel/budget.js";
 import { RunLease } from "../kernel/run-lease.js";
 import {
@@ -30,7 +31,7 @@ import {
   type WindowPlanOptions,
 } from "./window-planner.js";
 
-const DEFAULT_PROTOCOL_VERSION = "v5-book-1";
+const DEFAULT_PROTOCOL_VERSION = "v5-book-3";
 const DEFAULT_MAX_ATTEMPTS = 2;
 const DEFAULT_MAX_CONCURRENCY = 2;
 const DEFAULT_WARMUP_WINDOWS = 2;
@@ -83,6 +84,7 @@ interface AttemptResult {
   window: PersistedWindow;
   result?: PilotResult;
   error?: string;
+  fatalProviderError?: boolean;
 }
 
 function nonNegativeInteger(value: number, name: string): number {
@@ -232,12 +234,14 @@ export async function runBook(options: BookRunOptions): Promise<BookRunResult> {
         persistedNarrativeMemories: store.loadNarrativeMemories(),
         previousActiveTail: store.loadStyleTail(),
         styleState: options.styleState,
+        researchMode: "on_demand",
       });
       return { window: claimed, result };
     } catch (error) {
       return {
         window: claimed,
         error: error instanceof Error ? error.message : String(error),
+        fatalProviderError: error instanceof ModelProviderError,
       };
     }
   };
@@ -245,6 +249,16 @@ export async function runBook(options: BookRunOptions): Promise<BookRunResult> {
   const finalizeAttempt = async (initial: AttemptResult): Promise<WindowExecutionSummary> => {
     let attempt = initial;
     while (true) {
+      if (attempt.fatalProviderError) {
+        const error = attempt.error ?? "external model provider failure";
+        store.failWindow(attempt.window.windowId, {
+          error,
+          retry: true,
+          budget: {},
+          warnings: ["external model provider failure; run aborted without human task"],
+        });
+        throw new ModelProviderError(error);
+      }
       const result = attempt.result;
       const conflict = result === undefined
         ? undefined
@@ -265,7 +279,10 @@ export async function runBook(options: BookRunOptions): Promise<BookRunResult> {
             text: translation.text,
           })),
           lexicalAnchors: result.audit.lexicalAnchors,
-          narrativeMemories: memoriesFromSnapshot(result.snapshot),
+          narrativeMemories: [
+            ...memoriesFromSnapshot(result.snapshot),
+            ...result.narrativeMemories,
+          ],
           styleTail: boundedActiveTail(
             result.translations.map((translation) => translation.text).join("\n\n"),
           ),

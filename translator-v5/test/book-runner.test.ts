@@ -92,7 +92,7 @@ test("book runner warms up, runs a parallel wave, and resumes without model call
   const storePath = join(directory, "state.db");
   createFixture(sourceDb, 4);
   const faux = fauxProvider();
-  faux.setResponses(Array.from({ length: 8 }, () => dynamicResponse));
+  faux.setResponses(Array.from({ length: 4 }, () => dynamicResponse));
   const first = await runBook({
     dbPath: sourceDb,
     storePath,
@@ -107,7 +107,7 @@ test("book runner warms up, runs a parallel wave, and resumes without model call
   });
   assert.deepEqual(first.waves.map((wave) => wave.concurrency), [1, 1, 2]);
   assert.equal(first.status.completedWindows, 4);
-  assert.equal(first.status.modelCalls, 8);
+  assert.equal(first.status.modelCalls, 4);
 
   const noCalls = fauxProvider();
   noCalls.setResponses([]);
@@ -124,7 +124,7 @@ test("book runner warms up, runs a parallel wave, and resumes without model call
     hardDeadlineMs: 30_000,
   });
   assert.equal(resumed.processedWindows, 0);
-  assert.equal(resumed.status.modelCalls, 8);
+  assert.equal(resumed.status.modelCalls, 4);
 });
 
 test("book runner retries a no-submit window with a fresh per-window budget", async () => {
@@ -134,9 +134,7 @@ test("book runner retries a no-submit window with a fresh per-window budget", as
   createFixture(sourceDb, 1);
   const faux = fauxProvider();
   faux.setResponses([
-    dynamicResponse,
     fauxAssistantMessage("No translation was submitted."),
-    dynamicResponse,
     dynamicResponse,
   ]);
   const result = await runBook({
@@ -156,6 +154,38 @@ test("book runner retries a no-submit window with a fresh per-window budget", as
     ?? result.windows[0];
   assert.equal(result.status.completedWindows, 1);
   assert.equal(window?.attemptCount, 2);
-  assert.equal(result.status.modelCalls, 4);
+  assert.equal(result.status.modelCalls, 2);
+  store.close();
+});
+
+test("book runner aborts external provider failures without creating a human task", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "v5-book-provider-failure-"));
+  const sourceDb = join(directory, "source.db");
+  const storePath = join(directory, "state.db");
+  createFixture(sourceDb, 1);
+  const faux = fauxProvider();
+  faux.setResponses([
+    fauxAssistantMessage([], {
+      stopReason: "error",
+      errorMessage: "401: authentication failed for fixture credential",
+    }),
+  ]);
+
+  await assert.rejects(
+    runBook({
+      dbPath: sourceDb,
+      storePath,
+      outputDir: join(directory, "output"),
+      model: faux.getModel(),
+      streamFn: faux.provider.streamSimple.bind(faux.provider),
+      windowOptions: { maxBlocks: 1, maxSourceTokens: 100 },
+      maxAttempts: 2,
+      hardDeadlineMs: 30_000,
+    }),
+    /authentication failed/i,
+  );
+  const store = new BookStore(storePath);
+  assert.equal(store.statusSummary().humanRequiredWindows, 0);
+  assert.equal(store.statusSummary().pendingWindows, 1);
   store.close();
 });

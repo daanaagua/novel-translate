@@ -16,8 +16,10 @@ import {
 } from "../src/agents/translator.js";
 import type { ProvisionalSnapshot } from "../src/domain/provisional-snapshot.js";
 import type { V4Block } from "../src/domain/types.js";
+import { EvidenceIndex } from "../src/index/evidence-index.js";
 import { BudgetLedger } from "../src/kernel/budget.js";
 import { CandidateCollector } from "../src/tools/candidate-collector.js";
+import { TranslationTools } from "../src/tools/translation-tools.js";
 import { TranslationValidator } from "../src/validators/translation-validator.js";
 
 function chapterBlock(index: number, text: string): V4Block {
@@ -118,6 +120,137 @@ test("translation agent receives minimal context and may retrieve evidence", asy
   assert.equal(outcome.initialPrompt.includes("all narrative memories"), false);
   assert.equal(outcome.validation.valid, true);
   assert.equal(outcome.humanRequired, false);
+});
+
+test("on-demand evidence lookup is literal-form bounded and position safe", async () => {
+  const target = chapterBlock(0, "Rakesh changed her version of the scape.");
+  const future = chapterBlock(1, "The scape was a shared virtual sensory scene.");
+  const evidenceIndex = EvidenceIndex.fromBlocks([target, future]);
+  try {
+    const createTools = () => new TranslationTools({
+      budget: new BudgetLedger(),
+      targetBlocks: [target],
+      collector: new CandidateCollector(),
+      stableTerms: [],
+      resolvedEvidence: [],
+      styleState: { register: "literary" },
+      evidenceIndex,
+    });
+    const global = await createTools().requestTranslationEvidence({
+      question: "What concrete interface does scape denote here?",
+      sourceForms: ["scape"],
+      channel: "translator_global",
+    });
+    assert.ok(global.evidence.some((hit) => hit.globalIndex === future.globalIndex));
+
+    const narrative = await createTools().requestTranslationEvidence({
+      question: "What can the narrator know at this point?",
+      sourceForms: ["scape"],
+      channel: "narrative_before_target",
+    });
+    assert.ok(narrative.evidence.every((hit) => hit.globalIndex <= target.globalIndex));
+
+    await assert.rejects(
+      createTools().requestTranslationEvidence({
+        question: "Look up an unrelated person.",
+        sourceForms: ["Typhon"],
+        channel: "translator_global",
+      }),
+      /not present in the target island/i,
+    );
+  } finally {
+    evidenceIndex.close();
+  }
+});
+
+test("translator may request targeted evidence and continue in the same session", async () => {
+  const target = chapterBlock(0, "Rakesh changed her version of the scape.");
+  const future = chapterBlock(1, "The scape was a shared virtual sensory scene.");
+  const island = splitIntoChapterIslands([target])[0];
+  assert.ok(island);
+  const evidenceIndex = EvidenceIndex.fromBlocks([target, future]);
+  const faux = fauxProvider();
+  faux.setResponses([
+    fauxAssistantMessage(
+      fauxToolCall("request_translation_evidence", {
+        question: "What concrete interface does scape denote here?",
+        sourceForms: ["scape"],
+        channel: "translator_global",
+      }),
+      { stopReason: "toolUse" },
+    ),
+    fauxAssistantMessage(
+      fauxToolCall("finalize_translation", {
+        translations: [{ blockId: target.id, text: "拉凯什改变了她那一版拟景。" }],
+        notes: [],
+      }),
+      { stopReason: "toolUse" },
+    ),
+  ]);
+  try {
+    const outcome = await new Translator(new PiRuntime()).translateIsland({
+      island,
+      model: faux.getModel(),
+      streamFn: faux.provider.streamSimple.bind(faux.provider),
+      budget: new BudgetLedger(),
+      collector: new CandidateCollector(),
+      stableTerms: [],
+      snapshot: { ...snapshot(), questions: [], translatorFacts: [], evidence: [] },
+      styleState: { register: "literary" },
+      previousActiveTail: "",
+      evidenceIndex,
+    });
+
+    assert.deepEqual(outcome.run.toolNames, [
+      "request_translation_evidence",
+      "finalize_translation",
+    ]);
+    assert.equal(outcome.validation.valid, true);
+  } finally {
+    evidenceIndex.close();
+  }
+});
+
+test("final submission can attach bounded source-grounded narrative memory", async () => {
+  const target = chapterBlock(0, "Rakesh changed her version of the scape.");
+  const evidenceIndex = EvidenceIndex.fromBlocks([target]);
+  try {
+    const tools = new TranslationTools({
+      budget: new BudgetLedger(),
+      targetBlocks: [target],
+      collector: new CandidateCollector(),
+      stableTerms: [{
+        conceptId: "person-rakesh",
+        lexemeId: "lex-rakesh",
+        sourceForm: "Rakesh",
+        canonicalSource: "Rakesh",
+        target: "拉凯什",
+        locked: true,
+      }],
+      resolvedEvidence: [],
+      styleState: { register: "literary" },
+      evidenceIndex,
+    });
+
+    await tools.finalizeTranslation({
+      translations: [{ blockId: target.id, text: "拉凯什改变了她那一版拟景。" }],
+      notes: [],
+      memoryCandidates: [{
+        kind: "local_continuity",
+        subjectForms: ["Rakesh"],
+        fact: "Rakesh can alter her own version of the scape.",
+        confidence: 0.95,
+      }],
+    });
+
+    const memories = tools.durableMemories();
+    assert.equal(memories.length, 1);
+    assert.deepEqual(memories[0]?.subjectIds, ["person-rakesh"]);
+    assert.equal(memories[0]?.visibleFromGlobalIndex, target.globalIndex + 1);
+    assert.equal(memories[0]?.evidenceIds.length, 1);
+  } finally {
+    evidenceIndex.close();
+  }
 });
 
 test("low-confidence research claims are withheld from translation", async () => {

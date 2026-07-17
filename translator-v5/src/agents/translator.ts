@@ -3,6 +3,8 @@ import type { Model } from "@earendil-works/pi-ai";
 
 import type { ProvisionalSnapshot } from "../domain/provisional-snapshot.js";
 import type { StableTerm, V4Block } from "../domain/types.js";
+import type { EvidenceIndex } from "../index/evidence-index.js";
+import type { NarrativeMemoryRecord } from "../fullbook/types.js";
 import type { BudgetLedger } from "../kernel/budget.js";
 import type {
   CandidateCollector,
@@ -42,6 +44,7 @@ export interface TranslateIslandInput {
   previousActiveTail: string;
   signal?: AbortSignal;
   deadlineMs?: number;
+  evidenceIndex?: EvidenceIndex;
 }
 
 export interface TranslationOutcome {
@@ -54,6 +57,7 @@ export interface TranslationOutcome {
   repairRuns: PiRunResult[];
   repaired: boolean;
   humanRequired: boolean;
+  durableMemories: NarrativeMemoryRecord[];
 }
 
 function paragraphs(text: string): string[] {
@@ -200,6 +204,7 @@ export class Translator {
       stableTerms: terms,
       resolvedEvidence: resolutions,
       styleState: input.styleState,
+      evidenceIndex: input.evidenceIndex,
     });
     const before = input.collector.translations().length;
     const initialPrompt = this.#initialPrompt(input, terms);
@@ -209,6 +214,9 @@ export class Translator {
         "Preserve meaning, ambiguity, paragraph structure, voice, and all block boundaries.",
         "Use translator-global facts only to disambiguate wording; do not add facts unavailable to the narrator.",
         "Do not leave ordinary source-language prose words untranslated unless the stable terminology explicitly preserves them.",
+        "If and only if a concrete ambiguity can change the Chinese wording, call request_translation_evidence with one to three literal English forms copied from the target island.",
+        "Use narrative_before_target for narrator-visible context and translator_global only for silent lexical disambiguation. Do not research themes, allusions, or general lore.",
+        "With finalize_translation, optionally submit up to four concise English memoryCandidates for explicit source-grounded facts likely to affect later wording. Use literal subjectForms from this island; do not submit themes, predictions, interpretations, or low-confidence guesses.",
         "Use typed tools only. Submit every block exactly once with finalize_translation.",
       ].join("\n"),
       prompt: initialPrompt,
@@ -216,6 +224,7 @@ export class Translator {
       model: input.model,
       tools: tools.specs().filter((tool) =>
         tool.name === "retrieve_resolved_evidence"
+        || (tool.name === "request_translation_evidence" && input.evidenceIndex !== undefined)
         || tool.name === "finalize_translation"),
       budget: input.budget,
       terminateTools: ["finalize_translation"],
@@ -277,6 +286,7 @@ export class Translator {
       repairRuns,
       repaired: candidate?.repaired ?? false,
       humanRequired: !validation.valid,
+      durableMemories: tools.durableMemories(),
     };
   }
 

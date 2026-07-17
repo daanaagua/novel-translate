@@ -164,6 +164,7 @@ export interface RunPilotOptions {
   persistedNarrativeMemories?: readonly NarrativeMemoryRecord[];
   previousActiveTail?: string;
   styleState?: StyleState;
+  researchMode?: "upfront" | "on_demand";
 }
 
 export interface PilotResult {
@@ -174,6 +175,7 @@ export interface PilotResult {
   audit: PilotAudit;
   artifacts: PilotArtifactPaths;
   leasePath: string;
+  narrativeMemories: NarrativeMemoryRecord[];
 }
 
 export interface PilotPreflight {
@@ -361,37 +363,50 @@ export async function runTranslationWindow(
     });
     let research: ResearchOutcome | undefined;
     let snapshot: ProvisionalSnapshot;
-    try {
-      research = await new EvidenceResolver(runtime).run({
-        scout,
-        tools: researchTools,
-        collector,
-        budget,
-        model: options.model,
-        streamFn: options.streamFn,
-        targetBlocks,
-        protocolVersion: options.protocolVersion ?? "v5-agent-kernel-pilot-1",
-        signal: controller.signal,
-      });
-      snapshot = research.snapshot;
-      if (!research.metrics.questionGatePassed) {
-        degradedReasons.push("question scout skipped submit_questions gate; retained bounded evidence results");
-      }
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      degradedReasons.push(`research fallback: ${message}`);
-      const questions = collector.questions();
-      collector.finishResearch(questions.map((question) => question.questionId));
+    if (options.researchMode === "on_demand") {
       snapshot = buildProvisionalSnapshot({
         protocolVersion: options.protocolVersion ?? "v5-agent-kernel-pilot-1",
         systemPrompt: scout.systemPrompt(),
         model: options.model,
         targetBlocks,
-        questions,
-        resolutions: collector.resolutions(),
-        unresolvedQuestionIds: questions.map((question) => question.questionId),
-        evidence: researchTools.issuedEvidence(),
+        questions: [],
+        resolutions: [],
+        unresolvedQuestionIds: [],
+        evidence: [],
       });
+    } else {
+      try {
+        research = await new EvidenceResolver(runtime).run({
+          scout,
+          tools: researchTools,
+          collector,
+          budget,
+          model: options.model,
+          streamFn: options.streamFn,
+          targetBlocks,
+          protocolVersion: options.protocolVersion ?? "v5-agent-kernel-pilot-1",
+          signal: controller.signal,
+        });
+        snapshot = research.snapshot;
+        if (!research.metrics.questionGatePassed) {
+          degradedReasons.push("question scout skipped submit_questions gate; retained bounded evidence results");
+        }
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        degradedReasons.push(`research fallback: ${message}`);
+        const questions = collector.questions();
+        collector.finishResearch(questions.map((question) => question.questionId));
+        snapshot = buildProvisionalSnapshot({
+          protocolVersion: options.protocolVersion ?? "v5-agent-kernel-pilot-1",
+          systemPrompt: scout.systemPrompt(),
+          model: options.model,
+          targetBlocks,
+          questions,
+          resolutions: collector.resolutions(),
+          unresolvedQuestionIds: questions.map((question) => question.questionId),
+          evidence: researchTools.issuedEvidence(),
+        });
+      }
     }
     snapshot = mergeProjectedMemories(
       snapshot,
@@ -405,6 +420,9 @@ export async function runTranslationWindow(
     state.transition("translating");
 
     const translator = new Translator(runtime);
+    const onDemandEvidenceIndex = options.researchMode === "on_demand"
+      ? context.evidenceIndex
+      : undefined;
     const islands = splitIntoChapterIslands(targetBlocks);
     const translationOutcomes = await mapWithConcurrency(
       islands,
@@ -423,6 +441,7 @@ export async function runTranslationWindow(
           paragraphPolicy: "preserve source paragraph boundaries",
         },
         previousActiveTail: boundedActiveTail(options.previousActiveTail ?? ""),
+        evidenceIndex: onDemandEvidenceIndex,
         signal: controller.signal,
       }),
     );
@@ -524,6 +543,12 @@ export async function runTranslationWindow(
       audit,
       artifacts,
       leasePath,
+      narrativeMemories: translationOutcomes.flatMap((outcome) =>
+        outcome.durableMemories.map((memory) => ({
+          ...memory,
+          subjectIds: [...memory.subjectIds],
+          evidenceIds: [...memory.evidenceIds],
+        }))),
     };
   } catch (error) {
     state.fail();
