@@ -16,6 +16,7 @@ from src.core.llm_client import LLMManager
 from src.core.translator import TranslationEngine, TranslationConfig
 from src.core.project_manager import ProjectManager
 from src.core.exporter import BookExporter
+from src.core.v5_exporter import V5BookExporter
 from src.agents.glossary_manager import GlossaryManager
 from src.core.schemas import ChunkStatus
 from src.core.v4 import (
@@ -1053,6 +1054,23 @@ def cmd_export_v4(args):
     return 0
 
 
+def cmd_export_v5(args):
+    project = _load_project_or_error(args.book_id)
+    if not project:
+        return 1
+    try:
+        result = V5BookExporter(project).export_v5(
+            output_dir=args.output_dir,
+            allow_incomplete=args.allow_incomplete,
+        )
+    except Exception as exc:
+        print(f"[ERROR] V5 导出失败: {exc}")
+        return 1
+    print(f"[OK] TXT: {result.txt_path}")
+    print(f"[OK] EPUB: {result.epub_path}")
+    return 0
+
+
 def cmd_compare_v4(args):
     project = _load_project_or_error(args.book_id)
     if not project:
@@ -1387,6 +1405,12 @@ def main(argv=None):
     p_export_v4.add_argument("--strict-validation", action="store_true")
     p_export_v4.add_argument("--include-annotations", action="store_true")
     p_export_v4.set_defaults(func=cmd_export_v4)
+
+    p_export_v5 = subparsers.add_parser("export-v5", help="严格导出translator-v5的TXT和EPUB")
+    p_export_v5.add_argument("book_id", help="项目ID")
+    p_export_v5.add_argument("--output-dir")
+    p_export_v5.add_argument("--allow-incomplete", action="store_true")
+    p_export_v5.set_defaults(func=cmd_export_v5)
 
     p_compare_v4 = subparsers.add_parser("compare-v4", help="生成串行基线与parallel_v4人工对照")
     p_compare_v4.add_argument("book_id", help="项目ID")

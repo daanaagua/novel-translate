@@ -79,12 +79,12 @@
 - 修改：`main.py`
 - 测试：`tests/test_v5_exporter.py`
 
-- [ ] 先写测试：从临时 V5 store 和项目章节构造有序译文章节；严格模式拒绝缺块/hash 不符；成功产出带 BOM 的 TXT 和有效 EPUB。
-- [ ] 运行 `python -m pytest tests/test_v5_exporter.py -q` 确认失败。
-- [ ] 实现 `V5BookExporter`，只读 V5 store，并复用 `BookExporter` 的 EPUB 生成代码。
-- [ ] 增加 `python main.py export-v5 BOOK_ID [--allow-incomplete] [--output-dir]`。
+- [x] 先写测试：从临时 V5 store 和项目章节构造有序译文章节；严格模式拒绝缺块/hash 不符；成功产出带 BOM 的 TXT 和有效 EPUB。
+- [x] 运行 `python -m pytest tests/test_v5_exporter.py -q` 确认失败。
+- [x] 实现 `V5BookExporter`，只读 V5 store，并复用 `BookExporter` 的 EPUB 生成代码。
+- [x] 增加 `python main.py export-v5 BOOK_ID [--allow-incomplete] [--output-dir]`。
 - [ ] 重跑定向测试和 Python 正式回归。
-- [ ] Commit：`feat: export v5 translations to txt and epub`。
+- [x] Commit：`feat: export v5 translations to txt and epub`。
 
 ### 任务 6：Little, Big 冷启动验收
 
