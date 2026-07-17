@@ -6,7 +6,8 @@
   "scripts": {
     "test": "node --test --import tsx test/**/*.test.ts",
     "typecheck": "tsc --noEmit",
-    "pilot": "tsx src/cli.ts"
+    "pilot": "tsx src/cli.ts",
+    "book": "tsx src/cli.ts book"
   },
   "dependencies": {
     "@earendil-works/pi-agent-core": "0.80.10",

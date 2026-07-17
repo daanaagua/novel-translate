@@ -310,12 +310,7 @@ export class BookStore {
         INSERT INTO lexical_anchors(
           normalized_source, source_form, target, mode, confidence, updated_at
         ) VALUES(?, ?, ?, ?, ?, datetime('now'))
-        ON CONFLICT(normalized_source) DO UPDATE SET
-          source_form=excluded.source_form,
-          target=excluded.target,
-          mode=excluded.mode,
-          confidence=excluded.confidence,
-          updated_at=excluded.updated_at
+        ON CONFLICT(normalized_source) DO NOTHING
       `);
       for (const anchor of input.lexicalAnchors) {
         upsertAnchor.run(
@@ -484,6 +479,12 @@ export class BookStore {
       text: row.text,
       status: row.status,
     }));
+  }
+
+  allWindows(): PersistedWindow[] {
+    return all<WindowRow>(
+      this.#database.prepare("SELECT * FROM windows ORDER BY ordinal"),
+    ).map(windowFromRow);
   }
 
   statusSummary(): BookStatusSummary {

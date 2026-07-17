@@ -64,13 +64,13 @@
 - 测试：`translator-v5/test/book-runner.test.ts`
 - 测试：`translator-v5/test/cli.test.ts`
 
-- [ ] 先写 faux 模型端到端测试：串行热身后并发 2、风险降速、每窗独立预算、无提交重试、失败窗不污染活动状态、重启不重复已完成窗、无人值守继续并汇总人工队列。
-- [ ] 运行定向测试确认失败。
-- [ ] 实现 `preflightBook`、`runBook`、波次提交和每窗最多两次尝试；事件和 metrics 不保存 key/reasoning。
-- [ ] 增加 `book preflight|run|status|export` 参数；保留现有 `preview` 兼容入口。
-- [ ] 生成整书 TXT、双语 TXT、audit 和 metrics；严格模式拒绝缺块。
-- [ ] 重跑全体 V5 测试与类型检查。
-- [ ] Commit：`feat: run resumable full-book translation`。
+- [x] 先写 faux 模型端到端测试：串行热身后并发 2、风险降速、每窗独立预算、无提交重试、失败窗不污染活动状态、重启不重复已完成窗、无人值守继续并汇总人工队列。
+- [x] 运行定向测试确认失败。
+- [x] 实现 `preflightBook`、`runBook`、波次提交和每窗最多两次尝试；事件和 metrics 不保存 key/reasoning。
+- [x] 增加 `book preflight|run|status|export` 参数；保留现有 `preview` 兼容入口。
+- [x] 生成整书 TXT、双语 TXT、audit 和 metrics；严格模式拒绝缺块。
+- [x] 重跑全体 V5 测试与类型检查。
+- [x] Commit：`feat: run resumable full-book translation`。
 
 ### 任务 5：复用 Python 外围导出 TXT/EPUB
 

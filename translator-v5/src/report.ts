@@ -1,4 +1,8 @@
 import type { V4Block } from "./domain/types.js";
+import { mkdirSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
+
+import type { BookStore } from "./storage/book-store.js";
 
 export interface PilotTranslation {
   blockId: string;
@@ -57,4 +61,48 @@ export function joinTranslations(
       sourceText: block.sourceText,
       text: translations.get(block.id) as string,
     }));
+}
+
+export interface BookArtifactPaths {
+  translation: string;
+  bilingual: string;
+  audit: string;
+  metrics: string;
+}
+
+export function writeBookArtifacts(
+  store: BookStore,
+  outputDirectory: string,
+  options: { allowIncomplete?: boolean } = {},
+): BookArtifactPaths {
+  const status = store.statusSummary();
+  if (!options.allowIncomplete && status.translatedBlocks !== status.totalBlocks) {
+    throw new Error(
+      `strict book export requires ${status.totalBlocks} translated blocks; found ${status.translatedBlocks}`,
+    );
+  }
+  const translations: PilotTranslation[] = store.activeTranslations().map((item) => ({
+    blockId: item.blockId,
+    globalIndex: item.globalIndex,
+    chapterId: item.chapterId,
+    chapterTitle: item.chapterTitle,
+    sourceText: item.sourceText,
+    text: item.text,
+  }));
+  mkdirSync(outputDirectory, { recursive: true });
+  const paths = {
+    translation: join(outputDirectory, "v5_book_translation.txt"),
+    bilingual: join(outputDirectory, "v5_book_bilingual.txt"),
+    audit: join(outputDirectory, "v5_book_audit.json"),
+    metrics: join(outputDirectory, "v5_book_metrics.json"),
+  };
+  writeFileSync(paths.translation, renderTranslation(translations), "utf8");
+  writeFileSync(paths.bilingual, renderBilingual(translations), "utf8");
+  writeFileSync(paths.audit, `${JSON.stringify({
+    schemaVersion: "v5-book-audit-1",
+    status,
+    windows: store.allWindows(),
+  }, null, 2)}\n`, "utf8");
+  writeFileSync(paths.metrics, `${JSON.stringify(status, null, 2)}\n`, "utf8");
+  return paths;
 }
