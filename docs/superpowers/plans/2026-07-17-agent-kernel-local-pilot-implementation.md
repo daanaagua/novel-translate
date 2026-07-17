@@ -713,7 +713,7 @@ git commit -m "feat: run cold local agent pilot"
 - 创建：`docs/superpowers/reports/2026-07-17-v5-agent-kernel-pilot.md`
 - 生成但不提交：`projects/new_sun_omnibus/exports/v5-agent-pilot/*`
 
-- [ ] **步骤 1：运行本地配置预检，不调用模型**
+- [x] **步骤 1：运行本地配置预检，不调用模型**
 
 运行：
 
@@ -729,12 +729,12 @@ npm run pilot -- preview `
 预期：报告 5 blocks、33,307 source chars、0 narrative reads、20 call hard limit，且 key
 不出现在 stdout、event log 或序列化配置中。
 
-- [ ] **步骤 2：运行真实 Pi/DeepSeek pilot**
+- [x] **步骤 2：运行真实 Pi/DeepSeek pilot**
 
 使用任务 8 CLI。30 分钟硬 deadline 由 `AbortController` 执行，不用外部 shell timeout
 代替；进程结束后确认没有残留 Node 子进程和活动 lease。
 
-- [ ] **步骤 3：核验机器指标**
+- [x] **步骤 3：核验机器指标**
 
 必须确认：
 
@@ -747,12 +747,12 @@ wall_time <= 1800s
 lease_released = true
 ```
 
-- [ ] **步骤 4：人工抽查输出与证据链**
+- [x] **步骤 4：人工抽查输出与证据链**
 
 检查 Typhon/Piaton/Severian/Claw、段落完整性、引号和连续性；列出 Agent 主动查询了
 什么、没有查询什么、哪些判断 unresolved。质量判断不由自动指标替代。
 
-- [ ] **步骤 5：编写决策报告**
+- [x] **步骤 5：编写决策报告**
 
 报告对比：
 
@@ -765,7 +765,7 @@ V5 cold local: measured values
 结论只能是 `promote / iterate / reject` 之一，并给出下一轮最小改动；不得因已投入
 TypeScript/Pi 成本而默认 promote。
 
-- [ ] **步骤 6：运行最终验证并 Commit**
+- [x] **步骤 6：运行最终验证并 Commit**
 
 运行：`npm test && npm run typecheck`，再运行 Python 回归。  
 提交：
@@ -779,14 +779,14 @@ git commit -m "docs: evaluate v5 agent kernel pilot"
 
 ## 最终验证清单
 
-- [ ] `git diff --check` 无错误。
-- [ ] `translator-v5` 全部 Node 测试通过。
-- [ ] TypeScript strict typecheck 通过。
-- [ ] Python 正式测试集仍为 666 passed、8 subtests passed。
-- [ ] V5 对 V4 数据库只读。
-- [ ] V5 没有查询 narrative tables。
-- [ ] Pi 工具清单不含 bash/read/edit/任意 SQL。
-- [ ] 运行超时或失败不会留下 lease 或并发子进程。
-- [ ] API key 不出现在 git diff、日志、audit、stdout。
-- [ ] 五块译文和双语对照可直接阅读。
-- [ ] 真实运行指标和 V4 对照已写入报告。
+- [x] `git diff --check` 无错误。
+- [x] `translator-v5` 全部 Node 测试通过。
+- [x] TypeScript strict typecheck 通过。
+- [x] Python 正式测试集仍为 666 passed、8 subtests passed。
+- [x] V5 对 V4 数据库只读。
+- [x] V5 没有查询 narrative tables。
+- [x] Pi 工具清单不含 bash/read/edit/任意 SQL。
+- [x] 运行超时或失败不会留下 lease 或并发子进程。
+- [x] API key 不出现在 git diff、日志、audit、stdout。
+- [x] 五块译文和双语对照可直接阅读。
+- [x] 真实运行指标和 V4 对照已写入报告。

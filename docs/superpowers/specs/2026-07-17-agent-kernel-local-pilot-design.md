@@ -150,9 +150,10 @@ Kernel 不判断文学含义，也不生成中文。
 工具。每个作用域创建短生命周期、内存会话：
 
 - Question Scout：每个目标 island 一次；
-- Evidence Resolver：每组相关问题一次；
+- Evidence Resolver：拆成有局部轮次上限的检索阶段与独占提交预算的证据终结阶段；
+- Lexical Anchorer：并行翻译前一次，只处理跨 island 重复且尚无稳定译名的形式；
 - Translation Agent：每个 island 一次；
-- Repair Agent：仅确定性校验失败时一次。
+- Repair Agent：仅确定性校验失败时运行；全局最多三次最小补丁，不无限循环。
 
 持久记忆属于 SQLite/event log，不属于 Pi 对话历史。
 
@@ -220,6 +221,7 @@ inspect_local_continuity(block_id, neighbor_count)
 retrieve_resolved_evidence(question_ids)
 inspect_style_state(scene_type)
 finalize_translation(block_translations, used_resolution_ids, unresolved_ids)
+submit_lexical_anchors(repeated_forms, target_modes, confidence)
 ```
 
 `finalize_translation` 只是提交候选。Kernel 仍会运行结构和完整性校验。
@@ -232,7 +234,8 @@ retrieve_failure_evidence(failure_ids)
 submit_repaired_translation(block_translations, addressed_failure_ids)
 ```
 
-修复最多一轮；失败后保留原候选并输出警告，不无限循环。
+修复按 block ID 合并最小补丁；若补丁引入新的确定性失败，可在全局三轮硬预算内继续。
+三轮后仍失败则返回人工处理，不无限循环。
 
 ## 7. 问题到检索的桥接
 
@@ -280,16 +283,17 @@ Translation Agent 初始只接收强制最小包：
 
 ## 9. 预算与停止
 
-提丰试验默认硬上限：
+提丰试验实现后的硬上限：
 
-- Question Scout：最多 1 次模型响应；
-- Evidence Resolver：最多 3 个 Agent turn；
-- 研究工具：最多 8 次调用；
+- Question Scout：最多 3 个纠错 turn，且只开放 `submit_questions`；
+- Evidence Search：最多 2 个 turn、6 次检索工具；
+- Evidence Finalizer：最多 2 个 turn，独占 `finish_research`；
+- 研究工具：全局最多 10 次调用；
 - 单次工具最多 8 个证据；
 - 研究证据正文累计最多 12,000 字符；
-- Translation Agent：每个 island 最多 3 个 turn；
-- 翻译工具：每个 island 最多 6 次调用；
-- Repair Agent：最多 1 个 turn；
+- Lexical Anchorer：最多 2 个 turn；
+- 翻译与锚点：全局最多 10 个 turn、18 次工具调用；
+- Repair Agent：每次最多 1 个 turn，全局最多 3 个 turn；
 - 整个试验模型调用硬上限：20；
 - 整个试验墙钟软目标：15 分钟，硬上限：30 分钟。
 
@@ -444,8 +448,8 @@ final output path
 - Pi runtime 不支持当前模型工具调用：使用同一 typed action schema 的 JSON action
   loop 适配器完成试验，并在报告中标明，不伪装为原生 tool call；
 - 单个研究问题失败：标记 unresolved，继续翻译；
-- 单个翻译 island 失败：在剩余预算内重试一次，仍失败则返回人工处理；
-- 结构校验失败：只允许一次 Repair Agent；
+- 单个翻译 island 失败：按失败项提交最小 block 补丁；
+- 确定性校验失败：在全局三次修复预算内迭代，仍失败则返回人工处理；
 - 预算耗尽：停止增加知识，输出 provisional 结果和完整警告；
 - 进程终止：lease 到期后可恢复，不能产生第二个并发 run；
 - 任何持久化不变量失败：事务回滚，不覆盖 V4 数据。
