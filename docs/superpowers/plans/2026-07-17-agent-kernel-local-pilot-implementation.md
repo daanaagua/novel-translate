@@ -169,7 +169,7 @@ git commit -m "build: scaffold v5 pi pilot"
 - 创建：`translator-v5/src/kernel/run-lease.ts`
 - 测试：`translator-v5/test/kernel.test.ts`
 
-- [ ] **步骤 1：编写预算和能力失败测试**
+- [x] **步骤 1：编写预算和能力失败测试**
 
 ```ts
 test("rejects the ninth research tool call without running it", async () => {
@@ -186,12 +186,12 @@ test("does not register generic filesystem or shell capabilities", () => {
 });
 ```
 
-- [ ] **步骤 2：运行测试确认失败**
+- [x] **步骤 2：运行测试确认失败**
 
 运行：`npm test -- --test-name-pattern="rejects|does not register"`  
 预期：FAIL，Kernel 类型未定义。
 
-- [ ] **步骤 3：实现状态和硬预算**
+- [x] **步骤 3：实现状态和硬预算**
 
 ```ts
 export type BudgetCounter =
@@ -213,7 +213,7 @@ export class BudgetLedger {
 默认上限来自规格：20 个模型调用、8 个研究工具调用、12,000 个 off-target
 证据字符、每个 island 3 个翻译 turn、30 分钟 abort deadline。
 
-- [ ] **步骤 4：实现能力注册、事件和租约**
+- [x] **步骤 4：实现能力注册、事件和租约**
 
 ```ts
 export interface KernelTool<Args, Result> {
@@ -227,12 +227,12 @@ export interface KernelTool<Args, Result> {
 删除自己 token 对应的 lock。事件记录 `started/tool/model/validation/degraded/finished`，
 每条带 monotonically increasing sequence。
 
-- [ ] **步骤 5：补充并发租约和事件排序测试并运行**
+- [x] **步骤 5：补充并发租约和事件排序测试并运行**
 
 运行：`npm test && npm run typecheck`  
 预期：PASS。
 
-- [ ] **步骤 6：Commit**
+- [x] **步骤 6：Commit**
 
 ```bash
 git add translator-v5/src/domain translator-v5/src/kernel translator-v5/test/kernel.test.ts

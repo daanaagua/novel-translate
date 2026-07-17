@@ -1,0 +1,68 @@
+export type BudgetCounter =
+  | "modelCalls"
+  | "researchTurns"
+  | "researchToolCalls"
+  | "evidenceChars"
+  | "translationTurns"
+  | "translationToolCalls"
+  | "repairTurns";
+
+export const DEFAULT_BUDGET_LIMITS: Readonly<Record<BudgetCounter, number>> = {
+  modelCalls: 20,
+  researchTurns: 3,
+  researchToolCalls: 8,
+  evidenceChars: 12_000,
+  translationTurns: 9,
+  translationToolCalls: 18,
+  repairTurns: 1,
+};
+
+export class BudgetExceeded extends Error {
+  public constructor(
+    public readonly counter: BudgetCounter,
+    public readonly limit: number,
+    public readonly requestedTotal: number,
+  ) {
+    super(
+      `budget exceeded for ${counter}: requested ${requestedTotal}, limit ${limit}`,
+    );
+    this.name = "BudgetExceeded";
+  }
+}
+
+export class BudgetLedger {
+  private readonly limits: Record<BudgetCounter, number>;
+  private readonly consumed: Record<BudgetCounter, number>;
+
+  public constructor(overrides: Partial<Record<BudgetCounter, number>> = {}) {
+    this.limits = { ...DEFAULT_BUDGET_LIMITS, ...overrides };
+    this.consumed = Object.fromEntries(
+      Object.keys(DEFAULT_BUDGET_LIMITS).map((counter) => [counter, 0]),
+    ) as Record<BudgetCounter, number>;
+
+    for (const [counter, limit] of Object.entries(this.limits)) {
+      if (!Number.isFinite(limit) || limit < 0) {
+        throw new Error(`invalid budget limit for ${counter}: ${limit}`);
+      }
+    }
+  }
+
+  public consume(counter: BudgetCounter, amount: number): void {
+    if (!Number.isFinite(amount) || amount < 0) {
+      throw new Error(`invalid budget amount for ${counter}: ${amount}`);
+    }
+    const requestedTotal = this.consumed[counter] + amount;
+    if (requestedTotal > this.limits[counter]) {
+      throw new BudgetExceeded(counter, this.limits[counter], requestedTotal);
+    }
+    this.consumed[counter] = requestedTotal;
+  }
+
+  public remaining(counter: BudgetCounter): number {
+    return this.limits[counter] - this.consumed[counter];
+  }
+
+  public snapshot(): Readonly<Record<BudgetCounter, number>> {
+    return { ...this.consumed };
+  }
+}
