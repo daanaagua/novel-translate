@@ -258,7 +258,7 @@ git commit -m "ci: verify FolioLoom core"
 
 - 创建：`docs/releases/v1.0.0.md`
 
-- [ ] **步骤 1：写入 Release notes**
+- [x] **步骤 1：写入 Release notes**
 
 固定包含以下章节：
 
@@ -273,7 +273,7 @@ git commit -m "ci: verify FolioLoom core"
 
 Highlights 只描述已经存在的无损账本、审计/恢复、证据型实体链接、波次术语锚点、结构化风格和局部修复。Verification 写明离线测试数量及真实一/三窗口门禁；limitations 写明 CLI、无公开全书基准、Provider 配置偏开发者。
 
-- [ ] **步骤 2：扫描夸大和占位文本**
+- [x] **步骤 2：扫描夸大和占位文本**
 
 ```powershell
 rg -n "TODO|TBD|待定|best|领先|全面优于|production-ready|GUI 已完成" docs/releases/v1.0.0.md
@@ -281,7 +281,7 @@ rg -n "TODO|TBD|待定|best|领先|全面优于|production-ready|GUI 已完成" 
 
 预期：无命中；“CLI”“没有统一 GUI”“尚无公开全书基准”均有明确说明。
 
-- [ ] **步骤 3：提交 Release notes**
+- [x] **步骤 3：提交 Release notes**
 
 ```powershell
 git add docs/releases/v1.0.0.md
