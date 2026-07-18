@@ -3,6 +3,11 @@ import { readFileSync, realpathSync } from "node:fs";
 import { dirname, isAbsolute, relative, resolve, sep } from "node:path";
 import { TextDecoder } from "node:util";
 
+import {
+  getSourceLanguageProfile,
+  supportedSourceLanguageIds,
+} from "../language/profiles.js";
+import type { SourceLanguageProfile } from "../language/types.js";
 import type {
   CanonicalSegment,
   ExcludedRawRange,
@@ -121,6 +126,7 @@ function sourceVersionFor(
   manifest: Record<string, unknown>,
   canonicalSegments: readonly CanonicalSegment[],
   excludedRawRanges: readonly ExcludedRawRange[],
+  languageProfile?: SourceLanguageProfile,
 ): string {
   const identity = [
     ["schema_version", stringField(manifest, "schema_version")],
@@ -144,7 +150,43 @@ function sourceVersionFor(
       ["policy", range.policy],
     ])],
   ];
+  if (languageProfile !== undefined) {
+    identity.push(
+      ["source_language", languageProfile.id],
+      ["source_language_profile_version", languageProfile.version],
+    );
+  }
   return sha256(JSON.stringify(identity));
+}
+
+function languageForManifest(manifest: Record<string, unknown>): {
+  profile: SourceLanguageProfile;
+  compatibilityMode: boolean;
+} {
+  const value = manifest.sourceLanguage;
+  if (value === undefined) {
+    return {
+      profile: getSourceLanguageProfile("en"),
+      compatibilityMode: true,
+    };
+  }
+  if (typeof value !== "string" || value.trim().length === 0) {
+    throw new SourceIntegrityError(
+      "MANIFEST_INVALID",
+      "sourceLanguage must be a supported non-empty language id",
+    );
+  }
+  const normalized = value.trim().toLocaleLowerCase().split("-", 1)[0] as string;
+  if (!supportedSourceLanguageIds().includes(normalized)) {
+    throw new SourceIntegrityError(
+      "MANIFEST_INVALID",
+      `unsupported sourceLanguage: ${value}`,
+    );
+  }
+  return {
+    profile: getSourceLanguageProfile(normalized),
+    compatibilityMode: false,
+  };
 }
 
 function validateSegments(
@@ -276,6 +318,9 @@ export class SourceLedger implements ScalarSource {
   readonly canonicalPath: string;
   readonly sourceText: string;
   readonly sourceVersion: string;
+  readonly sourceLanguage: string;
+  readonly sourceLanguageCompatibilityMode: boolean;
+  readonly languageProfile: SourceLanguageProfile;
   readonly canonicalChars: number;
   readonly canonicalSegments: readonly CanonicalSegment[];
   readonly excludedRawRanges: readonly ExcludedRawRange[];
@@ -287,6 +332,8 @@ export class SourceLedger implements ScalarSource {
     canonicalPath: string;
     sourceText: string;
     sourceVersion: string;
+    languageProfile: SourceLanguageProfile;
+    sourceLanguageCompatibilityMode: boolean;
     canonicalSegments: CanonicalSegment[];
     excludedRawRanges: ExcludedRawRange[];
     coordinates: UnicodeScalarMap;
@@ -296,6 +343,9 @@ export class SourceLedger implements ScalarSource {
     this.canonicalPath = options.canonicalPath;
     this.sourceText = options.sourceText;
     this.sourceVersion = options.sourceVersion;
+    this.languageProfile = options.languageProfile;
+    this.sourceLanguage = options.languageProfile.id;
+    this.sourceLanguageCompatibilityMode = options.sourceLanguageCompatibilityMode;
     this.canonicalSegments = options.canonicalSegments;
     this.excludedRawRanges = options.excludedRawRanges;
     this.coordinates = options.coordinates;
@@ -384,10 +434,12 @@ export class SourceLedger implements ScalarSource {
       manifest.excluded_raw_ranges,
       raw.length,
     );
+    const language = languageForManifest(manifest);
     const sourceVersion = sourceVersionFor(
       manifest,
       canonicalSegments,
       excludedRawRanges,
+      language.compatibilityMode ? undefined : language.profile,
     );
 
     return new SourceLedger({
@@ -396,6 +448,8 @@ export class SourceLedger implements ScalarSource {
       canonicalPath,
       sourceText,
       sourceVersion,
+      languageProfile: language.profile,
+      sourceLanguageCompatibilityMode: language.compatibilityMode,
       canonicalSegments,
       excludedRawRanges,
       coordinates,

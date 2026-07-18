@@ -4,6 +4,8 @@ import { resolve } from "node:path";
 
 import type { StableTerm, V4Block } from "../domain/types.js";
 import { EvidenceIndex } from "../index/evidence-index.js";
+import { getSourceLanguageProfile } from "../language/profiles.js";
+import type { SourceLanguageProfile } from "../language/types.js";
 import { auditSourceCoverage } from "../source/auditor.js";
 import { buildLosslessBlocks } from "../source/block-builder.js";
 import { SourceLedger } from "../source/source-ledger.js";
@@ -30,6 +32,7 @@ export class BookContext {
   readonly sourceFingerprint: string;
   readonly evidenceIndex: EvidenceIndex;
   readonly certifiedSource: CertifiedSourceInput | null;
+  readonly languageProfile: SourceLanguageProfile;
   readonly #adapter: V4ReadAdapter | undefined;
   readonly #blocks: V4Block[];
   readonly #losslessBlocks: LosslessBlock[];
@@ -48,6 +51,7 @@ export class BookContext {
     ledger?: SourceLedger;
     stableTerms: StableTerm[];
     certifiedSource?: CertifiedSourceInput;
+    languageProfile?: SourceLanguageProfile;
   }) {
     this.sourceDbPath = options.sourceDbPath;
     this.sourceFingerprint = options.sourceFingerprint;
@@ -58,6 +62,7 @@ export class BookContext {
     this.#ledger = options.ledger;
     this.#stableTerms = options.stableTerms;
     this.certifiedSource = options.certifiedSource ?? null;
+    this.languageProfile = options.languageProfile ?? getSourceLanguageProfile("en");
     this.evidenceIndex = EvidenceIndex.fromBlocks(
       options.losslessBlocks ?? options.blocks ?? [],
     );
@@ -121,6 +126,9 @@ export class BookContext {
       sourceFormat: manifest.source_format,
       encoding: manifest.encoding,
       extractor: manifest.extractor,
+      sourceLanguage: ledger.sourceLanguage,
+      sourceLanguageProfileVersion: ledger.languageProfile.version,
+      sourceLanguageCompatibilityMode: ledger.sourceLanguageCompatibilityMode,
       ranges: ledger.canonicalSegments.map((range, index) => ({
         rangeId: `range-${index}`,
         canonicalStart: range.canonicalStart,
@@ -149,6 +157,7 @@ export class BookContext {
         ledger,
         stableTerms,
         certifiedSource,
+        languageProfile: ledger.languageProfile,
       });
     } catch (error) {
       adapter?.close();

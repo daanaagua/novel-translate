@@ -92,6 +92,27 @@ function assertSourceVersionUnchanged(context: BookContext): void {
     );
   }
 }
+
+function runMetadataWithLanguageProfile(
+  metadata: unknown,
+  context: BookContext,
+): Record<string, unknown> {
+  const userMetadata = typeof metadata === "object"
+    && metadata !== null
+    && !Array.isArray(metadata)
+    ? metadata as Record<string, unknown>
+    : metadata === undefined
+      ? {}
+      : { userMetadata: metadata };
+  return {
+    ...userMetadata,
+    sourceLanguageProfile: {
+      id: context.languageProfile.id,
+      version: context.languageProfile.version,
+      compatibilityMode: context.sourceLedger.sourceLanguageCompatibilityMode,
+    },
+  };
+}
 const DEFAULT_WARMUP_WINDOWS = 2;
 
 export interface BookPreflight {
@@ -610,7 +631,7 @@ async function runLosslessBook(
       modelId,
       initialSnapshotId: initialSnapshot.id,
       initialSnapshot,
-      metadata: options.runMeta.metadata ?? {},
+      metadata: runMetadataWithLanguageProfile(options.runMeta.metadata, context),
     });
     const planned = planBookWindows(context.losslessBlocks, {
       ...options.windowOptions,

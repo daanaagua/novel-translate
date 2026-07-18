@@ -38,6 +38,7 @@ interface LedgerFixtureOptions {
   extractor?: string;
   canonicalSegments?: readonly Record<string, unknown>[];
   excludedRawRanges?: readonly Record<string, unknown>[];
+  sourceLanguage?: string;
 }
 
 function ledgerFixture(
@@ -61,6 +62,9 @@ function ledgerFixture(
     source_format: options.sourceFormat ?? ".txt",
     encoding: options.encoding ?? "utf-8",
     extractor: options.extractor ?? "plain-text-v1",
+    ...(options.sourceLanguage === undefined
+      ? {}
+      : { sourceLanguage: options.sourceLanguage }),
     canonical_path: "source.txt",
     canonical_chars: scalarLength(source),
     canonical_sha256: sha256(canonical),
@@ -192,6 +196,42 @@ test("lossless source version includes raw payload and extraction provenance", (
     rmSync(first.directory, { recursive: true, force: true });
     rmSync(second.directory, { recursive: true, force: true });
     rmSync(third.directory, { recursive: true, force: true });
+  }
+});
+
+test("source language profile participates in new source identity", () => {
+  const english = ledgerFixture("Same source.", { sourceLanguage: "en" });
+  const french = ledgerFixture("Same source.", { sourceLanguage: "fr" });
+  try {
+    const englishLedger = SourceLedger.open(english.manifestPath);
+    const frenchLedger = SourceLedger.open(french.manifestPath);
+    assert.equal(englishLedger.sourceLanguage, "en");
+    assert.equal(frenchLedger.sourceLanguage, "fr");
+    assert.equal(englishLedger.sourceLanguageCompatibilityMode, false);
+    assert.notEqual(englishLedger.sourceVersion, frenchLedger.sourceVersion);
+    assert.equal(englishLedger.languageProfile.id, "en");
+    assert.equal(frenchLedger.languageProfile.id, "fr");
+  } finally {
+    rmSync(english.directory, { recursive: true, force: true });
+    rmSync(french.directory, { recursive: true, force: true });
+  }
+});
+
+test("legacy manifest keeps its old identity while loading English compatibility", () => {
+  const fixture = ledgerFixture("Legacy source.");
+  try {
+    const before = SourceLedger.open(fixture.manifestPath);
+    assert.equal(before.sourceLanguage, "en");
+    assert.equal(before.languageProfile.id, "en");
+    assert.equal(before.sourceLanguageCompatibilityMode, true);
+
+    mutateManifest(fixture, (manifest) => {
+      manifest.sourceLanguage = "en";
+    });
+    const explicit = SourceLedger.open(fixture.manifestPath);
+    assert.notEqual(before.sourceVersion, explicit.sourceVersion);
+  } finally {
+    rmSync(fixture.directory, { recursive: true, force: true });
   }
 });
 

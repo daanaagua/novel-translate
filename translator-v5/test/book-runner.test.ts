@@ -40,6 +40,7 @@ function losslessFixture(source: string) {
     source_format: ".txt",
     encoding: "utf-8",
     extractor: "plain-text-v1",
+    sourceLanguage: "en",
     canonical_path: "source.txt",
     canonical_chars: scalarLength(source),
     canonical_sha256: hash,
@@ -198,6 +199,18 @@ test("two tiny logical windows use one physical model session and commit indepen
   assert.equal(fixture.faux.state.callCount, 1);
   assert.equal(result.status.completedWindows, 2);
   assert.equal(result.status.modelCalls, 1);
+  const store = new LosslessBookStore(fixture.options.storePath);
+  try {
+    assert.deepEqual(store.listTranslationRuns()[0]?.metadata, {
+      sourceLanguageProfile: {
+        id: "en",
+        version: "source-language-profile-1",
+        compatibilityMode: false,
+      },
+    });
+  } finally {
+    store.close();
+  }
 });
 
 test("failed lossless doctor blocks every model call", async () => {

@@ -131,6 +131,7 @@ export interface ScalarSource {
   readonly sourceText: string;
   readonly coordinates: UnicodeScalarMap;
   readonly sourceVersion?: string;
+  readonly sourceLanguage?: string;
 }
 
 export type SourceInput = string | ScalarSource;

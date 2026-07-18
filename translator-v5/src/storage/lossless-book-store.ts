@@ -5,6 +5,7 @@ import { DatabaseSync, type StatementSync } from "node:sqlite";
 
 import type { CommitPromotion } from "../fullbook/commit-coordinator.js";
 import type { BookWindowPlan, BookWindowStatus } from "../fullbook/types.js";
+import { supportedSourceLanguageIds } from "../language/profiles.js";
 import {
   canonicalJson,
   KnowledgeStore,
@@ -47,6 +48,9 @@ export interface CertifiedSourceInput {
   sourceFormat: string;
   encoding: string;
   extractor: string;
+  sourceLanguage?: string;
+  sourceLanguageProfileVersion?: string;
+  sourceLanguageCompatibilityMode?: boolean;
   ranges: readonly CertifiedSourceRange[];
 }
 
@@ -1858,6 +1862,18 @@ export class LosslessBookStore {
     const sourceFormat = requireNonempty(input.sourceFormat, "sourceFormat");
     const encoding = requireNonempty(input.encoding, "encoding");
     const extractor = requireNonempty(input.extractor, "extractor");
+    const sourceLanguage = input.sourceLanguage ?? "en";
+    if (!supportedSourceLanguageIds().includes(sourceLanguage)) {
+      throw new TypeError(`unsupported sourceLanguage: ${sourceLanguage}`);
+    }
+    const sourceLanguageProfileVersion = requireNonempty(
+      input.sourceLanguageProfileVersion ?? "legacy-source-language-profile",
+      "sourceLanguageProfileVersion",
+    );
+    const sourceLanguageCompatibilityMode = input.sourceLanguageCompatibilityMode ?? true;
+    if (typeof sourceLanguageCompatibilityMode !== "boolean") {
+      throw new TypeError("sourceLanguageCompatibilityMode must be boolean");
+    }
     if (!Array.isArray(input.ranges)) {
       throw new TypeError("source ranges must be an array");
     }
@@ -1911,6 +1927,9 @@ export class LosslessBookStore {
       sourceFormat,
       encoding,
       extractor,
+      sourceLanguage,
+      sourceLanguageProfileVersion,
+      sourceLanguageCompatibilityMode,
       ranges,
     };
   }

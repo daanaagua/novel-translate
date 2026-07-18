@@ -10,7 +10,7 @@ import { BookContext } from "../src/fullbook/book-context.js";
 import { scalarLength } from "../src/source/types.js";
 import { V4ReadAdapter } from "../src/storage/v4-read-adapter.js";
 
-function manifestFixture(directory: string, source: string): string {
+function manifestFixture(directory: string, source: string, sourceLanguage?: string): string {
   const raw = Buffer.from(source, "utf8");
   const hash = createHash("sha256").update(raw).digest("hex");
   writeFileSync(join(directory, "original.txt"), raw);
@@ -25,6 +25,7 @@ function manifestFixture(directory: string, source: string): string {
     source_format: ".txt",
     encoding: "utf-8",
     extractor: "plain-text-v1",
+    ...(sourceLanguage === undefined ? {} : { sourceLanguage }),
     canonical_path: "source.txt",
     canonical_chars: scalarLength(source),
     canonical_sha256: hash,
@@ -124,5 +125,26 @@ test("lossless book context never loads legacy blocks but imports stable terms",
     }
   } finally {
     V4ReadAdapter.prototype.loadBlocks = original;
+  }
+});
+
+test("lossless book context exposes one reusable source language profile", () => {
+  const directory = mkdtempSync(join(tmpdir(), "v5-language-context-"));
+  const manifestPath = manifestFixture(
+    directory,
+    "CHAPITRE PREMIER\n\nLe texte.",
+    "fr",
+  );
+  const context = BookContext.openLossless({ manifestPath });
+  try {
+    assert.equal(context.languageProfile.id, "fr");
+    assert.equal(context.languageProfile, context.sourceLedger.languageProfile);
+    assert.equal(context.certifiedSource?.sourceLanguage, "fr");
+    assert.equal(
+      context.certifiedSource?.sourceLanguageProfileVersion,
+      context.languageProfile.version,
+    );
+  } finally {
+    context.close();
   }
 });

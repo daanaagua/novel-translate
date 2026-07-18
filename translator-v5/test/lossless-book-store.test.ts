@@ -56,6 +56,9 @@ function sourceInput(sourceVersion = "source-v1"): CertifiedSourceInput {
     sourceFormat: "txt",
     encoding: "utf-8",
     extractor: "plain-text-v1",
+    sourceLanguage: "en",
+    sourceLanguageProfileVersion: "source-language-profile-1",
+    sourceLanguageCompatibilityMode: false,
     ranges: [{
       rangeId: "range-0",
       canonicalStart: 0,
@@ -66,6 +69,25 @@ function sourceInput(sourceVersion = "source-v1"): CertifiedSourceInput {
     }],
   };
 }
+
+test("registered certified source rejects language profile drift", () => {
+  const path = fixturePath();
+  const store = new LosslessBookStore(path);
+  try {
+    const source = sourceInput();
+    store.registerSource(source);
+    assert.throws(() => store.registerSource({
+      ...source,
+      sourceLanguage: "fr",
+    }), /already identifies a different source/);
+    assert.throws(() => store.registerSource({
+      ...source,
+      sourceLanguageProfileVersion: "source-language-profile-2",
+    }), /already identifies a different source/);
+  } finally {
+    store.close();
+  }
+});
 
 function blocks(sourceVersion = "source-v1"): LosslessBlock[] {
   const firstText = "Alpha.";
