@@ -1,8 +1,13 @@
+import { createHash } from "node:crypto";
 import type { V4Block } from "./domain/types.js";
 import { mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
+import { createKnowledgeSnapshot, type KnowledgeSnapshot } from "./knowledge/snapshot.js";
+import { blockId as losslessBlockId } from "./source/block-builder.js";
+import { scalarLength } from "./source/types.js";
 import type { BookStore } from "./storage/book-store.js";
+import type { LosslessBookStore } from "./storage/lossless-book-store.js";
 
 export interface PilotTranslation {
   blockId: string;
@@ -70,6 +75,278 @@ export interface BookArtifactPaths {
   metrics: string;
 }
 
+export function bookArtifactFileNames(complete: boolean): BookArtifactPaths {
+  const qualifier = complete ? "" : ".partial";
+  return {
+    translation: `v5_book_translation${qualifier}.txt`,
+    bilingual: `v5_book_bilingual${qualifier}.txt`,
+    audit: `v5_book_audit${qualifier}.json`,
+    metrics: `v5_book_metrics${qualifier}.json`,
+  };
+}
+
+export interface LosslessBookAuditReport {
+  schema: "v5-book-store-audit-1";
+  runId: string;
+  sourceVersion: string;
+  protocolVersion: string;
+  modelId: string;
+  runStatus: string;
+  runMetadata: unknown;
+  complete: boolean;
+  totalBlockCount: number;
+  translatedBlockCount: number;
+  missingBlockIds: string[];
+  missingBlockCount: number;
+  incidentCodes: string[];
+}
+
+function sha256(text: string): string {
+  return createHash("sha256").update(text, "utf8").digest("hex");
+}
+
+export function auditLosslessBookStore(
+  store: LosslessBookStore,
+  runId: string,
+): LosslessBookAuditReport {
+  const state = store.auditState(runId);
+  const incidents: string[] = [];
+  const blocks = [...state.blocks].sort((left, right) => (
+    left.globalIndex - right.globalIndex || left.blockId.localeCompare(right.blockId)
+  ));
+  const blockById = new Map(blocks.map((block) => [block.blockId, block]));
+  let cursor = 0;
+  const canonical = createHash("sha256");
+  for (let index = 0; index < blocks.length; index += 1) {
+    const block = blocks[index]!;
+    if (block.sourceVersion !== state.sourceVersion) {
+      incidents.push("SOURCE_VERSION_MISMATCH");
+    }
+    if (block.globalIndex !== index) {
+      incidents.push("BLOCK_ORDER_INVALID");
+    }
+    if (block.canonicalStart > cursor) {
+      incidents.push("SOURCE_SPAN_GAP");
+    } else if (block.canonicalStart < cursor) {
+      incidents.push("SOURCE_SPAN_OVERLAP");
+    }
+    if (block.canonicalEnd <= block.canonicalStart) {
+      incidents.push("SOURCE_SPAN_INVALID");
+    }
+    if (scalarLength(block.sourceText) !== block.canonicalEnd - block.canonicalStart) {
+      incidents.push("SOURCE_TEXT_LENGTH_MISMATCH");
+    }
+    if (sha256(block.sourceText) !== block.sourceHash) {
+      incidents.push("SOURCE_HASH_MISMATCH");
+    }
+    if (losslessBlockId(
+      state.sourceVersion,
+      block.canonicalStart,
+      block.canonicalEnd,
+      block.sourceText,
+    ) !== block.blockId) {
+      incidents.push("BLOCK_ID_MISMATCH");
+    }
+    cursor = Math.max(cursor, block.canonicalEnd);
+    canonical.update(block.sourceText, "utf8");
+  }
+  if (cursor < state.canonicalChars) {
+    incidents.push("SOURCE_SPAN_GAP");
+  }
+  if (cursor > state.canonicalChars) {
+    incidents.push("SOURCE_SPAN_INVALID");
+  }
+  if (canonical.digest("hex") !== state.canonicalSha256) {
+    incidents.push("CANONICAL_HASH_MISMATCH");
+  }
+
+  const windowById = new Map(state.windows.map((window) => [window.windowId, window]));
+  const membershipsByWindow = new Map<string, typeof state.memberships>();
+  const membershipByBlock = new Map<string, string>();
+  for (const membership of state.memberships) {
+    if (membership.runId !== state.runId
+      || membership.sourceVersion !== state.sourceVersion
+      || !windowById.has(membership.windowId)
+      || !blockById.has(membership.blockId)) {
+      incidents.push("BLOCK_MEMBERSHIP_INVALID");
+    }
+    if (membershipByBlock.has(membership.blockId)) {
+      incidents.push("BLOCK_MEMBERSHIP_INVALID");
+    }
+    membershipByBlock.set(membership.blockId, membership.windowId);
+    const members = membershipsByWindow.get(membership.windowId) ?? [];
+    members.push(membership);
+    membershipsByWindow.set(membership.windowId, members);
+  }
+  const sourceOrder: string[] = [];
+  const orderedWindows = [...state.windows].sort((left, right) => left.ordinal - right.ordinal);
+  for (let ordinal = 0; ordinal < orderedWindows.length; ordinal += 1) {
+    const window = orderedWindows[ordinal]!;
+    if (window.ordinal !== ordinal) {
+      incidents.push("WINDOW_MEMBERSHIP_INVALID");
+    }
+    const members = [...(membershipsByWindow.get(window.windowId) ?? [])]
+      .sort((left, right) => left.position - right.position);
+    if (members.some((member, index) => member.position !== index)) {
+      incidents.push("BLOCK_MEMBERSHIP_INVALID");
+    }
+    const memberBlocks = members
+      .map((member) => blockById.get(member.blockId))
+      .filter((block) => block !== undefined);
+    if (memberBlocks.reduce((total, block) => total + block.tokenCount, 0) !== window.sourceTokens
+      || memberBlocks.reduce(
+        (total, block) => total + block.canonicalEnd - block.canonicalStart,
+        0,
+      ) !== window.sourceChars) {
+      incidents.push("WINDOW_MEMBERSHIP_INVALID");
+    }
+    sourceOrder.push(...members.map((member) => member.blockId));
+  }
+  if (sourceOrder.length !== blocks.length
+    || sourceOrder.some((blockId, index) => blockId !== blocks[index]?.blockId)) {
+    incidents.push("BLOCK_MEMBERSHIP_INVALID");
+  }
+
+  const snapshotById = new Map(state.snapshots.map((snapshot) => [snapshot.snapshotId, snapshot]));
+  let previousSnapshotId: string | null = null;
+  for (const snapshot of state.snapshots) {
+    const payload = snapshot.payload as Partial<KnowledgeSnapshot> | null;
+    if (snapshot.contentHash !== snapshot.snapshotId
+      || payload === null
+      || typeof payload !== "object"
+      || payload.runId !== state.runId
+      || payload.id !== snapshot.snapshotId
+      || payload.contentHash !== snapshot.snapshotId
+      || payload.parentSnapshotId !== snapshot.parentSnapshotId
+      || !Array.isArray(payload.revisions)) {
+      incidents.push("SNAPSHOT_LINEAGE_INVALID");
+    } else {
+      const rebuilt = createKnowledgeSnapshot(
+        state.runId,
+        payload.revisions,
+        payload.parentSnapshotId,
+      );
+      if (rebuilt.id !== snapshot.snapshotId) {
+        incidents.push("SNAPSHOT_LINEAGE_INVALID");
+      }
+    }
+    if (snapshot.parentSnapshotId !== previousSnapshotId) {
+      incidents.push("SNAPSHOT_LINEAGE_INVALID");
+    }
+    if (snapshot.producingWindowId !== null
+      && !windowById.has(snapshot.producingWindowId)) {
+      incidents.push("SNAPSHOT_LINEAGE_INVALID");
+    }
+    previousSnapshotId = snapshot.snapshotId;
+  }
+  for (const window of state.windows) {
+    if (window.snapshotId !== null && !snapshotById.has(window.snapshotId)) {
+      incidents.push("SNAPSHOT_LINEAGE_INVALID");
+    }
+  }
+
+  const translatedBlockIds = new Set<string>();
+  for (const translation of state.translations.filter((item) => item.active)) {
+    const block = blockById.get(translation.blockId);
+    const valid = translation.runId === state.runId
+      && translation.sourceVersion === state.sourceVersion
+      && translation.stageState === "promoted"
+      && block !== undefined
+      && translation.sourceHash === block.sourceHash
+      && membershipByBlock.get(translation.blockId) === translation.windowId
+      && snapshotById.has(translation.snapshotId);
+    if (!valid || translatedBlockIds.has(translation.blockId)) {
+      incidents.push("ACTIVE_TRANSLATION_INVALID");
+    } else {
+      translatedBlockIds.add(translation.blockId);
+    }
+  }
+  const missingBlockIds = blocks
+    .filter((block) => !translatedBlockIds.has(block.blockId))
+    .map((block) => block.blockId);
+  if (state.runStatus === "completed" && missingBlockIds.length > 0) {
+    incidents.push("RUN_LINEAGE_INVALID");
+  }
+  const incidentCodes = [...new Set(incidents)].sort();
+  return {
+    schema: "v5-book-store-audit-1",
+    runId: state.runId,
+    sourceVersion: state.sourceVersion,
+    protocolVersion: state.protocolVersion,
+    modelId: state.modelId,
+    runStatus: state.runStatus,
+    runMetadata: state.runMetadata,
+    complete: missingBlockIds.length === 0 && incidentCodes.length === 0,
+    totalBlockCount: blocks.length,
+    translatedBlockCount: translatedBlockIds.size,
+    missingBlockIds,
+    missingBlockCount: missingBlockIds.length,
+    incidentCodes,
+  };
+}
+
+export function writeLosslessBookArtifacts(
+  store: LosslessBookStore,
+  runId: string,
+  outputDirectory: string,
+  options: { allowIncomplete?: boolean } = {},
+): BookArtifactPaths {
+  const audit = auditLosslessBookStore(store, runId);
+  if (audit.incidentCodes.length > 0) {
+    throw new Error(`lossless export audit failed: ${audit.incidentCodes.join(",")}`);
+  }
+  if (!options.allowIncomplete && !audit.complete) {
+    throw new Error(
+      `strict book export requires ${audit.totalBlockCount} translated blocks; found ${audit.translatedBlockCount}`,
+    );
+  }
+  const state = store.auditState(runId);
+  const active = new Map(store.activeTranslations(runId).map((item) => [item.blockId, item]));
+  const windowById = new Map(state.windows.map((window) => [window.windowId, window]));
+  const windowIdByBlock = new Map(
+    state.memberships.map((membership) => [membership.blockId, membership.windowId]),
+  );
+  const translations: PilotTranslation[] = state.blocks
+    .filter((block) => active.has(block.blockId))
+    .sort((left, right) => left.globalIndex - right.globalIndex)
+    .map((block) => {
+      const translation = active.get(block.blockId)!;
+      const window = windowById.get(windowIdByBlock.get(block.blockId) ?? "");
+      return {
+        blockId: block.blockId,
+        globalIndex: block.globalIndex,
+        chapterId: window?.chapterId ?? null,
+        chapterTitle: window?.chapterTitle ?? null,
+        sourceText: block.sourceText,
+        text: translation.text,
+      };
+    });
+  mkdirSync(outputDirectory, { recursive: true });
+  const names = bookArtifactFileNames(audit.complete);
+  const paths = {
+    translation: join(outputDirectory, names.translation),
+    bilingual: join(outputDirectory, names.bilingual),
+    audit: join(outputDirectory, names.audit),
+    metrics: join(outputDirectory, names.metrics),
+  };
+  writeFileSync(paths.translation, renderTranslation(translations), "utf8");
+  writeFileSync(paths.bilingual, renderBilingual(translations), "utf8");
+  writeFileSync(paths.audit, `${JSON.stringify(audit, null, 2)}\n`, "utf8");
+  writeFileSync(paths.metrics, `${JSON.stringify({
+    schema: "v5-book-metrics-1",
+    runId: audit.runId,
+    sourceVersion: audit.sourceVersion,
+    protocolVersion: audit.protocolVersion,
+    modelId: audit.modelId,
+    runMetadata: audit.runMetadata,
+    complete: audit.complete,
+    missingBlockIds: audit.missingBlockIds,
+    missingBlockCount: audit.missingBlockCount,
+    status: store.statusSummary(runId),
+  }, null, 2)}\n`, "utf8");
+  return paths;
+}
+
 export function writeBookArtifacts(
   store: BookStore,
   outputDirectory: string,
@@ -90,11 +367,13 @@ export function writeBookArtifacts(
     text: item.text,
   }));
   mkdirSync(outputDirectory, { recursive: true });
+  const complete = status.translatedBlocks === status.totalBlocks;
+  const names = bookArtifactFileNames(complete);
   const paths = {
-    translation: join(outputDirectory, "v5_book_translation.txt"),
-    bilingual: join(outputDirectory, "v5_book_bilingual.txt"),
-    audit: join(outputDirectory, "v5_book_audit.json"),
-    metrics: join(outputDirectory, "v5_book_metrics.json"),
+    translation: join(outputDirectory, names.translation),
+    bilingual: join(outputDirectory, names.bilingual),
+    audit: join(outputDirectory, names.audit),
+    metrics: join(outputDirectory, names.metrics),
   };
   writeFileSync(paths.translation, renderTranslation(translations), "utf8");
   writeFileSync(paths.bilingual, renderBilingual(translations), "utf8");

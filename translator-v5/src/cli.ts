@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import { resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 
@@ -6,14 +7,29 @@ import {
   createDeepSeekStreamFn,
 } from "./agents/pi-runtime.js";
 import { loadOpenCodeApiKey, loadPilotConfig } from "./config.js";
-import { preflightBook, runBook } from "./fullbook/book-runner.js";
+import {
+  LOSSLESS_BOOK_PROTOCOL_VERSION,
+  preflightBook,
+  runBook,
+} from "./fullbook/book-runner.js";
+import { planBookWindows, type WindowPlanOptions } from "./fullbook/window-planner.js";
 import { preflightPilot, runPilot } from "./pilot-runner.js";
-import { writeBookArtifacts } from "./report.js";
-import { BookStore } from "./storage/book-store.js";
+import {
+  auditLosslessBookStore,
+  type BookArtifactPaths,
+  writeLosslessBookArtifacts,
+} from "./report.js";
+import { auditSourceCoverage } from "./source/auditor.js";
+import { buildLosslessBlocks } from "./source/block-builder.js";
+import { SourceIntegrityError, SourceLedger } from "./source/source-ledger.js";
+import { annotateStructure } from "./source/structure-annotator.js";
+import { LosslessBookStore } from "./storage/lossless-book-store.js";
 
 export type CliCommand =
   | "preview"
   | "book-preflight"
+  | "book-doctor"
+  | "book-audit"
   | "book-run"
   | "book-status"
   | "book-export";
@@ -21,6 +37,9 @@ export type CliCommand =
 export interface CliOptions {
   command: CliCommand;
   db?: string;
+  manifest?: string;
+  legacyV4Db?: string;
+  runId?: string;
   config?: string;
   output?: string;
   store?: string;
@@ -34,6 +53,93 @@ export interface CliOptions {
   maxBlocks?: number;
   maxSourceTokens?: number;
   hardDeadlineMs?: number;
+}
+
+export interface BookDoctorReport {
+  schema: "v5-book-doctor-1";
+  sourceVersion: string;
+  sourceChars: number;
+  coveredChars: number;
+  annotationCount: number;
+  blockCount: number;
+  windowCount: number;
+  incidentCodes: string[];
+  modelCallsAllowed: false;
+}
+
+interface CliRuntimeDependencies {
+  createModel: typeof createDeepSeekModel;
+  createStreamFn: typeof createDeepSeekStreamFn;
+}
+
+export interface CliErrorPayload {
+  schema: "v5-book-cli-error-1";
+  code: string;
+  message: string;
+}
+
+export function cliErrorPayload(error: unknown): CliErrorPayload {
+  return {
+    schema: "v5-book-cli-error-1",
+    code: error instanceof SourceIntegrityError ? error.code : "CLI_ERROR",
+    message: error instanceof Error ? error.message : String(error),
+  };
+}
+
+export function doctorBook(
+  manifestPath: string,
+  windowOptions: WindowPlanOptions = {},
+): BookDoctorReport {
+  const ledger = SourceLedger.open(manifestPath);
+  const annotations = annotateStructure(ledger, ledger.sourceVersion);
+  const blocks = buildLosslessBlocks(ledger, annotations, {
+    sourceVersion: ledger.sourceVersion,
+  });
+  const audit = auditSourceCoverage(ledger, blocks, {
+    sourceVersion: ledger.sourceVersion,
+  });
+  const windows = planBookWindows(blocks, windowOptions);
+  return {
+    schema: "v5-book-doctor-1",
+    sourceVersion: ledger.sourceVersion,
+    sourceChars: audit.sourceChars,
+    coveredChars: audit.coveredChars,
+    annotationCount: annotations.length,
+    blockCount: blocks.length,
+    windowCount: windows.length,
+    incidentCodes: [...new Set(audit.incidents.map((incident) => incident.code))].sort(),
+    modelCallsAllowed: false,
+  };
+}
+
+export function resolveRunSelection(
+  store: LosslessBookStore,
+  explicitRunId: string | undefined,
+  mode: "run" | "read",
+): string | undefined {
+  const runs = store.listTranslationRuns();
+  if (explicitRunId !== undefined) {
+    if (!runs.some((run) => run.runId === explicitRunId)) {
+      throw new Error(`unknown translation run ${explicitRunId}`);
+    }
+    return explicitRunId;
+  }
+  if (mode === "run") {
+    const unfinished = runs.filter((run) => run.status === "created" || run.status === "running");
+    if (unfinished.length === 0) {
+      return undefined;
+    }
+    if (unfinished.length === 1) {
+      return unfinished[0]!.runId;
+    }
+    throw new Error("multiple unfinished runs require explicit --run");
+  }
+  if (runs.length !== 1) {
+    throw new Error(
+      `status/export requires --run when the store contains ${runs.length} candidate runs`,
+    );
+  }
+  return runs[0]!.runId;
 }
 
 function parseIndexes(value: string): number[] {
@@ -70,21 +176,35 @@ function positiveFlag(
   return parsed;
 }
 
-function parseFlags(argv: readonly string[]): {
+function parseFlags(
+  argv: readonly string[],
+  context: string,
+  valueNames: readonly string[],
+  booleanNames: readonly string[] = [],
+): {
   values: Map<string, string>;
   booleans: Set<string>;
 } {
   const values = new Map<string, string>();
   const booleans = new Set<string>();
-  const booleanNames = new Set(["--preflight-only", "--allow-incomplete"]);
+  const allowedValues = new Set(valueNames);
+  const allowedBooleans = new Set(booleanNames);
+  const seen = new Set<string>();
   for (let index = 0; index < argv.length; index += 1) {
     const argument = argv[index] as string;
-    if (booleanNames.has(argument)) {
-      booleans.add(argument);
-      continue;
-    }
     if (!argument.startsWith("--")) {
       throw new Error(`unexpected argument: ${argument}`);
+    }
+    if (!allowedValues.has(argument) && !allowedBooleans.has(argument)) {
+      throw new Error(`unknown flag for ${context}: ${argument}`);
+    }
+    if (seen.has(argument)) {
+      throw new Error(`duplicate flag: ${argument}`);
+    }
+    seen.add(argument);
+    if (allowedBooleans.has(argument)) {
+      booleans.add(argument);
+      continue;
     }
     const value = argv[index + 1];
     if (value === undefined || value.startsWith("--")) {
@@ -94,6 +214,24 @@ function parseFlags(argv: readonly string[]): {
     index += 1;
   }
   return { values, booleans };
+}
+
+function identifierValue(
+  values: ReadonlyMap<string, string>,
+  name: string,
+  required = false,
+): string | undefined {
+  const value = values.get(name);
+  if (value === undefined) {
+    if (required) {
+      throw new Error(`missing ${name}`);
+    }
+    return undefined;
+  }
+  if (value.trim().length === 0) {
+    throw new Error(`${name} must be nonempty`);
+  }
+  return value;
 }
 
 function pathValue(
@@ -113,7 +251,12 @@ function pathValue(
 
 export function parseArgs(argv: readonly string[]): CliOptions {
   if (argv[0] === "preview") {
-    const { values, booleans } = parseFlags(argv.slice(1));
+    const { values, booleans } = parseFlags(
+      argv.slice(1),
+      "preview",
+      ["--db", "--config", "--output", "--global-index", "--opencode-auth"],
+      ["--preflight-only"],
+    );
     return {
       command: "preview",
       db: pathValue(values, "--db"),
@@ -127,44 +270,103 @@ export function parseArgs(argv: readonly string[]): CliOptions {
     };
   }
   if (argv[0] !== "book" || argv[1] === undefined) {
-    throw new Error("usage: pilot preview ... | pilot book preflight|run|status|export ...");
+    throw new Error(
+      "usage: pilot preview ... | pilot book preflight|doctor|audit|run|status|export ...",
+    );
   }
   const action = argv[1];
-  const { values, booleans } = parseFlags(argv.slice(2));
-  const common = {
-    maxBlocks: positiveFlag(values, "--max-blocks"),
-    maxSourceTokens: positiveFlag(values, "--max-source-tokens"),
-  };
   if (action === "preflight") {
+    const { values } = parseFlags(
+      argv.slice(2),
+      "book preflight",
+      ["--db", "--max-blocks", "--max-source-tokens"],
+    );
     return {
       command: "book-preflight",
       db: pathValue(values, "--db"),
-      ...common,
+      maxBlocks: positiveFlag(values, "--max-blocks"),
+      maxSourceTokens: positiveFlag(values, "--max-source-tokens"),
+    };
+  }
+  if (action === "doctor") {
+    const { values } = parseFlags(
+      argv.slice(2),
+      "book doctor",
+      ["--manifest", "--max-blocks", "--max-source-tokens"],
+    );
+    const maxBlocks = positiveFlag(values, "--max-blocks");
+    const maxSourceTokens = positiveFlag(values, "--max-source-tokens");
+    return {
+      command: "book-doctor",
+      manifest: pathValue(values, "--manifest"),
+      ...(maxBlocks === undefined ? {} : { maxBlocks }),
+      ...(maxSourceTokens === undefined ? {} : { maxSourceTokens }),
+    };
+  }
+  if (action === "audit") {
+    const { values } = parseFlags(
+      argv.slice(2),
+      "book audit",
+      ["--store", "--run"],
+    );
+    return {
+      command: "book-audit",
+      store: pathValue(values, "--store"),
+      runId: identifierValue(values, "--run", true),
     };
   }
   if (action === "run") {
+    const { values } = parseFlags(
+      argv.slice(2),
+      "book run",
+      [
+        "--manifest", "--v4-db", "--store", "--config", "--output",
+        "--opencode-auth", "--run", "--max-windows", "--max-concurrency",
+        "--max-attempts", "--max-blocks", "--max-source-tokens",
+        "--hard-deadline-ms",
+      ],
+    );
     return {
       command: "book-run",
-      db: pathValue(values, "--db"),
+      manifest: pathValue(values, "--manifest"),
+      legacyV4Db: pathValue(values, "--v4-db", false),
       store: pathValue(values, "--store"),
       config: pathValue(values, "--config"),
-      output: pathValue(values, "--output"),
+      output: pathValue(values, "--output", false),
       openCodeAuth: pathValue(values, "--opencode-auth", false),
+      runId: identifierValue(values, "--run"),
       maxWindows: positiveFlag(values, "--max-windows"),
       maxConcurrency: positiveFlag(values, "--max-concurrency"),
       maxAttempts: positiveFlag(values, "--max-attempts"),
       hardDeadlineMs: positiveFlag(values, "--hard-deadline-ms"),
-      ...common,
+      maxBlocks: positiveFlag(values, "--max-blocks"),
+      maxSourceTokens: positiveFlag(values, "--max-source-tokens"),
     };
   }
   if (action === "status") {
-    return { command: "book-status", store: pathValue(values, "--store") };
+    const { values } = parseFlags(
+      argv.slice(2),
+      "book status",
+      ["--store", "--run"],
+    );
+    return {
+      command: "book-status",
+      store: pathValue(values, "--store"),
+      runId: identifierValue(values, "--run"),
+    };
   }
   if (action === "export") {
+    const { values, booleans } = parseFlags(
+      argv.slice(2),
+      "book export",
+      ["--store", "--output", "--run"],
+      ["--allow-incomplete"],
+    );
     return {
       command: "book-export",
       store: pathValue(values, "--store"),
       output: pathValue(values, "--output"),
+      runId: identifierValue(values, "--run"),
       allowIncomplete: booleans.has("--allow-incomplete"),
     };
   }
@@ -188,7 +390,10 @@ function loadRuntimeConfig(options: CliOptions) {
     });
 }
 
-export async function main(argv = process.argv.slice(2)): Promise<void> {
+export async function main(
+  argv = process.argv.slice(2),
+  dependencyOverrides: Partial<CliRuntimeDependencies> = {},
+): Promise<void> {
   const options = parseArgs(argv);
   if (options.command === "book-preflight") {
     console.log(JSON.stringify(preflightBook(requireOption(options, "db"), {
@@ -197,12 +402,39 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
     }), null, 2));
     return;
   }
-  if (options.command === "book-status") {
-    const store = new BookStore(requireOption(options, "store"));
+  if (options.command === "book-doctor") {
+    console.log(JSON.stringify(doctorBook(requireOption(options, "manifest"), {
+      maxBlocks: options.maxBlocks,
+      maxSourceTokens: options.maxSourceTokens,
+    }), null, 2));
+    return;
+  }
+  if (options.command === "book-audit") {
+    const store = new LosslessBookStore(requireOption(options, "store"));
     try {
+      console.log(JSON.stringify(auditLosslessBookStore(
+        store,
+        requireOption(options, "runId"),
+      ), null, 2));
+    } finally {
+      store.close();
+    }
+    return;
+  }
+  if (options.command === "book-status") {
+    const store = new LosslessBookStore(requireOption(options, "store"));
+    try {
+      const runId = resolveRunSelection(store, options.runId, "read") as string;
+      const state = store.auditState(runId);
       console.log(JSON.stringify({
-        status: store.statusSummary(),
-        windows: store.allWindows(),
+        schema: "v5-book-status-1",
+        runId,
+        sourceVersion: state.sourceVersion,
+        protocolVersion: state.protocolVersion,
+        modelId: state.modelId,
+        runMetadata: state.runMetadata,
+        status: store.statusSummary(runId),
+        windows: store.allWindows(runId),
       }, null, 2));
     } finally {
       store.close();
@@ -210,10 +442,12 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
     return;
   }
   if (options.command === "book-export") {
-    const store = new BookStore(requireOption(options, "store"));
+    const store = new LosslessBookStore(requireOption(options, "store"));
     try {
-      console.log(JSON.stringify(writeBookArtifacts(
+      const runId = resolveRunSelection(store, options.runId, "read") as string;
+      console.log(JSON.stringify(writeLosslessBookArtifacts(
         store,
+        runId,
         requireOption(options, "output"),
         { allowIncomplete: options.allowIncomplete },
       ), null, 2));
@@ -223,14 +457,42 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
     return;
   }
 
-  const config = loadRuntimeConfig(options);
-  const model = createDeepSeekModel(config);
-  const streamFn = createDeepSeekStreamFn(config);
+  const runtime: CliRuntimeDependencies = {
+    createModel: dependencyOverrides.createModel ?? createDeepSeekModel,
+    createStreamFn: dependencyOverrides.createStreamFn ?? createDeepSeekStreamFn,
+  };
   if (options.command === "book-run") {
+    const selectionStore = new LosslessBookStore(requireOption(options, "store"));
+    let selectedRunId: string | undefined;
+    let selectedRun: ReturnType<LosslessBookStore["listTranslationRuns"]>[number] | undefined;
+    try {
+      selectedRunId = resolveRunSelection(selectionStore, options.runId, "run");
+      selectedRun = selectionStore.listTranslationRuns()
+        .find((run) => run.runId === selectedRunId);
+    } finally {
+      selectionStore.close();
+    }
+    const config = loadRuntimeConfig(options);
+    const model = runtime.createModel(config);
+    const streamFn = runtime.createStreamFn(config);
+    const runId = selectedRunId ?? randomUUID();
     const result = await runBook({
-      dbPath: requireOption(options, "db"),
+      manifestPath: requireOption(options, "manifest"),
+      ...(options.legacyV4Db === undefined ? {} : { legacyV4DbPath: options.legacyV4Db }),
       storePath: requireOption(options, "store"),
-      outputDir: requireOption(options, "output"),
+      runMeta: selectedRun === undefined
+        ? {
+            runId,
+            protocolVersion: LOSSLESS_BOOK_PROTOCOL_VERSION,
+            modelId: config.model,
+            metadata: { createdBy: "book-cli" },
+          }
+        : {
+            runId,
+            protocolVersion: selectedRun.protocolVersion,
+            modelId: selectedRun.modelId,
+            metadata: selectedRun.metadata,
+          },
       model,
       streamFn,
       windowOptions: {
@@ -242,10 +504,24 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
       maxAttempts: options.maxAttempts,
       hardDeadlineMs: options.hardDeadlineMs,
     });
-    console.log(JSON.stringify(result, null, 2));
+    let artifacts: BookArtifactPaths | null = result.artifacts;
+    if (options.output !== undefined) {
+      const store = new LosslessBookStore(requireOption(options, "store"));
+      try {
+        artifacts = writeLosslessBookArtifacts(store, runId, options.output, {
+          allowIncomplete: true,
+        });
+      } finally {
+        store.close();
+      }
+    }
+    console.log(JSON.stringify({ ...result, artifacts }, null, 2));
     return;
   }
 
+  const config = loadRuntimeConfig(options);
+  const model = runtime.createModel(config);
+  const streamFn = runtime.createStreamFn(config);
   const db = requireOption(options, "db");
   const indexes = options.globalIndexes ?? [];
   const preflight = preflightPilot(db, indexes);
@@ -277,7 +553,7 @@ const entry = process.argv[1] === undefined
   : pathToFileURL(resolve(process.argv[1])).href;
 if (entry === import.meta.url) {
   main().catch((error: unknown) => {
-    console.error(error instanceof Error ? error.message : String(error));
+    console.error(JSON.stringify(cliErrorPayload(error)));
     process.exitCode = 1;
   });
 }

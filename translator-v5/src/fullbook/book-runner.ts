@@ -44,7 +44,8 @@ import {
   type WindowPlanOptions,
 } from "./window-planner.js";
 
-const DEFAULT_PROTOCOL_VERSION = "v5-book-3";
+export const LOSSLESS_BOOK_PROTOCOL_VERSION = "v5-book-3";
+const DEFAULT_PROTOCOL_VERSION = LOSSLESS_BOOK_PROTOCOL_VERSION;
 const DEFAULT_MAX_ATTEMPTS = 2;
 const DEFAULT_MAX_CONCURRENCY = 2;
 const DEFAULT_WARMUP_WINDOWS = 2;

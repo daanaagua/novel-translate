@@ -77,6 +77,15 @@ export interface LosslessBookStatusSummary {
   modelCalls: number;
 }
 
+export interface StoredTranslationRun {
+  runId: string;
+  sourceVersion: string;
+  protocolVersion: string;
+  modelId: string;
+  status: string;
+  metadata: unknown;
+}
+
 export interface StagedTranslationInput {
   blockId: string;
   sourceHash: string;
@@ -152,6 +161,61 @@ export interface AuditProjection {
   translations: ActiveLosslessTranslation[];
   knowledge: KnowledgeHistoryRecord[];
   snapshotIds: string[];
+}
+
+export interface LosslessAuditBlock {
+  blockId: string;
+  sourceVersion: string;
+  canonicalStart: number;
+  canonicalEnd: number;
+  sourceText: string;
+  sourceHash: string;
+  globalIndex: number;
+  tokenCount: number;
+}
+
+export interface LosslessAuditMembership {
+  runId: string;
+  windowId: string;
+  sourceVersion: string;
+  blockId: string;
+  position: number;
+}
+
+export interface LosslessAuditTranslation {
+  runId: string;
+  windowId: string;
+  sourceVersion: string;
+  blockId: string;
+  sourceHash: string;
+  stageState: string;
+  active: boolean;
+  snapshotId: string;
+}
+
+export interface LosslessAuditSnapshot {
+  sequence: number;
+  snapshotId: string;
+  parentSnapshotId: string | null;
+  producingWindowId: string | null;
+  contentHash: string;
+  payload: unknown;
+}
+
+export interface LosslessAuditState {
+  runId: string;
+  sourceVersion: string;
+  protocolVersion: string;
+  modelId: string;
+  runStatus: string;
+  runMetadata: unknown;
+  canonicalSha256: string;
+  canonicalChars: number;
+  blocks: LosslessAuditBlock[];
+  windows: PersistedLosslessWindow[];
+  memberships: LosslessAuditMembership[];
+  translations: LosslessAuditTranslation[];
+  snapshots: LosslessAuditSnapshot[];
 }
 
 interface SourceVersionRow {
@@ -359,6 +423,20 @@ export class LosslessBookStore {
       this.#database.prepare("PRAGMA journal_mode"),
     )?.journal_mode;
     return { foreignKeys: foreignKeys === 1, journalMode: journalMode ?? "" };
+  }
+
+  listTranslationRuns(): StoredTranslationRun[] {
+    return all<RunRow>(this.#database.prepare(`
+      SELECT run_id, source_version, protocol_version, model_id, metadata_json, status
+      FROM translation_runs ORDER BY created_at, run_id
+    `)).map((run) => ({
+      runId: run.run_id,
+      sourceVersion: run.source_version,
+      protocolVersion: run.protocol_version,
+      modelId: run.model_id,
+      status: run.status,
+      metadata: JSON.parse(run.metadata_json) as unknown,
+    }));
   }
 
   registerSource(input: CertifiedSourceInput): string {
@@ -1437,6 +1515,107 @@ export class LosslessBookStore {
       translations: this.activeTranslations(runId),
       knowledge: this.knowledgeHistory(runId),
       snapshotIds,
+    };
+  }
+
+  auditState(runId: string): LosslessAuditState {
+    const run = this.#run(runId);
+    const source = this.#source(run.source_version);
+    const blocks = all<{
+      block_id: string;
+      source_version: string;
+      canonical_start: number;
+      canonical_end: number;
+      source_text: string;
+      source_hash: string;
+      global_index: number;
+      token_count: number;
+    }>(this.#database.prepare(`
+      SELECT block_id, source_version, canonical_start, canonical_end, source_text,
+             source_hash, global_index, token_count
+      FROM logical_blocks WHERE source_version=? ORDER BY global_index, block_id
+    `), run.source_version).map((row) => ({
+      blockId: row.block_id,
+      sourceVersion: row.source_version,
+      canonicalStart: row.canonical_start,
+      canonicalEnd: row.canonical_end,
+      sourceText: row.source_text,
+      sourceHash: row.source_hash,
+      globalIndex: row.global_index,
+      tokenCount: row.token_count,
+    }));
+    const memberships = all<{
+      run_id: string;
+      window_id: string;
+      source_version: string;
+      block_id: string;
+      position: number;
+    }>(this.#database.prepare(`
+      SELECT run_id, window_id, source_version, block_id, position
+      FROM window_membership WHERE run_id=? ORDER BY window_id, position
+    `), runId).map((row) => ({
+      runId: row.run_id,
+      windowId: row.window_id,
+      sourceVersion: row.source_version,
+      blockId: row.block_id,
+      position: row.position,
+    }));
+    const translations = all<{
+      run_id: string;
+      window_id: string;
+      source_version: string;
+      block_id: string;
+      source_hash: string;
+      stage_state: string;
+      active: number;
+      snapshot_id: string;
+    }>(this.#database.prepare(`
+      SELECT run_id, window_id, source_version, block_id, source_hash,
+             stage_state, active, snapshot_id
+      FROM translations WHERE run_id=? ORDER BY translation_id
+    `), runId).map((row) => ({
+      runId: row.run_id,
+      windowId: row.window_id,
+      sourceVersion: row.source_version,
+      blockId: row.block_id,
+      sourceHash: row.source_hash,
+      stageState: row.stage_state,
+      active: row.active === 1,
+      snapshotId: row.snapshot_id,
+    }));
+    const snapshots = all<{
+      sequence: number;
+      snapshot_id: string;
+      parent_snapshot_id: string | null;
+      producing_window_id: string | null;
+      content_hash: string;
+      payload_json: string;
+    }>(this.#database.prepare(`
+      SELECT rowid AS sequence, snapshot_id, parent_snapshot_id,
+             producing_window_id, content_hash, payload_json
+      FROM knowledge_snapshots WHERE run_id=? ORDER BY rowid
+    `), runId).map((row) => ({
+      sequence: row.sequence,
+      snapshotId: row.snapshot_id,
+      parentSnapshotId: row.parent_snapshot_id,
+      producingWindowId: row.producing_window_id,
+      contentHash: row.content_hash,
+      payload: JSON.parse(row.payload_json) as unknown,
+    }));
+    return {
+      runId: run.run_id,
+      sourceVersion: run.source_version,
+      protocolVersion: run.protocol_version,
+      modelId: run.model_id,
+      runStatus: run.status,
+      runMetadata: JSON.parse(run.metadata_json) as unknown,
+      canonicalSha256: source.canonical_sha256,
+      canonicalChars: source.canonical_chars,
+      blocks,
+      windows: this.allWindows(runId),
+      memberships,
+      translations,
+      snapshots,
     };
   }
 
