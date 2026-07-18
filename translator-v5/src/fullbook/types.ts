@@ -18,6 +18,22 @@ export interface BookWindowPlan {
   oversized: boolean;
 }
 
+export type RequestBatchWindow = BookWindowPlan & {
+  readonly status?: BookWindowStatus;
+};
+
+export interface RequestBatchOptions {
+  tinyWindowTokens: number;
+  maxRequestTokens: number;
+  maxWindowsPerRequest: number;
+}
+
+export interface PhysicalRequestPlan {
+  requestId: string;
+  windows: RequestBatchWindow[];
+  sourceTokens: number;
+}
+
 export interface WindowExecutionSummary {
   status: Extract<
     BookWindowStatus,
