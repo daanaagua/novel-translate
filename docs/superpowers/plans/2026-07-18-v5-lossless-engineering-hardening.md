@@ -220,7 +220,7 @@ git commit -m "feat: preserve certified source ledger"
 - 创建：`translator-v5/test/source-ledger.test.ts`
 - 创建：`translator-v5/test/block-builder.property.test.ts`
 
-- [ ] **步骤 1：编写覆盖、重复标题和数据库篡改的失败测试**
+- [x] **步骤 1：编写覆盖、重复标题和数据库篡改的失败测试**
 
 ```ts
 test("lossless blocks cover canonical source exactly once despite duplicate chapter names", () => {
@@ -244,7 +244,7 @@ test("auditor reports the exact first gap without using chapter ids", () => {
 });
 ```
 
-- [ ] **步骤 2：运行测试确认模块不存在**
+- [x] **步骤 2：运行测试确认模块不存在**
 
 ```powershell
 Set-Location translator-v5
@@ -253,7 +253,7 @@ node --test --import tsx test/source-ledger.test.ts test/block-builder.property.
 
 预期：FAIL，无法导入 `source/*` 模块。
 
-- [ ] **步骤 3：实现 source 类型、清单加载和位置型 ID**
+- [x] **步骤 3：实现 source 类型、清单加载和位置型 ID**
 
 ```ts
 export interface LosslessBlock {
@@ -279,11 +279,11 @@ export function blockId(sourceVersion: string, start: number, end: number, text:
 `SourceLedger.open(manifestPath)` 必须核对 raw 文件大小/hash、canonical 文件 hash/字符数和 manifest schema；不一致时抛出带稳定错误码的 `SourceIntegrityError`。
 它还必须独立检查 `canonical_segments` 连续覆盖 `[0, canonical_chars)`，以及 `excluded_raw_ranges` 的 policy 属于允许枚举。清单中的范围缺口、重叠、越界或未知 policy 在 block builder 运行前直接失败。
 
-- [ ] **步骤 4：实现只标注位置的结构解析和平铺保底 block builder**
+- [x] **步骤 4：实现只标注位置的结构解析和平铺保底 block builder**
 
 结构解析器只返回 `{ id, kind, start, end, title, boundaryWeight }`。block builder 以空行和句子末尾作为候选切点，任何切法都使用连续 `[cursor, next)` 区间；最后一个区间必须结束于 `source.length`。章节识别结果只影响 `structureId` 与切点代价。
 
-- [ ] **步骤 5：实现不复用 builder 判断函数的 Auditor**
+- [x] **步骤 5：实现不复用 builder 判断函数的 Auditor**
 
 ```ts
 export function auditSourceCoverage(source: string, input: readonly LosslessBlock[]): AuditReport {
@@ -304,11 +304,11 @@ export function auditSourceCoverage(source: string, input: readonly LosslessBloc
 }
 ```
 
-- [ ] **步骤 6：增加 200 个固定种子的生成样本**
+- [x] **步骤 6：增加 200 个固定种子的生成样本**
 
 使用测试内置的 xorshift32 生成重复标题、空标题、混合换行、Unicode、极短章和超长单段；每个样本断言 blocks 拼接精确等于 canonical source、区间连续且 ID 唯一。不要增加外部 property-test 依赖。
 
-- [ ] **步骤 7：运行测试、typecheck 并 Commit**
+- [x] **步骤 7：运行测试、typecheck 并 Commit**
 
 ```powershell
 Set-Location translator-v5
