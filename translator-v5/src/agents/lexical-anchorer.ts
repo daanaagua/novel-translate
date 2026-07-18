@@ -4,6 +4,12 @@ import type { StreamFn } from "@earendil-works/pi-agent-core";
 import type { Model } from "@earendil-works/pi-ai";
 
 import type { StableTerm, V4Block } from "../domain/types.js";
+import {
+  entityLinkAsTerms,
+  evaluateEntityLink,
+  type EntityLink,
+  type EntityLinkEvidenceKind,
+} from "../domain/entity-links.js";
 import type { BudgetLedger } from "../kernel/budget.js";
 import { getSourceLanguageProfile } from "../language/profiles.js";
 import type { SourceLanguageProfile } from "../language/types.js";
@@ -35,8 +41,21 @@ interface LexicalAnchorInput {
 
 export interface LexicalAnchorOutcome {
   anchors: LexicalAnchor[];
+  entityLinks: EntityLink[];
   terms: StableTerm[];
   run: PiRunResult;
+}
+
+interface EntityLinkSubmission {
+  sourceForms: string[];
+  proposedTarget: string;
+  evidenceKind: Extract<EntityLinkEvidenceKind,
+    | "explicit_naming"
+    | "apposition"
+    | "contextual_compatibility"
+    | "distributional_compatibility">;
+  evidenceQuote: string;
+  confidence: number;
 }
 
 function establishedForms(stableTerms: readonly StableTerm[]): string[] {
@@ -95,7 +114,12 @@ export class LexicalAnchorer {
       profile.normalizeSourceForm(candidate.sourceForm),
       candidate.sourceForm,
     ]));
+    const candidateByForm = new Map(input.candidates.map((candidate) => [
+      profile.normalizeSourceForm(candidate.sourceForm),
+      candidate,
+    ]));
     let anchors: LexicalAnchor[] = [];
+    let entityLinks: EntityLink[] = [];
     const tool: TypedToolSpec = {
       name: "submit_lexical_anchors",
       label: "Submit lexical anchors",
@@ -108,10 +132,25 @@ export class LexicalAnchorer {
           mode: Type.Union([Type.Literal("stable"), Type.Literal("contextual")]),
           confidence: Type.Number({ minimum: 0, maximum: 1 }),
         }), { maxItems: 24 }),
+        entityLinks: Type.Optional(Type.Array(Type.Object({
+          sourceForms: Type.Array(Type.String(), { minItems: 2, maxItems: 4 }),
+          proposedTarget: Type.String(),
+          evidenceKind: Type.Union([
+            Type.Literal("explicit_naming"),
+            Type.Literal("apposition"),
+            Type.Literal("contextual_compatibility"),
+            Type.Literal("distributional_compatibility"),
+          ]),
+          evidenceQuote: Type.String(),
+          confidence: Type.Number({ minimum: 0, maximum: 1 }),
+        }, { additionalProperties: false }), { maxItems: 6 })),
       }),
       execute: async (rawArgs, signal) => {
         assertNotAborted(signal);
-        const args = rawArgs as { anchors: LexicalAnchor[] };
+        const args = rawArgs as {
+          anchors: LexicalAnchor[];
+          entityLinks?: EntityLinkSubmission[];
+        };
         if (!Array.isArray(args.anchors) || args.anchors.length !== allowed.size) {
           throw new Error(`expected exactly ${allowed.size} lexical anchor decisions`);
         }
@@ -130,9 +169,49 @@ export class LexicalAnchorer {
           }
           seen.add(key);
         }
+        entityLinks = (args.entityLinks ?? []).map((link, index) => {
+          const normalizedForms = [...new Set(link.sourceForms.map((form) =>
+            profile.normalizeSourceForm(form)))];
+          if (normalizedForms.length < 2
+            || normalizedForms.some((form) => !allowed.has(form))) {
+            throw new Error(`entity link ${index} references unknown or duplicate forms`);
+          }
+          const contexts = normalizedForms.flatMap((form) =>
+            candidateByForm.get(form)?.contexts ?? []);
+          const quote = link.evidenceQuote.replace(/\s+/gu, " ").trim();
+          if (quote.length === 0
+            || !contexts.some((context) =>
+              context.replace(/\s+/gu, " ").includes(quote))) {
+            throw new Error(`entity link ${index} evidence quote is outside supplied contexts`);
+          }
+          const evidenceBase = createHash("sha256")
+            .update(`${normalizedForms.sort().join("\0")}\0${quote}`)
+            .digest("hex")
+            .slice(0, 20);
+          return evaluateEntityLink({
+            sourceForms: link.sourceForms,
+            proposedTarget: link.proposedTarget,
+            profile,
+            evidence: [{
+              evidenceId: `anchor-evidence-${evidenceBase}`,
+              kind: link.evidenceKind,
+              weight: link.confidence,
+              sourceForms: link.sourceForms,
+            }, {
+              evidenceId: `anchor-model-${evidenceBase}`,
+              kind: "model_verdict",
+              weight: link.confidence,
+              sourceForms: link.sourceForms,
+            }],
+          });
+        });
         input.budget.consume("translationToolCalls", 1);
         anchors = args.anchors.map((anchor) => ({ ...anchor }));
-        return { accepted: true, anchors: anchors.length };
+        return {
+          accepted: true,
+          anchors: anchors.length,
+          entityLinks: entityLinks.length,
+        };
       },
     };
     const run = await this.runtime.run({
@@ -142,6 +221,7 @@ export class LexicalAnchorer {
         "Mark proper names, unique titles, and invariant technical terms as stable and choose one concise Chinese target.",
         "Mark ordinary words, forms whose Chinese rendering changes by discourse role, and forms of address as contextual.",
         "Do not force surface consistency where Chinese grammar or relationship context requires variation.",
+        "When compact evidence explicitly links two supplied forms to one entity, submit an entityLinks item and quote the exact supplied context. Leave uncertain relationships unconfirmed.",
         "Call submit_lexical_anchors exactly once and classify every supplied form.",
       ].join("\n"),
       prompt: [
@@ -160,14 +240,22 @@ export class LexicalAnchorer {
       signal: input.signal,
       deadlineMs: input.deadlineMs,
     }, input.streamFn);
+    const confirmedForms = new Set(entityLinks
+      .filter((link) => link.status === "confirmed")
+      .flatMap((link) => link.normalizedForms));
     return {
       anchors: anchors.map((anchor) => ({ ...anchor })),
-      terms: anchors
+      entityLinks: entityLinks.map((link) => structuredClone(link)),
+      terms: [
+        ...anchors
         .filter((anchor) =>
           anchor.mode === "stable"
           && anchor.confidence >= 0.85
-          && anchor.target.trim().length > 0)
+          && anchor.target.trim().length > 0
+          && !confirmedForms.has(profile.normalizeSourceForm(anchor.sourceForm)))
         .map(anchorAsTerm),
+        ...entityLinks.flatMap(entityLinkAsTerms),
+      ],
       run,
     };
   }

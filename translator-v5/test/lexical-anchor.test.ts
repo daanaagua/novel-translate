@@ -109,3 +109,40 @@ test("Pi lexical anchor decisions become run-local stable terms", async () => {
   assert.equal(outcome.terms[0]?.target, "调和者");
   assert.equal(outcome.terms[0]?.locked, true);
 });
+
+test("Pi lexical anchor evidence can confirm two surface forms as one entity", async () => {
+  const candidates = collectWindowAnchorCandidates(
+    [block("Loukianos, whom they called Lucian the Scoffer, laughed.")],
+    [block("Loukianos, whom they called Lucian the Scoffer, laughed.")],
+    [],
+  );
+  const faux = fauxProvider();
+  faux.setResponses([fauxAssistantMessage(fauxToolCall("submit_lexical_anchors", {
+    anchors: candidates.map((candidate) => ({
+      sourceForm: candidate.sourceForm,
+      target: "卢奇安",
+      mode: "stable",
+      confidence: 0.95,
+    })),
+    entityLinks: [{
+      sourceForms: ["Loukianos", "Lucian"],
+      proposedTarget: "卢奇安",
+      evidenceKind: "explicit_naming",
+      evidenceQuote: "Loukianos, whom they called Lucian the Scoffer, laughed.",
+      confidence: 0.95,
+    }],
+  }), { stopReason: "toolUse" })]);
+
+  const outcome = await new LexicalAnchorer(new PiRuntime()).run({
+    candidates,
+    stableTerms: [],
+    model: faux.getModel(),
+    streamFn: faux.provider.streamSimple.bind(faux.provider),
+    budget: new BudgetLedger(),
+  });
+
+  assert.equal(outcome.entityLinks[0]?.status, "confirmed");
+  assert.equal(new Set(outcome.terms
+    .filter((term) => ["Loukianos", "Lucian"].includes(term.sourceForm))
+    .map((term) => term.conceptId)).size, 1);
+});
