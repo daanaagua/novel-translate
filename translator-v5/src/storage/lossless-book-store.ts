@@ -188,9 +188,25 @@ export interface LosslessAuditTranslation {
   sourceVersion: string;
   blockId: string;
   sourceHash: string;
+  text: string;
+  resultStatus: string;
+  version: number;
   stageState: string;
   active: boolean;
   snapshotId: string;
+}
+
+export interface LosslessAuditKnowledgeRevision {
+  runId: string;
+  recordId: string;
+  revisionId: string;
+  revision: number;
+  normalizedSubject: string;
+  kind: string;
+  status: string;
+  active: boolean;
+  payload: unknown;
+  producingWindowId: string;
 }
 
 export interface LosslessAuditSnapshot {
@@ -215,6 +231,7 @@ export interface LosslessAuditState {
   windows: PersistedLosslessWindow[];
   memberships: LosslessAuditMembership[];
   translations: LosslessAuditTranslation[];
+  knowledgeRevisions: LosslessAuditKnowledgeRevision[];
   snapshots: LosslessAuditSnapshot[];
 }
 
@@ -1566,12 +1583,15 @@ export class LosslessBookStore {
       source_version: string;
       block_id: string;
       source_hash: string;
+      text: string;
+      result_status: string;
+      version: number;
       stage_state: string;
       active: number;
       snapshot_id: string;
     }>(this.#database.prepare(`
-      SELECT run_id, window_id, source_version, block_id, source_hash,
-             stage_state, active, snapshot_id
+      SELECT run_id, window_id, source_version, block_id, source_hash, text,
+             result_status, version, stage_state, active, snapshot_id
       FROM translations WHERE run_id=? ORDER BY translation_id
     `), runId).map((row) => ({
       runId: row.run_id,
@@ -1579,9 +1599,40 @@ export class LosslessBookStore {
       sourceVersion: row.source_version,
       blockId: row.block_id,
       sourceHash: row.source_hash,
+      text: row.text,
+      resultStatus: row.result_status,
+      version: row.version,
       stageState: row.stage_state,
       active: row.active === 1,
       snapshotId: row.snapshot_id,
+    }));
+    const knowledgeRevisions = all<{
+      run_id: string;
+      record_id: string;
+      revision_id: string;
+      revision: number;
+      normalized_subject: string;
+      kind: string;
+      status: string;
+      active: number;
+      payload_json: string;
+      producing_window_id: string;
+    }>(this.#database.prepare(`
+      SELECT run_id, record_id, revision_id, revision, normalized_subject, kind,
+             status, active, payload_json, producing_window_id
+      FROM knowledge_records WHERE run_id=?
+      ORDER BY normalized_subject, kind, revision
+    `), runId).map((row) => ({
+      runId: row.run_id,
+      recordId: row.record_id,
+      revisionId: row.revision_id,
+      revision: row.revision,
+      normalizedSubject: row.normalized_subject,
+      kind: row.kind,
+      status: row.status,
+      active: row.active === 1,
+      payload: JSON.parse(row.payload_json) as unknown,
+      producingWindowId: row.producing_window_id,
     }));
     const snapshots = all<{
       sequence: number;
@@ -1615,6 +1666,7 @@ export class LosslessBookStore {
       windows: this.allWindows(runId),
       memberships,
       translations,
+      knowledgeRevisions,
       snapshots,
     };
   }

@@ -78,10 +78,22 @@ export interface CliErrorPayload {
   message: string;
 }
 
+class CliCommandError extends Error {
+  readonly code: string;
+
+  constructor(code: string, message: string) {
+    super(`${code}: ${message}`);
+    this.name = "CliCommandError";
+    this.code = code;
+  }
+}
+
 export function cliErrorPayload(error: unknown): CliErrorPayload {
   return {
     schema: "v5-book-cli-error-1",
-    code: error instanceof SourceIntegrityError ? error.code : "CLI_ERROR",
+    code: error instanceof SourceIntegrityError || error instanceof CliCommandError
+      ? error.code
+      : "CLI_ERROR",
     message: error instanceof Error ? error.message : String(error),
   };
 }
@@ -412,10 +424,17 @@ export async function main(
   if (options.command === "book-audit") {
     const store = new LosslessBookStore(requireOption(options, "store"));
     try {
-      console.log(JSON.stringify(auditLosslessBookStore(
+      const report = auditLosslessBookStore(
         store,
         requireOption(options, "runId"),
-      ), null, 2));
+      );
+      console.log(JSON.stringify(report, null, 2));
+      if (report.incidentCodes.length > 0) {
+        throw new CliCommandError(
+          "BOOK_AUDIT_FAILED",
+          `integrity incidents: ${report.incidentCodes.join(",")}`,
+        );
+      }
     } finally {
       store.close();
     }

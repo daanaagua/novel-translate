@@ -267,12 +267,15 @@ test("book audit recomputes persisted integrity and missing blocks without a pro
   const originalLog = console.log;
   console.log = (...values: unknown[]) => output.push(values.join(" "));
   try {
-    await main(["book", "audit", "--store", storePath, "--run", "run-audit"], {
-      createModel: () => {
-        providerConstructions += 1;
-        throw new Error("provider must not be constructed");
-      },
-    });
+    await assert.rejects(
+      main(["book", "audit", "--store", storePath, "--run", "run-audit"], {
+        createModel: () => {
+          providerConstructions += 1;
+          throw new Error("provider must not be constructed");
+        },
+      }),
+      /BOOK_AUDIT_FAILED/,
+    );
   } finally {
     console.log = originalLog;
   }

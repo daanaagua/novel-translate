@@ -589,7 +589,7 @@ git commit -m "feat: run lossless batched book translation"
 - 修改：`translator-v5/test/cli.test.ts`
 - 修改：`translator-v5/src/report.ts`
 
-- [ ] **步骤 1：编写新命令解析和 partial 命名测试**
+- [x] **步骤 1：编写新命令解析和 partial 命名测试**
 
 ```ts
 test("CLI parses lossless doctor and audit without model configuration", () => {
@@ -602,22 +602,22 @@ test("CLI parses lossless doctor and audit without model configuration", () => {
 });
 ```
 
-- [ ] **步骤 2：运行 CLI 测试确认命令未知**
+- [x] **步骤 2：运行 CLI 测试确认命令未知**
 
 ```powershell
 Set-Location translator-v5
 node --test --import tsx test/cli.test.ts
 ```
 
-- [ ] **步骤 3：实现 `doctor` 与 `audit`**
+- [x] **步骤 3：实现 `doctor` 与 `audit`**
 
 `book doctor --manifest` 只加载源账本、构建 annotations/blocks/windows 并运行独立 Auditor；输出稳定 JSON，包括 source version、覆盖率、incident codes 和是否允许模型调用。`book audit --store --run` 从 store 的审计投影与 canonical source 重算，不加载模型配置。
 
-- [ ] **步骤 4：版本化 `run`、`status` 和 partial artifacts**
+- [x] **步骤 4：版本化 `run`、`status` 和 partial artifacts**
 
 `book run` 必须接收 `--manifest`，可选 `--v4-db`；第一次运行创建并打印 run ID，恢复时要求 `--run` 或 store 中唯一未完成 run。`status/export` 的 run 省略规则相同。允许不完整时文件名包含 `.partial`，audit JSON 写明缺块数。
 
-- [ ] **步骤 5：运行 CLI、report 测试和 Commit**
+- [x] **步骤 5：运行 CLI、report 测试和 Commit**
 
 ```powershell
 Set-Location translator-v5

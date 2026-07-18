@@ -4,6 +4,11 @@ import { mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
 import { createKnowledgeSnapshot, type KnowledgeSnapshot } from "./knowledge/snapshot.js";
+import {
+  canonicalJson,
+  KnowledgeStore,
+  type KnowledgeRevision,
+} from "./knowledge/knowledge-store.js";
 import { blockId as losslessBlockId } from "./source/block-builder.js";
 import { scalarLength } from "./source/types.js";
 import type { BookStore } from "./storage/book-store.js";
@@ -208,8 +213,41 @@ export function auditLosslessBookStore(
   }
 
   const snapshotById = new Map(state.snapshots.map((snapshot) => [snapshot.snapshotId, snapshot]));
+  try {
+    const revisions = state.knowledgeRevisions.map(
+      (row) => row.payload as KnowledgeRevision,
+    );
+    const history = new KnowledgeStore(revisions);
+    const projectableStatuses = new Set([
+      "provisional",
+      "active",
+      "needs_revalidate",
+      "contextual",
+    ]);
+    for (const row of state.knowledgeRevisions) {
+      const payload = row.payload as KnowledgeRevision;
+      const latest = history.latestRevision(row.normalizedSubject, row.kind);
+      const expectedActive = latest?.revisionId === row.revisionId
+        && projectableStatuses.has(payload.status);
+      if (row.runId !== state.runId
+        || row.recordId !== sha256(`${row.normalizedSubject}\0${row.kind}`)
+        || payload.revisionId !== row.revisionId
+        || payload.revision !== row.revision
+        || payload.normalizedSubject !== row.normalizedSubject
+        || payload.kind !== row.kind
+        || payload.status !== row.status
+        || row.active !== expectedActive) {
+        throw new Error(`knowledge row ${row.revisionId} differs from its canonical payload`);
+      }
+    }
+  } catch {
+    incidents.push("KNOWLEDGE_HISTORY_INVALID");
+  }
+  let projectedKnowledge: KnowledgeStore | undefined;
+  const consumedKnowledgeRows = new Set<number>();
   let previousSnapshotId: string | null = null;
-  for (const snapshot of state.snapshots) {
+  for (let snapshotIndex = 0; snapshotIndex < state.snapshots.length; snapshotIndex += 1) {
+    const snapshot = state.snapshots[snapshotIndex]!;
     const payload = snapshot.payload as Partial<KnowledgeSnapshot> | null;
     if (snapshot.contentHash !== snapshot.snapshotId
       || payload === null
@@ -230,6 +268,43 @@ export function auditLosslessBookStore(
         incidents.push("SNAPSHOT_LINEAGE_INVALID");
       }
     }
+    try {
+      if (payload === null || !Array.isArray(payload.revisions)) {
+        throw new Error("snapshot has no typed knowledge projection");
+      }
+      if (snapshotIndex === 0) {
+        if (snapshot.producingWindowId !== null) {
+          throw new Error("initial snapshot must not have a producing window");
+        }
+        projectedKnowledge = new KnowledgeStore(payload.revisions);
+      } else {
+        if (projectedKnowledge === undefined || snapshot.producingWindowId === null) {
+          throw new Error("derived snapshot is missing its knowledge predecessor");
+        }
+        const appended: KnowledgeRevision[] = [];
+        for (let index = 0; index < state.knowledgeRevisions.length; index += 1) {
+          const revision = state.knowledgeRevisions[index]!;
+          if (revision.producingWindowId === snapshot.producingWindowId) {
+            appended.push(revision.payload as KnowledgeRevision);
+            consumedKnowledgeRows.add(index);
+          }
+        }
+        projectedKnowledge = new KnowledgeStore([
+          ...projectedKnowledge.listRevisions(),
+          ...appended,
+        ]);
+        const expected = createKnowledgeSnapshot(
+          state.runId,
+          projectedKnowledge.projectableRevisions(),
+          snapshot.parentSnapshotId,
+        );
+        if (canonicalJson(expected) !== canonicalJson(payload)) {
+          throw new Error("snapshot projection differs from persisted domain history");
+        }
+      }
+    } catch {
+      incidents.push("KNOWLEDGE_HISTORY_INVALID");
+    }
     if (snapshot.parentSnapshotId !== previousSnapshotId) {
       incidents.push("SNAPSHOT_LINEAGE_INVALID");
     }
@@ -238,6 +313,9 @@ export function auditLosslessBookStore(
       incidents.push("SNAPSHOT_LINEAGE_INVALID");
     }
     previousSnapshotId = snapshot.snapshotId;
+  }
+  if (consumedKnowledgeRows.size !== state.knowledgeRevisions.length) {
+    incidents.push("KNOWLEDGE_HISTORY_INVALID");
   }
   for (const window of state.windows) {
     if (window.snapshotId !== null && !snapshotById.has(window.snapshotId)) {
@@ -248,9 +326,16 @@ export function auditLosslessBookStore(
   const translatedBlockIds = new Set<string>();
   for (const translation of state.translations.filter((item) => item.active)) {
     const block = blockById.get(translation.blockId);
+    const window = windowById.get(translation.windowId);
     const valid = translation.runId === state.runId
       && translation.sourceVersion === state.sourceVersion
       && translation.stageState === "promoted"
+      && translation.text.trim().length > 0
+      && Number.isSafeInteger(translation.version)
+      && translation.version > 0
+      && (translation.resultStatus === "completed"
+        || translation.resultStatus === "completed_with_warnings")
+      && window?.status === translation.resultStatus
       && block !== undefined
       && translation.sourceHash === block.sourceHash
       && membershipByBlock.get(translation.blockId) === translation.windowId
