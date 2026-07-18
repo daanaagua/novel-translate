@@ -147,7 +147,7 @@ test("Pi lexical anchor evidence can confirm two surface forms as one entity", a
     .map((term) => term.conceptId)).size, 1);
 });
 
-test("entity aliases reject explanatory phrases as a locked canonical target", async () => {
+test("entity aliases project explanatory phrases to a concise locked target", async () => {
   const source = "Loukianos, who was also known as Lucian the Scoffer, wrote.";
   const candidates = collectWindowAnchorCandidates([block(source)], [block(source)], []);
   const submission = (proposedTarget: string) => ({
@@ -185,7 +185,7 @@ test("entity aliases reject explanatory phrases as a locked canonical target", a
     budget: new BudgetLedger(),
   });
 
-  assert.equal(faux.state.callCount, 2);
+  assert.equal(faux.state.callCount, 1);
   assert.equal(outcome.entityLinks[0]?.preferredTarget, "卢奇安");
   assert.ok(outcome.terms
     .filter((term) => ["Loukianos", "Lucian"].includes(term.sourceForm))

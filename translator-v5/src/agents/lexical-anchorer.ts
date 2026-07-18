@@ -58,6 +58,13 @@ interface EntityLinkSubmission {
   confidence: number;
 }
 
+function canonicalEntityTarget(value: string): string {
+  return (value.trim().split(
+    /(?:（|\(|\[|【|,|，|;|；|\s+(?:又称|亦称|即|alias)\s+)/iu,
+    1,
+  )[0] ?? "").trim();
+}
+
 function establishedForms(stableTerms: readonly StableTerm[]): string[] {
   return stableTerms.flatMap((term) => [term.sourceForm, term.canonicalSource]);
 }
@@ -170,7 +177,7 @@ export class LexicalAnchorer {
           seen.add(key);
         }
         entityLinks = (args.entityLinks ?? []).map((link, index) => {
-          const proposedTarget = link.proposedTarget.trim();
+          const proposedTarget = canonicalEntityTarget(link.proposedTarget);
           if (proposedTarget.length === 0
             || Array.from(proposedTarget).length > 32
             || /[()（）\[\]【】,，;；]/u.test(proposedTarget)) {
@@ -230,7 +237,7 @@ export class LexicalAnchorer {
         "Mark ordinary words, forms whose Chinese rendering changes by discourse role, and forms of address as contextual.",
         "Do not force surface consistency where Chinese grammar or relationship context requires variation.",
         "When compact evidence explicitly links two supplied forms to one entity, submit an entityLinks item and quote the exact supplied context. Leave uncertain relationships unconfirmed.",
-        "For entityLinks, proposedTarget must be the concise canonical Chinese name alone. Do not include aliases, titles, parenthetical explanations, or relation glosses; surrounding descriptors remain contextual translation.",
+        "For entityLinks, proposedTarget must be the concise canonical Chinese name alone. Do not include aliases, titles, parenthetical explanations, or relation glosses; surrounding descriptors remain contextual translation. The harness will conservatively project only the leading canonical name if you append an explanation.",
         "Call submit_lexical_anchors exactly once and classify every supplied form.",
       ].join("\n"),
       prompt: [
