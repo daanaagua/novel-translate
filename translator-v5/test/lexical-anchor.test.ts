@@ -146,3 +146,48 @@ test("Pi lexical anchor evidence can confirm two surface forms as one entity", a
     .filter((term) => ["Loukianos", "Lucian"].includes(term.sourceForm))
     .map((term) => term.conceptId)).size, 1);
 });
+
+test("entity aliases reject explanatory phrases as a locked canonical target", async () => {
+  const source = "Loukianos, who was also known as Lucian the Scoffer, wrote.";
+  const candidates = collectWindowAnchorCandidates([block(source)], [block(source)], []);
+  const submission = (proposedTarget: string) => ({
+    anchors: candidates.map((candidate) => ({
+      sourceForm: candidate.sourceForm,
+      target: candidate.sourceForm === "Scoffer" ? "嘲弄者" : "卢奇安",
+      mode: "stable" as const,
+      confidence: 0.95,
+    })),
+    entityLinks: [{
+      sourceForms: ["Loukianos", "Lucian"],
+      proposedTarget,
+      evidenceKind: "explicit_naming" as const,
+      evidenceQuote: source,
+      confidence: 0.95,
+    }],
+  });
+  const faux = fauxProvider();
+  faux.setResponses([
+    fauxAssistantMessage(fauxToolCall(
+      "submit_lexical_anchors",
+      submission("卢奇安（嘲弄者卢奇安）"),
+    ), { stopReason: "toolUse" }),
+    fauxAssistantMessage(fauxToolCall(
+      "submit_lexical_anchors",
+      submission("卢奇安"),
+    ), { stopReason: "toolUse" }),
+  ]);
+
+  const outcome = await new LexicalAnchorer(new PiRuntime()).run({
+    candidates,
+    stableTerms: [],
+    model: faux.getModel(),
+    streamFn: faux.provider.streamSimple.bind(faux.provider),
+    budget: new BudgetLedger(),
+  });
+
+  assert.equal(faux.state.callCount, 2);
+  assert.equal(outcome.entityLinks[0]?.preferredTarget, "卢奇安");
+  assert.ok(outcome.terms
+    .filter((term) => ["Loukianos", "Lucian"].includes(term.sourceForm))
+    .every((term) => term.target === "卢奇安"));
+});

@@ -170,6 +170,14 @@ export class LexicalAnchorer {
           seen.add(key);
         }
         entityLinks = (args.entityLinks ?? []).map((link, index) => {
+          const proposedTarget = link.proposedTarget.trim();
+          if (proposedTarget.length === 0
+            || Array.from(proposedTarget).length > 32
+            || /[()（）\[\]【】,，;；]/u.test(proposedTarget)) {
+            throw new Error(
+              `entity link ${index} proposedTarget must be one concise canonical Chinese name without aliases, titles, parentheses, or explanations`,
+            );
+          }
           const normalizedForms = [...new Set(link.sourceForms.map((form) =>
             profile.normalizeSourceForm(form)))];
           if (normalizedForms.length < 2
@@ -190,7 +198,7 @@ export class LexicalAnchorer {
             .slice(0, 20);
           return evaluateEntityLink({
             sourceForms: link.sourceForms,
-            proposedTarget: link.proposedTarget,
+            proposedTarget,
             profile,
             evidence: [{
               evidenceId: `anchor-evidence-${evidenceBase}`,
@@ -222,6 +230,7 @@ export class LexicalAnchorer {
         "Mark ordinary words, forms whose Chinese rendering changes by discourse role, and forms of address as contextual.",
         "Do not force surface consistency where Chinese grammar or relationship context requires variation.",
         "When compact evidence explicitly links two supplied forms to one entity, submit an entityLinks item and quote the exact supplied context. Leave uncertain relationships unconfirmed.",
+        "For entityLinks, proposedTarget must be the concise canonical Chinese name alone. Do not include aliases, titles, parenthetical explanations, or relation glosses; surrounding descriptors remain contextual translation.",
         "Call submit_lexical_anchors exactly once and classify every supplied form.",
       ].join("\n"),
       prompt: [
