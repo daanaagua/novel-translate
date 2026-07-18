@@ -4,7 +4,7 @@
 
 **Goal:** Make V5 source-language aware and restore lexical, style, and deterministic validation continuity in the lossless full-book runner without sacrificing exact source coverage or parallel determinism.
 
-**Architecture:** Add a registry of immutable `SourceLanguageProfile` objects and route structure recognition, anchor candidate extraction, normalization, and residue detection through it. Carry the selected profile from the certified manifest into the derived plan and run metadata. At each lossless wave, build one immutable anchor snapshot, share it and the prior committed style tail across physical requests, validate each returned logical window deterministically, repair only invalid blocks once, and atomically persist only evidence actually used by successful windows.
+**Architecture:** Add a registry of immutable `SourceLanguageProfile` objects and route structure recognition, anchor candidate extraction, normalization, and residue detection through it. Model aliases as provisional, evidence-bearing entity links that can be revalidated when later contexts arrive instead of forcing early string-based merges. Replace the raw previous-text tail with a hierarchical style state: immutable book constitution, scoped voice profile, mixed discourse-mode weights, and a bounded decaying local state. At each lossless wave, share immutable entity/term/style snapshots across physical requests, validate each returned logical window deterministically, repair only invalid blocks once, and atomically persist only evidence actually used by successful windows.
 
 **Tech stack:** Python 3 project initializer and pytest; TypeScript 7, Node test runner, `Intl.Segmenter`, Unicode property escapes, SQLite, Pi agent runtime.
 
@@ -216,7 +216,76 @@ git add translator-v5/src/source/structure-annotator.ts translator-v5/src/agents
 git commit -m "refactor: route source language behavior through profiles"
 ```
 
-## Task 5: Add one immutable lexical-anchor snapshot per lossless wave
+## Task 5: Add provisional entity links and evidence-driven alias revalidation
+
+**Files:**
+
+- Create: `translator-v5/src/domain/entity-links.ts`
+- Create: `translator-v5/src/fullbook/entity-revalidation.ts`
+- Modify: `translator-v5/src/agents/lexical-anchorer.ts`
+- Modify: `translator-v5/src/knowledge/knowledge-store.ts`
+- Modify: `translator-v5/src/storage/lossless-book-store.ts`
+- Create: `translator-v5/test/entity-links.test.ts`
+- Modify: `translator-v5/test/lexical-anchor.test.ts`
+- Modify: `translator-v5/test/lossless-book-store.test.ts`
+
+**Step 1: Write failing entity-link tests**
+
+Prove:
+
+- two surface forms can remain `provisional` without being forced into one entity;
+- direct apposition, explicit naming evidence, or a sufficiently strong combination of independent contextual signals can promote a link to `confirmed`;
+- string similarity alone can propose a link but can never confirm it;
+- contradictory evidence moves the link to `conflicted` and preserves both evidence chains;
+- confirmed aliases share one `conceptId` and preferred Chinese target while preserving their individual source forms;
+- a new occurrence automatically schedules revalidation for a provisional or conflicted link;
+- future knowledge can confirm an alias without silently rewriting already committed translation rows;
+- the same evidence set produces the same score, state, and revision independent of insertion order.
+
+Use a deterministic linkage score with separately recorded components, for example:
+
+```text
+linkScore = explicitNamingEvidence
+          + appositionEvidence
+          + contextualCompatibility
+          + distributionalCompatibility
+          + boundedModelVerdict
+          - contradictionPenalty
+```
+
+Run:
+
+```powershell
+npm test -- --test-name-pattern="entity link|alias revalidation"
+```
+
+Expected: fail because entity-link state does not exist.
+
+**Step 2: Implement append-only entity links**
+
+- Store source forms, canonical normalization, evidence IDs, score components, status, confidence, preferred target, and revision provenance.
+- Keep `provisional`, `confirmed`, and `conflicted` transitions explicit and append-only.
+- Permit deterministic evidence to settle direct cases; use one bounded model verdict only when evidence can materially change translation.
+- Treat `conceptId` as entity identity and `lexemeId` as a surface-form identity so confirmed aliases can share a concept without losing lexical history.
+- Emit a typed drift candidate when a newly confirmed alias disagrees with an earlier active translation; do not rewrite translated blocks inside the knowledge transaction.
+
+**Step 3: Run focused tests and typecheck**
+
+```powershell
+npm test -- --test-name-pattern="entity link|alias revalidation"
+npm run typecheck
+```
+
+Expected: pass.
+
+**Step 4: Commit**
+
+```powershell
+git add translator-v5/src/domain/entity-links.ts translator-v5/src/fullbook/entity-revalidation.ts translator-v5/src/agents/lexical-anchorer.ts translator-v5/src/knowledge/knowledge-store.ts translator-v5/src/storage/lossless-book-store.ts translator-v5/test
+git commit -m "feat: revalidate evidence-backed entity aliases"
+```
+
+## Task 6: Add one immutable lexical and entity snapshot per lossless wave
 
 **Files:**
 
@@ -235,7 +304,8 @@ Test that:
 - a clean run invokes lexical anchoring once for a wave, not once per window or request;
 - all physical requests in the wave receive the same immutable term snapshot;
 - reverse completion order produces byte-identical knowledge history;
-- aliases returned with one target are projected consistently into every request;
+- confirmed aliases are projected with one entity target into every request;
+- provisional links are presented as uncertainty rather than as locked terminology;
 - only actually referenced anchors become promoted knowledge evidence;
 - a fully failed wave promotes no staged anchor knowledge;
 - resuming with the same anchor input hash reuses the staged/cached decision.
@@ -254,7 +324,7 @@ Expected: fail.
 
 - Collect candidates from selected wave blocks plus compact whole-corpus concordance.
 - Invoke `LexicalAnchorer` once with a dedicated budget ledger.
-- Build an immutable `WaveAnchorSnapshot` with an input hash.
+- Build an immutable `WaveAnchorSnapshot` containing stable terms, confirmed entity aliases, and bounded provisional-link warnings, with an input hash.
 - Pass its relevant stable terms to each batch request.
 - Convert referenced decisions into deterministic knowledge candidates attached to the earliest successful logical ordinal.
 - Reuse existing staged/promoted revision machinery rather than adding a side-channel mutable glossary.
@@ -275,12 +345,19 @@ git add translator-v5/src/fullbook/book-runner.ts translator-v5/src/agents/trans
 git commit -m "feat: anchor terminology once per lossless wave"
 ```
 
-## Task 6: Restore deterministic style-tail continuity
+## Task 7: Replace the raw style tail with hierarchical structured style
 
 **Files:**
 
+- Create: `translator-v5/src/style/types.ts`
+- Create: `translator-v5/src/style/effective-style.ts`
+- Create: `translator-v5/src/style/style-observation.ts`
+- Create: `translator-v5/src/style/style-projection.ts`
 - Modify: `translator-v5/src/fullbook/book-runner.ts`
+- Modify: `translator-v5/src/agents/translation-batch.ts`
+- Modify: `translator-v5/src/tools/translation-tools.ts`
 - Modify: `translator-v5/src/storage/lossless-book-store.ts`
+- Create: `translator-v5/test/structured-style.test.ts`
 - Modify: `translator-v5/test/book-runner.test.ts`
 - Modify: `translator-v5/test/lossless-book-store.test.ts`
 
@@ -288,30 +365,42 @@ git commit -m "feat: anchor terminology once per lossless wave"
 
 Verify:
 
-- the runner loads the latest preceding completed logical window tail;
-- all parallel siblings receive the same prior tail;
-- reverse physical completion order selects the next tail by logical ordinal;
-- resume after interruption reconstructs the same active tail;
-- tail length stays bounded.
+- an immutable `BookStyleConstitution` stores executable global rules such as register, sentence policy, explicitation, imagery, dialogue, technical prose, and typography;
+- scoped `VoiceProfile` records can distinguish narrator, character, letter, document, or quoted voice without changing the book constitution;
+- a source block can carry mixed `DiscourseModeWeights` rather than one rigid label (`narrative`, `dialogue`, `action`, `description`, `technical`, `documentary`, `lyrical`, `interior`);
+- effective style is a deterministic composition of book constitution, visible voice, top discourse modes, and decaying local state;
+- the local state contains only bounded active register, relationship-sensitive address choices, rhythm observations, recent lexical choices, and continuity notes;
+- local influence decays by logical distance and expires; it cannot mutate the immutable book constitution;
+- examples are retrieved only from accepted translations with compatible voice and discourse mode, capped at two short snippets;
+- all parallel siblings receive the same pre-wave style snapshot;
+- reverse completion order and resume produce the same next style state by logical ordinal;
+- rejected or repaired-but-invalid translations cannot become style evidence;
+- the final prompt projection is bounded and contains concise rules rather than a raw prior translation dump.
 
 Run:
 
 ```powershell
-npm test -- --test-name-pattern="style tail|previous active tail"
+npm test -- --test-name-pattern="structured style|effective style|style projection"
 ```
 
 Expected: fail for the lossless runner.
 
-**Step 2: Implement deterministic tail selection**
+**Step 2: Implement the style hierarchy without an extra classifier call**
 
-- Add a run-scoped store query for the latest completed tail before the wave ordinal.
-- Pass `boundedActiveTail(...)` to every `runTranslationBatch` call.
-- After promotion, derive future tail state by logical ordinal, never wall-clock completion.
+- Keep the book constitution explicit and versioned; initialize it from project configuration or an approved calibration result, never from an arbitrary previous block.
+- Extract language-neutral source features such as quote ratio, paragraph shape, sentence-length distribution, numeral/formula density, parenthetical density, and document-like layout.
+- Combine those deterministic features with bounded structured `styleObservation` returned in the existing translation submission; do not add a separate style-agent model call.
+- Represent mode membership as normalized weights and project only the top relevant rules.
+- Resolve voice from position-safe narrative/entity memory when available; otherwise use the declared main narrator profile without inventing a character voice.
+- Maintain local observations with an exponential distance decay and hard TTL.
+- Select zero to two accepted same-mode/same-voice examples; absence of a match is preferable to a mismatched example.
+- Persist append-only observations and derive snapshots, so replay and audit reproduce the same style state.
+- Pass a compact `EffectiveStyleProjection` to `runTranslationBatch`; retain `previousActiveTail` only as a temporary backward-compatibility input until migration tests pass.
 
 **Step 3: Run focused tests and typecheck**
 
 ```powershell
-npm test -- --test-name-pattern="style tail|previous active tail"
+npm test -- --test-name-pattern="structured style|effective style|style projection"
 npm run typecheck
 ```
 
@@ -320,11 +409,11 @@ Expected: pass.
 **Step 4: Commit**
 
 ```powershell
-git add translator-v5/src/fullbook/book-runner.ts translator-v5/src/storage/lossless-book-store.ts translator-v5/test/book-runner.test.ts translator-v5/test/lossless-book-store.test.ts
-git commit -m "fix: preserve style continuity in lossless waves"
+git add translator-v5/src/style translator-v5/src/fullbook/book-runner.ts translator-v5/src/agents/translation-batch.ts translator-v5/src/tools/translation-tools.ts translator-v5/src/storage/lossless-book-store.ts translator-v5/test
+git commit -m "feat: compose scoped structured translation style"
 ```
 
-## Task 7: Add deterministic batch validation and one targeted repair pass
+## Task 8: Add deterministic batch validation and one targeted repair pass
 
 **Files:**
 
@@ -377,7 +466,7 @@ git add translator-v5/src/agents/translation-batch.ts translator-v5/src/agents/r
 git commit -m "fix: validate and locally repair lossless batches"
 ```
 
-## Task 8: Report source extraction anomalies without mutating source
+## Task 9: Report source extraction anomalies without mutating source
 
 **Files:**
 
@@ -427,7 +516,7 @@ git add translator-v5/src/source/anomaly-report.ts translator-v5/src/fullbook/bo
 git commit -m "feat: report immutable source extraction anomalies"
 ```
 
-## Task 9: Full regression and local Dragon Waiting gates
+## Task 10: Full regression and local Dragon Waiting gates
 
 **Files:**
 
@@ -460,7 +549,7 @@ Delete only the ignored `dragon_waiting_flash` derived project after verifying i
 - Confirm exact source coverage and anomaly report.
 - Run one lossless window with one concurrent request.
 - Inspect persisted anchor/knowledge history and bilingual output.
-- Require `Loukianos of Samosata` and `Lucian the Scoffer` to share a target/alias identity without book-specific code.
+- Require `Loukianos of Samosata` and `Lucian the Scoffer` either to share a confirmed entity/target or to remain one explicit provisional link; they must not silently become two unrelated locked entities.
 - Require no missing blocks, system leakage, or unhandled validation findings.
 
 If this gate fails, stop and diagnose; do not launch the full book.
@@ -468,7 +557,8 @@ If this gate fails, stop and diagnose; do not launch the full book.
 **Step 4: Run three-window continuity gate**
 
 - Resume through three total windows.
-- Confirm the prior style tail is actually included in the following request.
+- Confirm the next request receives a bounded effective style projection derived from the prior accepted logical state, not a raw translation tail.
+- Confirm technical/documentary passages and dialogue receive different discourse-mode projections while retaining the same book constitution.
 - Confirm anchor snapshots are reused consistently and audit passes.
 - Record model calls, translation turns, source tokens, and wall time.
 
@@ -486,4 +576,3 @@ git log --oneline --decorate -12
 ```
 
 Commit only tracked general-purpose fixes or documentation. Never commit model outputs, credentials, SQLite files, or downloaded novels.
-
