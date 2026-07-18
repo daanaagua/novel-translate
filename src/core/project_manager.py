@@ -10,7 +10,7 @@ import yaml
 
 from .schemas import Book
 from .preprocessor import TextPreprocessor
-from .source_ledger import create_source_ledger
+from .source_ledger import create_source_ledger, normalize_source_language
 from .history import TranslationMemory
 from .knowledge_base import KnowledgeBase
 
@@ -86,6 +86,7 @@ class ProjectManager:
         max_chunk_tokens: int = 1100,
         overlap_sentences: int = 0,
         source_encoding: Optional[str] = None,
+        source_language: str = "en",
     ) -> Project:
         """
         创建新项目
@@ -97,6 +98,7 @@ class ProjectManager:
         """
         project_dir = self.projects_root / book_id
         src_file = Path(source_path)
+        source_language = normalize_source_language(source_language)
 
         if not src_file.exists():
             raise FileNotFoundError(f"源文件不存在: {source_path}")
@@ -120,7 +122,12 @@ class ProjectManager:
             document = temp_prep.load_document(
                 str(src_file), source_encoding=source_encoding
             )
-            create_source_ledger(src_file, project_dir, document)
+            create_source_ledger(
+                src_file,
+                project_dir,
+                document,
+                source_language=source_language,
+            )
         except Exception as e:
             shutil.rmtree(project_dir, ignore_errors=True)
             raise RuntimeError(f"原文处理失败: {e}")
@@ -144,6 +151,7 @@ class ProjectManager:
                         "source_path": str(src_file.resolve()),
                         "source_format": src_file.suffix.lower(),
                         "source_encoding": document.encoding,
+                        "source_language": source_language,
                         "chunking": {
                             "max_tokens": max_chunk_tokens,
                             "overlap_sentences": overlap_sentences,

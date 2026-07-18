@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from pathlib import Path
 from typing import Iterable, Mapping
 
@@ -11,6 +12,7 @@ from .preprocessor import SourceDocument
 
 
 SOURCE_LEDGER_SCHEMA = "v5-source-ledger-1"
+SUPPORTED_SOURCE_LANGUAGES = frozenset({"en", "fr", "de", "es", "ru", "ja", "und"})
 ALLOWED_EXCLUDED_RAW_POLICIES = frozenset(
     {
         "UTF8_BOM",
@@ -26,6 +28,18 @@ ALLOWED_EXCLUDED_RAW_POLICIES = frozenset(
 
 def _sha256(payload: bytes) -> str:
     return hashlib.sha256(payload).hexdigest()
+
+
+def normalize_source_language(value: str) -> str:
+    """Return the supported primary BCP-47 source-language subtag."""
+    if not isinstance(value, str) or not re.fullmatch(
+        r"[A-Za-z]{2,3}(?:-[A-Za-z0-9]{2,8})*", value
+    ):
+        raise ValueError(f"invalid source language: {value!r}")
+    primary = value.split("-", 1)[0].lower()
+    if primary not in SUPPORTED_SOURCE_LANGUAGES:
+        raise ValueError(f"unsupported source language: {value!r}")
+    return primary
 
 
 def _validate_canonical_segments(
@@ -90,7 +104,10 @@ def _write_immutable(path: Path, payload: bytes) -> None:
 
 
 def create_source_ledger(
-    source: Path, project_dir: Path, document: SourceDocument
+    source: Path,
+    project_dir: Path,
+    document: SourceDocument,
+    source_language: str = "en",
 ) -> dict:
     """保存原始字节、canonical source 和经验证的 provenance 清单。"""
     source = Path(source)
@@ -106,6 +123,7 @@ def create_source_ledger(
         raise ValueError("source changed after document load")
     canonical = document.text.replace("\r\n", "\n").replace("\r", "\n")
     canonical_bytes = canonical.encode("utf-8")
+    source_language = normalize_source_language(source_language)
 
     segments = _validate_canonical_segments(
         document.canonical_segments, len(canonical)
@@ -128,6 +146,7 @@ def create_source_ledger(
         "source_format": document.source_format,
         "encoding": document.encoding,
         "extractor": document.extractor,
+        "sourceLanguage": source_language,
         "canonical_path": "source.txt",
         "canonical_chars": len(canonical),
         "canonical_sha256": _sha256(canonical_bytes),

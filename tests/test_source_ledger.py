@@ -232,3 +232,74 @@ def test_init_cli_forwards_explicit_source_encoding(tmp_path, monkeypatch):
         ["init", "novel", str(tmp_path / "novel.txt"), "--encoding", "gbk"]
     ) == 0
     assert captured["source_encoding"] == "gbk"
+
+
+def test_project_records_normalized_source_language_in_manifest_and_config(tmp_path):
+    original = tmp_path / "roman.txt"
+    original.write_text("Chapitre premier\n\nLe texte.", encoding="utf-8")
+
+    project = ProjectManager(str(tmp_path / "projects")).create_project(
+        "roman",
+        str(original),
+        source_language="fr-FR",
+        overlap_sentences=0,
+    )
+
+    manifest = json.loads(project.source_manifest_file.read_text(encoding="utf-8"))
+    config = project.config_file.read_text(encoding="utf-8")
+    assert manifest["sourceLanguage"] == "fr"
+    assert "source_language: fr" in config
+
+
+def test_new_project_defaults_source_language_to_english(tmp_path):
+    original = tmp_path / "novel.txt"
+    original.write_text("Chapter One\n\nText.", encoding="utf-8")
+
+    project = ProjectManager(str(tmp_path / "projects")).create_project(
+        "novel", str(original), overlap_sentences=0
+    )
+
+    manifest = json.loads(project.source_manifest_file.read_text(encoding="utf-8"))
+    assert manifest["sourceLanguage"] == "en"
+
+
+@pytest.mark.parametrize("language", ["", "english", "en_US", "zh", "en-!"])
+def test_invalid_or_unsupported_source_language_rolls_back(tmp_path, language):
+    original = tmp_path / "novel.txt"
+    original.write_text("Text.", encoding="utf-8")
+    projects = tmp_path / "projects"
+
+    with pytest.raises(ValueError, match="source language"):
+        ProjectManager(str(projects)).create_project(
+            "novel", str(original), source_language=language
+        )
+
+    assert not (projects / "novel").exists()
+
+
+def test_init_cli_forwards_explicit_source_language(tmp_path, monkeypatch):
+    import main as cli
+
+    captured = {}
+
+    class FakeProjectManager:
+        def create_project(self, **kwargs):
+            captured.update(kwargs)
+            return SimpleNamespace(root_dir=tmp_path / "projects" / kwargs["book_id"])
+
+    class FakeConfigLoader:
+        @staticmethod
+        def load_config():
+            return {}
+
+    monkeypatch.setattr(cli, "project_manager", FakeProjectManager())
+    monkeypatch.setattr(cli, "config_loader", FakeConfigLoader())
+
+    assert cli.main([
+        "init",
+        "roman",
+        str(tmp_path / "roman.txt"),
+        "--source-language",
+        "fr",
+    ]) == 0
+    assert captured["source_language"] == "fr"

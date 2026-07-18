@@ -89,6 +89,7 @@ def cmd_init(args):
             max_chunk_tokens=int(chunking.get("max_tokens", 1100)),
             overlap_sentences=int(chunking.get("overlap_sentences", 0)),
             source_encoding=args.encoding,
+            source_language=args.source_language,
         )
         print(f"[OK] 项目创建成功！位置: {project.root_dir}")
         print(f"下一步: 请运行 'python main.py translate {args.book_id}' 开始翻译")
@@ -1109,6 +1110,11 @@ def main(argv=None):
     p_init.add_argument(
         "--encoding",
         help="无 BOM 且非 UTF-8 的纯文本源编码（如 gbk）",
+    )
+    p_init.add_argument(
+        "--source-language",
+        default="en",
+        help="source language tag (en, fr, de, es, ru, ja, or und)",
     )
     p_init.set_defaults(func=cmd_init)
     
