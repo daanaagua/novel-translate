@@ -294,7 +294,7 @@ git commit -m "docs: prepare FolioLoom v1 release notes"
 
 - 不修改源码；失败时回到对应任务修复并单独提交。
 
-- [ ] **步骤 1：运行 V1.0 内核回归**
+- [x] **步骤 1：运行 V1.0 内核回归**
 
 ```powershell
 Set-Location D:\llm\小说翻译\translator-v5
@@ -304,7 +304,7 @@ npm.cmd run typecheck
 
 预期：全部通过。
 
-- [ ] **步骤 2：检查 diff 和用户文件**
+- [x] **步骤 2：检查 diff 和用户文件**
 
 ```powershell
 Set-Location D:\llm\小说翻译
@@ -315,7 +315,7 @@ git log --oneline --decorate -8
 
 预期：原有 `docs/superpowers/reports/2026-07-18-little-big-lossless-migration.md` 用户修改仍未被提交；发布改动均已进入独立提交。
 
-- [ ] **步骤 3：扫描当前公开候选树**
+- [x] **步骤 3：扫描当前公开候选树**
 
 ```powershell
 git ls-tree -r --name-only HEAD | Where-Object {
