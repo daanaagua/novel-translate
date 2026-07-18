@@ -88,6 +88,7 @@ def cmd_init(args):
             force=args.force,
             max_chunk_tokens=int(chunking.get("max_tokens", 1100)),
             overlap_sentences=int(chunking.get("overlap_sentences", 0)),
+            source_encoding=args.encoding,
         )
         print(f"[OK] 项目创建成功！位置: {project.root_dir}")
         print(f"下一步: 请运行 'python main.py translate {args.book_id}' 开始翻译")
@@ -1105,6 +1106,10 @@ def main(argv=None):
     p_init.add_argument("book_id", help="项目ID (英文，无空格)")
     p_init.add_argument("file", help="小说原文路径 (.txt/.md/.docx/.epub)")
     p_init.add_argument("--force", "-f", action="store_true", help="强制覆盖已存在项目")
+    p_init.add_argument(
+        "--encoding",
+        help="无 BOM 且非 UTF-8 的纯文本源编码（如 gbk）",
+    )
     p_init.set_defaults(func=cmd_init)
     
     # list

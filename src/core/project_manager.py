@@ -85,6 +85,7 @@ class ProjectManager:
         force: bool = False,
         max_chunk_tokens: int = 1100,
         overlap_sentences: int = 0,
+        source_encoding: Optional[str] = None,
     ) -> Project:
         """
         创建新项目
@@ -116,7 +117,9 @@ class ProjectManager:
             overlap_sentences=overlap_sentences,
         )
         try:
-            document = temp_prep.load_document(str(src_file))
+            document = temp_prep.load_document(
+                str(src_file), source_encoding=source_encoding
+            )
             create_source_ledger(src_file, project_dir, document)
         except Exception as e:
             shutil.rmtree(project_dir, ignore_errors=True)
@@ -140,6 +143,7 @@ class ProjectManager:
                         "book_id": book_id,
                         "source_path": str(src_file.resolve()),
                         "source_format": src_file.suffix.lower(),
+                        "source_encoding": document.encoding,
                         "chunking": {
                             "max_tokens": max_chunk_tokens,
                             "overlap_sentences": overlap_sentences,

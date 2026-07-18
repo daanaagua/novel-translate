@@ -2,6 +2,7 @@ import hashlib
 import json
 from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 from zipfile import ZIP_DEFLATED, ZipFile
 
 import pytest
@@ -175,3 +176,58 @@ def test_project_creation_rolls_back_if_initialization_fails(tmp_path, monkeypat
     with pytest.raises(RuntimeError, match="injected initialization failure"):
         manager.create_project("novel", str(original))
     assert not (tmp_path / "projects" / "novel").exists()
+
+
+def test_ambiguous_non_utf8_source_requires_explicit_encoding(tmp_path):
+    original = tmp_path / "ambiguous.txt"
+    original.write_bytes(b"\x80\x81\x82")
+    projects = tmp_path / "projects"
+
+    with pytest.raises(RuntimeError, match="ENCODING_AMBIGUOUS"):
+        ProjectManager(str(projects)).create_project("ambiguous", str(original))
+
+    assert not (projects / "ambiguous").exists()
+
+
+def test_explicit_gbk_source_encoding_is_recorded_and_decoded(tmp_path):
+    source_text = "\u7b2c\u4e00\u7ae0\r\n\r\n\u6b63\u6587\u3002\r\n"
+    original = tmp_path / "novel.txt"
+    original.write_bytes(source_text.encode("gbk"))
+
+    assert TextPreprocessor().load_text(
+        str(original), source_encoding="gbk"
+    ) == source_text.replace("\r\n", "\n")
+    project = ProjectManager(str(tmp_path / "projects")).create_project(
+        "novel", str(original), source_encoding="gbk", overlap_sentences=0
+    )
+
+    manifest = json.loads(project.source_manifest_file.read_text(encoding="utf-8"))
+    assert manifest["encoding"] == "gbk"
+    assert project.raw_source_file.read_bytes() == original.read_bytes()
+    assert project.source_file.read_text(encoding="utf-8") == source_text.replace(
+        "\r\n", "\n"
+    )
+
+
+def test_init_cli_forwards_explicit_source_encoding(tmp_path, monkeypatch):
+    import main as cli
+
+    captured = {}
+
+    class FakeProjectManager:
+        def create_project(self, **kwargs):
+            captured.update(kwargs)
+            return SimpleNamespace(root_dir=tmp_path / "projects" / kwargs["book_id"])
+
+    class FakeConfigLoader:
+        @staticmethod
+        def load_config():
+            return {}
+
+    monkeypatch.setattr(cli, "project_manager", FakeProjectManager())
+    monkeypatch.setattr(cli, "config_loader", FakeConfigLoader())
+
+    assert cli.main(
+        ["init", "novel", str(tmp_path / "novel.txt"), "--encoding", "gbk"]
+    ) == 0
+    assert captured["source_encoding"] == "gbk"

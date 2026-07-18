@@ -27,6 +27,18 @@ class SourceDocument:
     raw_sha256: str | None = None
 
 
+class EncodingAmbiguousError(ValueError):
+    """无 BOM 且无显式编码时，原始字节不是有效 UTF-8。"""
+
+    code = "ENCODING_AMBIGUOUS"
+
+    def __init__(self, path: Path):
+        super().__init__(
+            f"{self.code}: 无法可靠确定源文件编码: {path}；"
+            "请显式指定 source encoding"
+        )
+
+
 _BOM_ENCODINGS = (
     (codecs.BOM_UTF32_LE, "utf-32-le", "UTF32_LE_BOM"),
     (codecs.BOM_UTF32_BE, "utf-32-be", "UTF32_BE_BOM"),
@@ -47,7 +59,9 @@ def _detected_bom(raw: bytes) -> tuple[bytes, str, str] | None:
     return None
 
 
-def _decode_plain_text(raw: bytes, path: Path) -> tuple[str, str]:
+def _decode_plain_text(
+    raw: bytes, path: Path, source_encoding: str | None = None
+) -> tuple[str, str]:
     bom = _detected_bom(raw)
     if bom:
         marker, encoding, _policy = bom
@@ -56,13 +70,20 @@ def _decode_plain_text(raw: bytes, path: Path) -> tuple[str, str]:
         except UnicodeDecodeError as exc:
             raise ValueError(f"无法按 BOM 指定编码读取文件: {path}") from exc
 
-    for encoding in ('utf-8', 'gbk', 'latin-1'):
+    if source_encoding is not None:
+        try:
+            encoding = codecs.lookup(source_encoding).name
+        except LookupError as exc:
+            raise ValueError(f"不支持的源文件编码: {source_encoding}") from exc
         try:
             return _normalize_newlines(raw.decode(encoding)), encoding
-        except UnicodeDecodeError:
-            continue
+        except (UnicodeDecodeError, TypeError) as exc:
+            raise ValueError(f"无法按显式编码 {encoding} 读取文件: {path}") from exc
 
-    raise ValueError(f"无法读取文件，请检查编码: {path}")
+    try:
+        return _normalize_newlines(raw.decode("utf-8")), "utf-8"
+    except UnicodeDecodeError as exc:
+        raise EncodingAmbiguousError(path) from exc
 
 
 class TextPreprocessor:
@@ -108,7 +129,9 @@ class TextPreprocessor:
         self.max_chunk_tokens = max_chunk_tokens
         self.overlap_sentences = overlap_sentences
     
-    def load_document(self, file_path: str) -> SourceDocument:
+    def load_document(
+        self, file_path: str, source_encoding: str | None = None
+    ) -> SourceDocument:
         """
         加载源文件，同时保留解码、提取和排除策略。
         
@@ -127,7 +150,7 @@ class TextPreprocessor:
 
         if suffix in {'.txt', '.md'}:
             raw = path.read_bytes()
-            text, encoding = _decode_plain_text(raw, path)
+            text, encoding = _decode_plain_text(raw, path, source_encoding)
             bom = _detected_bom(raw)
             raw_start = len(bom[0]) if bom else 0
             excluded = (
@@ -154,6 +177,11 @@ class TextPreprocessor:
                 excluded_raw_ranges=excluded,
                 raw_size=len(raw),
                 raw_sha256=hashlib.sha256(raw).hexdigest(),
+            )
+
+        if source_encoding is not None:
+            raise ValueError(
+                f"显式 source encoding 仅适用于 .txt/.md，不适用于 {suffix}"
             )
 
         if suffix == '.epub':
@@ -204,9 +232,11 @@ class TextPreprocessor:
             f"不支持的文件格式: {suffix}；支持 .txt、.md、.docx、.epub"
         )
 
-    def load_text(self, file_path: str) -> str:
+    def load_text(
+        self, file_path: str, source_encoding: str | None = None
+    ) -> str:
         """兼容旧调用方；正式导入应使用 :meth:`load_document`。"""
-        return self.load_document(file_path).text
+        return self.load_document(file_path, source_encoding=source_encoding).text
 
     def _load_docx(self, path: Path) -> str:
         """兼容旧调用方的 DOCX 文本加载。"""
@@ -288,9 +318,11 @@ class TextPreprocessor:
         content, _encoding = self._load_plain_text_with_encoding(path)
         return content
 
-    def _load_plain_text_with_encoding(self, path: Path) -> tuple[str, str]:
+    def _load_plain_text_with_encoding(
+        self, path: Path, source_encoding: str | None = None
+    ) -> tuple[str, str]:
         """以确定性顺序解码，且不用替换字符掩盖解码错误。"""
-        return _decode_plain_text(path.read_bytes(), path)
+        return _decode_plain_text(path.read_bytes(), path, source_encoding)
     
     def _clean_text(self, text: str) -> str:
         """仅做无损的换行规范化。"""
