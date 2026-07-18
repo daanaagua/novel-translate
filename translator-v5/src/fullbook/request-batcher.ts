@@ -14,6 +14,18 @@ export type {
 
 const REQUEST_PROTOCOL_VERSION = "v5-physical-request-1";
 
+export class RequestBatchError extends Error {
+  readonly code = "REQUEST_SOURCE_TOKENS_EXCEEDED" as const;
+
+  constructor(windowId: string, sourceTokens: number, maxRequestTokens: number) {
+    super(
+      `REQUEST_SOURCE_TOKENS_EXCEEDED: logical window ${windowId} has `
+      + `${sourceTokens} source tokens, max ${maxRequestTokens}`,
+    );
+    this.name = "RequestBatchError";
+  }
+}
+
 function positiveInteger(value: number, name: string): number {
   if (!Number.isSafeInteger(value) || value < 1) {
     throw new TypeError(`${name} must be a positive safe integer`);
@@ -72,6 +84,15 @@ export function packPhysicalRequests(
   );
   const windows = [...input].sort((left, right) =>
     left.ordinal - right.ordinal || left.windowId.localeCompare(right.windowId));
+  for (const window of windows) {
+    if (window.sourceTokens > maxRequestTokens) {
+      throw new RequestBatchError(
+        window.windowId,
+        window.sourceTokens,
+        maxRequestTokens,
+      );
+    }
+  }
   const requests: PhysicalRequestPlan[] = [];
   let current: RequestBatchWindow[] = [];
   let currentTokens = 0;

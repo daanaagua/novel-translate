@@ -7,6 +7,8 @@ import type {
   BookWindowStatus,
 } from "../src/fullbook/types.js";
 import { packPhysicalRequests } from "../src/fullbook/request-batcher.js";
+import { buildLosslessBlocks } from "../src/source/block-builder.js";
+import { annotateStructure } from "../src/source/structure-annotator.js";
 import type { LosslessBlock } from "../src/source/types.js";
 import {
   nextConcurrency,
@@ -176,6 +178,33 @@ test("window ids do not depend on lossless structure title text", () => {
   );
 });
 
+test("annotated short chapters retain positional boundaries through builder and planner", () => {
+  const source = [
+    "Chapter I", "", "Alpha.", "",
+    "Chapter II", "", "Beta.", "",
+    "Chapter III", "", "Gamma.",
+  ].join("\n");
+  const sourceVersion = "integrated-source-v1";
+  const annotations = annotateStructure(source, sourceVersion);
+  const chapterIds = annotations
+    .filter((item) => item.kind === "chapter_heading")
+    .map((item) => item.id);
+  const blocks = buildLosslessBlocks(source, annotations, {
+    maxSourceTokens: 1_000,
+    sourceVersion,
+  });
+  const windows = planBookWindows(blocks, {
+    targetSourceTokens: 100,
+    maxSourceTokens: 1_000,
+    maxBlocks: 10,
+  });
+
+  assert.equal(blocks.map((item) => item.sourceText).join(""), source);
+  assert.deepEqual(blocks.map((item) => item.structureId), chapterIds);
+  assert.deepEqual(windows.map((item) => item.blockIds.length), [1, 1, 1]);
+  assert.deepEqual(windows.map((item) => item.chapterId), chapterIds);
+});
+
 test("request batcher packs tiny logical windows without merging their identities", () => {
   const windows = [window(0, 1), window(1, 12), window(2, 2_000)];
   const requests = packPhysicalRequests(windows, {
@@ -223,6 +252,26 @@ test("request batcher enforces token and window-count micro-batch limits", () =>
   assert.deepEqual(tokenBound.map((item) => item.windows.length), [2, 2, 1]);
   assert.deepEqual(tokenBound.map((item) => item.sourceTokens), [40, 40, 20]);
   assert.deepEqual(countBound.map((item) => item.windows.length), [2, 2, 1]);
+});
+
+test("request batcher rejects one oversized logical window without rewriting it", () => {
+  const oversized = {
+    ...window(0, 2_601),
+    oversized: true,
+  };
+
+  assert.throws(
+    () => packPhysicalRequests([oversized], {
+      tinyWindowTokens: 64,
+      maxRequestTokens: 2_600,
+      maxWindowsPerRequest: 6,
+    }),
+    (error: unknown) => error instanceof Error
+      && "code" in error
+      && error.code === "REQUEST_SOURCE_TOKENS_EXCEEDED",
+  );
+  assert.equal(oversized.sourceTokens, 2_601);
+  assert.deepEqual(oversized.blockIds, ["block-0"]);
 });
 
 test("request ids are deterministic, order-stable, and membership-sensitive", () => {

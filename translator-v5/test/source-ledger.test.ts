@@ -36,6 +36,7 @@ interface LedgerFixtureOptions {
   sourceFormat?: string;
   encoding?: string;
   extractor?: string;
+  canonicalSegments?: readonly Record<string, unknown>[];
   excludedRawRanges?: readonly Record<string, unknown>[];
 }
 
@@ -63,7 +64,7 @@ function ledgerFixture(
     canonical_path: "source.txt",
     canonical_chars: scalarLength(source),
     canonical_sha256: sha256(canonical),
-    canonical_segments: [{
+    canonical_segments: options.canonicalSegments ?? [{
       canonical_start: 0,
       canonical_end: scalarLength(source),
       origin_kind: "decoded_bytes",
@@ -107,6 +108,16 @@ test("lossless source ledger verifies hashes and keeps Unicode scalar coordinate
       ["source_format", ".txt"],
       ["encoding", "utf-8"],
       ["extractor", "plain-text-v1"],
+      ["canonical_segments", [[
+        ["canonical_start", 0],
+        ["canonical_end", 4],
+        ["origin_kind", "decoded_bytes"],
+        ["origin_ref", "source/original.txt"],
+        ["transformation", "decode+newline-normalize"],
+        ["raw_start", 0],
+        ["raw_end", Buffer.byteLength("A😀\nB")],
+      ]]],
+      ["excluded_raw_ranges", []],
     ])));
     assert.equal(ledger.canonicalChars, 4);
     assert.equal(ledger.slice(1, 2), "😀");
@@ -181,6 +192,96 @@ test("lossless source version includes raw payload and extraction provenance", (
     rmSync(first.directory, { recursive: true, force: true });
     rmSync(second.directory, { recursive: true, force: true });
     rmSync(third.directory, { recursive: true, force: true });
+  }
+});
+
+test("lossless source version includes validated lineage without JSON field-order drift", () => {
+  const source = "Canonical text.";
+  const raw = Buffer.from("same-container-payload");
+  const segment = {
+    canonical_start: 0,
+    canonical_end: scalarLength(source),
+    origin_kind: "container_member",
+    origin_ref: "OPS/chapter-1.xhtml",
+    transformation: "extract-text",
+  };
+  const common = {
+    raw,
+    sourceFormat: ".epub",
+    encoding: "container",
+    extractor: "epub-spine-v1",
+  };
+  const baseline = ledgerFixture(source, {
+    ...common,
+    canonicalSegments: [segment],
+    excludedRawRanges: [{
+      raw_start: 0,
+      raw_end: raw.length,
+      policy: "EPUB_NON_SPINE_DATA",
+    }],
+  });
+  const changedSegment = ledgerFixture(source, {
+    ...common,
+    canonicalSegments: [{
+      ...segment,
+      origin_ref: "OPS/chapter-2.xhtml",
+    }],
+    excludedRawRanges: [{
+      raw_start: 0,
+      raw_end: raw.length,
+      policy: "EPUB_NON_SPINE_DATA",
+    }],
+  });
+  const changedExclusion = ledgerFixture(source, {
+    ...common,
+    canonicalSegments: [segment],
+    excludedRawRanges: [
+      {
+        raw_start: 0,
+        raw_end: 4,
+        policy: "EPUB_NON_SPINE_DATA",
+      },
+      {
+        raw_start: 4,
+        raw_end: raw.length,
+        policy: "EPUB_NON_SPINE_DATA",
+      },
+    ],
+  });
+  const reorderedFields = ledgerFixture(source, {
+    ...common,
+    canonicalSegments: [{
+      transformation: "extract-text",
+      origin_ref: "OPS/chapter-1.xhtml",
+      origin_kind: "container_member",
+      canonical_end: scalarLength(source),
+      canonical_start: 0,
+    }],
+    excludedRawRanges: [{
+      policy: "EPUB_NON_SPINE_DATA",
+      raw_end: raw.length,
+      raw_start: 0,
+    }],
+  });
+  try {
+    const baselineVersion = SourceLedger.open(baseline.manifestPath).sourceVersion;
+    assert.notEqual(
+      baselineVersion,
+      SourceLedger.open(changedSegment.manifestPath).sourceVersion,
+    );
+    assert.notEqual(
+      baselineVersion,
+      SourceLedger.open(changedExclusion.manifestPath).sourceVersion,
+    );
+    assert.equal(
+      baselineVersion,
+      SourceLedger.open(reorderedFields.manifestPath).sourceVersion,
+    );
+  } finally {
+    rmSync(baseline.directory, { recursive: true, force: true });
+    rmSync(changedSegment.directory, { recursive: true, force: true });
+    rmSync(changedExclusion.directory, { recursive: true, force: true });
+    rmSync(reorderedFields.directory, { recursive: true, force: true });
   }
 });
 
@@ -309,4 +410,20 @@ test("auditor independently detects overlap and source hash tampering", () => {
       (incident) => incident.code === "SOURCE_HASH_MISMATCH",
     ),
   );
+});
+
+test("auditor rejects a zero-length ghost block as an invalid source span", () => {
+  const source = "Alpha.\n\nBeta.";
+  const blocks = buildLosslessBlocks(source, [], { maxSourceTokens: 100 });
+  const ghost = {
+    ...blocks[0]!,
+    canonicalEnd: blocks[0]!.canonicalStart,
+    sourceText: "",
+    sourceHash: sha256(""),
+  };
+  const report = auditSourceCoverage(source, [ghost]);
+
+  assert.equal(report.ok, false);
+  assert.equal(report.incidents[0]?.code, "SOURCE_SPAN_INVALID");
+  assert.equal(report.incidents[0]?.start, report.incidents[0]?.end);
 });

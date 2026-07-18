@@ -117,7 +117,11 @@ function manifestMemberPath(
   return realTarget;
 }
 
-function sourceVersionFor(manifest: Record<string, unknown>): string {
+function sourceVersionFor(
+  manifest: Record<string, unknown>,
+  canonicalSegments: readonly CanonicalSegment[],
+  excludedRawRanges: readonly ExcludedRawRange[],
+): string {
   const identity = [
     ["schema_version", stringField(manifest, "schema_version")],
     ["raw_sha256", stringField(manifest, "raw_sha256")],
@@ -125,6 +129,20 @@ function sourceVersionFor(manifest: Record<string, unknown>): string {
     ["source_format", stringField(manifest, "source_format")],
     ["encoding", stringField(manifest, "encoding")],
     ["extractor", stringField(manifest, "extractor")],
+    ["canonical_segments", canonicalSegments.map((segment) => [
+      ["canonical_start", segment.canonicalStart],
+      ["canonical_end", segment.canonicalEnd],
+      ["origin_kind", segment.originKind],
+      ["origin_ref", segment.originRef],
+      ["transformation", segment.transformation],
+      ["raw_start", segment.rawStart ?? null],
+      ["raw_end", segment.rawEnd ?? null],
+    ])],
+    ["excluded_raw_ranges", excludedRawRanges.map((range) => [
+      ["raw_start", range.rawStart],
+      ["raw_end", range.rawEnd],
+      ["policy", range.policy],
+    ])],
   ];
   return sha256(JSON.stringify(identity));
 }
@@ -313,8 +331,6 @@ export class SourceLedger implements ScalarSource {
         `expected ${COORDINATE_UNIT}, got ${String(manifest.coordinate_unit)}`,
       );
     }
-    const sourceVersion = sourceVersionFor(manifest);
-
     const directory = dirname(resolvedManifestPath);
     const rawPath = manifestMemberPath(directory, stringField(manifest, "raw_path"));
     const canonicalPath = manifestMemberPath(
@@ -367,6 +383,11 @@ export class SourceLedger implements ScalarSource {
     const excludedRawRanges = validateExcludedRanges(
       manifest.excluded_raw_ranges,
       raw.length,
+    );
+    const sourceVersion = sourceVersionFor(
+      manifest,
+      canonicalSegments,
+      excludedRawRanges,
     );
 
     return new SourceLedger({

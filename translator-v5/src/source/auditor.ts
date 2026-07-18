@@ -30,7 +30,7 @@ function validRange(block: LosslessBlock, sourceChars: number): boolean {
   return Number.isSafeInteger(block.canonicalStart)
     && Number.isSafeInteger(block.canonicalEnd)
     && block.canonicalStart >= 0
-    && block.canonicalEnd >= block.canonicalStart
+    && block.canonicalEnd > block.canonicalStart
     && block.canonicalEnd <= sourceChars;
 }
 

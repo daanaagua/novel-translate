@@ -100,18 +100,30 @@ export function buildLosslessBlocks(
   const sortedAnnotations = [...annotations].sort((left, right) => (
     left.start - right.start || left.end - right.end || left.id.localeCompare(right.id)
   ));
+  const structureStarts = [...new Set(
+    sortedAnnotations.map((annotation) => annotation.start),
+  )].filter((start) => start > 0);
   const hardWidth = maxSourceTokens * APPROXIMATE_SCALARS_PER_TOKEN;
   const blocks: LosslessBlock[] = [];
   let cursor = 0;
+  let structureIndex = 0;
   while (cursor < coordinates.length) {
     const hardEnd = Math.min(coordinates.length, cursor + hardWidth);
     let end = cursor;
-    for (const candidate of cuts) {
-      if (candidate > hardEnd) {
-        break;
-      }
-      if (candidate > cursor) {
-        end = candidate;
+    while ((structureStarts[structureIndex] ?? Number.POSITIVE_INFINITY) <= cursor) {
+      structureIndex += 1;
+    }
+    const nextStructureStart = structureStarts[structureIndex];
+    if (nextStructureStart !== undefined && nextStructureStart <= hardEnd) {
+      end = nextStructureStart;
+    } else {
+      for (const candidate of cuts) {
+        if (candidate > hardEnd) {
+          break;
+        }
+        if (candidate > cursor) {
+          end = candidate;
+        }
       }
     }
     if (end === cursor) {
