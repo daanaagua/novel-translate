@@ -326,7 +326,7 @@ git commit -m "feat: build and audit lossless source blocks"
 - 创建：`translator-v5/src/fullbook/request-batcher.ts`
 - 修改：`translator-v5/test/window-planner.test.ts`
 
-- [ ] **步骤 1：编写语义边界和微批的失败测试**
+- [x] **步骤 1：编写语义边界和微批的失败测试**
 
 ```ts
 test("planner balances text size but strongly prefers chapter boundaries", () => {
@@ -344,7 +344,7 @@ test("request batcher packs tiny logical windows without merging their identitie
 });
 ```
 
-- [ ] **步骤 2：运行定向测试确认新参数和 batcher 不存在**
+- [x] **步骤 2：运行定向测试确认新参数和 batcher 不存在**
 
 ```powershell
 Set-Location translator-v5
@@ -353,11 +353,11 @@ node --test --import tsx --test-name-pattern="balances|batcher" test/window-plan
 
 预期：FAIL，缺少 `targetSourceTokens` 或 `packPhysicalRequests`。
 
-- [ ] **步骤 3：用动态规划替换贪心切窗**
+- [x] **步骤 3：用动态规划替换贪心切窗**
 
 对每个合法 block 边界计算：长度偏差、跨结构边界惩罚、过短惩罚和超限无穷惩罚；从尾到头保存最低累计代价及下一个切点。窗口 ID 仍由协议、block IDs 和 source hashes 产生。单 block 超限时允许独立窗口并标记 `oversized`。
 
-- [ ] **步骤 4：实现纯函数 physical request packer**
+- [x] **步骤 4：实现纯函数 physical request packer**
 
 ```ts
 export interface PhysicalRequestPlan {
@@ -374,7 +374,7 @@ export function packPhysicalRequests(
 }
 ```
 
-- [ ] **步骤 5：运行窗口全测、typecheck 并 Commit**
+- [x] **步骤 5：运行窗口全测、typecheck 并 Commit**
 
 ```powershell
 Set-Location translator-v5
