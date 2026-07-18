@@ -521,7 +521,7 @@ git commit -m "feat: snapshot and sequence book knowledge"
 - 修改：`translator-v5/src/fullbook/book-runner.ts`
 - 修改：`translator-v5/test/book-runner.test.ts`
 
-- [ ] **步骤 1：编写一调用多微窗、单窗失败隔离和 doctor 零调用测试**
+- [x] **步骤 1：编写一调用多微窗、单窗失败隔离和 doctor 零调用测试**
 
 ```ts
 test("two tiny logical windows use one physical model session and commit independently", async () => {
@@ -540,14 +540,14 @@ test("failed doctor blocks every model call", async () => {
 });
 ```
 
-- [ ] **步骤 2：运行定向测试确认仍使用 V4 source DB**
+- [x] **步骤 2：运行定向测试确认仍使用 V4 source DB**
 
 ```powershell
 Set-Location translator-v5
 node --test --import tsx --test-name-pattern="tiny logical|failed doctor" test/book-runner.test.ts
 ```
 
-- [ ] **步骤 3：实现 batch agent 的单次终止提交**
+- [x] **步骤 3：实现 batch agent 的单次终止提交**
 
 batch prompt 为每个 island 提供 `windowId`、block IDs 和原文。唯一终止工具为：
 
@@ -564,15 +564,15 @@ interface FinalizeTranslationBatchArgs {
 
 Kernel 校验 window ID 集合完全一致、每个 block 只出现一次。返回后拆成独立 staged window；一个窗口不完整时只标记该窗口失败，合法窗口仍可顺序晋升。
 
-- [ ] **步骤 4：让正式 `BookContext` 从 source manifest 建立 blocks**
+- [x] **步骤 4：让正式 `BookContext` 从 source manifest 建立 blocks**
 
 `BookContext.openLossless({ manifestPath, legacyV4DbPath? })` 加载 SourceLedger、annotations、lossless blocks 和单一 EvidenceIndex。`legacyV4DbPath` 仅调用 `loadStableTerms()`；不得再调用 V4 `loadBlocks()`。旧 `open(databasePath)` 只保留 preview 兼容。
 
-- [ ] **步骤 5：改造 Runner 使用 schema v2、snapshot 和 physical requests**
+- [x] **步骤 5：改造 Runner 使用 schema v2、snapshot 和 physical requests**
 
 `runBook()` 参数替换为 `manifestPath`、可选 `legacyV4DbPath` 和 `runMeta`。开头同步运行 Auditor；通过后初始化 source/run/window plan。每波获取一个 snapshot，执行 physical requests，stage 后交给 Coordinator 按 ordinal 晋升。
 
-- [ ] **步骤 6：运行 Runner 全测、typecheck 并 Commit**
+- [x] **步骤 6：运行 Runner 全测、typecheck 并 Commit**
 
 ```powershell
 Set-Location translator-v5
