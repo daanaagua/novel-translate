@@ -391,7 +391,7 @@ git commit -m "feat: plan semantic windows and micro batches"
 - 创建：`translator-v5/src/storage/lossless-book-store.ts`
 - 创建：`translator-v5/test/lossless-book-store.test.ts`
 
-- [ ] **步骤 1：编写 source/run 约束和回滚失败测试**
+- [x] **步骤 1：编写 source/run 约束和回滚失败测试**
 
 ```ts
 test("store cannot mix translations from two runs", () => {
@@ -413,7 +413,7 @@ test("failed atomic commit leaves no active translation or knowledge row", () =>
 });
 ```
 
-- [ ] **步骤 2：运行测试确认 v2 store 不存在**
+- [x] **步骤 2：运行测试确认 v2 store 不存在**
 
 ```powershell
 Set-Location translator-v5
@@ -422,13 +422,13 @@ node --test --import tsx test/lossless-book-store.test.ts
 
 预期：FAIL，无法导入 `lossless-book-store`。
 
-- [ ] **步骤 3：实现集中 DDL 和显式 run 外键**
+- [x] **步骤 3：实现集中 DDL 和显式 run 外键**
 
 DDL 创建 `source_versions`、`source_ranges`、`structure_annotations`、`logical_blocks`、`translation_runs`、`window_plans`、`window_membership`、`translations`、`knowledge_records`、`knowledge_snapshots`、`migration_candidates`、`recovery_runs` 和 `events`。所有 window、translation、snapshot 都携带 `run_id`；活动译文唯一索引为 `(run_id, block_id) WHERE active=1`。
 
 `translations` 的触发器或提交前检查必须验证 translation source hash 等于 `logical_blocks.source_hash`；`window_membership` 对 `(run_id, block_id)` 唯一，阻止一块进入两个窗口。
 
-- [ ] **步骤 4：实现小而明确的事务 API**
+- [x] **步骤 4：实现小而明确的事务 API**
 
 ```ts
 export class LosslessBookStore {
@@ -446,7 +446,7 @@ export class LosslessBookStore {
 
 v1 `BookStore` 保持只读兼容，不执行原地 schema migration。
 
-- [ ] **步骤 5：运行 store 测试、现有 store 回归和 Commit**
+- [x] **步骤 5：运行 store 测试、现有 store 回归和 Commit**
 
 ```powershell
 Set-Location translator-v5
