@@ -80,7 +80,7 @@ export class CommitCoordinator {
     this.#hooks = hooks;
     this.#currentSnapshot = createKnowledgeSnapshot(
       this.runId,
-      this.knowledge.listRevisions(),
+      this.knowledge.projectableRevisions(),
     );
     this.#snapshots.set(this.#currentSnapshot.id, this.#currentSnapshot);
   }
@@ -164,8 +164,8 @@ export class CommitCoordinator {
     });
   }
 
-  promoteReady(): number[] {
-    const promoted: number[] = [];
+  promoteReady(): string[] {
+    const promoted: string[] = [];
     while (true) {
       const bound = this.#windowsByOrdinal.get(this.#nextOrdinal);
       if (bound === undefined || bound.staged === undefined || bound.promoted) {
@@ -176,7 +176,7 @@ export class CommitCoordinator {
       nextKnowledge.reconcileCandidates(staged.candidates, staged.windowId);
       const nextSnapshot = createKnowledgeSnapshot(
         this.runId,
-        nextKnowledge.listRevisions(),
+        nextKnowledge.projectableRevisions(),
         this.#currentSnapshot.id,
       );
       const promotion = deepFreeze<CommitPromotion>({
@@ -194,7 +194,7 @@ export class CommitCoordinator {
       this.#snapshots.set(nextSnapshot.id, nextSnapshot);
       this.#currentSnapshot = nextSnapshot;
       bound.promoted = true;
-      promoted.push(bound.ordinal);
+      promoted.push(bound.windowId);
       this.#nextOrdinal += 1;
     }
     return promoted;

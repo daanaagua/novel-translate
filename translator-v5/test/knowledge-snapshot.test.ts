@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import test from "node:test";
 
 import {
@@ -6,9 +7,11 @@ import {
   type CommitPromotion,
 } from "../src/fullbook/commit-coordinator.js";
 import {
+  canonicalJson,
   KnowledgeStore,
   transitionAllowed,
   type KnowledgeCandidate,
+  type KnowledgeRevision,
 } from "../src/knowledge/knowledge-store.js";
 import {
   createKnowledgeSnapshot,
@@ -45,6 +48,18 @@ function stage(
   });
 }
 
+function rehashRevision(
+  revision: KnowledgeRevision,
+  changes: Partial<Omit<KnowledgeRevision, "revisionId">>,
+): KnowledgeRevision {
+  const { revisionId: _oldId, ...oldContent } = revision;
+  const content = { ...oldContent, ...changes };
+  return {
+    revisionId: createHash("sha256").update(canonicalJson(content)).digest("hex"),
+    ...content,
+  };
+}
+
 test("parallel windows share one immutable snapshot and promote in ordinal order", () => {
   const coordinator = new CommitCoordinator("run-reverse");
   const snapshotId = bindPair(coordinator);
@@ -53,7 +68,7 @@ test("parallel windows share one immutable snapshot and promote in ordinal order
   assert.deepEqual(coordinator.promoteReady(), []);
 
   stage(coordinator, 0, snapshotId, [candidate("c0", "term", "甲")]);
-  assert.deepEqual(coordinator.promoteReady(), [0, 1]);
+  assert.deepEqual(coordinator.promoteReady(), ["window-0", "window-1"]);
   assert.equal(
     coordinator.activeKnowledge("term", "term")?.status,
     "needs_revalidate",
@@ -94,7 +109,7 @@ test("same-value candidates merge while conflicting values need revalidation", (
   stage(same, 1, sameSnapshot, [
     candidate("same-a", "Name", { notes: { a: 1, b: 2 }, spelling: "阿尔法" }),
   ]);
-  assert.deepEqual(same.promoteReady(), [0, 1]);
+  assert.deepEqual(same.promoteReady(), ["window-0", "window-1"]);
   const merged = same.activeKnowledge("Name", "term");
   assert.equal(merged?.status, "active");
   assert.deepEqual(merged?.candidateIds, ["same-a", "same-b"]);
@@ -173,6 +188,139 @@ test("snapshots are deeply immutable and hash canonical content", () => {
   }, TypeError);
 });
 
+test("snapshots project only the latest translator-visible revision per active key", () => {
+  const store = new KnowledgeStore();
+  store.appendRevision({
+    normalizedSubject: "alpha", kind: "term", payload: "候选",
+    status: "candidate", candidateIds: ["alpha-c"], sourceWindowIds: ["seed"],
+  });
+  store.appendRevision({
+    normalizedSubject: "alpha", kind: "term", payload: "暂定",
+    status: "provisional", candidateIds: ["alpha-p"], sourceWindowIds: ["seed"],
+  });
+  store.appendRevision({
+    normalizedSubject: "beta", kind: "term", payload: "甲",
+    status: "active", candidateIds: ["beta-a"], sourceWindowIds: ["seed"],
+  });
+  store.appendRevision({
+    normalizedSubject: "delta", kind: "term", payload: { alternatives: ["丙", "丁"] },
+    alternatives: ["丁", "丙"], status: "needs_revalidate",
+    candidateIds: ["delta-a", "delta-b"], sourceWindowIds: ["seed"],
+  });
+  store.appendRevision({
+    normalizedSubject: "gamma", kind: "fact", payload: "仅此语境",
+    status: "contextual", candidateIds: ["gamma"], sourceWindowIds: ["seed"],
+  });
+  store.appendRevision({
+    normalizedSubject: "hidden", kind: "term", payload: "未晋升",
+    status: "candidate", candidateIds: ["hidden"], sourceWindowIds: ["seed"],
+  });
+  store.appendRevision({
+    normalizedSubject: "retired", kind: "term", payload: "旧值",
+    status: "active", candidateIds: ["retired"], sourceWindowIds: ["seed"],
+  });
+  store.appendRevision({
+    normalizedSubject: "retired", kind: "term", payload: "旧值",
+    status: "superseded", candidateIds: ["retired"], sourceWindowIds: ["seed"],
+  });
+
+  assert.equal(store.listRevisions().length, 8);
+  assert.deepEqual(store.projectableRevisions().map((item) => [
+    item.normalizedSubject,
+    item.status,
+  ]), [
+    ["alpha", "provisional"],
+    ["beta", "active"],
+    ["delta", "needs_revalidate"],
+    ["gamma", "contextual"],
+  ]);
+
+  const coordinator = new CommitCoordinator("run-projected", store);
+  const initial = coordinator.snapshotForNextWave();
+  assert.deepEqual(
+    initial.revisions.map((item) => item.revisionId),
+    store.projectableRevisions().map((item) => item.revisionId),
+  );
+  coordinator.bindWindow({ ordinal: 0, windowId: "window-0", snapshot: initial });
+  stage(coordinator, 0, initial.id, [candidate("beta-conflict", "beta", "乙")]);
+  assert.deepEqual(coordinator.promoteReady(), ["window-0"]);
+  const next = coordinator.snapshotForNextWave();
+  assert.equal(next.revisions.length, 4);
+  assert.deepEqual(next.revisions.filter((item) => item.normalizedSubject === "beta")
+    .map((item) => item.status), ["needs_revalidate"]);
+  assert.equal(next.revisions.some((item) =>
+    item.status === "candidate" || item.status === "superseded"), false);
+  assert.equal(coordinator.knowledge.listRevisions().length, 9);
+});
+
+test("hydration validates and canonicalizes the complete append-only chain", () => {
+  const seed = new KnowledgeStore();
+  seed.appendRevision({
+    normalizedSubject: "name", kind: "term", payload: { target: "甲" },
+    status: "candidate", candidateIds: ["c0"], sourceWindowIds: ["w0"],
+  });
+  seed.appendRevision({
+    normalizedSubject: "name", kind: "term", payload: { target: "甲" },
+    status: "provisional", candidateIds: ["c0"], sourceWindowIds: ["w0"],
+  });
+  seed.appendRevision({
+    normalizedSubject: "name", kind: "term", payload: { target: "甲" },
+    status: "active", candidateIds: ["c1", "c0"], sourceWindowIds: ["w1", "w0"],
+  });
+  const legal = seed.listRevisions();
+  const hydrated = new KnowledgeStore([...legal].reverse());
+  assert.deepEqual(hydrated.listRevisions(), legal);
+  assert.equal(Object.isFrozen(hydrated.listRevisions()[0]), true);
+  assert.deepEqual(hydrated.fork().listRevisions(), legal);
+  const multiKey = new KnowledgeStore();
+  multiKey.appendRevision({
+    normalizedSubject: "zeta", kind: "term", payload: "末", status: "active",
+  });
+  multiKey.appendRevision({
+    normalizedSubject: "alpha", kind: "term", payload: "首", status: "active",
+  });
+  assert.deepEqual(multiKey.fork().listRevisions(), multiKey.listRevisions());
+
+  const first = legal[0] as KnowledgeRevision;
+  const second = legal[1] as KnowledgeRevision;
+  const revision99 = rehashRevision(second, { revision: 99 });
+  assert.throws(() => new KnowledgeStore([first, revision99]), /continuous|revision/i);
+  assert.throws(() => new KnowledgeStore([
+    first,
+    { ...second, revisionId: "0".repeat(64) },
+  ]), /revision.*id|hash/i);
+  const illegalTransition = rehashRevision(second, { status: "candidate" });
+  assert.throws(() => new KnowledgeStore([first, illegalTransition]), /transition/i);
+  assert.throws(() => new KnowledgeStore([first, first]), /duplicate|revision/i);
+  const gap = rehashRevision(second, { revision: 3 });
+  assert.throws(() => new KnowledgeStore([first, gap]), /continuous|revision/i);
+});
+
+test("hydration rejects malformed runtime revision fields", () => {
+  const seed = new KnowledgeStore();
+  const valid = seed.appendRevision({
+    normalizedSubject: "name", kind: "term", payload: "甲", status: "active",
+    candidateIds: ["c0"], sourceWindowIds: ["w0"],
+  });
+  const malformed: unknown[] = [
+    { ...valid, status: "invented" },
+    { ...valid, normalizedSubject: 7 },
+    { ...valid, kind: [] },
+    { ...valid, candidateIds: "c0" },
+    { ...valid, candidateIds: [7] },
+    { ...valid, sourceWindowIds: [null] },
+    { ...valid, alternatives: "甲" },
+    { ...valid, alternatives: [] },
+    { ...valid, payload: undefined },
+  ];
+  for (const revision of malformed) {
+    assert.throws(
+      () => new KnowledgeStore([revision as KnowledgeRevision]),
+      Error,
+    );
+  }
+});
+
 test("coordinator rejects cross-run and unknown snapshots plus duplicate stages", () => {
   const first = new CommitCoordinator("run-a");
   const second = new CommitCoordinator("run-b");
@@ -223,7 +371,7 @@ test("a promotion failure cannot skip the failing ordinal", () => {
   assert.throws(() => coordinator.promoteReady(), /injected promotion failure/);
   assert.deepEqual(attempts, [0]);
   assert.equal(coordinator.activeKnowledge("Later", "term"), undefined);
-  assert.deepEqual(coordinator.promoteReady(), [0, 1]);
+  assert.deepEqual(coordinator.promoteReady(), ["window-0", "window-1"]);
   assert.deepEqual(attempts, [0, 0, 1]);
 });
 

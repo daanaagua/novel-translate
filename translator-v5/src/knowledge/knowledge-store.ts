@@ -17,6 +17,22 @@ const ALLOWED_TRANSITIONS: Readonly<Record<KnowledgeStatus, readonly KnowledgeSt
   superseded: [],
 };
 
+const KNOWLEDGE_STATUSES = new Set<KnowledgeStatus>([
+  "candidate",
+  "provisional",
+  "active",
+  "needs_revalidate",
+  "contextual",
+  "superseded",
+]);
+
+const PROJECTABLE_STATUSES = new Set<KnowledgeStatus>([
+  "provisional",
+  "active",
+  "needs_revalidate",
+  "contextual",
+]);
+
 export function transitionAllowed(
   from: KnowledgeStatus,
   to: KnowledgeStatus,
@@ -43,6 +59,8 @@ export interface KnowledgeRevision {
   readonly sourceWindowIds: readonly string[];
 }
 
+type KnowledgeRevisionContent = Omit<KnowledgeRevision, "revisionId">;
+
 export interface AppendKnowledgeRevision {
   readonly normalizedSubject: string;
   readonly kind: string;
@@ -65,7 +83,7 @@ function compareText(left: string, right: string): number {
   return left < right ? -1 : left > right ? 1 : 0;
 }
 
-function requireIdentifier(value: string, label: string): string {
+function requireIdentifier(value: unknown, label: string): string {
   if (typeof value !== "string" || value.trim().length === 0) {
     throw new TypeError(`${label} must be nonempty`);
   }
@@ -129,16 +147,16 @@ export function deepFreeze<T>(value: T): T {
   return value;
 }
 
-function digest(value: unknown): string {
-  return createHash("sha256").update(canonicalJson(value)).digest("hex");
-}
-
 function keyOf(normalizedSubject: string, kind: string): string {
   return `${normalizedSubject}\0${kind}`;
 }
 
-function sortedUnique(values: readonly string[]): string[] {
-  return [...new Set(values)].sort(compareText);
+function requireStringArray(value: unknown, label: string): string[] {
+  if (!Array.isArray(value)) {
+    throw new TypeError(`${label} must be an array`);
+  }
+  return [...new Set(value.map((item) => requireIdentifier(item, `${label} item`)))]
+    .sort(compareText);
 }
 
 function sortedAlternatives(values: readonly unknown[]): unknown[] {
@@ -154,6 +172,41 @@ function sortedAlternatives(values: readonly unknown[]): unknown[] {
     .map(([, value]) => value);
 }
 
+function normalizeRevisionContent(input: unknown): KnowledgeRevisionContent {
+  if (input === null || typeof input !== "object" || Array.isArray(input)) {
+    throw new TypeError("knowledge revision must be an object");
+  }
+  const raw = input as Record<string, unknown>;
+  if (!Number.isSafeInteger(raw.revision) || (raw.revision as number) < 1) {
+    throw new TypeError("knowledge revision must be a positive safe integer");
+  }
+  if (typeof raw.status !== "string"
+    || !KNOWLEDGE_STATUSES.has(raw.status as KnowledgeStatus)) {
+    throw new TypeError(`invalid knowledge status: ${String(raw.status)}`);
+  }
+  if (!Array.isArray(raw.alternatives) || raw.alternatives.length === 0) {
+    throw new TypeError("knowledge alternatives must be a nonempty array");
+  }
+  return {
+    revision: raw.revision as number,
+    normalizedSubject: requireIdentifier(raw.normalizedSubject, "normalizedSubject"),
+    kind: requireIdentifier(raw.kind, "kind"),
+    payload: canonicalClone(raw.payload),
+    alternatives: sortedAlternatives(raw.alternatives),
+    status: raw.status as KnowledgeStatus,
+    candidateIds: requireStringArray(raw.candidateIds, "candidateIds"),
+    sourceWindowIds: requireStringArray(raw.sourceWindowIds, "sourceWindowIds"),
+  };
+}
+
+function revisionFromContent(input: unknown): KnowledgeRevision {
+  const content = normalizeRevisionContent(input);
+  const revisionId = createHash("sha256")
+    .update(canonicalJson(content))
+    .digest("hex");
+  return deepFreeze({ revisionId, ...content });
+}
+
 function compareRevision(left: KnowledgeRevision, right: KnowledgeRevision): number {
   return compareText(left.normalizedSubject, right.normalizedSubject)
     || compareText(left.kind, right.kind)
@@ -167,60 +220,99 @@ function compareRevision(left: KnowledgeRevision, right: KnowledgeRevision): num
  */
 export class KnowledgeStore {
   readonly #revisions: KnowledgeRevision[] = [];
-  readonly #activeByKey = new Map<string, KnowledgeRevision>();
+  readonly #latestByKey = new Map<string, KnowledgeRevision>();
 
   constructor(revisions: readonly KnowledgeRevision[] = []) {
-    for (const revision of [...revisions].sort(compareRevision)) {
-      const copy = deepFreeze(canonicalClone(revision));
-      this.#revisions.push(copy);
-      const key = keyOf(copy.normalizedSubject, copy.kind);
-      const previous = this.#activeByKey.get(key);
-      if (previous === undefined || copy.revision > previous.revision) {
-        this.#activeByKey.set(key, copy);
+    if (!Array.isArray(revisions)) {
+      throw new TypeError("knowledge revisions must be an array");
+    }
+    const hydrated = revisions.map((raw) => {
+      if (raw === null || typeof raw !== "object" || Array.isArray(raw)) {
+        throw new TypeError("knowledge revision must be an object");
       }
+      const suppliedId = requireIdentifier(
+        (raw as unknown as Record<string, unknown>).revisionId,
+        "revisionId",
+      );
+      const copy = revisionFromContent(raw);
+      if (suppliedId !== copy.revisionId) {
+        throw new Error(`knowledge revision id/hash mismatch: ${suppliedId}`);
+      }
+      return copy;
+    }).sort(compareRevision);
+    for (const copy of hydrated) {
+      const key = keyOf(copy.normalizedSubject, copy.kind);
+      const previous = this.#latestByKey.get(key);
+      const expectedRevision = (previous?.revision ?? 0) + 1;
+      if (copy.revision !== expectedRevision) {
+        throw new Error(
+          `knowledge revisions must be continuous for ${copy.normalizedSubject}/${copy.kind}: `
+          + `expected ${expectedRevision}, got ${copy.revision}`,
+        );
+      }
+      if (previous !== undefined && !transitionAllowed(previous.status, copy.status)) {
+        throw new Error(
+          `knowledge transition is not allowed: ${previous.status} -> ${copy.status}`,
+        );
+      }
+      this.#revisions.push(copy);
+      this.#latestByKey.set(key, copy);
     }
   }
 
   listRevisions(): readonly KnowledgeRevision[] {
-    return Object.freeze([...this.#revisions]);
+    return Object.freeze([...this.#revisions].sort(compareRevision));
   }
 
   activeKnowledge(
     normalizedSubject: string,
     kind: string,
   ): KnowledgeRevision | undefined {
-    return this.#activeByKey.get(keyOf(normalizedSubject, kind));
+    const latest = this.latestRevision(normalizedSubject, kind);
+    return latest !== undefined && PROJECTABLE_STATUSES.has(latest.status)
+      ? latest
+      : undefined;
+  }
+
+  latestRevision(
+    normalizedSubject: string,
+    kind: string,
+  ): KnowledgeRevision | undefined {
+    return this.#latestByKey.get(keyOf(normalizedSubject, kind));
+  }
+
+  projectableRevisions(): readonly KnowledgeRevision[] {
+    return Object.freeze([...this.#latestByKey.values()]
+      .filter((revision) => PROJECTABLE_STATUSES.has(revision.status))
+      .sort((left, right) =>
+        compareText(left.normalizedSubject, right.normalizedSubject)
+        || compareText(left.kind, right.kind)
+        || compareText(left.revisionId, right.revisionId)));
   }
 
   appendRevision(input: AppendKnowledgeRevision): KnowledgeRevision {
     const normalizedSubject = requireIdentifier(input.normalizedSubject, "normalizedSubject");
     const kind = requireIdentifier(input.kind, "kind");
     const key = keyOf(normalizedSubject, kind);
-    const previous = this.#activeByKey.get(key);
-    if (previous !== undefined && !transitionAllowed(previous.status, input.status)) {
-      throw new Error(`knowledge transition is not allowed: ${previous.status} -> ${input.status}`);
-    }
-    const alternatives = sortedAlternatives(input.alternatives ?? [input.payload]);
-    if (alternatives.length === 0) {
-      throw new TypeError("knowledge alternatives must not be empty");
-    }
+    const previous = this.#latestByKey.get(key);
     const revision = (previous?.revision ?? 0) + 1;
-    const content = {
+    const appended = revisionFromContent({
       revision,
       normalizedSubject,
       kind,
-      payload: canonicalClone(input.payload),
-      alternatives,
+      payload: input.payload,
+      alternatives: input.alternatives ?? [input.payload],
       status: input.status,
-      candidateIds: sortedUnique(input.candidateIds ?? []),
-      sourceWindowIds: sortedUnique(input.sourceWindowIds ?? []),
-    };
-    const appended = deepFreeze<KnowledgeRevision>({
-      revisionId: digest(content),
-      ...content,
+      candidateIds: input.candidateIds ?? [],
+      sourceWindowIds: input.sourceWindowIds ?? [],
     });
+    if (previous !== undefined && !transitionAllowed(previous.status, appended.status)) {
+      throw new Error(
+        `knowledge transition is not allowed: ${previous.status} -> ${appended.status}`,
+      );
+    }
     this.#revisions.push(appended);
-    this.#activeByKey.set(key, appended);
+    this.#latestByKey.set(key, appended);
     return appended;
   }
 
@@ -263,7 +355,7 @@ export class KnowledgeStore {
       group.candidates.sort((left, right) =>
         compareText(canonicalJson(left.payload), canonicalJson(right.payload))
         || compareText(left.recordId, right.recordId));
-      const current = this.activeKnowledge(group.normalizedSubject, group.kind);
+      const current = this.latestRevision(group.normalizedSubject, group.kind);
       const alternatives = sortedAlternatives([
         ...(current?.alternatives ?? []),
         ...group.candidates.map((candidate) => candidate.payload),
@@ -295,9 +387,9 @@ export class KnowledgeStore {
 
   replaceWith(replacement: KnowledgeStore): void {
     this.#revisions.splice(0, this.#revisions.length, ...replacement.#revisions);
-    this.#activeByKey.clear();
-    for (const [key, revision] of replacement.#activeByKey) {
-      this.#activeByKey.set(key, revision);
+    this.#latestByKey.clear();
+    for (const [key, revision] of replacement.#latestByKey) {
+      this.#latestByKey.set(key, revision);
     }
   }
 }
