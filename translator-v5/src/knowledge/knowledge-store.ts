@@ -172,6 +172,21 @@ function sortedAlternatives(values: readonly unknown[]): unknown[] {
     .map(([, value]) => value);
 }
 
+function singletonCandidateStatus(kind: string, payload: unknown): KnowledgeStatus {
+  if (kind !== "entity_alias_link"
+    || payload === null
+    || typeof payload !== "object"
+    || Array.isArray(payload)) {
+    return "active";
+  }
+  const status = (payload as { status?: unknown }).status;
+  return status === "confirmed"
+    ? "active"
+    : status === "conflicted"
+      ? "needs_revalidate"
+      : "provisional";
+}
+
 function normalizeRevisionContent(input: unknown): KnowledgeRevisionContent {
   if (input === null || typeof input !== "object" || Array.isArray(input)) {
     throw new TypeError("knowledge revision must be an object");
@@ -361,7 +376,7 @@ export class KnowledgeStore {
         ...group.candidates.map((candidate) => candidate.payload),
       ]);
       const status: KnowledgeStatus = alternatives.length === 1
-        ? "active"
+        ? singletonCandidateStatus(group.kind, alternatives[0])
         : "needs_revalidate";
       appended.push(this.appendRevision({
         normalizedSubject: group.normalizedSubject,

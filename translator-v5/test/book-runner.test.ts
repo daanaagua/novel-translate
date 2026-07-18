@@ -187,6 +187,128 @@ function losslessBatchResponse(context: Context) {
   }), { stopReason: "toolUse" });
 }
 
+function lexicalAnchorResponse(
+  context: Context,
+  entityLink?: {
+    sourceForms: string[];
+    proposedTarget: string;
+    evidenceQuote: string;
+  },
+) {
+  const prompt = userText(context);
+  const match = /SOURCE-LANGUAGE FORMS AND COMPACT CONCORDANCE\n\n(\[[\s\S]*?\])\n\nESTABLISHED TERMS/u.exec(prompt);
+  assert.ok(match?.[1], prompt.slice(0, 500));
+  const candidates = JSON.parse(match[1]) as Array<{ sourceForm: string }>;
+  return fauxAssistantMessage(fauxToolCall("submit_lexical_anchors", {
+    anchors: candidates.map((candidate) => ({
+      sourceForm: candidate.sourceForm,
+      target: entityLink?.sourceForms.includes(candidate.sourceForm)
+        ? entityLink.proposedTarget
+        : `译-${candidate.sourceForm}`,
+      mode: "stable",
+      confidence: 0.95,
+    })),
+    entityLinks: entityLink === undefined ? [] : [{
+      ...entityLink,
+      evidenceKind: "explicit_naming",
+      confidence: 0.98,
+    }],
+  }), { stopReason: "toolUse" });
+}
+
+test("wave anchor runs once and every physical request receives the same confirmed alias target", async () => {
+  const fixture = losslessFixture(
+    "Loukianos, whom they called Lucian the Scoffer, laughed.\n\nBOOK ONE",
+  );
+  const translationPrompts: string[] = [];
+  fixture.faux.setResponses([
+    (context) => lexicalAnchorResponse(context, {
+      sourceForms: ["Loukianos", "Lucian"],
+      proposedTarget: "卢基阿诺斯",
+      evidenceQuote: "Loukianos, whom they called Lucian the Scoffer, laughed.",
+    }),
+    (context) => {
+      translationPrompts.push(userText(context));
+      return losslessBatchResponse(context);
+    },
+    (context) => {
+      translationPrompts.push(userText(context));
+      return losslessBatchResponse(context);
+    },
+  ]);
+
+  const result = await runBook({
+    ...fixture.options,
+    tinyWindowTokens: 1,
+    maxWindowsPerRequest: 1,
+    maxConcurrency: 2,
+  } as never);
+
+  assert.equal(fixture.faux.state.callCount, 3);
+  assert.equal(result.status.modelCalls, 3);
+  assert.equal(translationPrompts.length, 2);
+  const projectedTerms = translationPrompts.map((prompt) => {
+    const match = /STABLE TERMS\n\n(\[[\s\S]*?\])\n\nUNRESOLVED ENTITY LINKS/u.exec(prompt);
+    assert.ok(match?.[1]);
+    return JSON.parse(match[1]) as Array<{
+      sourceForm: string;
+      target: string;
+      conceptId: string;
+    }>;
+  });
+  assert.deepEqual(projectedTerms[0], projectedTerms[1]);
+  const aliases = projectedTerms[0]!.filter((term) =>
+    term.sourceForm === "Loukianos" || term.sourceForm === "Lucian");
+  assert.equal(aliases.length, 2);
+  assert.equal(new Set(aliases.map((term) => term.target)).size, 1);
+  assert.equal(new Set(aliases.map((term) => term.conceptId)).size, 1);
+
+  const store = new LosslessBookStore(fixture.options.storePath);
+  const revisions = store.knowledgeRevisions("run-lossless");
+  store.close();
+  assert.equal(revisions.filter((revision) => revision.kind === "entity_alias_link").length, 1);
+});
+
+test("failed wave promotes no anchor knowledge and resume reuses its cached anchor decision", async () => {
+  const fixture = losslessFixture(
+    "Loukianos, whom they called Lucian the Scoffer, laughed.",
+  );
+  fixture.faux.setResponses([
+    (context) => lexicalAnchorResponse(context, {
+      sourceForms: ["Loukianos", "Lucian"],
+      proposedTarget: "卢基阿诺斯",
+      evidenceQuote: "Loukianos, whom they called Lucian the Scoffer, laughed.",
+    }),
+    fauxAssistantMessage([], {
+      stopReason: "error",
+      errorMessage: "503: fixture provider unavailable",
+    }),
+  ]);
+
+  await assert.rejects(runBook(fixture.options as never), /provider unavailable/i);
+  const failedStore = new LosslessBookStore(fixture.options.storePath);
+  assert.deepEqual(failedStore.knowledgeRevisions("run-lossless"), []);
+  failedStore.close();
+
+  const resumedProvider = fauxProvider();
+  resumedProvider.setResponses([losslessBatchResponse]);
+  const resumed = await runBook({
+    ...fixture.options,
+    model: resumedProvider.getModel(),
+    streamFn: resumedProvider.provider.streamSimple.bind(resumedProvider.provider),
+  } as never);
+
+  assert.equal(resumedProvider.state.callCount, 1);
+  assert.equal(resumed.status.completedWindows, 1);
+  const recoveredStore = new LosslessBookStore(fixture.options.storePath);
+  assert.equal(
+    recoveredStore.knowledgeRevisions("run-lossless")
+      .filter((revision) => revision.kind === "entity_alias_link").length,
+    1,
+  );
+  recoveredStore.close();
+});
+
 test("two tiny logical windows use one physical model session and commit independently", async () => {
   const fixture = losslessFixture("EDGEWOOD\n\nBOOK ONE");
   fixture.faux.setResponses([fauxAssistantMessage(fauxToolCall(

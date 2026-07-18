@@ -5,13 +5,24 @@ import { join, resolve } from "node:path";
 import type { StreamFn } from "@earendil-works/pi-agent-core";
 import type { Model } from "@earendil-works/pi-ai";
 
-import type { LexicalAnchor } from "../agents/lexical-anchorer.js";
-import { ModelProviderError } from "../agents/pi-runtime.js";
+import {
+  collectWindowAnchorCandidates,
+  LexicalAnchorer,
+  type LexicalAnchor,
+  type LexicalAnchorOutcome,
+} from "../agents/lexical-anchorer.js";
+import { ModelProviderError, PiRuntime } from "../agents/pi-runtime.js";
 import { runTranslationBatch } from "../agents/translation-batch.js";
+import { entityLinkAsTerms, type EntityLink } from "../domain/entity-links.js";
+import type { StableTerm, V4Block } from "../domain/types.js";
 import { DEFAULT_BUDGET_LIMITS } from "../kernel/budget.js";
 import { BudgetLedger } from "../kernel/budget.js";
 import { RunLease } from "../kernel/run-lease.js";
-import { KnowledgeStore, type KnowledgeCandidate } from "../knowledge/knowledge-store.js";
+import {
+  canonicalJson,
+  KnowledgeStore,
+  type KnowledgeCandidate,
+} from "../knowledge/knowledge-store.js";
 import { createKnowledgeSnapshot } from "../knowledge/snapshot.js";
 import { SourceLedger } from "../source/source-ledger.js";
 import {
@@ -528,6 +539,223 @@ function knowledgeCandidatesFor(
   });
 }
 
+interface WaveKnowledgeCandidate {
+  candidate: KnowledgeCandidate;
+  sourceForms: readonly string[];
+}
+
+interface WaveAnchorSnapshot {
+  schemaVersion: "v5-wave-anchor-1";
+  inputHash: string;
+  anchors: readonly LexicalAnchor[];
+  entityLinks: readonly EntityLink[];
+  terms: readonly StableTerm[];
+}
+
+function waveAnchorInputHash(
+  context: BookContext,
+  candidates: readonly { sourceForm: string; contexts: readonly string[] }[],
+  stableTerms: readonly StableTerm[],
+): string {
+  return createHash("sha256").update(canonicalJson({
+    schemaVersion: "v5-wave-anchor-input-1",
+    profile: {
+      id: context.languageProfile.id,
+      version: context.languageProfile.version,
+    },
+    candidates,
+    stableTerms: stableTerms.map((term) => ({
+      sourceForm: term.sourceForm,
+      canonicalSource: term.canonicalSource,
+      target: term.target,
+      locked: term.locked,
+    })),
+  })).digest("hex");
+}
+
+function parseWaveAnchorSnapshot(
+  value: unknown,
+  expectedInputHash: string,
+): WaveAnchorSnapshot {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error("corrupt cached wave anchor decision");
+  }
+  const candidate = value as Partial<WaveAnchorSnapshot>;
+  if (candidate.schemaVersion !== "v5-wave-anchor-1"
+    || candidate.inputHash !== expectedInputHash
+    || !Array.isArray(candidate.anchors)
+    || !Array.isArray(candidate.entityLinks)
+    || !Array.isArray(candidate.terms)) {
+    throw new Error("corrupt cached wave anchor decision");
+  }
+  return structuredClone(candidate as WaveAnchorSnapshot);
+}
+
+function unresolvedEntityWarnings(snapshot: WaveAnchorSnapshot | undefined): string[] {
+  return snapshot?.entityLinks.filter((link) => link.status !== "confirmed")
+    .map((link) => [
+      link.sourceForms.join(" / "),
+      link.status,
+      "same-entity relation is unresolved; do not lock them to one Chinese target",
+    ].join(": ")) ?? [];
+}
+
+function losslessAsV4(block: BookContext["losslessBlocks"][number]): V4Block {
+  return {
+    id: block.id,
+    legacyId: null,
+    chapterId: block.structureId,
+    chapterTitle: block.structureTitle,
+    globalIndex: block.globalIndex,
+    blockIndex: block.globalIndex,
+    sourceText: block.sourceText,
+    sourceHash: block.sourceHash,
+    tokenCount: block.tokenCount,
+  };
+}
+
+function withoutStructureHeadingLines(
+  block: V4Block,
+  context: BookContext,
+): V4Block | undefined {
+  const sourceText = block.sourceText.split(/\r?\n/gu)
+    .filter((line) => context.languageProfile.detectStructureHeading(line.trim()) === null)
+    .join("\n")
+    .trim();
+  return sourceText.length === 0 ? undefined : { ...block, sourceText };
+}
+
+function termsFromKnowledge(
+  revisions: readonly unknown[],
+): StableTerm[] {
+  const terms: StableTerm[] = [];
+  for (const raw of revisions) {
+    if (raw === null || typeof raw !== "object" || Array.isArray(raw)) {
+      continue;
+    }
+    const revision = raw as { kind?: unknown; payload?: unknown; status?: unknown };
+    if (revision.status !== "active") {
+      continue;
+    }
+    if (revision.kind === "lexical_anchor"
+      && revision.payload !== null
+      && typeof revision.payload === "object"
+      && !Array.isArray(revision.payload)) {
+      const term = revision.payload as Partial<StableTerm>;
+      if (typeof term.conceptId === "string"
+        && typeof term.lexemeId === "string"
+        && typeof term.sourceForm === "string"
+        && typeof term.canonicalSource === "string"
+        && typeof term.target === "string"
+        && typeof term.locked === "boolean") {
+        terms.push(term as StableTerm);
+      }
+    }
+    if (revision.kind === "entity_alias_link"
+      && revision.payload !== null
+      && typeof revision.payload === "object"
+      && !Array.isArray(revision.payload)) {
+      terms.push(...entityLinkAsTerms(revision.payload as EntityLink));
+    }
+  }
+  return terms;
+}
+
+function uniqueTerms(
+  terms: readonly StableTerm[],
+  context: BookContext,
+): StableTerm[] {
+  const byForm = new Map<string, StableTerm>();
+  for (const term of terms) {
+    byForm.set(context.languageProfile.normalizeSourceForm(term.sourceForm), { ...term });
+  }
+  return [...byForm.values()].sort((left, right) =>
+    left.sourceForm.localeCompare(right.sourceForm));
+}
+
+function waveKnowledgeCandidates(
+  runId: string,
+  outcome: Pick<WaveAnchorSnapshot, "terms" | "entityLinks"> | undefined,
+  context: BookContext,
+): WaveKnowledgeCandidate[] {
+  if (outcome === undefined) {
+    return [];
+  }
+  const entityForms = new Set(outcome.entityLinks.flatMap((link) =>
+    link.normalizedForms));
+  const result: WaveKnowledgeCandidate[] = [];
+  for (const term of outcome.terms) {
+    if (entityForms.has(context.languageProfile.normalizeSourceForm(term.sourceForm))) {
+      continue;
+    }
+    const payload = { ...term };
+    result.push({
+      candidate: {
+        recordId: `wave-anchor-${createHash("sha256")
+          .update(`${runId}\0${canonicalJson(payload)}`)
+          .digest("hex")
+          .slice(0, 24)}`,
+        normalizedSubject: context.languageProfile.normalizeSourceForm(term.sourceForm),
+        kind: "lexical_anchor",
+        payload,
+      },
+      sourceForms: [term.sourceForm],
+    });
+  }
+  for (const link of outcome.entityLinks) {
+    result.push({
+      candidate: {
+        recordId: `wave-entity-${createHash("sha256")
+          .update(`${runId}\0${canonicalJson(link)}`)
+          .digest("hex")
+          .slice(0, 24)}`,
+        normalizedSubject: `entity-alias:${link.linkId}`,
+        kind: "entity_alias_link",
+        payload: link,
+      },
+      sourceForms: link.sourceForms,
+    });
+  }
+  return result;
+}
+
+function windowContainsAnyForm(
+  window: PersistedLosslessWindow,
+  forms: readonly string[],
+  blockById: ReadonlyMap<string, BookContext["losslessBlocks"][number]>,
+  context: BookContext,
+): boolean {
+  const requested = new Set(forms.map((form) =>
+    context.languageProfile.normalizeSourceForm(form)));
+  return window.blockIds.some((blockId) => {
+    const block = blockById.get(blockId);
+    return block !== undefined && context.languageProfile.segment(block.sourceText)
+      .some((token) => token.isWordLike && requested.has(token.normalized));
+  });
+}
+
+function assignWaveKnowledge(
+  candidates: readonly WaveKnowledgeCandidate[],
+  selected: readonly PersistedLosslessWindow[],
+  successfulWindowIds: ReadonlySet<string>,
+  blockById: ReadonlyMap<string, BookContext["losslessBlocks"][number]>,
+  context: BookContext,
+): Map<string, KnowledgeCandidate[]> {
+  const assigned = new Map<string, KnowledgeCandidate[]>();
+  const successful = selected.filter((window) => successfulWindowIds.has(window.windowId));
+  for (const item of candidates) {
+    const owner = successful.find((window) =>
+      windowContainsAnyForm(window, item.sourceForms, blockById, context));
+    if (owner === undefined) {
+      continue;
+    }
+    const values = assigned.get(owner.windowId) ?? [];
+    values.push(item.candidate);
+    assigned.set(owner.windowId, values);
+  }
+  return assigned;
+}
+
 function firstUncommitted(
   windows: readonly PersistedLosslessWindow[],
 ): PersistedLosslessWindow | undefined {
@@ -670,6 +898,61 @@ async function runLosslessBook(
       }
 
       const snapshot = store.latestKnowledgeSnapshot(runId);
+      const establishedTerms = uniqueTerms([
+        ...context.stableTerms,
+        ...termsFromKnowledge(snapshot.revisions),
+      ], context);
+      const selectedBlocks = selected.flatMap((window) => window.blockIds
+        .map((blockId) => blockById.get(blockId))
+        .filter((block): block is NonNullable<typeof block> => block !== undefined))
+        .map(losslessAsV4);
+      const corpusBlocks = context.losslessBlocks.map(losslessAsV4);
+      const anchorCandidates = collectWindowAnchorCandidates(
+        selectedBlocks.map((block) => withoutStructureHeadingLines(block, context))
+          .filter((block): block is V4Block => block !== undefined),
+        corpusBlocks.map((block) => withoutStructureHeadingLines(block, context))
+          .filter((block): block is V4Block => block !== undefined),
+        establishedTerms,
+        [],
+        context.languageProfile,
+      );
+      const anchorBudget = new BudgetLedger();
+      let waveAnchorSnapshot: WaveAnchorSnapshot | undefined;
+      if (anchorCandidates.length >= 2) {
+        const inputHash = waveAnchorInputHash(context, anchorCandidates, establishedTerms);
+        const cached = store.waveAnchorDecision(runId, inputHash);
+        if (cached !== undefined) {
+          waveAnchorSnapshot = parseWaveAnchorSnapshot(cached, inputHash);
+        } else {
+          const outcome: LexicalAnchorOutcome = await new LexicalAnchorer(new PiRuntime()).run({
+            candidates: anchorCandidates,
+            stableTerms: establishedTerms,
+            model: options.model,
+            streamFn: options.streamFn,
+            budget: anchorBudget,
+            sourceLanguageProfile: context.languageProfile,
+            deadlineMs: options.hardDeadlineMs,
+          });
+          waveAnchorSnapshot = {
+            schemaVersion: "v5-wave-anchor-1",
+            inputHash,
+            anchors: outcome.anchors,
+            entityLinks: outcome.entityLinks,
+            terms: outcome.terms,
+          };
+          store.cacheWaveAnchorDecision(runId, inputHash, waveAnchorSnapshot);
+        }
+      }
+      const activeTerms = uniqueTerms([
+        ...establishedTerms,
+        ...(waveAnchorSnapshot?.terms ?? []),
+      ], context);
+      const unpersistedWaveKnowledge = waveKnowledgeCandidates(
+        runId,
+        waveAnchorSnapshot,
+        context,
+      );
+      const entityLinkWarnings = unresolvedEntityWarnings(waveAnchorSnapshot);
       const coordinator = new CommitCoordinator(
         runId,
         new KnowledgeStore(store.knowledgeRevisions(runId)),
@@ -688,6 +971,19 @@ async function runLosslessBook(
       let retryWindows = selected;
       let providerFailure: ModelProviderError | undefined;
       let initialRequestCount = 0;
+      let anchorBudgetPending = Object.keys(anchorBudget.snapshot()).length > 0;
+      const persistedBudgetFor = (
+        window: PersistedLosslessWindow,
+        requestBudget: Readonly<Record<string, number>>,
+        receivesRequestBudget: boolean,
+      ): Record<string, number> => {
+        let increment = receivesRequestBudget ? requestBudget : {};
+        if (anchorBudgetPending && window.windowId === selected[0]?.windowId) {
+          increment = combinedBudget(increment, anchorBudget.snapshot());
+          anchorBudgetPending = false;
+        }
+        return combinedBudget(window.budget, increment);
+      };
       while (retryWindows.length > 0 && providerFailure === undefined) {
         store.bindWindowsToSnapshot(
           runId,
@@ -721,12 +1017,14 @@ async function runLosslessBook(
             const result = await runTranslationBatch({
               request,
               blocks: context.losslessBlocks,
-              stableTerms: context.stableTerms,
+              stableTerms: activeTerms,
               snapshot,
               model: options.model,
               streamFn: options.streamFn,
               budget,
               styleState: options.styleState,
+              sourceLanguageProfile: context.languageProfile,
+              entityLinkWarnings,
               deadlineMs: options.hardDeadlineMs,
             });
             completionOrder.push({ request, budget, result });
@@ -735,6 +1033,24 @@ async function runLosslessBook(
           }
         }));
 
+        const successfulWindowIds = new Set(completionOrder.flatMap((completed) =>
+          completed.result?.windows
+            .filter((window) => window.status !== "failed")
+            .map((window) => window.windowId) ?? []));
+        const assignedWaveKnowledge = assignWaveKnowledge(
+          unpersistedWaveKnowledge,
+          selected,
+          successfulWindowIds,
+          blockById,
+          context,
+        );
+        const assignedRecordIds = new Set([...assignedWaveKnowledge.values()]
+          .flatMap((items) => items.map((item) => item.recordId)));
+        for (let index = unpersistedWaveKnowledge.length - 1; index >= 0; index -= 1) {
+          if (assignedRecordIds.has(unpersistedWaveKnowledge[index]!.candidate.recordId)) {
+            unpersistedWaveKnowledge.splice(index, 1);
+          }
+        }
         const nextRetries: PersistedLosslessWindow[] = [];
         for (const completed of completionOrder) {
           if (completed.error !== undefined) {
@@ -748,11 +1064,10 @@ async function runLosslessBook(
               store.failWindow(runId, window.windowId, {
                 error: message,
                 retry,
-                budget: combinedBudget(
-                  window.budget,
-                  completed.request.windows[0]?.windowId === window.windowId
-                    ? completed.budget.snapshot()
-                    : {},
+                budget: persistedBudgetFor(
+                  window,
+                  completed.budget.snapshot(),
+                  completed.request.windows[0]?.windowId === window.windowId,
                 ),
                 warnings: external
                   ? ["external model provider failure; run aborted without human task"]
@@ -778,11 +1093,10 @@ async function runLosslessBook(
               store.failWindow(runId, window.windowId, {
                 error,
                 retry,
-                budget: combinedBudget(
-                  window.budget,
-                  completed.request.windows[0]?.windowId === window.windowId
-                    ? completed.budget.snapshot()
-                    : {},
+                budget: persistedBudgetFor(
+                  window,
+                  completed.budget.snapshot(),
+                  completed.request.windows[0]?.windowId === window.windowId,
                 ),
                 warnings: [error, ...result.responseErrors],
               });
@@ -793,11 +1107,14 @@ async function runLosslessBook(
               continue;
             }
 
-            const candidates = knowledgeCandidatesFor(
-              runId,
-              window.windowId,
-              windowResult.memoryCandidates,
-            );
+            const candidates = [
+              ...knowledgeCandidatesFor(
+                runId,
+                window.windowId,
+                windowResult.memoryCandidates,
+              ),
+              ...(assignedWaveKnowledge.get(window.windowId) ?? []),
+            ];
             // Validate domain reconciliation before any durable stage is written.
             coordinator.knowledge.fork().reconcileCandidates(candidates, window.windowId);
             const ordinal = relativeOrdinal.get(window.windowId) as number;
@@ -820,11 +1137,10 @@ async function runLosslessBook(
                 .map((translation) => translation.text)
                 .join("\n\n")
                 .slice(-4_000),
-              budget: combinedBudget(
-                window.budget,
-                completed.request.windows[0]?.windowId === window.windowId
-                  ? completed.budget.snapshot()
-                  : {},
+              budget: persistedBudgetFor(
+                window,
+                completed.budget.snapshot(),
+                completed.request.windows[0]?.windowId === window.windowId,
               ),
               warnings,
             });

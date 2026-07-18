@@ -5,6 +5,8 @@ import type { StableTerm } from "../domain/types.js";
 import type { PhysicalRequestPlan } from "../fullbook/types.js";
 import type { BudgetLedger } from "../kernel/budget.js";
 import { canonicalJson } from "../knowledge/knowledge-store.js";
+import { getSourceLanguageProfile } from "../language/profiles.js";
+import type { SourceLanguageProfile } from "../language/types.js";
 import type { LosslessBlock } from "../source/types.js";
 import type { TranslationMemoryCandidate } from "../tools/candidate-collector.js";
 import {
@@ -38,6 +40,8 @@ export interface TranslationBatchInput {
   budget: BudgetLedger;
   styleState?: Readonly<Record<string, string>>;
   previousActiveTail?: string;
+  sourceLanguageProfile?: SourceLanguageProfile;
+  entityLinkWarnings?: readonly string[];
   signal?: AbortSignal;
   deadlineMs?: number;
 }
@@ -144,6 +148,7 @@ function validateSubmission(
 }
 
 function promptFor(input: TranslationBatchInput): string {
+  const profile = input.sourceLanguageProfile ?? getSourceLanguageProfile("en");
   const blockById = new Map(input.blocks.map((block) => [block.id, block]));
   const windows = input.request.windows.map((window) => ({
     windowId: window.windowId,
@@ -159,12 +164,15 @@ function promptFor(input: TranslationBatchInput): string {
   return [
     `PHYSICAL REQUEST ${input.request.requestId}`,
     `KNOWLEDGE SNAPSHOT ${input.snapshot.id}`,
+    `SOURCE LANGUAGE ${profile.displayName} (${profile.id}); TARGET LANGUAGE Chinese (zh)`,
     "KNOWLEDGE SNAPSHOT REVISIONS",
     canonicalJson(input.snapshot.revisions),
     "WINDOWS",
     JSON.stringify(windows),
     "STABLE TERMS",
     JSON.stringify(input.stableTerms),
+    "UNRESOLVED ENTITY LINKS",
+    JSON.stringify(input.entityLinkWarnings ?? []),
     "PREVIOUS ACTIVE TAIL",
     input.previousActiveTail ?? "",
     "STYLE STATE",
@@ -178,6 +186,7 @@ export async function runTranslationBatch(
 ): Promise<TranslationBatchResult> {
   nonempty(input.request.requestId, "requestId");
   nonempty(input.snapshot.id, "snapshotId");
+  const profile = input.sourceLanguageProfile ?? getSourceLanguageProfile("en");
   let submission: FinalizeTranslationBatchArgs | undefined;
   let duplicateTerminalCalls = 0;
   const finalizeTool: TypedToolSpec = {
@@ -216,6 +225,7 @@ export async function runTranslationBatch(
   const run = await new PiRuntime().run({
     systemPrompt: [
       "Translate the complete source text into polished, accurate Chinese literary prose.",
+      `The source language is ${profile.displayName} (${profile.id}); the target language is Chinese (zh).`,
       "Preserve meaning, ambiguity, paragraph structure, voice, and every block boundary.",
       "Logical windows remain independent even though this is one physical request.",
       "Use typed tools only and call finalize_translation_batch exactly once.",

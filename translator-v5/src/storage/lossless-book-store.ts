@@ -175,6 +175,11 @@ export interface CandidateHistoryRecord {
   stageState: "staged" | "promoted";
 }
 
+export interface CachedWaveAnchorDecision {
+  inputHash: string;
+  decision: unknown;
+}
+
 export interface AuditProjection {
   runId: string;
   sourceVersion: string;
@@ -1632,6 +1637,40 @@ export class LosslessBookStore {
       payload: JSON.parse(row.payload_json) as unknown,
       stageState: row.stage_state,
     }));
+  }
+
+  waveAnchorDecision(runId: string, inputHash: string): unknown | undefined {
+    this.#run(runId);
+    requireNonempty(inputHash, "wave anchor inputHash");
+    const matches = all<{ payload_json: string }>(this.#database.prepare(`
+      SELECT payload_json FROM events
+      WHERE run_id=? AND kind='wave_anchor_cached'
+      ORDER BY sequence
+    `), runId).map((row) => JSON.parse(row.payload_json) as CachedWaveAnchorDecision)
+      .filter((item) => item.inputHash === inputHash);
+    if (matches.length === 0) {
+      return undefined;
+    }
+    const canonical = canonicalJson(matches[0]?.decision);
+    if (matches.some((item) => canonicalJson(item.decision) !== canonical)) {
+      throw new Error(`conflicting cached wave anchor decision for ${inputHash}`);
+    }
+    return structuredClone(matches[0]?.decision);
+  }
+
+  cacheWaveAnchorDecision(runId: string, inputHash: string, decision: unknown): void {
+    this.#run(runId);
+    requireNonempty(inputHash, "wave anchor inputHash");
+    const existing = this.waveAnchorDecision(runId, inputHash);
+    if (existing !== undefined) {
+      if (canonicalJson(existing) !== canonicalJson(decision)) {
+        throw new Error(`cached wave anchor decision mismatch for ${inputHash}`);
+      }
+      return;
+    }
+    this.#transaction(() => {
+      this.#appendEvent(runId, "wave_anchor_cached", { inputHash, decision });
+    });
   }
 
   auditRows(runId: string): AuditProjection {
