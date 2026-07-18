@@ -80,6 +80,32 @@ export interface BookArtifactPaths {
   metrics: string;
 }
 
+export interface LosslessBookArtifactPaths extends BookArtifactPaths {
+  translationLineage: string;
+  bilingualLineage: string;
+  auditLineage: string;
+  epub?: string;
+}
+
+export interface LosslessBookLineageBlock {
+  ordinal: number;
+  blockId: string;
+  sourceHash: string;
+  translationRevision: number | null;
+}
+
+export interface LosslessBookLineage {
+  schema: "v5-book-lineage-1";
+  runId: string;
+  sourceVersion: string;
+  protocolVersion: string;
+  modelId: string;
+  runMetadata: unknown;
+  complete: boolean;
+  missingBlockIds: string[];
+  blocks: LosslessBookLineageBlock[];
+}
+
 export function bookArtifactFileNames(complete: boolean): BookArtifactPaths {
   const qualifier = complete ? "" : ".partial";
   return {
@@ -370,12 +396,62 @@ export function auditLosslessBookStore(
   };
 }
 
+export function losslessBookLineage(
+  store: LosslessBookStore,
+  runId: string,
+): LosslessBookLineage {
+  const audit = auditLosslessBookStore(store, runId);
+  if (audit.incidentCodes.length > 0) {
+    throw new Error(`lossless lineage audit failed: ${audit.incidentCodes.join(",")}`);
+  }
+  const state = store.auditState(runId);
+  const active = new Map(store.activeTranslations(runId).map((item) => [item.blockId, item]));
+  return {
+    schema: "v5-book-lineage-1",
+    runId: audit.runId,
+    sourceVersion: audit.sourceVersion,
+    protocolVersion: audit.protocolVersion,
+    modelId: audit.modelId,
+    runMetadata: audit.runMetadata,
+    complete: audit.complete,
+    missingBlockIds: audit.missingBlockIds,
+    blocks: [...state.blocks]
+      .sort((left, right) => left.globalIndex - right.globalIndex)
+      .map((block) => ({
+        ordinal: block.globalIndex,
+        blockId: block.blockId,
+        sourceHash: block.sourceHash,
+        translationRevision: active.get(block.blockId)?.version ?? null,
+      })),
+  };
+}
+
+function lineageFileName(artifactFileName: string): string {
+  return `${artifactFileName.replace(/\.(?:txt|json)$/u, "")}.lineage.json`;
+}
+
+export function losslessBookArtifactPaths(
+  outputDirectory: string,
+  complete: boolean,
+): LosslessBookArtifactPaths {
+  const names = bookArtifactFileNames(complete);
+  return {
+    translation: join(outputDirectory, names.translation),
+    bilingual: join(outputDirectory, names.bilingual),
+    audit: join(outputDirectory, names.audit),
+    metrics: join(outputDirectory, names.metrics),
+    translationLineage: join(outputDirectory, lineageFileName(names.translation)),
+    bilingualLineage: join(outputDirectory, lineageFileName(names.bilingual)),
+    auditLineage: join(outputDirectory, lineageFileName(names.audit)),
+  };
+}
+
 export function writeLosslessBookArtifacts(
   store: LosslessBookStore,
   runId: string,
   outputDirectory: string,
   options: { allowIncomplete?: boolean } = {},
-): BookArtifactPaths {
+): LosslessBookArtifactPaths {
   const audit = auditLosslessBookStore(store, runId);
   if (audit.incidentCodes.length > 0) {
     throw new Error(`lossless export audit failed: ${audit.incidentCodes.join(",")}`);
@@ -407,13 +483,7 @@ export function writeLosslessBookArtifacts(
       };
     });
   mkdirSync(outputDirectory, { recursive: true });
-  const names = bookArtifactFileNames(audit.complete);
-  const paths = {
-    translation: join(outputDirectory, names.translation),
-    bilingual: join(outputDirectory, names.bilingual),
-    audit: join(outputDirectory, names.audit),
-    metrics: join(outputDirectory, names.metrics),
-  };
+  const paths = losslessBookArtifactPaths(outputDirectory, audit.complete);
   writeFileSync(paths.translation, renderTranslation(translations), "utf8");
   writeFileSync(paths.bilingual, renderBilingual(translations), "utf8");
   writeFileSync(paths.audit, `${JSON.stringify(audit, null, 2)}\n`, "utf8");
@@ -429,6 +499,10 @@ export function writeLosslessBookArtifacts(
     missingBlockCount: audit.missingBlockCount,
     status: store.statusSummary(runId),
   }, null, 2)}\n`, "utf8");
+  const lineageJson = `${JSON.stringify(losslessBookLineage(store, runId), null, 2)}\n`;
+  writeFileSync(paths.translationLineage, lineageJson, "utf8");
+  writeFileSync(paths.bilingualLineage, lineageJson, "utf8");
+  writeFileSync(paths.auditLineage, lineageJson, "utf8");
   return paths;
 }
 

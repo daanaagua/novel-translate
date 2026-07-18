@@ -29,8 +29,11 @@ import type { IncidentCode } from "./recovery/types.js";
 import {
   auditLosslessBookStore,
   type BookArtifactPaths,
+  losslessBookArtifactPaths,
   writeLosslessBookArtifacts,
 } from "./report.js";
+import { verifyExport } from "./export/export-verifier.js";
+import { importLegacyV1 } from "./migration/v1-importer.js";
 import { auditSourceCoverage } from "./source/auditor.js";
 import { buildLosslessBlocks } from "./source/block-builder.js";
 import { SourceIntegrityError, SourceLedger } from "./source/source-ledger.js";
@@ -43,6 +46,8 @@ export type CliCommand =
   | "book-doctor"
   | "book-audit"
   | "book-recover"
+  | "book-verify-export"
+  | "book-migrate-v1"
   | "book-run"
   | "book-status"
   | "book-export";
@@ -52,10 +57,12 @@ export interface CliOptions {
   db?: string;
   manifest?: string;
   legacyV4Db?: string;
+  legacyStore?: string;
   runId?: string;
   incidentCode?: IncidentCode;
   config?: string;
   output?: string;
+  epub?: string;
   store?: string;
   globalIndexes?: number[];
   preflightOnly?: boolean;
@@ -308,7 +315,7 @@ export function parseArgs(argv: readonly string[]): CliOptions {
   }
   if (argv[0] !== "book" || argv[1] === undefined) {
     throw new Error(
-      "usage: pilot preview ... | pilot book preflight|doctor|audit|run|status|export ...",
+      "usage: pilot preview ... | pilot book preflight|doctor|audit|recover|verify-export|migrate-v1|run|status|export ...",
     );
   }
   const action = argv[1];
@@ -393,6 +400,34 @@ export function parseArgs(argv: readonly string[]): CliOptions {
       ...(config === undefined ? {} : { config }),
       ...(openCodeAuth === undefined ? {} : { openCodeAuth }),
       ...(hardDeadlineMs === undefined ? {} : { hardDeadlineMs }),
+    };
+  }
+  if (action === "verify-export") {
+    const { values } = parseFlags(
+      argv.slice(2),
+      "book verify-export",
+      ["--store", "--run", "--output", "--epub"],
+    );
+    const epub = pathValue(values, "--epub", false);
+    return {
+      command: "book-verify-export",
+      store: pathValue(values, "--store"),
+      runId: identifierValue(values, "--run", true),
+      output: pathValue(values, "--output"),
+      ...(epub === undefined ? {} : { epub }),
+    };
+  }
+  if (action === "migrate-v1") {
+    const { values } = parseFlags(
+      argv.slice(2),
+      "book migrate-v1",
+      ["--legacy-store", "--manifest", "--store"],
+    );
+    return {
+      command: "book-migrate-v1",
+      legacyStore: pathValue(values, "--legacy-store"),
+      manifest: pathValue(values, "--manifest"),
+      store: pathValue(values, "--store"),
     };
   }
   if (action === "run") {
@@ -501,6 +536,40 @@ export async function main(
         throw new CliCommandError(
           "BOOK_AUDIT_FAILED",
           `integrity incidents: ${report.incidentCodes.join(",")}`,
+        );
+      }
+    } finally {
+      store.close();
+    }
+    return;
+  }
+  if (options.command === "book-migrate-v1") {
+    console.log(JSON.stringify(importLegacyV1({
+      legacyStorePath: requireOption(options, "legacyStore"),
+      manifestPath: requireOption(options, "manifest"),
+      storePath: requireOption(options, "store"),
+    }), null, 2));
+    return;
+  }
+  if (options.command === "book-verify-export") {
+    const store = new LosslessBookStore(requireOption(options, "store"));
+    try {
+      const runId = requireOption(options, "runId");
+      const audit = auditLosslessBookStore(store, runId);
+      const paths = losslessBookArtifactPaths(
+        requireOption(options, "output"),
+        audit.complete,
+      );
+      const result = verifyExport(
+        options.epub === undefined ? paths : { ...paths, epub: options.epub },
+        store,
+        runId,
+      );
+      console.log(JSON.stringify(result, null, 2));
+      if (!result.ok) {
+        throw new CliCommandError(
+          "BOOK_EXPORT_VERIFICATION_FAILED",
+          `export incidents: ${result.incidentCodes.join(",")}`,
         );
       }
     } finally {

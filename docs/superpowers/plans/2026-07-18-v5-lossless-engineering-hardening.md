@@ -723,9 +723,10 @@ git commit -m "feat: recover lossless runs within typed bounds"
 - 创建：`translator-v5/test/v1-importer.test.ts`
 - 修改：`src/core/v5_exporter.py`
 - 修改：`tests/test_v5_exporter.py`
+- 修改：`main.py`
 - 修改：`translator-v5/src/cli.ts`
 
-- [ ] **步骤 1：编写混合 run、缺块和 lineage 篡改失败测试**
+- [x] **步骤 1：编写混合 run、缺块和 lineage 篡改失败测试**
 
 ```ts
 test("strict export rejects active rows from a different run", () => {
@@ -754,7 +755,7 @@ test("v1 importer activates only a unique exact source match", () => {
 });
 ```
 
-- [ ] **步骤 2：运行 TS/Python 定向测试确认 schema v2 尚不支持**
+- [x] **步骤 2：运行 TS/Python 定向测试确认 schema v2 尚不支持**
 
 ```powershell
 Set-Location translator-v5
@@ -764,19 +765,19 @@ Set-Location ..
 & 'D:\llm\小说翻译\.venv\Scripts\python.exe' -m pytest -q tests/test_v5_exporter.py
 ```
 
-- [ ] **步骤 3：生成稳定 lineage sidecar**
+- [x] **步骤 3：生成稳定 lineage sidecar**
 
 TXT、双语 TXT 和 audit 输出旁生成 `*.lineage.json`，包含 artifact schema、source version、run metadata、按 ordinal 排序的 block ID/source hash/translation revision。partial 文件明确写 `complete: false` 和 missing IDs。EPUB 在 `META-INF/v5-lineage.json` 写入同一投影。
 
-- [ ] **步骤 4：改造 Python exporter 只读 schema v2 指定 run**
+- [x] **步骤 4：改造 Python exporter 只读 schema v2 指定 run**
 
 `V5BookExporter(..., run_id=...)` 查询必须使用 `translations.run_id=? AND active=1`，并验证 translation run 的 source version 与 logical blocks 一致。省略 run ID 时只允许数据库存在一个可导出的 run；否则报错要求显式选择。
 
-- [ ] **步骤 5：实现 `verify-export`**
+- [x] **步骤 5：实现 `verify-export`**
 
 Verifier 核对 artifact lineage 与数据库投影的数量、顺序、source hash、revision、run metadata；EPUB 额外验证 ZIP 中 lineage 成员存在且 JSON 一致。它不比较中英文语义。
 
-- [ ] **步骤 6：实现显式 v1 migration run**
+- [x] **步骤 6：实现显式 v1 migration run**
 
 `importLegacyV1()` 读取旧 `book_blocks` 与活动 `translations`，对新 blocks 做精确 source hash + source text 匹配。只有唯一匹配才写入新建的 migration run；重复文本或邻接位置无法唯一对齐时写入 `migration_candidates`，不进入活动译文。migration run 保存旧 store fingerprint、旧模型 ID（缺失时为 `legacy-unknown`）和 `v5-book-3` provenance。CLI 增加：
 
@@ -786,7 +787,7 @@ book migrate-v1 --legacy-store OLD.db --manifest source_manifest.json --store NE
 
 命令输出新 `runId`、唯一导入数和 reference candidate 数。
 
-- [ ] **步骤 7：运行导出/迁移测试、typecheck 并 Commit**
+- [x] **步骤 7：运行导出/迁移测试、typecheck 并 Commit**
 
 ```powershell
 Set-Location translator-v5
@@ -794,7 +795,7 @@ node --test --import tsx test/export-verifier.test.ts test/v1-importer.test.ts t
 npm run typecheck
 Set-Location ..
 & 'D:\llm\小说翻译\.venv\Scripts\python.exe' -m pytest -q tests/test_v5_exporter.py
-git add translator-v5/src/report.ts translator-v5/src/export translator-v5/src/migration translator-v5/src/cli.ts translator-v5/test/export-verifier.test.ts translator-v5/test/v1-importer.test.ts src/core/v5_exporter.py tests/test_v5_exporter.py
+git add translator-v5/src/report.ts translator-v5/src/export translator-v5/src/migration translator-v5/src/cli.ts translator-v5/test/export-verifier.test.ts translator-v5/test/v1-importer.test.ts src/core/v5_exporter.py tests/test_v5_exporter.py main.py
 git commit -m "feat: verify single-run book exports"
 ```
 

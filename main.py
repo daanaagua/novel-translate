@@ -1060,7 +1060,7 @@ def cmd_export_v5(args):
     if not project:
         return 1
     try:
-        result = V5BookExporter(project).export_v5(
+        result = V5BookExporter(project, run_id=args.run_id).export_v5(
             output_dir=args.output_dir,
             allow_incomplete=args.allow_incomplete,
         )
@@ -1414,6 +1414,7 @@ def main(argv=None):
     p_export_v5 = subparsers.add_parser("export-v5", help="严格导出translator-v5的TXT和EPUB")
     p_export_v5.add_argument("book_id", help="项目ID")
     p_export_v5.add_argument("--output-dir")
+    p_export_v5.add_argument("--run-id", help="schema v2 translation run ID")
     p_export_v5.add_argument("--allow-incomplete", action="store_true")
     p_export_v5.set_defaults(func=cmd_export_v5)
 
