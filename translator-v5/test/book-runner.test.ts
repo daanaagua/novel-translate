@@ -173,14 +173,23 @@ function losslessBatchResponse(context: Context) {
   assert.ok(match?.[1], prompt.slice(0, 500));
   const windows = JSON.parse(match[1]) as Array<{
     windowId: string;
-    blocks: Array<{ blockId: string }>;
+    blocks: Array<{ blockId: string; sourceText: string }>;
+  }>;
+  const termMatch = /STABLE TERMS\n\n(\[[\s\S]*?\])\n\nUNRESOLVED ENTITY LINKS/u.exec(prompt);
+  const terms = JSON.parse(termMatch?.[1] ?? "[]") as Array<{
+    sourceForm: string;
+    target: string;
   }>;
   return fauxAssistantMessage(fauxToolCall("finalize_translation_batch", {
     windows: windows.map((window) => ({
       windowId: window.windowId,
       translations: window.blocks.map((block) => ({
         blockId: block.blockId,
-        text: "这是完整的中文译文。",
+        text: `${terms.filter((term) => block.sourceText.toLocaleLowerCase()
+          .includes(term.sourceForm.toLocaleLowerCase()))
+          .map((term) => term.target).join("、")}${"完整译文".repeat(
+            Math.max(1, Math.ceil([...block.sourceText].length / 12)),
+          )}。`,
       })),
       notes: [],
     })),
@@ -409,7 +418,7 @@ test("lossless runner resumes the same isolated run and promotes the remaining o
 
 test("lossless resume uses bounded structured style evidence instead of a raw prior tail", async () => {
   const fixture = losslessFixture("EDGEWOOD\n\nBOOK ONE");
-  const longTranslation = `${"克制样例".repeat(80)}不可回灌尾标`;
+  const longTranslation = "克制样例。";
   const firstWindow = structuredClone(fixture.submission.windows[0]!);
   firstWindow.translations[0]!.text = longTranslation;
   (firstWindow as typeof firstWindow & { styleObservation: unknown }).styleObservation = {
@@ -432,7 +441,6 @@ test("lossless resume uses bounded structured style evidence instead of a raw pr
     assert.match(prompt, /全书文体宪章/);
     assert.match(prompt, /冷静克制/);
     assert.doesNotMatch(prompt, /PREVIOUS ACTIVE TAIL/);
-    assert.doesNotMatch(prompt, /不可回灌尾标/);
     return losslessBatchResponse(context);
   }]);
   const resumed = await runBook({

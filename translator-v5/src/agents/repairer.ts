@@ -4,9 +4,9 @@ import type { Model } from "@earendil-works/pi-ai";
 import type { ProvisionalSnapshot } from "../domain/provisional-snapshot.js";
 import type { V4Block } from "../domain/types.js";
 import type { BudgetLedger } from "../kernel/budget.js";
-import type {
+import {
   CandidateCollector,
-  TranslationCandidate,
+  type TranslationCandidate,
 } from "../tools/candidate-collector.js";
 import {
   RepairTools,
@@ -30,6 +30,17 @@ interface RepairInput {
 export interface RepairOutcome {
   candidate?: TranslationCandidate;
   run: PiRunResult;
+}
+
+export interface BatchRepairInput {
+  blocks: readonly V4Block[];
+  failedCandidate: TranslationCandidate;
+  failures: readonly ValidationFailure[];
+  budget: BudgetLedger;
+  model: Model<any>;
+  streamFn: StreamFn;
+  signal?: AbortSignal;
+  deadlineMs?: number;
 }
 
 export class Repairer {
@@ -83,6 +94,38 @@ export class Repairer {
         : mergeRepairPatch(input.blocks, input.failedCandidate, patch),
       run,
     };
+  }
+
+  async repairBatch(input: BatchRepairInput): Promise<RepairOutcome> {
+    const collector = new CandidateCollector();
+    const sourceHashes = Object.fromEntries(input.blocks.map((block) => [
+      `block:${block.id}`,
+      block.sourceHash,
+    ]));
+    return this.repair({
+      ...input,
+      collector,
+      snapshot: {
+        schemaVersion: "v5-provisional-1",
+        protocolHash: "lossless-batch-repair",
+        modelHash: `${input.model.provider}:${input.model.id}`,
+        targetScope: {
+          blockIds: input.blocks.map((block) => block.id),
+          globalIndexes: input.blocks.map((block) => block.globalIndex),
+        },
+        coverage: {
+          completePrefix: false,
+          indexedGlobalIndexes: input.blocks.map((block) => block.globalIndex),
+        },
+        questions: [],
+        narrativeFacts: [],
+        translatorFacts: [],
+        unresolved: [],
+        evidence: [],
+        evidenceIds: [],
+        sourceHashes,
+      },
+    });
   }
 }
 

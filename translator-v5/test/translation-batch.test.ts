@@ -6,6 +6,7 @@ import {
   fauxAssistantMessage,
   fauxProvider,
   fauxToolCall,
+  type Context,
 } from "@earendil-works/pi-ai";
 
 import { runTranslationBatch } from "../src/agents/translation-batch.js";
@@ -47,6 +48,16 @@ const request: PhysicalRequestPlan = {
     oversized: false,
   })),
 };
+
+function promptText(context: Context): string {
+  const message = context.messages.findLast((item) => item.role === "user");
+  assert.ok(message?.role === "user");
+  return typeof message.content === "string"
+    ? message.content
+    : message.content.filter((item) => item.type === "text")
+      .map((item) => item.text)
+      .join("\n");
+}
 
 test("batch isolates one malformed logical window without discarding its valid sibling", async () => {
   const faux = fauxProvider();
@@ -259,4 +270,97 @@ test("batch projects bounded structured style and returns the same-call style ob
   assert.match(prompt, /全书文体宪章/);
   assert.doesNotMatch(prompt, /PREVIOUS ACTIVE TAIL/);
   assert.equal(result.windows[0]?.styleObservation?.activeRegister, "冷静克制");
+});
+
+test("batch validation repairs only the invalid block once and preserves its valid sibling", async () => {
+  const faux = fauxProvider();
+  const repairPrompts: string[] = [];
+  faux.setResponses([
+    fauxAssistantMessage(fauxToolCall("finalize_translation_batch", {
+      windows: [{
+        windowId: "window-0",
+        translations: [{ blockId: "block-0", text: "错误译文。" }],
+        notes: [],
+      }, {
+        windowId: "window-1",
+        translations: [{ blockId: "block-1", text: "贝塔。" }],
+        notes: [],
+      }],
+    }), { stopReason: "toolUse" }),
+    (context) => {
+      repairPrompts.push(promptText(context));
+      return fauxAssistantMessage(fauxToolCall("submit_repaired_translation", {
+        translations: [{ blockId: "block-0", text: "阿尔法。" }],
+        notes: [],
+      }), { stopReason: "toolUse" });
+    },
+  ]);
+
+  const result = await runTranslationBatch({
+    request,
+    blocks,
+    stableTerms: [{
+      conceptId: "alpha",
+      lexemeId: "alpha-lexeme",
+      sourceForm: "Alpha",
+      canonicalSource: "Alpha",
+      target: "阿尔法",
+      locked: true,
+    }],
+    snapshot: { id: "snapshot-0", revisions: [] },
+    model: faux.getModel(),
+    streamFn: faux.provider.streamSimple.bind(faux.provider),
+    budget: new BudgetLedger(),
+  });
+
+  assert.equal(faux.state.callCount, 2);
+  assert.deepEqual(result.windows.map((window) => window.status), ["completed", "completed"]);
+  assert.equal(result.windows[0]?.translations[0]?.text, "阿尔法。");
+  assert.equal(result.windows[1]?.translations[0]?.text, "贝塔。");
+  assert.match(repairPrompts[0] ?? "", /stable_term_mismatch/);
+  assert.match(repairPrompts[0] ?? "", /block-0/);
+  assert.doesNotMatch(repairPrompts[0] ?? "", /\[block-1\]/);
+});
+
+test("one invalid repair fails only that logical window and never triggers a second repair", async () => {
+  const faux = fauxProvider();
+  faux.setResponses([
+    fauxAssistantMessage(fauxToolCall("finalize_translation_batch", {
+      windows: [{
+        windowId: "window-0",
+        translations: [{ blockId: "block-0", text: "错误译文。" }],
+        notes: [],
+      }, {
+        windowId: "window-1",
+        translations: [{ blockId: "block-1", text: "贝塔。" }],
+        notes: [],
+      }],
+    }), { stopReason: "toolUse" }),
+    fauxAssistantMessage(fauxToolCall("submit_repaired_translation", {
+      translations: [{ blockId: "block-0", text: "仍然错误。" }],
+      notes: [],
+    }), { stopReason: "toolUse" }),
+  ]);
+
+  const result = await runTranslationBatch({
+    request,
+    blocks,
+    stableTerms: [{
+      conceptId: "alpha",
+      lexemeId: "alpha-lexeme",
+      sourceForm: "Alpha",
+      canonicalSource: "Alpha",
+      target: "阿尔法",
+      locked: true,
+    }],
+    snapshot: { id: "snapshot-0", revisions: [] },
+    model: faux.getModel(),
+    streamFn: faux.provider.streamSimple.bind(faux.provider),
+    budget: new BudgetLedger(),
+  });
+
+  assert.equal(faux.state.callCount, 2);
+  assert.equal(result.windows[0]?.status, "failed");
+  assert.match(result.windows[0]?.error ?? "", /stable_term_mismatch/);
+  assert.equal(result.windows[1]?.status, "completed");
 });
