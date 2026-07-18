@@ -392,3 +392,21 @@ test("windows must be bound with continuous ordinals and matching identities", (
     candidates: [],
   }), /ordinal/i);
 });
+
+test("coordinator resumes from the exact persisted immutable snapshot", () => {
+  const knowledge = new KnowledgeStore();
+  knowledge.reconcileCandidates([candidate("seed", "Name", "甲")], "window-seed");
+  const persisted = createKnowledgeSnapshot(
+    "run-resume",
+    knowledge.projectableRevisions(),
+    "snapshot-before-resume",
+  );
+  const coordinator = new CommitCoordinator(
+    "run-resume",
+    new KnowledgeStore(persisted.revisions),
+    undefined,
+    persisted,
+  );
+  assert.equal(coordinator.snapshotForNextWave().id, persisted.id);
+  coordinator.bindWindow({ ordinal: 0, windowId: "window-next", snapshot: persisted });
+});

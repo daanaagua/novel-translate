@@ -74,14 +74,25 @@ export class CommitCoordinator {
     runId: string,
     knowledge: KnowledgeStore = new KnowledgeStore(),
     hooks?: CommitCoordinatorHooks,
+    initialSnapshot?: KnowledgeSnapshot,
   ) {
     this.runId = requireIdentifier(runId, "runId");
     this.knowledge = knowledge;
     this.#hooks = hooks;
-    this.#currentSnapshot = createKnowledgeSnapshot(
+    const rebuilt = createKnowledgeSnapshot(
       this.runId,
       this.knowledge.projectableRevisions(),
+      initialSnapshot?.parentSnapshotId ?? null,
     );
+    if (initialSnapshot !== undefined) {
+      if (initialSnapshot.runId !== this.runId) {
+        throw new Error(`snapshot ${initialSnapshot.id} belongs to another run`);
+      }
+      if (rebuilt.id !== initialSnapshot.id) {
+        throw new Error(`snapshot ${initialSnapshot.id} does not match knowledge state`);
+      }
+    }
+    this.#currentSnapshot = initialSnapshot ?? rebuilt;
     this.#snapshots.set(this.#currentSnapshot.id, this.#currentSnapshot);
   }
 

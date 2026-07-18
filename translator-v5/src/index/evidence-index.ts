@@ -1,11 +1,14 @@
 import { createHash } from "node:crypto";
 import { DatabaseSync, type SQLInputValue } from "node:sqlite";
 
-import type {
-  EvidenceHit,
-  V4Block,
-  VisibilityChannel,
-} from "../domain/types.js";
+import type { EvidenceHit, VisibilityChannel } from "../domain/types.js";
+
+interface EvidenceSourceBlock {
+  id: string;
+  globalIndex: number;
+  sourceText: string;
+  sourceHash: string;
+}
 
 export interface MentionSearch {
   terms: readonly string[];
@@ -39,7 +42,7 @@ function normalizeQuote(value: string): string {
   return value.replace(/\s+/gu, " ").trim();
 }
 
-function evidenceId(block: V4Block, paragraphIndex: number, quote: string): string {
+function evidenceId(block: EvidenceSourceBlock, paragraphIndex: number, quote: string): string {
   return `ev_${createHash("sha256")
     .update(block.id)
     .update("\0")
@@ -74,7 +77,7 @@ function assertSearchBounds(targetGlobalIndex: number, limit: number): void {
 export class EvidenceIndex {
   readonly #database: DatabaseSync;
 
-  private constructor(blocks: readonly V4Block[]) {
+  private constructor(blocks: readonly EvidenceSourceBlock[]) {
     this.#database = new DatabaseSync(":memory:");
     this.#database.exec(`
       CREATE TABLE evidence_paragraphs (
@@ -125,7 +128,7 @@ export class EvidenceIndex {
     }
   }
 
-  static fromBlocks(blocks: readonly V4Block[]): EvidenceIndex {
+  static fromBlocks(blocks: readonly EvidenceSourceBlock[]): EvidenceIndex {
     return new EvidenceIndex(blocks);
   }
 

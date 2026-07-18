@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
-import { mkdtempSync } from "node:fs";
+import { createHash } from "node:crypto";
+import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -13,7 +14,86 @@ import {
 } from "@earendil-works/pi-ai";
 
 import { runBook } from "../src/fullbook/book-runner.js";
+import { planBookWindows } from "../src/fullbook/window-planner.js";
+import { buildLosslessBlocks } from "../src/source/block-builder.js";
+import { SourceLedger } from "../src/source/source-ledger.js";
+import { annotateStructure } from "../src/source/structure-annotator.js";
 import { BookStore } from "../src/storage/book-store.js";
+import { LosslessBookStore } from "../src/storage/lossless-book-store.js";
+import { scalarLength } from "../src/source/types.js";
+
+function losslessFixture(source: string) {
+  const directory = mkdtempSync(join(tmpdir(), "v5-lossless-runner-"));
+  const rawPath = join(directory, "original.txt");
+  const canonicalPath = join(directory, "source.txt");
+  const manifestPath = join(directory, "source_manifest.json");
+  const raw = Buffer.from(source, "utf8");
+  const hash = createHash("sha256").update(raw).digest("hex");
+  writeFileSync(rawPath, raw);
+  writeFileSync(canonicalPath, raw);
+  writeFileSync(manifestPath, JSON.stringify({
+    schema_version: "v5-source-ledger-1",
+    coordinate_unit: "unicode_scalar",
+    raw_path: "original.txt",
+    raw_size: raw.length,
+    raw_sha256: hash,
+    source_format: ".txt",
+    encoding: "utf-8",
+    extractor: "plain-text-v1",
+    canonical_path: "source.txt",
+    canonical_chars: scalarLength(source),
+    canonical_sha256: hash,
+    canonical_segments: [{
+      canonical_start: 0,
+      canonical_end: scalarLength(source),
+      origin_kind: "decoded_bytes",
+      origin_ref: "original.txt",
+      raw_start: 0,
+      raw_end: raw.length,
+      transformation: "decode+newline-normalize",
+    }],
+    excluded_raw_ranges: [],
+  }), "utf8");
+  const ledger = SourceLedger.open(manifestPath);
+  const blocks = buildLosslessBlocks(
+    ledger,
+    annotateStructure(ledger, ledger.sourceVersion),
+    { sourceVersion: ledger.sourceVersion },
+  );
+  const windows = planBookWindows(blocks, {
+    maxBlocks: 1,
+    maxSourceTokens: 100,
+    protocolVersion: "lossless-v5-1",
+  });
+  const faux = fauxProvider();
+  return {
+    canonicalPath,
+    faux,
+    submission: {
+      windows: windows.map((window) => ({
+        windowId: window.windowId,
+        translations: window.blockIds.map((blockId) => ({
+          blockId,
+          text: "这是完整的中文译文。",
+        })),
+        notes: [],
+      })),
+    },
+    options: {
+      manifestPath,
+      storePath: join(directory, "book-v2.db"),
+      runMeta: { runId: "run-lossless", protocolVersion: "lossless-v5-1" },
+      model: faux.getModel(),
+      streamFn: faux.provider.streamSimple.bind(faux.provider),
+      windowOptions: { maxBlocks: 1, maxSourceTokens: 100 },
+      tinyWindowTokens: 32,
+      maxRequestTokens: 100,
+      maxWindowsPerRequest: 4,
+      maxConcurrency: 2,
+      hardDeadlineMs: 30_000,
+    },
+  };
+}
 
 function createFixture(path: string, blockCount: number): void {
   const database = new DatabaseSync(path);
@@ -85,6 +165,141 @@ function dynamicResponse(context: Context) {
     notes: [],
   }), { stopReason: "toolUse" });
 }
+
+function losslessBatchResponse(context: Context) {
+  const prompt = userText(context);
+  const match = /WINDOWS\n\n(\[[\s\S]*?\])\n\nSTABLE TERMS/u.exec(prompt);
+  assert.ok(match?.[1], prompt.slice(0, 500));
+  const windows = JSON.parse(match[1]) as Array<{
+    windowId: string;
+    blocks: Array<{ blockId: string }>;
+  }>;
+  return fauxAssistantMessage(fauxToolCall("finalize_translation_batch", {
+    windows: windows.map((window) => ({
+      windowId: window.windowId,
+      translations: window.blocks.map((block) => ({
+        blockId: block.blockId,
+        text: "这是完整的中文译文。",
+      })),
+      notes: [],
+    })),
+  }), { stopReason: "toolUse" });
+}
+
+test("two tiny logical windows use one physical model session and commit independently", async () => {
+  const fixture = losslessFixture("EDGEWOOD\n\nBOOK ONE");
+  fixture.faux.setResponses([fauxAssistantMessage(fauxToolCall(
+    "finalize_translation_batch",
+    fixture.submission,
+  ), { stopReason: "toolUse" })]);
+
+  const result = await runBook(fixture.options as never);
+
+  assert.equal(fixture.faux.state.callCount, 1);
+  assert.equal(result.status.completedWindows, 2);
+  assert.equal(result.status.modelCalls, 1);
+});
+
+test("failed lossless doctor blocks every model call", async () => {
+  const fixture = losslessFixture("Alpha.");
+  writeFileSync(fixture.canonicalPath, "Corrupt.", "utf8");
+
+  await assert.rejects(runBook(fixture.options as never), /HASH_MISMATCH/);
+  assert.equal(fixture.faux.state.callCount, 0);
+});
+
+test("one malformed window in a batch cannot erase its valid earlier sibling", async () => {
+  const fixture = losslessFixture("EDGEWOOD\n\nBOOK ONE");
+  const malformed = structuredClone(fixture.submission);
+  malformed.windows[1]!.translations[0]!.text = "";
+  fixture.faux.setResponses([fauxAssistantMessage(fauxToolCall(
+    "finalize_translation_batch",
+    malformed,
+  ), { stopReason: "toolUse" })]);
+
+  const result = await runBook({ ...fixture.options, maxAttempts: 1 } as never);
+
+  assert.equal(fixture.faux.state.callCount, 1);
+  assert.equal(result.status.completedWindows, 1);
+  assert.equal(result.status.humanRequiredWindows, 1);
+  assert.deepEqual(result.windows.map((window) => window.status), [
+    "completed",
+    "human_required",
+  ]);
+});
+
+test("lossless provider errors stay retryable and never become human incidents", async () => {
+  const fixture = losslessFixture("EDGEWOOD\n\nBOOK ONE");
+  fixture.faux.setResponses([fauxAssistantMessage([], {
+    stopReason: "error",
+    errorMessage: "503: fixture provider unavailable",
+  })]);
+
+  await assert.rejects(runBook(fixture.options as never), /provider unavailable/i);
+  const store = new LosslessBookStore(fixture.options.storePath);
+  const status = store.statusSummary("run-lossless");
+  store.close();
+  assert.equal(status.humanRequiredWindows, 0);
+  assert.equal(status.pendingWindows, 2);
+});
+
+test("lossless runner resumes the same isolated run and promotes the remaining ordinal", async () => {
+  const fixture = losslessFixture("EDGEWOOD\n\nBOOK ONE");
+  fixture.faux.setResponses([fauxAssistantMessage(fauxToolCall(
+    "finalize_translation_batch",
+    { windows: [fixture.submission.windows[0]] },
+  ), { stopReason: "toolUse" })]);
+  const first = await runBook({ ...fixture.options, maxWindows: 1 } as never);
+  assert.equal(first.status.completedWindows, 1);
+  assert.equal(first.status.pendingWindows, 1);
+
+  const resumedProvider = fauxProvider();
+  resumedProvider.setResponses([fauxAssistantMessage(fauxToolCall(
+    "finalize_translation_batch",
+    { windows: [fixture.submission.windows[1]] },
+  ), { stopReason: "toolUse" })]);
+  const resumed = await runBook({
+    ...fixture.options,
+    model: resumedProvider.getModel(),
+    streamFn: resumedProvider.provider.streamSimple.bind(resumedProvider.provider),
+  } as never);
+  assert.equal(resumedProvider.state.callCount, 1);
+  assert.equal(resumed.processedWindows, 1);
+  assert.equal(resumed.status.completedWindows, 2);
+  assert.deepEqual(resumed.windows.map((window) => window.status), ["completed", "completed"]);
+});
+
+test("reverse physical completion still promotes lossless windows in ordinal order", async () => {
+  const fixture = losslessFixture("EDGEWOOD\n\nBOOK ONE");
+  const completionOrder: number[] = [];
+  fixture.faux.setResponses([
+    async (context) => {
+      await new Promise((resolveDelay) => setTimeout(resolveDelay, 25));
+      completionOrder.push(0);
+      return losslessBatchResponse(context);
+    },
+    async (context) => {
+      completionOrder.push(1);
+      return losslessBatchResponse(context);
+    },
+  ]);
+  const result = await runBook({
+    ...fixture.options,
+    tinyWindowTokens: 1,
+    maxWindowsPerRequest: 1,
+    maxConcurrency: 2,
+  } as never);
+
+  assert.deepEqual(completionOrder, [1, 0]);
+  assert.equal(result.status.completedWindows, 2);
+  const database = new DatabaseSync(fixture.options.storePath);
+  const promoted = (database.prepare(`
+    SELECT payload_json FROM events WHERE kind='window_promoted' ORDER BY sequence
+  `).all() as unknown as Array<{ payload_json: string }>).map((row) =>
+    (JSON.parse(row.payload_json) as { windowId: string }).windowId);
+  database.close();
+  assert.deepEqual(promoted, result.windows.map((window) => window.windowId));
+});
 
 test("book runner warms up, runs a parallel wave, and resumes without model calls", async () => {
   const directory = mkdtempSync(join(tmpdir(), "v5-book-runner-"));

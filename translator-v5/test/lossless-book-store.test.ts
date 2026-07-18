@@ -7,6 +7,7 @@ import { DatabaseSync } from "node:sqlite";
 import test from "node:test";
 
 import type { BookWindowPlan } from "../src/fullbook/types.js";
+import { createKnowledgeSnapshot } from "../src/knowledge/snapshot.js";
 import { blockId } from "../src/source/block-builder.js";
 import type { LosslessBlock } from "../src/source/types.js";
 import { BookStore } from "../src/storage/book-store.js";
@@ -439,10 +440,15 @@ test("promotion revalidates every staged row and rolls back after database tampe
   database.close();
 
   const reopened = new LosslessBookStore(path);
-  assert.throws(() => reopened.promoteStagedWindow("run-a", "window-0"), /empty.*translation/i);
+  const nextSnapshot = createKnowledgeSnapshot("run-a", [], "snapshot-a");
+  assert.throws(
+    () => reopened.promoteStagedWindow("run-a", "window-0", nextSnapshot),
+    /empty.*translation/i,
+  );
   assert.equal(reopened.activeTranslations("run-a").length, 0);
   assert.equal(reopened.knowledgeHistory("run-a")[0]?.active, false);
   assert.equal(reopened.auditRows("run-a").windows[0]?.status, "staged");
+  assert.equal(reopened.auditRows("run-a").snapshotIds.includes(nextSnapshot.id), false);
   reopened.close();
 });
 
@@ -467,6 +473,38 @@ test("store rejects cross-run windows and snapshots while allowing isolated acti
   assert.equal(store.activeTranslations("run-b").length, 2);
   assert.equal(store.auditRows("run-a").modelId, "model-a");
   assert.equal(store.auditRows("run-b").modelId, "model-b");
+  store.close();
+});
+
+test("resuming a run rejects protocol, model, metadata, and initial snapshot drift", () => {
+  const store = new LosslessBookStore(fixturePath());
+  initialize(store, runMeta("model-a", "a"));
+  assert.equal(store.createTranslationRun(runMeta("model-a", "a")), "run-a");
+  assert.throws(
+    () => store.createTranslationRun(runMeta("model-b", "a")),
+    /metadata mismatch/i,
+  );
+  assert.throws(
+    () => store.createTranslationRun({
+      ...runMeta("model-a", "a"),
+      protocolVersion: "changed-protocol",
+    }),
+    /metadata mismatch/i,
+  );
+  assert.throws(
+    () => store.createTranslationRun({
+      ...runMeta("model-a", "a"),
+      metadata: { fixture: "changed" },
+    }),
+    /metadata mismatch/i,
+  );
+  assert.throws(
+    () => store.createTranslationRun({
+      ...runMeta("model-a", "a"),
+      initialSnapshotId: "different-snapshot",
+    }),
+    /initial snapshot mismatch/i,
+  );
   store.close();
 });
 
@@ -504,5 +542,47 @@ test("public inputs reject unsafe integers, empty identifiers and non-serializab
   assert.throws(() => store.createTranslationRun({
     ...runMeta("model-a", "json"), metadata: cyclic,
   }), /JSON-serializable/i);
+  store.close();
+});
+
+test("wave snapshot binding and ordinal promotion are enforced by one atomic store", () => {
+  const store = new LosslessBookStore(fixturePath());
+  initialize(store, runMeta("model-a", "a"), windowsApart());
+  store.bindWindowsToSnapshot("run-a", ["window-0", "window-1"], "snapshot-a");
+  store.claimWindow("run-a", "window-0");
+  store.claimWindow("run-a", "window-1");
+  const [first, second] = blocks();
+  store.stageWindow({
+    ...validStage("run-a", "window-0", "snapshot-a"),
+    translations: [{ blockId: first!.id, sourceHash: first!.sourceHash, text: "阿尔法。" }],
+    knowledgeCandidates: [],
+  });
+  store.stageWindow({
+    ...validStage("run-a", "window-1", "snapshot-a"),
+    translations: [{ blockId: second!.id, sourceHash: second!.sourceHash, text: "贝塔。" }],
+    knowledgeCandidates: [],
+  });
+
+  const firstSnapshot = createKnowledgeSnapshot("run-a", [], "snapshot-a");
+  assert.throws(
+    () => store.promoteStagedWindow("run-a", "window-1", firstSnapshot),
+    /earlier ordinal/i,
+  );
+  const foreignSnapshot = createKnowledgeSnapshot("run-b", [], "snapshot-a");
+  assert.throws(
+    () => store.promoteStagedWindow("run-a", "window-0", foreignSnapshot),
+    /another run|run mismatch/i,
+  );
+  assert.equal(store.activeTranslations("run-a").length, 0);
+  assert.equal(store.auditRows("run-a").windows[0]?.status, "staged");
+
+  store.promoteStagedWindow("run-a", "window-0", firstSnapshot);
+  const secondSnapshot = createKnowledgeSnapshot("run-a", [], firstSnapshot.id);
+  store.promoteStagedWindow("run-a", "window-1", secondSnapshot);
+  assert.deepEqual(
+    store.auditRows("run-a").windows.map((window) => window.status),
+    ["completed", "completed"],
+  );
+  assert.ok(store.auditRows("run-a").snapshotIds.includes(secondSnapshot.id));
   store.close();
 });

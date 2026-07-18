@@ -42,6 +42,7 @@ const SEQUENTIAL_TOOLS = new Set([
   "submit_resolution",
   "finish_research",
   "finalize_translation",
+  "finalize_translation_batch",
   "submit_repaired_translation",
   "submit_lexical_anchors",
 ]);

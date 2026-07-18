@@ -4,6 +4,10 @@ import { dirname, resolve } from "node:path";
 import { DatabaseSync, type StatementSync } from "node:sqlite";
 
 import type { BookWindowPlan, BookWindowStatus } from "../fullbook/types.js";
+import {
+  createKnowledgeSnapshot,
+  type KnowledgeSnapshot,
+} from "../knowledge/snapshot.js";
 import { blockId } from "../source/block-builder.js";
 import type { LosslessBlock, StructureAnnotation } from "../source/types.js";
 import { scalarLength } from "../source/types.js";
@@ -49,7 +53,20 @@ export interface TranslationRunMeta {
   protocolVersion: string;
   modelId: string;
   initialSnapshotId: string;
+  initialSnapshot?: KnowledgeSnapshot;
   metadata?: unknown;
+}
+
+export interface LosslessBookStatusSummary {
+  totalWindows: number;
+  pendingWindows: number;
+  runningWindows: number;
+  stagedWindows: number;
+  completedWindows: number;
+  warningWindows: number;
+  humanRequiredWindows: number;
+  failedWindows: number;
+  modelCalls: number;
 }
 
 export interface StagedTranslationInput {
@@ -142,6 +159,7 @@ interface RunRow {
   source_version: string;
   protocol_version: string;
   model_id: string;
+  metadata_json: string;
   status: string;
 }
 
@@ -457,7 +475,38 @@ export class LosslessBookStore {
     const modelId = requireNonempty(meta.modelId, "modelId");
     const snapshotId = requireNonempty(meta.initialSnapshotId, "initialSnapshotId");
     const metadata = jsonText(meta.metadata ?? {}, "translation run metadata");
-    const emptySnapshot = "[]";
+    const initialSnapshot = meta.initialSnapshot;
+    if (initialSnapshot !== undefined) {
+      if (initialSnapshot.runId !== runId) {
+        throw new Error(`initial snapshot ${initialSnapshot.id} belongs to another run`);
+      }
+      if (initialSnapshot.id !== snapshotId
+        || initialSnapshot.id !== initialSnapshot.contentHash) {
+        throw new Error("initial snapshot identity mismatch");
+      }
+    }
+    const snapshotPayload = jsonText(initialSnapshot ?? [], "initial knowledge snapshot");
+    const snapshotHash = initialSnapshot?.contentHash ?? hashText(snapshotPayload);
+    const existing = one<RunRow>(
+      this.#database.prepare("SELECT * FROM translation_runs WHERE run_id=?"),
+      runId,
+    );
+    if (existing !== undefined) {
+      if (existing.source_version !== sourceVersion
+        || existing.protocol_version !== protocolVersion
+        || existing.model_id !== modelId
+        || existing.metadata_json !== metadata) {
+        throw new Error(`translation run ${runId} metadata mismatch`);
+      }
+      const snapshot = one<{ snapshot_id: string }>(this.#database.prepare(`
+        SELECT snapshot_id FROM knowledge_snapshots
+        WHERE run_id=? ORDER BY rowid LIMIT 1
+      `), runId);
+      if (snapshot?.snapshot_id !== snapshotId) {
+        throw new Error(`translation run ${runId} initial snapshot mismatch`);
+      }
+      return runId;
+    }
 
     this.#transaction(() => {
       this.#database.prepare(`
@@ -469,7 +518,7 @@ export class LosslessBookStore {
         INSERT INTO knowledge_snapshots(
           run_id, snapshot_id, content_hash, payload_json
         ) VALUES(?, ?, ?, ?)
-      `).run(runId, snapshotId, hashText(emptySnapshot), emptySnapshot);
+      `).run(runId, snapshotId, snapshotHash, snapshotPayload);
       this.#appendEvent(runId, "translation_run_created", {
         runId, sourceVersion, protocolVersion, modelId, snapshotId,
       });
@@ -479,14 +528,34 @@ export class LosslessBookStore {
 
   initializeWindowPlan(runId: string, windows: readonly BookWindowPlan[]): void {
     const run = this.#run(runId);
+    const normalized = this.#validateWindows(run, windows);
     const existing = one<{ count: number }>(
       this.#database.prepare("SELECT COUNT(*) AS count FROM window_plans WHERE run_id=?"),
       runId,
     )?.count ?? 0;
     if (existing !== 0) {
-      throw new Error(`window plan already initialized for run ${runId}`);
+      const persisted = all<WindowRow>(this.#database.prepare(`
+        SELECT * FROM window_plans WHERE run_id=? ORDER BY ordinal
+      `), runId).map((row) => {
+        const window = windowFromRow(row, this.#membershipIds(runId, row.window_id));
+        window.globalIndexes = this.#globalIndexes(runId, row.window_id);
+        return {
+          windowId: window.windowId,
+          ordinal: window.ordinal,
+          chapterId: window.chapterId,
+          chapterTitle: window.chapterTitle,
+          blockIds: window.blockIds,
+          globalIndexes: window.globalIndexes,
+          sourceTokens: window.sourceTokens,
+          sourceChars: window.sourceChars,
+          oversized: window.oversized,
+        } satisfies BookWindowPlan;
+      });
+      if (jsonText(persisted, "persisted window plan") !== jsonText(normalized, "window plan")) {
+        throw new Error(`window plan mismatch for run ${runId}`);
+      }
+      return;
     }
-    const normalized = this.#validateWindows(run, windows);
 
     this.#transaction(() => {
       const insertWindow = this.#database.prepare(`
@@ -528,6 +597,57 @@ export class LosslessBookStore {
       this.#appendEvent(runId, "window_plan_initialized", {
         runId,
         windows: normalized.map((window) => window.windowId),
+      });
+    });
+  }
+
+  bindWindowsToSnapshot(
+    runId: string,
+    windowIds: readonly string[],
+    snapshotId: string,
+  ): void {
+    this.#run(runId);
+    requireNonempty(snapshotId, "snapshotId");
+    if (!Array.isArray(windowIds) || windowIds.length === 0) {
+      throw new TypeError("windowIds must not be empty");
+    }
+    const unique = [...new Set(windowIds.map((windowId) =>
+      requireNonempty(windowId, "windowId")))];
+    if (unique.length !== windowIds.length) {
+      throw new Error("duplicate windowId in snapshot binding");
+    }
+    const snapshot = one<{ present: number }>(this.#database.prepare(`
+      SELECT 1 AS present FROM knowledge_snapshots WHERE run_id=? AND snapshot_id=?
+    `), runId, snapshotId);
+    if (snapshot === undefined) {
+      const foreign = one<{ run_id: string }>(this.#database.prepare(`
+        SELECT run_id FROM knowledge_snapshots WHERE snapshot_id=? LIMIT 1
+      `), snapshotId);
+      throw new Error(foreign === undefined
+        ? `unknown snapshot ${snapshotId} for run ${runId}`
+        : `snapshot ${snapshotId} belongs to another run`);
+    }
+    this.#transaction(() => {
+      for (const windowId of unique) {
+        const window = this.#window(runId, windowId);
+        if (window === undefined) {
+          throw new Error(`run ${runId} has no window ${windowId}`);
+        }
+        if (window.status !== "pending") {
+          throw new Error(`window is not pending: ${runId}/${windowId}`);
+        }
+        if (window.snapshotId !== null && window.snapshotId !== snapshotId) {
+          throw new Error(
+            `snapshot mismatch for ${windowId}: expected ${window.snapshotId}, got ${snapshotId}`,
+          );
+        }
+        this.#database.prepare(`
+          UPDATE window_plans SET snapshot_id=?, updated_at=datetime('now')
+          WHERE run_id=? AND window_id=? AND status='pending'
+        `).run(snapshotId, runId, windowId);
+      }
+      this.#appendEvent(runId, "wave_snapshot_bound", {
+        runId, snapshotId, windowIds: unique,
       });
     });
   }
@@ -606,6 +726,11 @@ export class LosslessBookStore {
       }
       if (window.status !== "running") {
         throw new Error(`window is not running: ${input.runId}/${input.windowId}`);
+      }
+      if (window.snapshotId !== null && window.snapshotId !== input.snapshotId) {
+        throw new Error(
+          `snapshot mismatch for ${input.windowId}: expected ${window.snapshotId}, got ${input.snapshotId}`,
+        );
       }
       const expected = this.#membership(input.runId, input.windowId);
       this.#validateTranslations(input.translations, expected);
@@ -686,7 +811,11 @@ export class LosslessBookStore {
     });
   }
 
-  promoteStagedWindow(runId: string, windowId: string): void {
+  promoteStagedWindow(
+    runId: string,
+    windowId: string,
+    nextSnapshot?: KnowledgeSnapshot,
+  ): void {
     requireNonempty(runId, "runId");
     requireNonempty(windowId, "windowId");
     this.#transaction(() => {
@@ -715,6 +844,65 @@ export class LosslessBookStore {
       );
       if (snapshot === undefined) {
         throw new Error(`snapshot ${row.snapshot_id} does not belong to run ${runId}`);
+      }
+      const earlier = one<{ window_id: string }>(this.#database.prepare(`
+        SELECT window_id FROM window_plans
+        WHERE run_id=? AND ordinal<?
+          AND status NOT IN ('completed', 'completed_with_warnings')
+        ORDER BY ordinal LIMIT 1
+      `), runId, row.ordinal);
+      if (earlier !== undefined) {
+        throw new Error(
+          `earlier ordinal ${earlier.window_id} blocks promotion of ${windowId}`,
+        );
+      }
+      if (nextSnapshot !== undefined) {
+        if (nextSnapshot.runId !== runId) {
+          throw new Error(`next snapshot ${nextSnapshot.id} belongs to another run`);
+        }
+        if (nextSnapshot.id !== nextSnapshot.contentHash) {
+          throw new Error(`next snapshot ${nextSnapshot.id} has an identity mismatch`);
+        }
+        if (nextSnapshot.parentSnapshotId === null) {
+          throw new Error("promoted knowledge snapshot requires a parent");
+        }
+        const parent = one<{ present: number }>(this.#database.prepare(`
+          SELECT 1 AS present FROM knowledge_snapshots
+          WHERE run_id=? AND snapshot_id=?
+        `), runId, nextSnapshot.parentSnapshotId);
+        if (parent === undefined) {
+          throw new Error(
+            `snapshot parent ${nextSnapshot.parentSnapshotId} does not belong to run ${runId}`,
+          );
+        }
+        const payload = jsonText(nextSnapshot, "next knowledge snapshot");
+        const existingSnapshot = one<{
+          content_hash: string;
+          payload_json: string;
+          producing_window_id: string | null;
+        }>(this.#database.prepare(`
+          SELECT content_hash, payload_json, producing_window_id
+          FROM knowledge_snapshots WHERE run_id=? AND snapshot_id=?
+        `), runId, nextSnapshot.id);
+        if (existingSnapshot === undefined) {
+          this.#database.prepare(`
+            INSERT INTO knowledge_snapshots(
+              run_id, snapshot_id, parent_snapshot_id, producing_window_id,
+              content_hash, payload_json
+            ) VALUES(?, ?, ?, ?, ?, ?)
+          `).run(
+            runId,
+            nextSnapshot.id,
+            nextSnapshot.parentSnapshotId,
+            windowId,
+            nextSnapshot.contentHash,
+            payload,
+          );
+        } else if (existingSnapshot.content_hash !== nextSnapshot.contentHash
+          || existingSnapshot.payload_json !== payload
+          || existingSnapshot.producing_window_id !== windowId) {
+          throw new Error(`snapshot ${nextSnapshot.id} already contains different data`);
+        }
       }
 
       const expected = this.#membership(runId, windowId);
@@ -785,8 +973,20 @@ export class LosslessBookStore {
       if (Number(completed.changes) !== 1) {
         throw new Error(`failed to complete staged window ${runId}/${windowId}`);
       }
+      const remaining = one<{ count: number }>(this.#database.prepare(`
+        SELECT COUNT(*) AS count FROM window_plans
+        WHERE run_id=? AND status NOT IN ('completed', 'completed_with_warnings')
+      `), runId)?.count ?? 0;
+      if (remaining === 0) {
+        this.#database.prepare(`
+          UPDATE translation_runs SET status='completed' WHERE run_id=?
+        `).run(runId);
+      }
       this.#appendEvent(runId, "window_promoted", {
-        runId, windowId, snapshotId: row.snapshot_id,
+        runId,
+        windowId,
+        snapshotId: row.snapshot_id,
+        nextSnapshotId: nextSnapshot?.id ?? null,
       });
     });
   }
@@ -803,10 +1003,12 @@ export class LosslessBookStore {
     this.#transaction(() => {
       const result = this.#database.prepare(`
         UPDATE window_plans
-        SET status=?, budget_json=?, warnings_json=?, last_error=?,
+        SET status=?, snapshot_id=CASE WHEN ?='pending' THEN NULL ELSE snapshot_id END,
+            budget_json=?, warnings_json=?, last_error=?,
             updated_at=datetime('now')
         WHERE run_id=? AND window_id=? AND status='running'
       `).run(
+        status,
         status,
         budgetJson,
         warningsJson,
@@ -835,6 +1037,113 @@ export class LosslessBookStore {
         error: failure.error.slice(0, 1_000),
       });
     });
+  }
+
+  recoverInterruptedWindows(runId: string): string[] {
+    this.#run(runId);
+    return this.#transaction(() => {
+      const interrupted = all<{ window_id: string }>(this.#database.prepare(`
+        SELECT window_id FROM window_plans
+        WHERE run_id=? AND status IN ('running', 'staged') ORDER BY ordinal
+      `), runId).map((row) => row.window_id);
+      if (interrupted.length === 0) {
+        return [];
+      }
+      this.#database.prepare(`
+        DELETE FROM translations
+        WHERE run_id=? AND active=0 AND window_id IN (
+          SELECT window_id FROM window_plans
+          WHERE run_id=? AND status IN ('running', 'staged')
+        )
+      `).run(runId, runId);
+      this.#database.prepare(`
+        DELETE FROM knowledge_records
+        WHERE run_id=? AND active=0 AND window_id IN (
+          SELECT window_id FROM window_plans
+          WHERE run_id=? AND status IN ('running', 'staged')
+        )
+      `).run(runId, runId);
+      this.#database.prepare(`
+        UPDATE window_plans
+        SET status='pending', result_status=NULL, snapshot_id=NULL,
+            style_tail='', budget_json='{}', warnings_json='[]',
+            last_error='recovered interrupted window', updated_at=datetime('now')
+        WHERE run_id=? AND status IN ('running', 'staged')
+      `).run(runId);
+      this.#appendEvent(runId, "interrupted_windows_recovered", {
+        runId, windowIds: interrupted,
+      });
+      return interrupted;
+    });
+  }
+
+  allWindows(runId: string): PersistedLosslessWindow[] {
+    this.#run(runId);
+    return all<WindowRow>(this.#database.prepare(`
+      SELECT * FROM window_plans WHERE run_id=? ORDER BY ordinal
+    `), runId).map((row) => {
+      const window = windowFromRow(row, this.#membershipIds(runId, row.window_id));
+      window.globalIndexes = this.#globalIndexes(runId, row.window_id);
+      return window;
+    });
+  }
+
+  pendingWindows(runId: string): PersistedLosslessWindow[] {
+    return this.allWindows(runId).filter((window) => window.status === "pending");
+  }
+
+  latestKnowledgeSnapshot(runId: string): KnowledgeSnapshot {
+    this.#run(runId);
+    const row = one<{ snapshot_id: string; payload_json: string }>(
+      this.#database.prepare(`
+        SELECT snapshot_id, payload_json FROM knowledge_snapshots
+        WHERE run_id=? ORDER BY rowid DESC LIMIT 1
+      `),
+      runId,
+    );
+    if (row === undefined) {
+      throw new Error(`translation run ${runId} has no knowledge snapshot`);
+    }
+    const parsed = JSON.parse(row.payload_json) as unknown;
+    if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
+      throw new Error(`knowledge snapshot ${row.snapshot_id} has no typed payload`);
+    }
+    const snapshot = parsed as KnowledgeSnapshot;
+    if (snapshot.runId !== runId
+      || snapshot.id !== row.snapshot_id
+      || snapshot.contentHash !== snapshot.id
+      || !Array.isArray(snapshot.revisions)) {
+      throw new Error(`knowledge snapshot ${row.snapshot_id} identity mismatch`);
+    }
+    const rebuilt = createKnowledgeSnapshot(
+      runId,
+      snapshot.revisions,
+      snapshot.parentSnapshotId,
+    );
+    if (rebuilt.id !== snapshot.id) {
+      throw new Error(`knowledge snapshot ${row.snapshot_id} content hash mismatch`);
+    }
+    return rebuilt;
+  }
+
+  statusSummary(runId: string): LosslessBookStatusSummary {
+    const windows = this.allWindows(runId);
+    const count = (status: PersistedLosslessWindow["status"]): number =>
+      windows.filter((window) => window.status === status).length;
+    return {
+      totalWindows: windows.length,
+      pendingWindows: count("pending"),
+      runningWindows: count("running"),
+      stagedWindows: count("staged"),
+      completedWindows: count("completed") + count("completed_with_warnings"),
+      warningWindows: count("completed_with_warnings"),
+      humanRequiredWindows: count("human_required"),
+      failedWindows: count("failed"),
+      modelCalls: windows.reduce(
+        (total, window) => total + (window.budget.modelCalls ?? 0),
+        0,
+      ),
+    };
   }
 
   activeTranslations(runId: string): ActiveLosslessTranslation[] {

@@ -1,0 +1,169 @@
+import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
+import test from "node:test";
+
+import {
+  fauxAssistantMessage,
+  fauxProvider,
+  fauxToolCall,
+} from "@earendil-works/pi-ai";
+
+import { runTranslationBatch } from "../src/agents/translation-batch.js";
+import type { PhysicalRequestPlan } from "../src/fullbook/types.js";
+import { BudgetLedger } from "../src/kernel/budget.js";
+import type { LosslessBlock } from "../src/source/types.js";
+
+function block(id: string, index: number, text: string): LosslessBlock {
+  return {
+    id,
+    sourceVersion: "source-v1",
+    canonicalStart: index * 10,
+    canonicalEnd: index * 10 + text.length,
+    sourceText: text,
+    sourceHash: createHash("sha256").update(text).digest("hex"),
+    globalIndex: index,
+    tokenCount: 2,
+    structureId: null,
+    structureTitle: null,
+  };
+}
+
+const blocks = [block("block-0", 0, "Alpha."), block("block-1", 1, "Beta.")];
+const request: PhysicalRequestPlan = {
+  requestId: "request-0",
+  sourceTokens: 4,
+  windows: blocks.map((item, ordinal) => ({
+    windowId: `window-${ordinal}`,
+    ordinal,
+    chapterId: "chapter-0",
+    chapterTitle: null,
+    blockIds: [item.id],
+    globalIndexes: [ordinal],
+    sourceTokens: item.tokenCount,
+    sourceChars: item.sourceText.length,
+    oversized: false,
+  })),
+};
+
+test("batch isolates one malformed logical window without discarding its valid sibling", async () => {
+  const faux = fauxProvider();
+  faux.setResponses([fauxAssistantMessage(fauxToolCall(
+    "finalize_translation_batch",
+    { windows: [{
+      windowId: "window-0",
+      translations: [{ blockId: "block-0", text: "阿尔法。" }],
+      notes: [],
+    }, {
+      windowId: "window-1",
+      translations: [{ blockId: "block-1", text: "" }],
+      notes: [],
+    }] },
+  ), { stopReason: "toolUse" })]);
+
+  const result = await runTranslationBatch({
+    request,
+    blocks,
+    stableTerms: [],
+    snapshot: { id: "snapshot-0", revisions: [] },
+    model: faux.getModel(),
+    streamFn: faux.provider.streamSimple.bind(faux.provider),
+    budget: new BudgetLedger(),
+  });
+
+  assert.equal(faux.state.callCount, 1);
+  assert.equal(result.windows[0]?.status, "completed");
+  assert.equal(result.windows[1]?.status, "failed");
+  assert.match(result.windows[1]?.error ?? "", /empty/i);
+});
+
+test("batch rejects unknown and duplicate outer window identities without erasing a valid window", async () => {
+  const faux = fauxProvider();
+  faux.setResponses([fauxAssistantMessage(fauxToolCall(
+    "finalize_translation_batch",
+    { windows: [{
+      windowId: "window-0",
+      translations: [{ blockId: "block-0", text: "阿尔法。" }],
+      notes: [],
+    }, {
+      windowId: "window-1",
+      translations: [{ blockId: "block-1", text: "贝塔。" }],
+      notes: [],
+    }, {
+      windowId: "window-1",
+      translations: [{ blockId: "block-1", text: "重复贝塔。" }],
+      notes: [],
+    }, {
+      windowId: "unknown-window",
+      translations: [{ blockId: "block-1", text: "未知。" }],
+      notes: [],
+    }] },
+  ), { stopReason: "toolUse" })]);
+
+  const result = await runTranslationBatch({
+    request,
+    blocks,
+    stableTerms: [],
+    snapshot: { id: "snapshot-0", revisions: [] },
+    model: faux.getModel(),
+    streamFn: faux.provider.streamSimple.bind(faux.provider),
+    budget: new BudgetLedger(),
+  });
+
+  assert.equal(result.windows[0]?.status, "completed");
+  assert.match(result.windows[1]?.error ?? "", /duplicate windowId/i);
+  assert.deepEqual(result.responseErrors, ["unknown windowId: unknown-window"]);
+  assert.deepEqual(result.run.toolNames, ["finalize_translation_batch"]);
+});
+
+test("batch reports a missing outer window only as that logical window failure", async () => {
+  const faux = fauxProvider();
+  faux.setResponses([fauxAssistantMessage(fauxToolCall(
+    "finalize_translation_batch",
+    { windows: [{
+      windowId: "window-0",
+      translations: [{ blockId: "block-0", text: "阿尔法。" }],
+      notes: [],
+    }] },
+  ), { stopReason: "toolUse" })]);
+
+  const result = await runTranslationBatch({
+    request,
+    blocks,
+    stableTerms: [],
+    snapshot: { id: "snapshot-0", revisions: [] },
+    model: faux.getModel(),
+    streamFn: faux.provider.streamSimple.bind(faux.provider),
+    budget: new BudgetLedger(),
+  });
+  assert.equal(result.windows[0]?.status, "completed");
+  assert.match(result.windows[1]?.error ?? "", /missing window submission/i);
+});
+
+test("batch accepts only the first terminating submission in one model session", async () => {
+  const faux = fauxProvider();
+  faux.setResponses([fauxAssistantMessage([
+    fauxToolCall("finalize_translation_batch", { windows: [{
+      windowId: "window-0",
+      translations: [{ blockId: "block-0", text: "阿尔法。" }],
+      notes: [],
+    }, {
+      windowId: "window-1",
+      translations: [{ blockId: "block-1", text: "贝塔。" }],
+      notes: [],
+    }] }),
+    fauxToolCall("finalize_translation_batch", { windows: [] }),
+  ], { stopReason: "toolUse" })]);
+  const budget = new BudgetLedger();
+  const result = await runTranslationBatch({
+    request,
+    blocks,
+    stableTerms: [],
+    snapshot: { id: "snapshot-0", revisions: [] },
+    model: faux.getModel(),
+    streamFn: faux.provider.streamSimple.bind(faux.provider),
+    budget,
+  });
+  assert.deepEqual(result.windows.map((window) => window.status), ["completed", "completed"]);
+  assert.ok(result.responseErrors.some((error) => /multiple terminating/i.test(error)));
+  assert.equal(budget.snapshot().translationToolCalls, 1);
+});
