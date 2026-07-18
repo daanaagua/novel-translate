@@ -57,6 +57,7 @@ def test_project_preserves_raw_source_and_writes_verified_manifest(tmp_path):
     manifest = json.loads(project.source_manifest_file.read_text(encoding="utf-8"))
     assert project.raw_source_file.read_bytes() == original.read_bytes()
     assert manifest["schema_version"] == "v5-source-ledger-1"
+    assert manifest["coordinate_unit"] == "unicode_scalar"
     assert manifest["raw_sha256"] == hashlib.sha256(original.read_bytes()).hexdigest()
     assert manifest["canonical_sha256"] == hashlib.sha256(
         project.source_file.read_bytes()

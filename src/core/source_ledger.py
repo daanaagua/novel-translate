@@ -121,6 +121,7 @@ def create_source_ledger(
 
     manifest = {
         "schema_version": SOURCE_LEDGER_SCHEMA,
+        "coordinate_unit": "unicode_scalar",
         "raw_path": raw_relative,
         "raw_size": len(raw),
         "raw_sha256": _sha256(raw),
