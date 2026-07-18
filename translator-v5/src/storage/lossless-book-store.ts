@@ -128,6 +128,16 @@ export interface WindowFailureInput {
   warnings: readonly string[];
 }
 
+export type FaultCheckpoint =
+  | "after_stage"
+  | "before_translation_insert"
+  | "before_promote"
+  | "before_commit";
+
+export interface FaultInjector {
+  checkpoint(name: FaultCheckpoint): void;
+}
+
 export interface PersistedLosslessWindow extends BookWindowPlan {
   status: BookWindowStatus | "staged";
   attemptCount: number;
@@ -415,9 +425,11 @@ function windowFromRow(row: WindowRow, blockIds: string[]): PersistedLosslessWin
 
 export class LosslessBookStore {
   readonly #database: DatabaseSync;
+  readonly #faultInjector: FaultInjector | undefined;
 
-  constructor(path: string) {
+  constructor(path: string, faultInjector?: FaultInjector) {
     const absolute = resolve(requireNonempty(path, "database path"));
+    this.#faultInjector = faultInjector;
     mkdirSync(dirname(absolute), { recursive: true });
     this.#database = new DatabaseSync(absolute);
     try {
@@ -869,6 +881,7 @@ export class LosslessBookStore {
           ?, ?, ?, 'staged', 0, ?
         )
       `);
+      this.#faultInjector?.checkpoint("before_translation_insert");
       for (const translation of input.translations) {
         const block = expected.get(translation.blockId) as LogicalBlockRow;
         insertTranslation.run(
@@ -927,6 +940,7 @@ export class LosslessBookStore {
         blocks: input.translations.map((translation) => translation.blockId),
       });
     });
+    this.#faultInjector?.checkpoint("after_stage");
   }
 
   promoteStagedWindow(promotion: CommitPromotion): void;
@@ -948,6 +962,7 @@ export class LosslessBookStore {
     const nextSnapshot = promotion?.nextSnapshot ?? legacyNextSnapshot;
     requireNonempty(runId, "runId");
     requireNonempty(windowId, "windowId");
+    this.#faultInjector?.checkpoint("before_promote");
     this.#transaction(() => {
       const row = one<WindowRow & { result_status: string | null }>(
         this.#database.prepare(`
@@ -2169,6 +2184,7 @@ export class LosslessBookStore {
     this.#database.exec("BEGIN IMMEDIATE");
     try {
       const result = operation();
+      this.#faultInjector?.checkpoint("before_commit");
       this.#database.exec("COMMIT");
       return result;
     } catch (error) {

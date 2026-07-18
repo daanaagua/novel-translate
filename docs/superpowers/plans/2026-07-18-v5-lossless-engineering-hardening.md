@@ -802,11 +802,14 @@ git commit -m "feat: verify single-run book exports"
 ### 任务 10：故障注入、全量回归与 `Little, Big` 迁移验收
 
 **文件：**
+- 修改：`translator-v5/src/storage/lossless-book-store.ts`
+- 修改：`translator-v5/src/fullbook/book-runner.ts`
+- 修改：`translator-v5/src/cli.ts`
 - 创建：`translator-v5/test/fault-injection.test.ts`
 - 修改：`translator-v5/test/block-builder.property.test.ts`
 - 创建：`docs/superpowers/reports/2026-07-18-little-big-lossless-migration.md`
 
-- [ ] **步骤 1：为事务检查点增加可注入测试钩子**
+- [x] **步骤 1：为事务检查点增加可注入测试钩子**
 
 仅在构造 `LosslessBookStore` 时允许传入：
 
@@ -818,7 +821,7 @@ export interface FaultInjector {
 
 生产默认实现为空；测试实现分别在四个位置抛错，重开数据库后核对没有半提交状态。
 
-- [ ] **步骤 2：编写中断、源变化、数据库锁和无效模型结果测试**
+- [x] **步骤 2：编写中断、源变化、数据库锁和无效模型结果测试**
 
 ```ts
 for (const checkpoint of CHECKPOINTS) {
@@ -834,11 +837,11 @@ for (const checkpoint of CHECKPOINTS) {
 
 另写独立用例验证：运行中修改 canonical source 会在下一波前阻塞；未知/重复 block ID 无法 stage；SQLite lock 产生 retryable storage incident，不产生人工翻译任务。
 
-- [ ] **步骤 3：把属性样本扩充到全部验收形态**
+- [x] **步骤 3：把属性样本扩充到全部验收形态**
 
 固定种子覆盖无章节、重复卷章、千个短章、十万字符单段、BOM/Unicode 控制字符、同名目录/正文、空标题和重复段落。每个样本运行 ledger → block → window → schema 初始化 → audit，不调用模型。
 
-- [ ] **步骤 4：运行全部 TypeScript 与 Python 正式测试**
+- [x] **步骤 4：运行全部 TypeScript 与 Python 正式测试**
 
 ```powershell
 Set-Location translator-v5
@@ -851,7 +854,7 @@ git diff --check
 
 预期：全部 PASS；`test_foila_logic.py` 仍因历史外部 `ARK_API_KEY` 需求明确排除。
 
-- [ ] **步骤 5：重建 `Little, Big` source ledger 并运行 doctor**
+- [x] **步骤 5：重建 `Little, Big` source ledger 并运行 doctor**
 
 使用原文件：
 
@@ -863,7 +866,7 @@ npm run book -- doctor --manifest '..\projects\little_big_lossless\source_manife
 
 记录 raw/canonical hashes、覆盖率、blocks、windows、重复标题数量、doctor 时间和内存；覆盖必须 100%、重叠必须 0。
 
-- [ ] **步骤 6：迁移旧四块作为候选并验证不静默晋升**
+- [x] **步骤 6：迁移旧四块作为候选并验证不静默晋升**
 
 ```powershell
 Set-Location translator-v5
@@ -878,12 +881,12 @@ npm run --silent book -- audit `
 
 唯一 source hash + text +位置匹配的旧译文进入 migration run；其余进入 `migration_candidates`。随后对该 run 生成 partial export 并运行 `verify-export`，确认没有其他 Flash run 或歧义候选混入活动译文。
 
-- [ ] **步骤 7：撰写验收报告并 Commit**
+- [x] **步骤 7：撰写验收报告并 Commit**
 
 报告列出故障注入矩阵、属性样本数量、完整回归结果、Little Big 覆盖证明、迁移结果、模型额外调用数（doctor/audit 应为 0）以及是否建议合并。
 
 ```powershell
-git add translator-v5/test/fault-injection.test.ts translator-v5/test/block-builder.property.test.ts docs/superpowers/reports/2026-07-18-little-big-lossless-migration.md
+git add translator-v5/src/storage/lossless-book-store.ts translator-v5/src/fullbook/book-runner.ts translator-v5/src/cli.ts translator-v5/test/fault-injection.test.ts translator-v5/test/block-builder.property.test.ts docs/superpowers/reports/2026-07-18-little-big-lossless-migration.md
 git commit -m "test: verify lossless recovery under faults"
 ```
 

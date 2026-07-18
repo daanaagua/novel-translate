@@ -13,6 +13,7 @@ import { BudgetLedger } from "../kernel/budget.js";
 import { RunLease } from "../kernel/run-lease.js";
 import { KnowledgeStore, type KnowledgeCandidate } from "../knowledge/knowledge-store.js";
 import { createKnowledgeSnapshot } from "../knowledge/snapshot.js";
+import { SourceLedger } from "../source/source-ledger.js";
 import {
   runTranslationWindow,
   type PilotResult,
@@ -48,6 +49,49 @@ export const LOSSLESS_BOOK_PROTOCOL_VERSION = "v5-book-3";
 const DEFAULT_PROTOCOL_VERSION = LOSSLESS_BOOK_PROTOCOL_VERSION;
 const DEFAULT_MAX_ATTEMPTS = 2;
 const DEFAULT_MAX_CONCURRENCY = 2;
+
+export class BookStorageIncidentError extends Error {
+  readonly code = "STORAGE_LOCKED" as const;
+  readonly retryable = true;
+
+  constructor(cause: unknown) {
+    super(`STORAGE_LOCKED: ${cause instanceof Error ? cause.message : String(cause)}`);
+    this.name = "BookStorageIncidentError";
+  }
+}
+
+class BookSourceVersionChangedError extends Error {
+  readonly code = "SOURCE_VERSION_CHANGED" as const;
+
+  constructor(message: string) {
+    super(`SOURCE_VERSION_CHANGED: ${message}`);
+    this.name = "BookSourceVersionChangedError";
+  }
+}
+
+function isStorageLocked(error: unknown): boolean {
+  return error instanceof Error
+    && /(?:SQLITE_BUSY|database(?: table)? is locked)/iu.test(error.message);
+}
+
+function assertSourceVersionUnchanged(context: BookContext): void {
+  const expected = context.sourceLedger.sourceVersion;
+  try {
+    const current = SourceLedger.open(context.sourceLedger.manifestPath);
+    if (current.sourceVersion !== expected) {
+      throw new BookSourceVersionChangedError(
+        `expected ${expected}, found ${current.sourceVersion}`,
+      );
+    }
+  } catch (error) {
+    if (error instanceof BookSourceVersionChangedError) {
+      throw error;
+    }
+    throw new BookSourceVersionChangedError(
+      error instanceof Error ? error.message : String(error),
+    );
+  }
+}
 const DEFAULT_WARMUP_WINDOWS = 2;
 
 export interface BookPreflight {
@@ -547,7 +591,7 @@ async function runLosslessBook(
   } catch (error) {
     lease.release();
     context.close();
-    throw error;
+    throw isStorageLocked(error) ? new BookStorageIncidentError(error) : error;
   }
   const waves: BookWaveReport[] = [];
   let processedWindows = 0;
@@ -577,6 +621,7 @@ async function runLosslessBook(
     const blockById = new Map(context.losslessBlocks.map((block) => [block.id, block]));
 
     while (processedWindows < maxWindows) {
+      assertSourceVersionUnchanged(context);
       const allWindows = store.allWindows(runId);
       const barrier = firstUncommitted(allWindows);
       if (barrier === undefined || barrier.status !== "pending") {
@@ -809,6 +854,11 @@ async function runLosslessBook(
       leaseReleased: true,
       artifacts: null,
     };
+  } catch (error) {
+    if (isStorageLocked(error)) {
+      throw new BookStorageIncidentError(error);
+    }
+    throw error;
   } finally {
     store.close();
     lease.release();

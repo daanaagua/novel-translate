@@ -97,6 +97,7 @@ export interface CliErrorPayload {
   schema: "v5-book-cli-error-1";
   code: string;
   message: string;
+  retryable?: boolean;
 }
 
 class CliCommandError extends Error {
@@ -110,12 +111,21 @@ class CliCommandError extends Error {
 }
 
 export function cliErrorPayload(error: unknown): CliErrorPayload {
+  const structured = error !== null && typeof error === "object"
+    ? error as { code?: unknown; retryable?: unknown }
+    : {};
+  const code = typeof structured.code === "string" && structured.code.trim().length > 0
+    ? structured.code
+    : error instanceof SourceIntegrityError || error instanceof CliCommandError
+      ? error.code
+      : "CLI_ERROR";
   return {
     schema: "v5-book-cli-error-1",
-    code: error instanceof SourceIntegrityError || error instanceof CliCommandError
-      ? error.code
-      : "CLI_ERROR",
+    code,
     message: error instanceof Error ? error.message : String(error),
+    ...(typeof structured.retryable === "boolean"
+      ? { retryable: structured.retryable }
+      : {}),
   };
 }
 
