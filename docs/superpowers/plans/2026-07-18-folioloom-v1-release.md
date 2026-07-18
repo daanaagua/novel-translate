@@ -177,7 +177,7 @@ git commit -m "docs: introduce FolioLoom v1"
 
 - 创建：`.github/workflows/ci.yml`
 
-- [ ] **步骤 1：编写 CI workflow**
+- [x] **步骤 1：编写 CI workflow**
 
 使用以下确定结构：
 
@@ -213,7 +213,7 @@ jobs:
 
 workflow 不配置 secrets，不运行真实模型，也不收集 Python legacy 测试。
 
-- [ ] **步骤 2：本地解析 YAML 并核对危险字段**
+- [x] **步骤 2：本地解析 YAML 并核对危险字段**
 
 运行：
 
@@ -234,7 +234,7 @@ print('ci-yaml-ok')
 
 预期：输出 `ci-yaml-ok`。
 
-- [ ] **步骤 3：重复执行 CI 对应命令**
+- [x] **步骤 3：重复执行 CI 对应命令**
 
 ```powershell
 Set-Location translator-v5
@@ -245,7 +245,7 @@ npm.cmd run typecheck
 
 预期：204 项或更多 Node 测试通过，类型检查通过。
 
-- [ ] **步骤 4：提交 CI**
+- [x] **步骤 4：提交 CI**
 
 ```powershell
 git add .github/workflows/ci.yml
