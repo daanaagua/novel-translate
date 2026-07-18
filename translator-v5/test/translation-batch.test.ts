@@ -11,6 +11,7 @@ import {
 import { runTranslationBatch } from "../src/agents/translation-batch.js";
 import type { PhysicalRequestPlan } from "../src/fullbook/types.js";
 import { BudgetLedger } from "../src/kernel/budget.js";
+import { canonicalJson } from "../src/knowledge/knowledge-store.js";
 import type { LosslessBlock } from "../src/source/types.js";
 
 function block(id: string, index: number, text: string): LosslessBlock {
@@ -74,6 +75,42 @@ test("batch isolates one malformed logical window without discarding its valid s
   assert.equal(result.windows[0]?.status, "completed");
   assert.equal(result.windows[1]?.status, "failed");
   assert.match(result.windows[1]?.error ?? "", /empty/i);
+});
+
+test("batch prompt includes the current knowledge snapshot revisions behind one sentinel", async () => {
+  const faux = fauxProvider();
+  faux.setResponses([fauxAssistantMessage(fauxToolCall(
+    "finalize_translation_batch",
+    { windows: request.windows.map((window) => ({
+      windowId: window.windowId,
+      translations: window.blockIds.map((blockId) => ({ blockId, text: `translated ${blockId}` })),
+      notes: [],
+    })) },
+  ), { stopReason: "toolUse" })]);
+  const revisions = [{
+    id: "knowledge-revision-1",
+    kind: "character",
+    normalizedSubject: "alice",
+    revision: 1,
+    status: "active",
+    payload: { canonicalName: "爱丽丝" },
+  }];
+
+  const result = await runTranslationBatch({
+    request,
+    blocks,
+    stableTerms: [],
+    snapshot: { id: "snapshot-0", revisions },
+    model: faux.getModel(),
+    streamFn: faux.provider.streamSimple.bind(faux.provider),
+    budget: new BudgetLedger(),
+  });
+
+  const prompt = (result.run.messages[0] as {
+    content?: Array<{ type: string; text?: string }>;
+  }).content?.[0]?.text ?? "";
+  assert.equal(prompt.match(/KNOWLEDGE SNAPSHOT REVISIONS/g)?.length, 1);
+  assert.ok(prompt.includes(canonicalJson(revisions)));
 });
 
 test("batch rejects unknown and duplicate outer window identities without erasing a valid window", async () => {

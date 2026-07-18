@@ -7,6 +7,8 @@ import { DatabaseSync } from "node:sqlite";
 import test from "node:test";
 
 import type { BookWindowPlan } from "../src/fullbook/types.js";
+import { CommitCoordinator } from "../src/fullbook/commit-coordinator.js";
+import { KnowledgeStore } from "../src/knowledge/knowledge-store.js";
 import { createKnowledgeSnapshot } from "../src/knowledge/snapshot.js";
 import { blockId } from "../src/source/block-builder.js";
 import type { LosslessBlock } from "../src/source/types.js";
@@ -193,7 +195,7 @@ test("schema v2 enables foreign keys and WAL and creates every audit table", () 
   for (const name of [
     "source_versions", "source_ranges", "structure_annotations", "logical_blocks",
     "translation_runs", "window_plans", "window_membership", "translations",
-    "knowledge_records", "knowledge_snapshots", "migration_candidates",
+    "knowledge_candidates", "knowledge_records", "knowledge_snapshots", "migration_candidates",
     "recovery_runs", "events", "lossless_schema_meta",
   ]) {
     assert.ok(names.includes(name), `missing table ${name}`);
@@ -401,16 +403,101 @@ test("stage writes only inactive rows and promote commits the complete window at
   const store = new LosslessBookStore(fixturePath());
   initialize(store);
   store.claimWindow("run-a", "window-0");
-  store.stageWindow(validStage());
+  store.stageWindow({ ...validStage(), knowledgeCandidates: [] });
   assert.equal(store.activeTranslations("run-a").length, 0);
-  assert.equal(store.knowledgeHistory("run-a")[0]?.active, false);
+  assert.equal(store.knowledgeHistory("run-a").length, 0);
   assert.equal(store.auditRows("run-a").windows[0]?.status, "staged");
 
   store.promoteStagedWindow("run-a", "window-0");
   assert.deepEqual(store.activeTranslations("run-a").map((item) => item.blockId), blocks().map((item) => item.id));
-  assert.equal(store.knowledgeHistory("run-a")[0]?.active, true);
+  assert.equal(store.knowledgeHistory("run-a").length, 0);
   assert.equal(store.auditRows("run-a").windows[0]?.status, "completed");
   store.close();
+});
+
+test("conflicting staged candidates persist as two domain revisions while raw candidates stay separate", () => {
+  const path = fixturePath();
+  const store = new LosslessBookStore(path);
+  store.registerSource(sourceInput());
+  store.replaceDerivedPlan("source-v1", { blocks: blocks(), annotations: [] });
+  const runId = "run-history";
+  const initialSnapshot = createKnowledgeSnapshot(runId, []);
+  store.createTranslationRun({
+    runId,
+    sourceVersion: "source-v1",
+    protocolVersion: "lossless-v5-1",
+    modelId: "model-a",
+    initialSnapshotId: initialSnapshot.id,
+    initialSnapshot,
+  });
+  store.initializeWindowPlan(runId, windowsApart());
+  store.bindWindowsToSnapshot(runId, ["window-0", "window-1"], initialSnapshot.id);
+  const coordinator = new CommitCoordinator(runId, new KnowledgeStore(), {
+    commitPromotion(promotion) {
+      store.promoteStagedWindow(promotion);
+    },
+  }, initialSnapshot);
+  coordinator.bindWindow({ ordinal: 0, windowId: "window-0", snapshot: initialSnapshot });
+  coordinator.bindWindow({ ordinal: 1, windowId: "window-1", snapshot: initialSnapshot });
+
+  const sourceBlocks = blocks();
+  const candidates = [
+    { recordId: "candidate-left", normalizedSubject: "alpha", kind: "term", payload: { target: "甲" } },
+    { recordId: "candidate-right", normalizedSubject: "alpha", kind: "term", payload: { target: "乙" } },
+  ];
+  for (let ordinal = 0; ordinal < 2; ordinal += 1) {
+    const windowId = `window-${ordinal}`;
+    const candidate = candidates[ordinal]!;
+    const sourceBlock = sourceBlocks[ordinal]!;
+    store.claimWindow(runId, windowId);
+    store.stageWindow({
+      runId,
+      windowId,
+      snapshotId: initialSnapshot.id,
+      status: "completed",
+      translations: [{
+        blockId: sourceBlock.id,
+        sourceHash: sourceBlock.sourceHash,
+        text: `译文-${ordinal}`,
+      }],
+      knowledgeCandidates: [candidate],
+      styleTail: "",
+      budget: {},
+      warnings: [],
+    });
+    coordinator.stage({
+      runId,
+      windowId,
+      ordinal,
+      snapshotId: initialSnapshot.id,
+      candidates: [candidate],
+    });
+    coordinator.promoteReady();
+  }
+
+  const history = store.knowledgeHistory(runId);
+  assert.deepEqual(history.map((revision) => revision.revision), [1, 2]);
+  assert.deepEqual(history.map((revision) => revision.status), ["active", "needs_revalidate"]);
+  assert.deepEqual(
+    store.latestKnowledgeSnapshot(runId).revisions,
+    [history[1]],
+  );
+  store.close();
+
+  const database = new DatabaseSync(path);
+  const recordIds = database.prepare(`
+    SELECT record_id FROM knowledge_records WHERE run_id=? ORDER BY revision
+  `).all(runId) as unknown as Array<{ record_id: string }>;
+  assert.equal(recordIds[0]?.record_id, recordIds[1]?.record_id);
+  const rawCandidates = database.prepare(`
+    SELECT candidate_id, stage_state FROM knowledge_candidates
+    WHERE run_id=? ORDER BY candidate_id
+  `).all(runId) as unknown as Array<{ candidate_id: string; stage_state: string }>;
+  assert.deepEqual(rawCandidates.map((row) => ({ ...row })), [
+    { candidate_id: "candidate-left", stage_state: "promoted" },
+    { candidate_id: "candidate-right", stage_state: "promoted" },
+  ]);
+  database.close();
 });
 
 test("failed staging of a bad second block leaves no translation or knowledge row", () => {
@@ -431,7 +518,7 @@ test("promotion revalidates every staged row and rolls back after database tampe
   const store = new LosslessBookStore(path);
   initialize(store);
   store.claimWindow("run-a", "window-0");
-  store.stageWindow(validStage());
+  store.stageWindow({ ...validStage(), knowledgeCandidates: [] });
   store.close();
 
   const database = new DatabaseSync(path);
@@ -446,7 +533,7 @@ test("promotion revalidates every staged row and rolls back after database tampe
     /empty.*translation/i,
   );
   assert.equal(reopened.activeTranslations("run-a").length, 0);
-  assert.equal(reopened.knowledgeHistory("run-a")[0]?.active, false);
+  assert.equal(reopened.knowledgeHistory("run-a").length, 0);
   assert.equal(reopened.auditRows("run-a").windows[0]?.status, "staged");
   assert.equal(reopened.auditRows("run-a").snapshotIds.includes(nextSnapshot.id), false);
   reopened.close();
@@ -460,7 +547,10 @@ test("store rejects cross-run windows and snapshots while allowing isolated acti
   store.claimWindow("run-a", "window-0");
   assert.throws(() => store.stageWindow(validStage("run-b", "window-0", "snapshot-a")), /snapshot.*run/i);
   assert.throws(() => store.stageWindow(validStage("run-a", "missing", "snapshot-a")), /run.*window/i);
-  store.stageWindow(validStage("run-a", "window-0", "snapshot-a"));
+  store.stageWindow({
+    ...validStage("run-a", "window-0", "snapshot-a"),
+    knowledgeCandidates: [],
+  });
   store.promoteStagedWindow("run-a", "window-0");
 
   store.claimWindow("run-b", "window-0");

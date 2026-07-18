@@ -269,6 +269,79 @@ test("lossless runner resumes the same isolated run and promotes the remaining o
   assert.deepEqual(resumed.windows.map((window) => window.status), ["completed", "completed"]);
 });
 
+test("lossless runner hydrates full knowledge history when resuming from a revision-two projection", async () => {
+  const fixture = losslessFixture("EDGEWOOD\n\nBOOK ONE\n\nCHAPTER ONE");
+  assert.equal(fixture.submission.windows.length, 3);
+  const responseWithMemory = (target: string) => (context: Context) => {
+    const prompt = userText(context);
+    const match = /WINDOWS\n\n(\[[\s\S]*?\])\n\nSTABLE TERMS/u.exec(prompt);
+    assert.ok(match?.[1]);
+    const windows = JSON.parse(match[1]) as Array<{
+      windowId: string;
+      blocks: Array<{ blockId: string }>;
+    }>;
+    return fauxAssistantMessage(fauxToolCall("finalize_translation_batch", {
+      windows: windows.map((window) => ({
+        windowId: window.windowId,
+        translations: window.blocks.map((block) => ({
+          blockId: block.blockId,
+          text: `译文-${target}`,
+        })),
+        notes: [],
+        memoryCandidates: [{
+          kind: "term",
+          subjectForms: ["Alpha"],
+          fact: target,
+          confidence: 0.9,
+        }],
+      })),
+    }), { stopReason: "toolUse" });
+  };
+  fixture.faux.setResponses([
+    responseWithMemory("甲"),
+    responseWithMemory("乙"),
+  ]);
+  const first = await runBook({
+    ...fixture.options,
+    maxWindows: 2,
+    maxConcurrency: 1,
+    maxWindowsPerRequest: 1,
+    tinyWindowTokens: 1,
+  } as never);
+  assert.equal(first.status.completedWindows, 2);
+  const afterTwo = new LosslessBookStore(fixture.options.storePath);
+  assert.deepEqual(afterTwo.knowledgeRevisions("run-lossless").map((revision) => revision.revision), [1, 2]);
+  assert.equal(afterTwo.latestKnowledgeSnapshot("run-lossless").revisions[0]?.revision, 2);
+  afterTwo.close();
+
+  const resumedProvider = fauxProvider();
+  resumedProvider.setResponses([(context) => {
+    const prompt = userText(context);
+    const projectionMatch = /KNOWLEDGE SNAPSHOT REVISIONS\n\n(\[[\s\S]*?\])\n\nWINDOWS/u.exec(prompt);
+    assert.ok(projectionMatch?.[1]);
+    const projection = JSON.parse(projectionMatch[1]) as Array<{ revision: number; status: string }>;
+    assert.deepEqual(projection.map((revision) => [revision.revision, revision.status]), [
+      [2, "needs_revalidate"],
+    ]);
+    return responseWithMemory("乙")(context);
+  }]);
+  const resumed = await runBook({
+    ...fixture.options,
+    model: resumedProvider.getModel(),
+    streamFn: resumedProvider.provider.streamSimple.bind(resumedProvider.provider),
+    maxConcurrency: 1,
+    maxWindowsPerRequest: 1,
+    tinyWindowTokens: 1,
+  } as never);
+  assert.equal(resumed.status.completedWindows, 3);
+  const recovered = new LosslessBookStore(fixture.options.storePath);
+  assert.deepEqual(
+    recovered.knowledgeRevisions("run-lossless").map((revision) => revision.revision),
+    [1, 2, 3],
+  );
+  recovered.close();
+});
+
 test("reverse physical completion still promotes lossless windows in ordinal order", async () => {
   const fixture = losslessFixture("EDGEWOOD\n\nBOOK ONE");
   const completionOrder: number[] = [];

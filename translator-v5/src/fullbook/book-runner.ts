@@ -605,14 +605,10 @@ async function runLosslessBook(
       const snapshot = store.latestKnowledgeSnapshot(runId);
       const coordinator = new CommitCoordinator(
         runId,
-        new KnowledgeStore(snapshot.revisions),
+        new KnowledgeStore(store.knowledgeRevisions(runId)),
         {
           commitPromotion: (promotion) => {
-            store.promoteStagedWindow(
-              promotion.runId,
-              promotion.windowId,
-              promotion.nextSnapshot,
-            );
+            store.promoteStagedWindow(promotion);
           },
         },
         snapshot,

@@ -30,6 +30,7 @@ export interface CommitPromotion {
   readonly ordinal: number;
   readonly snapshotId: string;
   readonly candidates: readonly KnowledgeCandidate[];
+  readonly appendedRevisions: readonly KnowledgeRevision[];
   readonly nextSnapshot: KnowledgeSnapshot;
 }
 
@@ -184,7 +185,10 @@ export class CommitCoordinator {
       }
       const staged = bound.staged;
       const nextKnowledge = this.knowledge.fork();
-      nextKnowledge.reconcileCandidates(staged.candidates, staged.windowId);
+      const appendedRevisions = nextKnowledge.reconcileCandidates(
+        staged.candidates,
+        staged.windowId,
+      );
       const nextSnapshot = createKnowledgeSnapshot(
         this.runId,
         nextKnowledge.projectableRevisions(),
@@ -196,6 +200,7 @@ export class CommitCoordinator {
         ordinal: staged.ordinal,
         snapshotId: staged.snapshotId,
         candidates: staged.candidates,
+        appendedRevisions,
         nextSnapshot,
       });
 

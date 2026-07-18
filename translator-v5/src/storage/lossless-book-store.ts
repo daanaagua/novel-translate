@@ -3,7 +3,15 @@ import { mkdirSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { DatabaseSync, type StatementSync } from "node:sqlite";
 
+import type { CommitPromotion } from "../fullbook/commit-coordinator.js";
 import type { BookWindowPlan, BookWindowStatus } from "../fullbook/types.js";
+import {
+  canonicalJson,
+  KnowledgeStore,
+  type KnowledgeCandidate,
+  type KnowledgeRevision,
+  type KnowledgeStatus,
+} from "../knowledge/knowledge-store.js";
 import {
   createKnowledgeSnapshot,
   type KnowledgeSnapshot,
@@ -121,17 +129,17 @@ export interface ActiveLosslessTranslation {
   version: number;
 }
 
-export interface KnowledgeHistoryRecord {
+export type KnowledgeHistoryRecord = KnowledgeRevision;
+
+export interface CandidateHistoryRecord {
   runId: string;
-  recordId: string;
-  revision: number;
+  candidateId: string;
   windowId: string;
   snapshotId: string;
   normalizedSubject: string;
   kind: string;
   payload: unknown;
-  status: string;
-  active: boolean;
+  stageState: "staged" | "promoted";
 }
 
 export interface AuditProjection {
@@ -239,6 +247,17 @@ function jsonText(value: unknown, label: string): string {
 function hashText(value: string): string {
   return createHash("sha256").update(value, "utf8").digest("hex");
 }
+
+function knowledgeRecordId(normalizedSubject: string, kind: string): string {
+  return hashText(`${normalizedSubject}\0${kind}`);
+}
+
+const PROJECTABLE_KNOWLEDGE_STATUSES = new Set<KnowledgeStatus>([
+  "provisional",
+  "active",
+  "needs_revalidate",
+  "contextual",
+]);
 
 function stringArrayFromJson(value: string, label: string): string[] {
   const parsed = JSON.parse(value) as unknown;
@@ -761,20 +780,14 @@ export class LosslessBookStore {
         );
       }
 
-      const insertKnowledge = this.#database.prepare(`
-        INSERT INTO knowledge_records(
-          run_id, record_id, revision, window_id, snapshot_id,
-          normalized_subject, kind, payload_json, status, active
-        ) VALUES(
-          ?, ?,
-          COALESCE((SELECT MAX(revision)+1 FROM knowledge_records WHERE run_id=? AND record_id=?), 1),
-          ?, ?, ?, ?, ?, 'candidate', 0
-        )
+      const insertKnowledgeCandidate = this.#database.prepare(`
+        INSERT INTO knowledge_candidates(
+          run_id, candidate_id, window_id, snapshot_id,
+          normalized_subject, kind, payload_json, stage_state
+        ) VALUES(?, ?, ?, ?, ?, ?, ?, 'staged')
       `);
       for (const candidate of candidates) {
-        insertKnowledge.run(
-          input.runId,
-          candidate.recordId,
+        insertKnowledgeCandidate.run(
           input.runId,
           candidate.recordId,
           input.windowId,
@@ -811,11 +824,23 @@ export class LosslessBookStore {
     });
   }
 
+  promoteStagedWindow(promotion: CommitPromotion): void;
   promoteStagedWindow(
     runId: string,
     windowId: string,
     nextSnapshot?: KnowledgeSnapshot,
+  ): void;
+  promoteStagedWindow(
+    promotionOrRunId: CommitPromotion | string,
+    legacyWindowId?: string,
+    legacyNextSnapshot?: KnowledgeSnapshot,
   ): void {
+    const promotion = typeof promotionOrRunId === "string"
+      ? undefined
+      : promotionOrRunId;
+    const runId = promotion?.runId ?? promotionOrRunId as string;
+    const windowId = promotion?.windowId ?? legacyWindowId as string;
+    const nextSnapshot = promotion?.nextSnapshot ?? legacyNextSnapshot;
     requireNonempty(runId, "runId");
     requireNonempty(windowId, "windowId");
     this.#transaction(() => {
@@ -834,6 +859,16 @@ export class LosslessBookStore {
       }
       if (row.snapshot_id === null || row.result_status === null) {
         throw new Error(`staged window is missing snapshot or result status: ${runId}/${windowId}`);
+      }
+      if (promotion !== undefined) {
+        if (promotion.windowId !== windowId || promotion.runId !== runId) {
+          throw new Error("promotion run/window provenance mismatch");
+        }
+        if (promotion.snapshotId !== row.snapshot_id) {
+          throw new Error(
+            `promotion snapshot mismatch for ${windowId}: expected ${row.snapshot_id}, got ${promotion.snapshotId}`,
+          );
+        }
       }
       const snapshot = one<{ present: number }>(
         this.#database.prepare(`
@@ -856,6 +891,87 @@ export class LosslessBookStore {
           `earlier ordinal ${earlier.window_id} blocks promotion of ${windowId}`,
         );
       }
+
+      const stagedCandidateRows = all<{
+        candidate_id: string;
+        window_id: string;
+        snapshot_id: string;
+        normalized_subject: string;
+        kind: string;
+        payload_json: string;
+        stage_state: string;
+      }>(this.#database.prepare(`
+        SELECT candidate_id, window_id, snapshot_id, normalized_subject, kind,
+               payload_json, stage_state
+        FROM knowledge_candidates
+        WHERE run_id=? AND window_id=? AND stage_state='staged'
+        ORDER BY candidate_id
+      `), runId, windowId);
+      const stagedCandidates: KnowledgeCandidate[] = stagedCandidateRows.map((candidate) => {
+        if (candidate.window_id !== windowId
+          || candidate.snapshot_id !== row.snapshot_id
+          || candidate.stage_state !== "staged") {
+          throw new Error(`candidate provenance mismatch for ${candidate.candidate_id}`);
+        }
+        return {
+          recordId: candidate.candidate_id,
+          normalizedSubject: candidate.normalized_subject,
+          kind: candidate.kind,
+          payload: JSON.parse(candidate.payload_json) as unknown,
+        };
+      });
+      const byRecordId = (candidates: readonly KnowledgeCandidate[]): KnowledgeCandidate[] =>
+        [...candidates].sort((left, right) =>
+          left.recordId < right.recordId ? -1 : left.recordId > right.recordId ? 1 : 0);
+      if (promotion === undefined && stagedCandidates.length > 0) {
+        throw new Error("knowledge candidates require a complete domain promotion");
+      }
+      if (promotion !== undefined
+        && canonicalJson(byRecordId(promotion.candidates))
+          !== canonicalJson(byRecordId(stagedCandidates))) {
+        throw new Error(`promotion candidates do not match staged provenance for ${windowId}`);
+      }
+
+      const existingKnowledge = this.knowledgeRevisions(runId);
+      const expectedKnowledge = new KnowledgeStore(existingKnowledge);
+      const expectedAppended = expectedKnowledge.reconcileCandidates(
+        stagedCandidates,
+        windowId,
+      );
+      const appendedRevisions = promotion?.appendedRevisions ?? [];
+      if (canonicalJson(appendedRevisions) !== canonicalJson(expectedAppended)) {
+        throw new Error(`promotion appended revisions do not reconcile staged candidates for ${windowId}`);
+      }
+      const nextKnowledge = new KnowledgeStore([
+        ...existingKnowledge,
+        ...appendedRevisions,
+      ]);
+
+      const currentSnapshot = one<{ snapshot_id: string }>(this.#database.prepare(`
+        SELECT snapshot_id FROM knowledge_snapshots
+        WHERE run_id=? ORDER BY rowid DESC LIMIT 1
+      `), runId);
+      if (currentSnapshot === undefined) {
+        throw new Error(`translation run ${runId} has no current knowledge snapshot`);
+      }
+      const expectedNextSnapshot = createKnowledgeSnapshot(
+        runId,
+        nextKnowledge.projectableRevisions(),
+        currentSnapshot.snapshot_id,
+      );
+      if (nextSnapshot !== undefined && nextSnapshot.runId !== runId) {
+        throw new Error(`next snapshot ${nextSnapshot.id} belongs to another run`);
+      }
+      if (nextSnapshot !== undefined && nextSnapshot.id !== nextSnapshot.contentHash) {
+        throw new Error(`next snapshot ${nextSnapshot.id} has an identity mismatch`);
+      }
+      if (nextSnapshot !== undefined
+        && canonicalJson(nextSnapshot) !== canonicalJson(expectedNextSnapshot)) {
+        throw new Error(`next knowledge snapshot does not match reconciled domain state for ${windowId}`);
+      }
+      if (promotion !== undefined && nextSnapshot === undefined) {
+        throw new Error("complete domain promotion requires a next knowledge snapshot");
+      }
       if (nextSnapshot !== undefined) {
         if (nextSnapshot.runId !== runId) {
           throw new Error(`next snapshot ${nextSnapshot.id} belongs to another run`);
@@ -865,6 +981,11 @@ export class LosslessBookStore {
         }
         if (nextSnapshot.parentSnapshotId === null) {
           throw new Error("promoted knowledge snapshot requires a parent");
+        }
+        if (nextSnapshot.parentSnapshotId !== currentSnapshot.snapshot_id) {
+          throw new Error(
+            `snapshot parent mismatch: expected ${currentSnapshot.snapshot_id}, got ${nextSnapshot.parentSnapshotId}`,
+          );
         }
         const parent = one<{ present: number }>(this.#database.prepare(`
           SELECT 1 AS present FROM knowledge_snapshots
@@ -962,10 +1083,39 @@ export class LosslessBookStore {
       if (Number(promoted.changes) !== expected.size) {
         throw new Error(`failed to promote complete window ${runId}/${windowId}`);
       }
-      this.#database.prepare(`
-        UPDATE knowledge_records SET active=1
-        WHERE run_id=? AND window_id=? AND snapshot_id=? AND active=0
-      `).run(runId, windowId, row.snapshot_id);
+
+      const insertKnowledgeRevision = this.#database.prepare(`
+        INSERT INTO knowledge_records(
+          run_id, record_id, revision_id, revision, normalized_subject, kind,
+          payload_json, status, active, producing_window_id
+        ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `);
+      for (const revision of appendedRevisions) {
+        const recordId = knowledgeRecordId(revision.normalizedSubject, revision.kind);
+        this.#database.prepare(`
+          UPDATE knowledge_records SET active=0
+          WHERE run_id=? AND record_id=? AND active=1
+        `).run(runId, recordId);
+        insertKnowledgeRevision.run(
+          runId,
+          recordId,
+          revision.revisionId,
+          revision.revision,
+          revision.normalizedSubject,
+          revision.kind,
+          canonicalJson(revision),
+          revision.status,
+          PROJECTABLE_KNOWLEDGE_STATUSES.has(revision.status) ? 1 : 0,
+          windowId,
+        );
+      }
+      const promotedCandidates = this.#database.prepare(`
+        UPDATE knowledge_candidates SET stage_state='promoted'
+        WHERE run_id=? AND window_id=? AND stage_state='staged'
+      `).run(runId, windowId);
+      if (Number(promotedCandidates.changes) !== stagedCandidates.length) {
+        throw new Error(`failed to promote staged knowledge candidates for ${runId}/${windowId}`);
+      }
       const completed = this.#database.prepare(`
         UPDATE window_plans SET status=result_status, updated_at=datetime('now')
         WHERE run_id=? AND window_id=? AND status='staged'
@@ -1001,6 +1151,10 @@ export class LosslessBookStore {
     const warningsJson = validateWarnings(failure.warnings);
     const status = failure.retry ? "pending" : "human_required";
     this.#transaction(() => {
+      this.#database.prepare(`
+        DELETE FROM knowledge_candidates
+        WHERE run_id=? AND window_id=? AND stage_state='staged'
+      `).run(runId, windowId);
       const result = this.#database.prepare(`
         UPDATE window_plans
         SET status=?, snapshot_id=CASE WHEN ?='pending' THEN NULL ELSE snapshot_id END,
@@ -1057,8 +1211,8 @@ export class LosslessBookStore {
         )
       `).run(runId, runId);
       this.#database.prepare(`
-        DELETE FROM knowledge_records
-        WHERE run_id=? AND active=0 AND window_id IN (
+        DELETE FROM knowledge_candidates
+        WHERE run_id=? AND stage_state='staged' AND window_id IN (
           SELECT window_id FROM window_plans
           WHERE run_id=? AND status IN ('running', 'staged')
         )
@@ -1177,32 +1331,81 @@ export class LosslessBookStore {
     }));
   }
 
-  knowledgeHistory(runId: string): KnowledgeHistoryRecord[] {
+  knowledgeRevisions(runId: string): KnowledgeRevision[] {
     this.#run(runId);
-    return all<{
+    const rows = all<{
       run_id: string;
       record_id: string;
+      revision_id: string;
       revision: number;
-      window_id: string;
-      snapshot_id: string;
       normalized_subject: string;
       kind: string;
       payload_json: string;
       status: string;
       active: number;
     }>(this.#database.prepare(`
-      SELECT * FROM knowledge_records WHERE run_id=? ORDER BY record_id, revision
+      SELECT run_id, record_id, revision_id, revision, normalized_subject, kind,
+             payload_json, status, active
+      FROM knowledge_records
+      WHERE run_id=?
+      ORDER BY normalized_subject, kind, revision
+    `), runId);
+    const revisions = rows.map((row): KnowledgeRevision => {
+      const parsed = JSON.parse(row.payload_json) as KnowledgeRevision;
+      if (row.run_id !== runId
+        || row.record_id !== knowledgeRecordId(row.normalized_subject, row.kind)
+        || parsed.revisionId !== row.revision_id
+        || parsed.revision !== row.revision
+        || parsed.normalizedSubject !== row.normalized_subject
+        || parsed.kind !== row.kind
+        || parsed.status !== row.status) {
+        throw new Error(`corrupt knowledge revision row ${row.revision_id}`);
+      }
+      return parsed;
+    });
+    const hydrated = new KnowledgeStore(revisions);
+    const canonical = [...hydrated.listRevisions()];
+    const rowByRevisionId = new Map(rows.map((row) => [row.revision_id, row]));
+    for (const revision of canonical) {
+      const row = rowByRevisionId.get(revision.revisionId) as (typeof rows)[number];
+      const latest = hydrated.latestRevision(revision.normalizedSubject, revision.kind);
+      const expectedActive = latest?.revisionId === revision.revisionId
+        && PROJECTABLE_KNOWLEDGE_STATUSES.has(revision.status);
+      if (Boolean(row.active) !== expectedActive) {
+        throw new Error(`corrupt active knowledge projection for ${revision.revisionId}`);
+      }
+    }
+    return canonical;
+  }
+
+  knowledgeHistory(runId: string): KnowledgeHistoryRecord[] {
+    return this.knowledgeRevisions(runId);
+  }
+
+  candidateHistory(runId: string): CandidateHistoryRecord[] {
+    this.#run(runId);
+    return all<{
+      run_id: string;
+      candidate_id: string;
+      window_id: string;
+      snapshot_id: string;
+      normalized_subject: string;
+      kind: string;
+      payload_json: string;
+      stage_state: "staged" | "promoted";
+    }>(this.#database.prepare(`
+      SELECT run_id, candidate_id, window_id, snapshot_id, normalized_subject,
+             kind, payload_json, stage_state
+      FROM knowledge_candidates WHERE run_id=? ORDER BY candidate_id
     `), runId).map((row) => ({
       runId: row.run_id,
-      recordId: row.record_id,
-      revision: row.revision,
+      candidateId: row.candidate_id,
       windowId: row.window_id,
       snapshotId: row.snapshot_id,
       normalizedSubject: row.normalized_subject,
       kind: row.kind,
       payload: JSON.parse(row.payload_json) as unknown,
-      status: row.status,
-      active: Boolean(row.active),
+      stageState: row.stage_state,
     }));
   }
 

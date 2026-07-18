@@ -1,9 +1,10 @@
 import { createHash } from "node:crypto";
 
 export const LOSSLESS_BOOK_SCHEMA_VERSION = 2;
-export const LOSSLESS_BOOK_SCHEMA_MARKER = "deepnovel-lossless-book-store";
+export const LOSSLESS_BOOK_SCHEMA_MARKER = "deepnovel-lossless-book-store-v2-knowledge-history";
 export const LOSSLESS_BOOK_SCHEMA_TABLES = [
   "events",
+  "knowledge_candidates",
   "knowledge_records",
   "knowledge_snapshots",
   "logical_blocks",
@@ -184,24 +185,41 @@ export const LOSSLESS_BOOK_SCHEMA_V2 = `
   CREATE UNIQUE INDEX idx_v5_lossless_active_translation
     ON translations(run_id, block_id) WHERE active=1;
 
-  CREATE TABLE knowledge_records(
+  CREATE TABLE knowledge_candidates(
     run_id TEXT NOT NULL,
-    record_id TEXT NOT NULL CHECK(length(trim(record_id)) > 0),
-    revision INTEGER NOT NULL CHECK(revision >= 1),
+    candidate_id TEXT NOT NULL CHECK(length(trim(candidate_id)) > 0),
     window_id TEXT NOT NULL,
     snapshot_id TEXT NOT NULL,
     normalized_subject TEXT NOT NULL CHECK(length(trim(normalized_subject)) > 0),
     kind TEXT NOT NULL CHECK(length(trim(kind)) > 0),
     payload_json TEXT NOT NULL CHECK(json_valid(payload_json)),
-    status TEXT NOT NULL DEFAULT 'candidate'
-      CHECK(status IN ('candidate', 'provisional', 'active', 'needs_revalidate', 'contextual', 'superseded')),
-    active INTEGER NOT NULL DEFAULT 0 CHECK(active IN (0, 1)),
+    stage_state TEXT NOT NULL DEFAULT 'staged'
+      CHECK(stage_state IN ('staged', 'promoted')),
     created_at TEXT NOT NULL DEFAULT (datetime('now')),
-    PRIMARY KEY(run_id, record_id, revision),
+    PRIMARY KEY(run_id, candidate_id),
     FOREIGN KEY(run_id, window_id)
       REFERENCES window_plans(run_id, window_id) ON DELETE RESTRICT,
     FOREIGN KEY(run_id, snapshot_id)
       REFERENCES knowledge_snapshots(run_id, snapshot_id) ON DELETE RESTRICT
+  ) STRICT;
+
+  CREATE TABLE knowledge_records(
+    run_id TEXT NOT NULL,
+    record_id TEXT NOT NULL CHECK(length(trim(record_id)) > 0),
+    revision_id TEXT NOT NULL CHECK(length(trim(revision_id)) > 0),
+    revision INTEGER NOT NULL CHECK(revision >= 1),
+    normalized_subject TEXT NOT NULL CHECK(length(trim(normalized_subject)) > 0),
+    kind TEXT NOT NULL CHECK(length(trim(kind)) > 0),
+    payload_json TEXT NOT NULL CHECK(json_valid(payload_json)),
+    status TEXT NOT NULL
+      CHECK(status IN ('candidate', 'provisional', 'active', 'needs_revalidate', 'contextual', 'superseded')),
+    active INTEGER NOT NULL DEFAULT 0 CHECK(active IN (0, 1)),
+    producing_window_id TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    PRIMARY KEY(run_id, record_id, revision),
+    UNIQUE(run_id, revision_id),
+    FOREIGN KEY(run_id, producing_window_id)
+      REFERENCES window_plans(run_id, window_id) ON DELETE RESTRICT
   ) STRICT;
 
   CREATE TABLE migration_candidates(

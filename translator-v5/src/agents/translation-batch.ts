@@ -4,6 +4,7 @@ import type { Model } from "@earendil-works/pi-ai";
 import type { StableTerm } from "../domain/types.js";
 import type { PhysicalRequestPlan } from "../fullbook/types.js";
 import type { BudgetLedger } from "../kernel/budget.js";
+import { canonicalJson } from "../knowledge/knowledge-store.js";
 import type { LosslessBlock } from "../source/types.js";
 import type { TranslationMemoryCandidate } from "../tools/candidate-collector.js";
 import {
@@ -158,6 +159,8 @@ function promptFor(input: TranslationBatchInput): string {
   return [
     `PHYSICAL REQUEST ${input.request.requestId}`,
     `KNOWLEDGE SNAPSHOT ${input.snapshot.id}`,
+    "KNOWLEDGE SNAPSHOT REVISIONS",
+    canonicalJson(input.snapshot.revisions),
     "WINDOWS",
     JSON.stringify(windows),
     "STABLE TERMS",
