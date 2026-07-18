@@ -75,7 +75,7 @@
 - 修改：`src/core/project_manager.py:17-24,66-148`
 - 创建：`tests/test_source_ledger.py`
 
-- [ ] **步骤 1：编写原始字节和 canonical 清单的失败测试**
+- [x] **步骤 1：编写原始字节和 canonical 清单的失败测试**
 
 ```python
 def test_project_preserves_raw_source_and_writes_verified_manifest(tmp_path):
@@ -106,7 +106,7 @@ def test_project_preserves_raw_source_and_writes_verified_manifest(tmp_path):
     }]
 ```
 
-- [ ] **步骤 2：运行定向测试确认因 source ledger API 不存在而失败**
+- [x] **步骤 2：运行定向测试确认因 source ledger API 不存在而失败**
 
 运行：
 
@@ -116,7 +116,7 @@ def test_project_preserves_raw_source_and_writes_verified_manifest(tmp_path):
 
 预期：FAIL，`Project` 没有 `raw_source_file` 或 `source_manifest_file`。
 
-- [ ] **步骤 3：实现格式感知的 `SourceDocument` 和清单写入器**
+- [x] **步骤 3：实现格式感知的 `SourceDocument` 和清单写入器**
 
 在 `preprocessor.py` 定义并让 `load_document()` 返回：
 
@@ -188,13 +188,13 @@ def create_source_ledger(source: Path, project_dir: Path, document: SourceDocume
     return manifest
 ```
 
-- [ ] **步骤 4：接入 `ProjectManager` 并验证原始文件与 canonical 文件分离**
+- [x] **步骤 4：接入 `ProjectManager` 并验证原始文件与 canonical 文件分离**
 
 `Project` 增加 `raw_source_file`（从 manifest 解析）和 `source_manifest_file`；`create_project()` 先调用 `load_document()`，再调用 `create_source_ledger()`，兼容 artifacts 继续读取 `source.txt`。失败时仍删除未完成项目目录。
 
 纯文本 canonicalization 只允许解码、移除已登记 BOM 和换行统一；不再静默 `strip()` 每行或折叠空行。EPUB/DOCX segment 的 `origin_ref` 分别使用 spine member 路径和文档段落序号；容器内不参与正文提取的字节以固定 policy code 登记。canonical segments 自身必须连续覆盖 `[0, canonical_chars)`，excluded policy 只能来自代码枚举，不能接受自由文本。
 
-- [ ] **步骤 5：运行测试和 Python 正式回归**
+- [x] **步骤 5：运行测试和 Python 正式回归**
 
 ```powershell
 & 'D:\llm\小说翻译\.venv\Scripts\python.exe' -m pytest -q tests/test_source_ledger.py tests/test_preprocessor_structure.py tests/test_pipeline_v3.py
@@ -202,7 +202,7 @@ def create_source_ledger(source: Path, project_dir: Path, document: SourceDocume
 
 预期：全部 PASS。
 
-- [ ] **步骤 6：Commit**
+- [x] **步骤 6：Commit**
 
 ```powershell
 git add src/core/source_ledger.py src/core/preprocessor.py src/core/project_manager.py tests/test_source_ledger.py
