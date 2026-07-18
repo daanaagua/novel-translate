@@ -27,7 +27,7 @@
 - 修改：`translator-v5/package.json`
 - 修改：`translator-v5/package-lock.json`
 
-- [ ] **步骤 1：记录当前兼容入口**
+- [x] **步骤 1：记录当前兼容入口**
 
 运行：
 
@@ -38,7 +38,7 @@ npm.cmd pkg get name version private scripts
 
 预期：名称仍为 `deepnovel-translator-v5-pilot`，并存在 `test`、`typecheck`、`pilot`、`book` scripts。
 
-- [ ] **步骤 2：修改 package 元数据**
+- [x] **步骤 2：修改 package 元数据**
 
 将关键字段改为：
 
@@ -60,7 +60,7 @@ npm.cmd pkg get name version private scripts
 
 保留旧 scripts，避免破坏现有测试和本地命令。
 
-- [ ] **步骤 3：只更新 lockfile 元数据**
+- [x] **步骤 3：只更新 lockfile 元数据**
 
 运行：
 
@@ -70,7 +70,7 @@ npm.cmd install --package-lock-only --ignore-scripts
 
 预期：`package-lock.json` 顶层及根 package 均显示 `folioloom@1.0.0`，依赖版本不发生无关升级。
 
-- [ ] **步骤 4：验证新旧入口**
+- [x] **步骤 4：验证新旧入口**
 
 运行：
 
@@ -85,7 +85,7 @@ npm.cmd run typecheck
 
 预期：`doctor` 输出一块源文本的稳定 JSON，证明新 npm script 把参数传给同一 `src/cli.ts`。该命令不得加载模型配置或调用收费模型。
 
-- [ ] **步骤 5：提交包身份**
+- [x] **步骤 5：提交包身份**
 
 ```powershell
 git add translator-v5/package.json translator-v5/package-lock.json
