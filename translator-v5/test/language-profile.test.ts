@@ -84,6 +84,36 @@ test("candidate collection is deterministically capped", () => {
   );
 });
 
+test("explicit alias evidence outranks case-ambiguous frontmatter vocabulary", () => {
+  const english = getSourceLanguageProfile("en");
+  const frontmatter = [
+    "Part One. What follows is history. There was one King Richard.",
+    "Richard, Duke of Gloucester. King Edward. Richard, Duke of York.",
+    "Loukianos of Samosata, who was also known as Lucian the Scoffer, wrote a story.",
+  ].join(" ");
+  const body = [
+    "what one finds there is up to the king and the duke.",
+    "there was one road up and one road down.",
+    "Richard met Edward. Richard met Edward.",
+  ].join(" ");
+
+  const candidates = english.collectAnchorCandidates({
+    targetTexts: [frontmatter],
+    corpusTexts: [frontmatter, body],
+    limit: 12,
+  });
+  const forms = candidates.map((candidate) => candidate.sourceForm);
+
+  assert.ok(forms.includes("Loukianos"));
+  assert.ok(forms.includes("Lucian"));
+  assert.ok(!forms.includes("What"));
+  assert.ok(!forms.includes("There"));
+  assert.ok(
+    (candidates.find((candidate) => candidate.sourceForm === "Loukianos")?.score ?? 0)
+      > (candidates.find((candidate) => candidate.sourceForm === "Richard")?.score ?? 0),
+  );
+});
+
 test("residue findings reject prose but preserve declared forms and technical tokens", () => {
   const english = getSourceLanguageProfile("en");
   const findings = english.detectSourceResidue(

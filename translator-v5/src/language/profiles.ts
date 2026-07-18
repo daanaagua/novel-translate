@@ -20,6 +20,7 @@ interface ProfileDefinition {
   stopWords: readonly string[];
   script: "latin" | "cyrillic" | "kana" | "unknown";
   leadingContractions?: readonly string[];
+  aliasCuePatterns?: readonly RegExp[];
 }
 
 const DEFINITIONS: readonly ProfileDefinition[] = [
@@ -40,6 +41,9 @@ const DEFINITIONS: readonly ProfileDefinition[] = [
       "you", "your",
     ],
     script: "latin",
+    aliasCuePatterns: [
+      /\b(?:also known as|known as|called|alias|a\.?k\.?a\.?)\b/iu,
+    ],
   },
   {
     id: "fr",
@@ -57,6 +61,9 @@ const DEFINITIONS: readonly ProfileDefinition[] = [
     ],
     script: "latin",
     leadingContractions: ["c", "d", "j", "l", "m", "n", "qu", "s", "t"],
+    aliasCuePatterns: [
+      /\b(?:aussi connu(?:e)? sous le nom de|connu(?:e)? comme|appel[ée]|surnomm[ée])\b/iu,
+    ],
   },
   {
     id: "de",
@@ -66,6 +73,7 @@ const DEFINITIONS: readonly ProfileDefinition[] = [
     chapterPatterns: [/^KAPITEL(?:\s+(?:\d+|[IVXLCDM]+|[\p{L}-]+))?$/iu],
     stopWords: ["aber", "das", "der", "die", "ein", "eine", "er", "es", "im", "in", "mit", "sie", "und", "von", "zu"],
     script: "latin",
+    aliasCuePatterns: [/\b(?:auch bekannt als|bekannt als|genannt)\b/iu],
   },
   {
     id: "es",
@@ -75,6 +83,9 @@ const DEFINITIONS: readonly ProfileDefinition[] = [
     chapterPatterns: [/^CAP[IÍ]TULO(?:\s+(?:\d+|[IVXLCDM]+|[\p{L}-]+))?$/iu],
     stopWords: ["a", "con", "de", "del", "el", "ella", "en", "la", "las", "los", "pero", "por", "que", "se", "un", "una", "y"],
     script: "latin",
+    aliasCuePatterns: [
+      /\b(?:tambi[ée]n conocid[oa] como|conocid[oa] como|llamad[oa])\b/iu,
+    ],
   },
   {
     id: "ru",
@@ -84,6 +95,7 @@ const DEFINITIONS: readonly ProfileDefinition[] = [
     chapterPatterns: [/^ГЛАВА(?:\s+[\p{L}\p{N}-]+)?$/iu],
     stopWords: ["а", "в", "и", "из", "к", "на", "но", "он", "она", "с", "что"],
     script: "cyrillic",
+    aliasCuePatterns: [/(?:также известн|известн.+ как|по прозвищу)/iu],
   },
   {
     id: "ja",
@@ -93,6 +105,7 @@ const DEFINITIONS: readonly ProfileDefinition[] = [
     chapterPatterns: [/^第[^\r\n]{1,20}章$/u],
     stopWords: [],
     script: "kana",
+    aliasCuePatterns: [/(?:別名|として知ら)/u],
   },
   {
     id: "und",
@@ -102,6 +115,7 @@ const DEFINITIONS: readonly ProfileDefinition[] = [
     chapterPatterns: [],
     stopWords: [],
     script: "unknown",
+    aliasCuePatterns: [/\b(?:alias|a\.?k\.?a\.?)\b/iu],
   },
 ];
 
@@ -199,7 +213,11 @@ function collectCandidates(
     }
   }
 
-  const corpus = new Map<string, { count: number; contexts: Set<string> }>();
+  const corpus = new Map<string, {
+    count: number;
+    candidateCaseCount: number;
+    contexts: Set<string>;
+  }>();
   for (const text of input.corpusTexts) {
     for (const token of segmentText(text, definition)) {
       if (!current.has(token.normalized)) {
@@ -207,9 +225,13 @@ function collectCandidates(
       }
       const record = corpus.get(token.normalized) ?? {
         count: 0,
+        candidateCaseCount: 0,
         contexts: new Set<string>(),
       };
       record.count += 1;
+      if (isCandidateToken(token, definition)) {
+        record.candidateCaseCount += 1;
+      }
       if (record.contexts.size < 3) {
         const context = compactContext(text, token.start);
         if (context.length > 0) {
@@ -220,20 +242,37 @@ function collectCandidates(
     }
   }
 
-  return [...current.entries()].map(([normalizedSource, wave]) => {
-    const evidence = corpus.get(normalizedSource) ?? { count: wave.count, contexts: new Set<string>() };
-    const score = 50
+  return [...current.entries()].flatMap(([normalizedSource, wave]) => {
+    const evidence = corpus.get(normalizedSource) ?? {
+      count: wave.count,
+      candidateCaseCount: wave.count,
+      contexts: new Set<string>(),
+    };
+    const contexts = [...evidence.contexts];
+    const hasAliasCue = contexts.some((context) =>
+      definition.aliasCuePatterns?.some((pattern) => pattern.test(context)) ?? false);
+    const caseConsistency = evidence.count === 0
+      ? 1
+      : evidence.candidateCaseCount / evidence.count;
+    const caseAmbiguous = evidence.candidateCaseCount < evidence.count
+      && caseConsistency <= 0.5;
+    if (caseAmbiguous && !hasAliasCue) {
+      return [];
+    }
+    const score = 20
       + Math.log1p(evidence.count) * 8
       + Math.min(wave.count, 4) * 3
-      + 15;
-    return {
+      + caseConsistency * 30
+      - (1 - caseConsistency) * 35
+      + (hasAliasCue ? 80 : 0);
+    return [{
       sourceForm: wave.sourceForm,
       normalizedSource,
-      contexts: [...evidence.contexts],
+      contexts,
       corpusFrequency: evidence.count,
       currentWaveOccurrences: wave.count,
       score,
-    };
+    }];
   }).sort((left, right) => right.score - left.score
     || left.sourceForm.localeCompare(right.sourceForm))
     .slice(0, limit);
