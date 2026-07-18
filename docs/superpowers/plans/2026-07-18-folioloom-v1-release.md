@@ -99,7 +99,7 @@ git commit -m "chore: name FolioLoom v1 package"
 - 创建：`LICENSE`
 - 修改：`README.md`
 
-- [ ] **步骤 1：创建标准 MIT 许可证**
+- [x] **步骤 1：创建标准 MIT 许可证**
 
 使用未经改写的 MIT 正文，版权行固定为：
 
@@ -107,7 +107,7 @@ git commit -m "chore: name FolioLoom v1 package"
 Copyright (c) 2026 daanaagua
 ```
 
-- [ ] **步骤 2：重写 README 首屏**
+- [x] **步骤 2：重写 README 首屏**
 
 README 开头按以下顺序组织：
 
@@ -142,7 +142,7 @@ npm.cmd run folioloom -- book run `
 
 其余 `doctor/run/status/recover/audit/export` 参数从 `translator-v5/src/cli.ts` 的解析器逐项核对。若完整命令过长，链接到一个“命令参考”小节，不能使用无法直接运行的省略号冒充快速开始。
 
-- [ ] **步骤 3：明确诚实边界**
+- [x] **步骤 3：明确诚实边界**
 
 README 必须明确写出：
 
@@ -153,7 +153,7 @@ README 必须明确写出：
 - API Key 只从本地配置或环境变量读取；
 - 用户只能处理自己有权翻译的文本。
 
-- [ ] **步骤 4：验证 README 中的路径和命令名**
+- [x] **步骤 4：验证 README 中的路径和命令名**
 
 运行：
 
@@ -164,7 +164,7 @@ Test-Path LICENSE
 
 预期：旧名称只允许出现在明确的历史说明中；所有正式入口称为 FolioLoom。
 
-- [ ] **步骤 5：提交文档与许可证**
+- [x] **步骤 5：提交文档与许可证**
 
 ```powershell
 git add LICENSE README.md
