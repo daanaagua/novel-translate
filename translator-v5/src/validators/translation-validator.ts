@@ -35,6 +35,18 @@ const SYSTEM_LEAK_PATTERNS = [
   /\{\s*["']translations["']\s*:/iu,
 ];
 
+function isolatedSourceIdentifiers(sourceText: string): string[] {
+  return sourceText.split(/\r?\n/u).flatMap((line) => {
+    const value = line.trim();
+    if (!/^[\p{L}\p{N}_@.+-]{2,64}$/u.test(value)) {
+      return [];
+    }
+    const looksIdentifierLike = /\p{Ll}\p{Lu}/u.test(value)
+      || /[\p{N}_@.+-]/u.test(value);
+    return looksIdentifierLike ? [value] : [];
+  });
+}
+
 export class TranslationValidator {
   validate(
     blocks: readonly V4Block[],
@@ -105,7 +117,10 @@ export class TranslationValidator {
         });
       }
       const untranslated = profile.detectSourceResidue(translation.text, {
-        preservedSourceForms: policy.allowedLatinTokens ?? [],
+        preservedSourceForms: [
+          ...(policy.allowedLatinTokens ?? []),
+          ...(source === undefined ? [] : isolatedSourceIdentifiers(source.sourceText)),
+        ],
       });
       if (untranslated.length > 0) {
         failures.push({

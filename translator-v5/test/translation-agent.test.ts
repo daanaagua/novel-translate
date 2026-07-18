@@ -334,6 +334,25 @@ test("typography is normalized and untranslated prose words are rejected", () =>
   );
 });
 
+test("validator preserves exact isolated source identifiers without allowing copied prose", () => {
+  const block = chapterBlock(0, "eGod\n\nThe sailors looked up.");
+  const preserved = new TranslationValidator().validate([block], {
+    translations: [{ blockId: block.id, text: "eGod\n\n水手们抬头望去。" }],
+    notes: [],
+    repaired: false,
+  });
+  assert.ok(!preserved.failures.some((failure) =>
+    failure.code === "untranslated_latin"));
+
+  const copied = new TranslationValidator().validate([block], {
+    translations: [{ blockId: block.id, text: "eGod\n\nsailors 抬头望去。" }],
+    notes: [],
+    repaired: false,
+  });
+  assert.ok(copied.failures.some((failure) =>
+    failure.code === "untranslated_latin" && failure.message.includes("sailors")));
+});
+
 test("deterministic validator delegates French residue to its language profile", () => {
   const block = chapterBlock(0, "Il répondit puis partit.");
   const validation = new TranslationValidator().validate([block], {
