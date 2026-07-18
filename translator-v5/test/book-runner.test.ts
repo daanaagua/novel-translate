@@ -338,6 +338,17 @@ test("two tiny logical windows use one physical model session and commit indepen
         version: "source-language-profile-1",
         compatibilityMode: false,
       },
+      sourceAnomalies: {
+        schema: "v5-source-anomaly-1",
+        counts: {
+          CONTROL_CHARACTER: 0,
+          EXTREME_LONG_LINE: 0,
+          REPEATED_FRONTMATTER_LINE: 0,
+          REPLACEMENT_CHARACTER: 0,
+          SPACED_HYPHENATION: 0,
+        },
+        findings: [],
+      },
     });
   } finally {
     store.close();

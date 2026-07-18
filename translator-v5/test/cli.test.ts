@@ -280,6 +280,17 @@ test("book doctor audits the lossless pipeline without constructing a provider",
   assert.equal(report.coveredChars, 13);
   assert.deepEqual(report.incidentCodes, []);
   assert.equal(report.modelCallsAllowed, false);
+  assert.deepEqual(report.sourceAnomalies, {
+    schema: "v5-source-anomaly-1",
+    counts: {
+      CONTROL_CHARACTER: 0,
+      EXTREME_LONG_LINE: 0,
+      REPEATED_FRONTMATTER_LINE: 0,
+      REPLACEMENT_CHARACTER: 0,
+      SPACED_HYPHENATION: 0,
+    },
+    findings: [],
+  });
   assert.ok(Number(report.blockCount) > 0);
   assert.ok(Number(report.windowCount) > 0);
 });

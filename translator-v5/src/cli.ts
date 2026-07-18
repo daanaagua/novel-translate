@@ -35,6 +35,10 @@ import {
 import { verifyExport } from "./export/export-verifier.js";
 import { importLegacyV1 } from "./migration/v1-importer.js";
 import { auditSourceCoverage } from "./source/auditor.js";
+import {
+  analyzeSourceAnomalies,
+  type SourceAnomalyReport,
+} from "./source/anomaly-report.js";
 import { buildLosslessBlocks } from "./source/block-builder.js";
 import { SourceIntegrityError, SourceLedger } from "./source/source-ledger.js";
 import { annotateStructure } from "./source/structure-annotator.js";
@@ -85,6 +89,7 @@ export interface BookDoctorReport {
   blockCount: number;
   windowCount: number;
   incidentCodes: string[];
+  sourceAnomalies: SourceAnomalyReport;
   modelCallsAllowed: false;
 }
 
@@ -151,6 +156,7 @@ export function doctorBook(
     blockCount: blocks.length,
     windowCount: windows.length,
     incidentCodes: [...new Set(audit.incidents.map((incident) => incident.code))].sort(),
+    sourceAnomalies: analyzeSourceAnomalies(ledger.sourceText),
     modelCallsAllowed: false,
   };
 }

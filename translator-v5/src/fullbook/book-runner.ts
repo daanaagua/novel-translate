@@ -25,6 +25,7 @@ import {
 } from "../knowledge/knowledge-store.js";
 import { createKnowledgeSnapshot } from "../knowledge/snapshot.js";
 import { SourceLedger } from "../source/source-ledger.js";
+import { analyzeSourceAnomalies } from "../source/anomaly-report.js";
 import {
   runTranslationWindow,
   type PilotResult,
@@ -133,6 +134,7 @@ function runMetadataWithLanguageProfile(
       version: context.languageProfile.version,
       compatibilityMode: context.sourceLedger.sourceLanguageCompatibilityMode,
     },
+    sourceAnomalies: analyzeSourceAnomalies(context.sourceLedger.sourceText),
   };
 }
 
