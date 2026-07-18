@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
-import { readFileSync } from "node:fs";
-import { dirname, isAbsolute, relative, resolve } from "node:path";
+import { readFileSync, realpathSync } from "node:fs";
+import { dirname, isAbsolute, relative, resolve, sep } from "node:path";
 import { TextDecoder } from "node:util";
 
 import type {
@@ -86,13 +86,47 @@ function manifestMemberPath(
 ): string {
   const target = resolve(manifestDirectory, member);
   const child = relative(manifestDirectory, target);
-  if (child === "" || child.startsWith("..") || isAbsolute(child)) {
+  if (child === ""
+    || child === ".."
+    || child.startsWith(`..${sep}`)
+    || isAbsolute(child)) {
     throw new SourceIntegrityError(
       "MANIFEST_PATH_INVALID",
       `manifest member escapes its directory: ${member}`,
     );
   }
-  return target;
+  let realTarget: string;
+  try {
+    realTarget = realpathSync(target);
+  } catch (error) {
+    throw new SourceIntegrityError(
+      "MANIFEST_PATH_INVALID",
+      error instanceof Error ? error.message : `manifest member cannot be resolved: ${member}`,
+    );
+  }
+  const realChild = relative(manifestDirectory, realTarget);
+  if (realChild === ""
+    || realChild === ".."
+    || realChild.startsWith(`..${sep}`)
+    || isAbsolute(realChild)) {
+    throw new SourceIntegrityError(
+      "MANIFEST_PATH_INVALID",
+      `manifest member escapes its directory through a link: ${member}`,
+    );
+  }
+  return realTarget;
+}
+
+function sourceVersionFor(manifest: Record<string, unknown>): string {
+  const identity = [
+    ["schema_version", stringField(manifest, "schema_version")],
+    ["raw_sha256", stringField(manifest, "raw_sha256")],
+    ["canonical_sha256", stringField(manifest, "canonical_sha256")],
+    ["source_format", stringField(manifest, "source_format")],
+    ["encoding", stringField(manifest, "encoding")],
+    ["extractor", stringField(manifest, "extractor")],
+  ];
+  return sha256(JSON.stringify(identity));
 }
 
 function validateSegments(
@@ -251,7 +285,7 @@ export class SourceLedger implements ScalarSource {
   }
 
   static open(manifestPath: string): SourceLedger {
-    const resolvedManifestPath = resolve(manifestPath);
+    const resolvedManifestPath = realpathSync(resolve(manifestPath));
     let manifest: Record<string, unknown>;
     try {
       manifest = record(
@@ -279,6 +313,7 @@ export class SourceLedger implements ScalarSource {
         `expected ${COORDINATE_UNIT}, got ${String(manifest.coordinate_unit)}`,
       );
     }
+    const sourceVersion = sourceVersionFor(manifest);
 
     const directory = dirname(resolvedManifestPath);
     const rawPath = manifestMemberPath(directory, stringField(manifest, "raw_path"));
@@ -339,7 +374,7 @@ export class SourceLedger implements ScalarSource {
       rawPath,
       canonicalPath,
       sourceText,
-      sourceVersion: canonicalHash,
+      sourceVersion,
       canonicalSegments,
       excludedRawRanges,
       coordinates,

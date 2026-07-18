@@ -4,6 +4,7 @@ import {
   mkdtempSync,
   readFileSync,
   rmSync,
+  symlinkSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -30,12 +31,23 @@ interface LedgerFixture {
   canonicalPath: string;
 }
 
-function ledgerFixture(source: string): LedgerFixture {
+interface LedgerFixtureOptions {
+  raw?: Buffer;
+  sourceFormat?: string;
+  encoding?: string;
+  extractor?: string;
+  excludedRawRanges?: readonly Record<string, unknown>[];
+}
+
+function ledgerFixture(
+  source: string,
+  options: LedgerFixtureOptions = {},
+): LedgerFixture {
   const directory = mkdtempSync(join(tmpdir(), "v5-source-ledger-"));
   const rawPath = join(directory, "original.txt");
   const canonicalPath = join(directory, "source.txt");
   const manifestPath = join(directory, "source_manifest.json");
-  const raw = Buffer.from(source, "utf8");
+  const raw = options.raw ?? Buffer.from(source, "utf8");
   const canonical = Buffer.from(source, "utf8");
   writeFileSync(rawPath, raw);
   writeFileSync(canonicalPath, canonical);
@@ -45,9 +57,9 @@ function ledgerFixture(source: string): LedgerFixture {
     raw_path: "original.txt",
     raw_size: raw.length,
     raw_sha256: sha256(raw),
-    source_format: ".txt",
-    encoding: "utf-8",
-    extractor: "plain-text-v1",
+    source_format: options.sourceFormat ?? ".txt",
+    encoding: options.encoding ?? "utf-8",
+    extractor: options.extractor ?? "plain-text-v1",
     canonical_path: "source.txt",
     canonical_chars: scalarLength(source),
     canonical_sha256: sha256(canonical),
@@ -60,7 +72,7 @@ function ledgerFixture(source: string): LedgerFixture {
       raw_end: raw.length,
       transformation: "decode+newline-normalize",
     }],
-    excluded_raw_ranges: [],
+    excluded_raw_ranges: options.excludedRawRanges ?? [],
   }), "utf8");
   return { directory, manifestPath, rawPath, canonicalPath };
 }
@@ -87,7 +99,15 @@ test("lossless source ledger verifies hashes and keeps Unicode scalar coordinate
   try {
     const ledger = SourceLedger.open(fixture.manifestPath);
     assert.equal(ledger.sourceText, "A😀\nB");
-    assert.equal(ledger.sourceVersion, sha256(Buffer.from("A😀\nB")));
+    const canonicalHash = sha256(Buffer.from("A😀\nB"));
+    assert.equal(ledger.sourceVersion, sha256(JSON.stringify([
+      ["schema_version", "v5-source-ledger-1"],
+      ["raw_sha256", canonicalHash],
+      ["canonical_sha256", canonicalHash],
+      ["source_format", ".txt"],
+      ["encoding", "utf-8"],
+      ["extractor", "plain-text-v1"],
+    ])));
     assert.equal(ledger.canonicalChars, 4);
     assert.equal(ledger.slice(1, 2), "😀");
     assert.deepEqual(
@@ -96,6 +116,98 @@ test("lossless source ledger verifies hashes and keeps Unicode scalar coordinate
     );
   } finally {
     rmSync(fixture.directory, { recursive: true, force: true });
+  }
+});
+
+test("lossless source version includes raw payload and extraction provenance", () => {
+  const source = "Same canonical text.\n";
+  const first = ledgerFixture(source, {
+    raw: Buffer.from("epub-container-one"),
+    sourceFormat: ".epub",
+    encoding: "container",
+    extractor: "epub-spine-v1",
+    excludedRawRanges: [{
+      raw_start: 0,
+      raw_end: Buffer.byteLength("epub-container-one"),
+      policy: "EPUB_NON_SPINE_DATA",
+    }],
+  });
+  const second = ledgerFixture(source, {
+    raw: Buffer.from("epub-container-two"),
+    sourceFormat: ".epub",
+    encoding: "container",
+    extractor: "epub-spine-v1",
+    excludedRawRanges: [{
+      raw_start: 0,
+      raw_end: Buffer.byteLength("epub-container-two"),
+      policy: "EPUB_NON_SPINE_DATA",
+    }],
+  });
+  const third = ledgerFixture(source, {
+    raw: Buffer.from("epub-container-one"),
+    sourceFormat: ".epub",
+    encoding: "container",
+    extractor: "epub-spine-v2",
+    excludedRawRanges: [{
+      raw_start: 0,
+      raw_end: Buffer.byteLength("epub-container-one"),
+      policy: "EPUB_NON_SPINE_DATA",
+    }],
+  });
+  try {
+    const firstLedger = SourceLedger.open(first.manifestPath);
+    const secondLedger = SourceLedger.open(second.manifestPath);
+    const thirdLedger = SourceLedger.open(third.manifestPath);
+    assert.notEqual(firstLedger.sourceVersion, secondLedger.sourceVersion);
+    assert.notEqual(firstLedger.sourceVersion, thirdLedger.sourceVersion);
+    assert.equal(
+      SourceLedger.open(first.manifestPath).sourceVersion,
+      firstLedger.sourceVersion,
+    );
+
+    const firstBlocks = buildLosslessBlocks(
+      firstLedger,
+      annotateStructure(firstLedger, firstLedger.sourceVersion),
+    );
+    const secondBlocks = buildLosslessBlocks(
+      secondLedger,
+      annotateStructure(secondLedger, secondLedger.sourceVersion),
+    );
+    assert.notDeepEqual(
+      firstBlocks.map((block) => block.id),
+      secondBlocks.map((block) => block.id),
+    );
+  } finally {
+    rmSync(first.directory, { recursive: true, force: true });
+    rmSync(second.directory, { recursive: true, force: true });
+    rmSync(third.directory, { recursive: true, force: true });
+  }
+});
+
+test("lossless source ledger rejects a manifest member that escapes through a symlink", () => {
+  const fixture = ledgerFixture("Alpha.");
+  const outside = mkdtempSync(join(tmpdir(), "v5-source-outside-"));
+  try {
+    writeFileSync(
+      join(outside, "original.txt"),
+      readFileSync(fixture.rawPath),
+    );
+    symlinkSync(
+      outside,
+      join(fixture.directory, "escape"),
+      process.platform === "win32" ? "junction" : "dir",
+    );
+    mutateManifest(fixture, (manifest) => {
+      manifest.raw_path = "escape/original.txt";
+    });
+
+    expectIntegrityCode(
+      () => SourceLedger.open(fixture.manifestPath),
+      "MANIFEST_PATH_INVALID",
+    );
+  } finally {
+    rmSync(fixture.directory, { recursive: true, force: true });
+    rmSync(outside, { recursive: true, force: true });
   }
 });
 
