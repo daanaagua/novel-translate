@@ -10,6 +10,7 @@ import yaml
 
 from .schemas import Book
 from .preprocessor import TextPreprocessor
+from .source_ledger import create_source_ledger
 from .history import TranslationMemory
 from .knowledge_base import KnowledgeBase
 
@@ -20,6 +21,7 @@ class Project:
         self.book_id = book_id
         self.root_dir = base_dir / book_id
         self.source_file = self.root_dir / "source.txt"
+        self.source_manifest_file = self.root_dir / "source_manifest.json"
         self.config_file = self.root_dir / "config.yaml"
         self.glossary_dir = self.root_dir / "glossary"
         
@@ -31,6 +33,19 @@ class Project:
         
         # 状态
         self._book_metadata: Optional[Book] = None
+
+    @property
+    def raw_source_file(self) -> Path:
+        """从经认证清单解析不可变原始载荷路径。"""
+        manifest = json.loads(self.source_manifest_file.read_text(encoding="utf-8"))
+        raw_path = manifest.get("raw_path")
+        if not isinstance(raw_path, str) or not raw_path:
+            raise ValueError("源清单缺少 raw_path")
+        target = (self.root_dir / raw_path).resolve()
+        root = self.root_dir.resolve()
+        if not target.is_relative_to(root):
+            raise ValueError("源清单 raw_path 越出项目目录")
+        return target
 
     @property
     def book(self) -> Book:
@@ -80,6 +95,10 @@ class ProjectManager:
             force: 是否覆盖已存在项目
         """
         project_dir = self.projects_root / book_id
+        src_file = Path(source_path)
+
+        if not src_file.exists():
+            raise FileNotFoundError(f"源文件不存在: {source_path}")
         
         if project_dir.exists():
             if not force:
@@ -91,56 +110,49 @@ class ProjectManager:
         (project_dir / "glossary").mkdir()
         (project_dir / "artifacts").mkdir()
         
-        # 2. 处理原文 (格式转换)
-        src_file = Path(source_path)
-        if not src_file.exists():
-            raise FileNotFoundError(f"源文件不存在: {source_path}")
-        
-        dest_source = project_dir / "source.txt"
-        
-        # 使用 Preprocessor 加载（支持 docx 自动转换）
-        # 注意：这里我们临时实例化一个 Preprocessor 仅用于转换
+        # 2. 保存原始载荷并建立 canonical source ledger。
         temp_prep = TextPreprocessor(
             max_chunk_tokens=max_chunk_tokens,
             overlap_sentences=overlap_sentences,
         )
         try:
-            # 加载并清洗文本
-            clean_text = temp_prep.load_text(str(src_file))
-            # 写入项目目录为纯文本
-            dest_source.write_text(clean_text, encoding='utf-8')
+            document = temp_prep.load_document(str(src_file))
+            create_source_ledger(src_file, project_dir, document)
         except Exception as e:
-            # 如果转换失败，回滚清理目录
-            shutil.rmtree(project_dir)
+            shutil.rmtree(project_dir, ignore_errors=True)
             raise RuntimeError(f"原文处理失败: {e}")
         
-        # 3. 初始化项目对象
-        project = Project(book_id, self.projects_root)
-        
-        # 4. 执行预处理 (构建 Artifacts)
-        self._initialize_artifacts(
-            project,
-            book_id,
-            max_chunk_tokens=max_chunk_tokens,
-            overlap_sentences=overlap_sentences,
-        )
+        try:
+            # 3. 初始化项目对象
+            project = Project(book_id, self.projects_root)
 
-        project.config_file.write_text(
-            yaml.safe_dump(
-                {
-                    "book_id": book_id,
-                    "source_path": str(src_file.resolve()),
-                    "source_format": src_file.suffix.lower(),
-                    "chunking": {
-                        "max_tokens": max_chunk_tokens,
-                        "overlap_sentences": overlap_sentences,
+            # 4. 执行兼容预处理（只读 canonical source）。
+            self._initialize_artifacts(
+                project,
+                book_id,
+                max_chunk_tokens=max_chunk_tokens,
+                overlap_sentences=overlap_sentences,
+            )
+
+            project.config_file.write_text(
+                yaml.safe_dump(
+                    {
+                        "book_id": book_id,
+                        "source_path": str(src_file.resolve()),
+                        "source_format": src_file.suffix.lower(),
+                        "chunking": {
+                            "max_tokens": max_chunk_tokens,
+                            "overlap_sentences": overlap_sentences,
+                        },
                     },
-                },
-                allow_unicode=True,
-                sort_keys=False,
-            ),
-            encoding="utf-8",
-        )
+                    allow_unicode=True,
+                    sort_keys=False,
+                ),
+                encoding="utf-8",
+            )
+        except Exception:
+            shutil.rmtree(project_dir, ignore_errors=True)
+            raise
         
         # 5. 初始化默认术语表 (可选，复制全局模板)
         # self._init_default_glossary(project)

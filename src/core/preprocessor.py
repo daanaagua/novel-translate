@@ -2,12 +2,67 @@
 预处理模块
 负责文本清洗、章节分割、语义分块
 """
+import codecs
+import hashlib
 import re
+from dataclasses import dataclass
 from typing import List, Optional, Tuple
 from pathlib import Path
 
 from ..core.schemas import Book, Chapter, TextChunk
 from ..core.epub_reader import EpubReader
+
+
+@dataclass(frozen=True)
+class SourceDocument:
+    """已解码的规范源文档及其可审计来源。"""
+
+    text: str
+    source_format: str
+    encoding: str
+    extractor: str
+    canonical_segments: tuple[dict, ...]
+    excluded_raw_ranges: tuple[dict, ...]
+    raw_size: int | None = None
+    raw_sha256: str | None = None
+
+
+_BOM_ENCODINGS = (
+    (codecs.BOM_UTF32_LE, "utf-32-le", "UTF32_LE_BOM"),
+    (codecs.BOM_UTF32_BE, "utf-32-be", "UTF32_BE_BOM"),
+    (codecs.BOM_UTF8, "utf-8-sig", "UTF8_BOM"),
+    (codecs.BOM_UTF16_LE, "utf-16-le", "UTF16_LE_BOM"),
+    (codecs.BOM_UTF16_BE, "utf-16-be", "UTF16_BE_BOM"),
+)
+
+
+def _normalize_newlines(text: str) -> str:
+    return text.replace("\r\n", "\n").replace("\r", "\n")
+
+
+def _detected_bom(raw: bytes) -> tuple[bytes, str, str] | None:
+    for marker, encoding, policy in _BOM_ENCODINGS:
+        if raw.startswith(marker):
+            return marker, encoding, policy
+    return None
+
+
+def _decode_plain_text(raw: bytes, path: Path) -> tuple[str, str]:
+    bom = _detected_bom(raw)
+    if bom:
+        marker, encoding, _policy = bom
+        try:
+            return _normalize_newlines(raw[len(marker):].decode(encoding)), encoding
+        except UnicodeDecodeError as exc:
+            raise ValueError(f"无法按 BOM 指定编码读取文件: {path}") from exc
+
+    for encoding in ('utf-8', 'gbk', 'latin-1'):
+        try:
+            return _normalize_newlines(raw.decode(encoding)), encoding
+        except UnicodeDecodeError:
+            continue
+
+    raise ValueError(f"无法读取文件，请检查编码: {path}")
 
 
 class TextPreprocessor:
@@ -53,81 +108,193 @@ class TextPreprocessor:
         self.max_chunk_tokens = max_chunk_tokens
         self.overlap_sentences = overlap_sentences
     
-    def load_text(self, file_path: str) -> str:
+    def load_document(self, file_path: str) -> SourceDocument:
         """
-        加载文本文件 (支持 .txt, .md, .docx, .epub)
+        加载源文件，同时保留解码、提取和排除策略。
         
         Args:
             file_path: 文件路径
         
         Returns:
-            清洗后的文本
+            带 provenance 的规范源文档
         """
         path = Path(file_path)
         
         if not path.exists():
             raise FileNotFoundError(f"文件不存在: {file_path}")
-            
+
         suffix = path.suffix.lower()
-        
+
+        if suffix in {'.txt', '.md'}:
+            raw = path.read_bytes()
+            text, encoding = _decode_plain_text(raw, path)
+            bom = _detected_bom(raw)
+            raw_start = len(bom[0]) if bom else 0
+            excluded = (
+                ({"raw_start": 0, "raw_end": raw_start, "policy": bom[2]},)
+                if bom
+                else ()
+            )
+            return SourceDocument(
+                text=text,
+                source_format=suffix,
+                encoding=encoding,
+                extractor="plain-text-v1",
+                canonical_segments=(
+                    {
+                        "canonical_start": 0,
+                        "canonical_end": len(text),
+                        "origin_kind": "decoded_bytes",
+                        "origin_ref": f"source/original{suffix}",
+                        "raw_start": raw_start,
+                        "raw_end": len(raw),
+                        "transformation": "decode+newline-normalize",
+                    },
+                ),
+                excluded_raw_ranges=excluded,
+                raw_size=len(raw),
+                raw_sha256=hashlib.sha256(raw).hexdigest(),
+            )
+
+        if suffix == '.epub':
+            raw = path.read_bytes()
+            text, segments = self._load_epub_with_segments(path)
+            if path.read_bytes() != raw:
+                raise ValueError("source changed while loading document")
+            return SourceDocument(
+                text=text,
+                source_format=suffix,
+                encoding="container",
+                extractor="epub-spine-v1",
+                canonical_segments=tuple(segments),
+                excluded_raw_ranges=(
+                    {
+                        "raw_start": 0,
+                        "raw_end": len(raw),
+                        "policy": "EPUB_NON_SPINE_DATA",
+                    },
+                ),
+                raw_size=len(raw),
+                raw_sha256=hashlib.sha256(raw).hexdigest(),
+            )
+
         if suffix == '.docx':
-            return self._load_docx(path)
-        elif suffix == '.epub':
-            document = EpubReader.read(path)
-            return self._clean_text(EpubReader.to_chapter_marked_text(document))
-        elif suffix not in {'.txt', '.md'}:
-            raise ValueError(f"不支持的文件格式: {suffix}；支持 .txt、.md、.docx、.epub")
-        else:
-            return self._load_plain_text(path)
+            raw = path.read_bytes()
+            text, segments = self._load_docx_with_segments(path)
+            if path.read_bytes() != raw:
+                raise ValueError("source changed while loading document")
+            return SourceDocument(
+                text=text,
+                source_format=suffix,
+                encoding="container",
+                extractor="docx-paragraph-v1",
+                canonical_segments=tuple(segments),
+                excluded_raw_ranges=(
+                    {
+                        "raw_start": 0,
+                        "raw_end": len(raw),
+                        "policy": "DOCX_NON_DOCUMENT_DATA",
+                    },
+                ),
+                raw_size=len(raw),
+                raw_sha256=hashlib.sha256(raw).hexdigest(),
+            )
+
+        raise ValueError(
+            f"不支持的文件格式: {suffix}；支持 .txt、.md、.docx、.epub"
+        )
+
+    def load_text(self, file_path: str) -> str:
+        """兼容旧调用方；正式导入应使用 :meth:`load_document`。"""
+        return self.load_document(file_path).text
 
     def _load_docx(self, path: Path) -> str:
-        """加载 docx 文件"""
+        """兼容旧调用方的 DOCX 文本加载。"""
+        text, _segments = self._load_docx_with_segments(path)
+        return text
+
+    def _load_docx_with_segments(self, path: Path) -> tuple[str, list[dict]]:
+        """按文档段落序号提取 DOCX，不丢弃空段落或边界空格。"""
         try:
             import docx
             doc = docx.Document(path)
-            # 提取所有段落文本
-            # 改进：直接过滤掉空段落，避免 excessive newlines 干扰正则
-            full_text = []
-            for para in doc.paragraphs:
-                text = para.text.strip()
-                if text:
-                    full_text.append(text)
-            
-            # 用双换行连接，保持段落感
-            return '\n\n'.join(full_text)
+            pieces: list[str] = []
+            segments: list[dict] = []
+            cursor = 0
+            for index, paragraph in enumerate(doc.paragraphs):
+                paragraph_text = _normalize_newlines(paragraph.text)
+                piece = ("" if index == 0 else "\n\n") + paragraph_text
+                pieces.append(piece)
+                end = cursor + len(piece)
+                segments.append(
+                    {
+                        "canonical_start": cursor,
+                        "canonical_end": end,
+                        "origin_kind": "docx_paragraph",
+                        "origin_ref": f"word/document.xml#paragraph={index}",
+                        "transformation": "paragraph-text-extract+newline-normalize",
+                    }
+                )
+                cursor = end
+            return "".join(pieces), segments
         except ImportError:
             raise ImportError("请安装 python-docx 以支持 .docx 文件: pip install python-docx")
         except Exception as e:
             raise ValueError(f"读取 docx 失败: {e}")
 
+    def _load_epub_with_segments(self, path: Path) -> tuple[str, list[dict]]:
+        """按 EPUB spine member 提取规范文本和连续 provenance 区间。"""
+        document = EpubReader.read(path)
+        pieces: list[str] = []
+        segments: list[dict] = []
+        cursor = 0
+        fallback_index = 1
+
+        for index, section in enumerate(document.sections):
+            heading = section.title.strip()
+            if heading.isdigit():
+                chapter_number = int(heading)
+                fallback_index = max(fallback_index, chapter_number + 1)
+            else:
+                chapter_number = fallback_index
+                fallback_index += 1
+
+            body = section.text
+            body_lines = body.splitlines()
+            if body_lines and body_lines[0].strip().casefold() == heading.casefold():
+                body = "\n".join(body_lines[1:]).strip()
+            display_heading = "" if heading.isdigit() else heading
+            rendered = (
+                f"Chapter {chapter_number}\n\n{display_heading}\n\n{body}".strip()
+            )
+            piece = ("" if index == 0 else "\n\n") + _normalize_newlines(rendered)
+            pieces.append(piece)
+            end = cursor + len(piece)
+            segments.append(
+                {
+                    "canonical_start": cursor,
+                    "canonical_end": end,
+                    "origin_kind": "epub_spine_member",
+                    "origin_ref": section.source_path,
+                    "transformation": "xhtml-text-extract+chapter-marker+newline-normalize",
+                }
+            )
+            cursor = end
+
+        return "".join(pieces), segments
+
     def _load_plain_text(self, path: Path) -> str:
-        """加载纯文本文件"""
-        # 读取文件，尝试多种编码
-        content = None
-        for encoding in ['utf-8', 'utf-8-sig', 'gbk', 'latin-1']:
-            try:
-                content = path.read_text(encoding=encoding)
-                break
-            except UnicodeDecodeError:
-                continue
-        
-        if content is None:
-            raise ValueError(f"无法读取文件，请检查编码: {file_path}")
-        
-        # 基础清洗
-        content = self._clean_text(content)
+        """兼容旧调用方的纯文本加载。"""
+        content, _encoding = self._load_plain_text_with_encoding(path)
         return content
+
+    def _load_plain_text_with_encoding(self, path: Path) -> tuple[str, str]:
+        """以确定性顺序解码，且不用替换字符掩盖解码错误。"""
+        return _decode_plain_text(path.read_bytes(), path)
     
     def _clean_text(self, text: str) -> str:
-        """基础文本清洗"""
-        # 统一换行符
-        text = text.replace('\r\n', '\n').replace('\r', '\n')
-        # 移除多余空行（保留最多两个连续换行）
-        text = re.sub(r'\n{3,}', '\n\n', text)
-        # 移除行首行尾空白
-        lines = [line.strip() for line in text.split('\n')]
-        text = '\n'.join(lines)
-        return text
+        """仅做无损的换行规范化。"""
+        return _normalize_newlines(text)
     
     def split_chapters(self, text: str) -> List[Tuple[str, str, str]]:
         """
