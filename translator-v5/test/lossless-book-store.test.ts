@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -6,6 +7,7 @@ import { DatabaseSync } from "node:sqlite";
 import test from "node:test";
 
 import type { BookWindowPlan } from "../src/fullbook/types.js";
+import { blockId } from "../src/source/block-builder.js";
 import type { LosslessBlock } from "../src/source/types.js";
 import { BookStore } from "../src/storage/book-store.js";
 import {
@@ -15,15 +17,37 @@ import {
   type WindowStageInput,
 } from "../src/storage/lossless-book-store.js";
 
+const CANONICAL_SOURCE = "Alpha.Beta.";
+
+function sha256(value: string): string {
+  return createHash("sha256").update(value, "utf8").digest("hex");
+}
+
 function fixturePath(): string {
   return join(mkdtempSync(join(tmpdir(), "v5-lossless-store-")), "book-v2.db");
+}
+
+function databaseShape(path: string): {
+  journalMode: string;
+  userVersion: number;
+  tables: string[];
+} {
+  const database = new DatabaseSync(path);
+  const journalMode = (database.prepare("PRAGMA journal_mode").get() as { journal_mode: string }).journal_mode;
+  const userVersion = (database.prepare("PRAGMA user_version").get() as { user_version: number }).user_version;
+  const tables = (database.prepare(`
+    SELECT name FROM sqlite_master
+    WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name
+  `).all() as unknown as Array<{ name: string }>).map((row) => row.name);
+  database.close();
+  return { journalMode, userVersion, tables };
 }
 
 function sourceInput(sourceVersion = "source-v1"): CertifiedSourceInput {
   return {
     sourceVersion,
-    rawSha256: "raw-sha-1",
-    canonicalSha256: "canonical-sha-1",
+    rawSha256: sha256(CANONICAL_SOURCE),
+    canonicalSha256: sha256(CANONICAL_SOURCE),
     canonicalChars: 11,
     coordinateUnit: "unicode_scalar",
     sourceFormat: "txt",
@@ -41,24 +65,26 @@ function sourceInput(sourceVersion = "source-v1"): CertifiedSourceInput {
 }
 
 function blocks(sourceVersion = "source-v1"): LosslessBlock[] {
+  const firstText = "Alpha.";
+  const secondText = "Beta.";
   return [{
-    id: "block-a",
+    id: blockId(sourceVersion, 0, 6, firstText),
     sourceVersion,
     canonicalStart: 0,
     canonicalEnd: 6,
-    sourceText: "Alpha.",
-    sourceHash: "hash-a",
+    sourceText: firstText,
+    sourceHash: sha256(firstText),
     globalIndex: 0,
     tokenCount: 2,
     structureId: null,
     structureTitle: null,
   }, {
-    id: "block-b",
+    id: blockId(sourceVersion, 6, 11, secondText),
     sourceVersion,
     canonicalStart: 6,
     canonicalEnd: 11,
-    sourceText: "Beta.",
-    sourceHash: "hash-b",
+    sourceText: secondText,
+    sourceHash: sha256(secondText),
     globalIndex: 1,
     tokenCount: 2,
     structureId: null,
@@ -67,12 +93,13 @@ function blocks(sourceVersion = "source-v1"): LosslessBlock[] {
 }
 
 function windowsTogether(): BookWindowPlan[] {
+  const [first, second] = blocks();
   return [{
     windowId: "window-0",
     ordinal: 0,
     chapterId: "chapter-0",
     chapterTitle: "One",
-    blockIds: ["block-a", "block-b"],
+    blockIds: [first!.id, second!.id],
     globalIndexes: [0, 1],
     sourceTokens: 4,
     sourceChars: 11,
@@ -81,9 +108,10 @@ function windowsTogether(): BookWindowPlan[] {
 }
 
 function windowsApart(): BookWindowPlan[] {
+  const [first, second] = blocks();
   return [{
     ...windowsTogether()[0]!,
-    blockIds: ["block-a"],
+    blockIds: [first!.id],
     globalIndexes: [0],
     sourceTokens: 2,
     sourceChars: 6,
@@ -92,7 +120,7 @@ function windowsApart(): BookWindowPlan[] {
     ordinal: 1,
     chapterId: "chapter-0",
     chapterTitle: "One",
-    blockIds: ["block-b"],
+    blockIds: [second!.id],
     globalIndexes: [1],
     sourceTokens: 2,
     sourceChars: 5,
@@ -128,14 +156,15 @@ function validStage(
   windowId = "window-0",
   snapshotId = "snapshot-a",
 ): WindowStageInput {
+  const [first, second] = blocks();
   return {
     runId,
     windowId,
     snapshotId,
     status: "completed",
-    translations: [{ blockId: "block-a", sourceHash: "hash-a", text: "阿尔法。" }, {
-      blockId: "block-b",
-      sourceHash: "hash-b",
+    translations: [{ blockId: first!.id, sourceHash: first!.sourceHash, text: "阿尔法。" }, {
+      blockId: second!.id,
+      sourceHash: second!.sourceHash,
       text: "贝塔。",
     }],
     knowledgeCandidates: [{
@@ -164,7 +193,7 @@ test("schema v2 enables foreign keys and WAL and creates every audit table", () 
     "source_versions", "source_ranges", "structure_annotations", "logical_blocks",
     "translation_runs", "window_plans", "window_membership", "translations",
     "knowledge_records", "knowledge_snapshots", "migration_candidates",
-    "recovery_runs", "events",
+    "recovery_runs", "events", "lossless_schema_meta",
   ]) {
     assert.ok(names.includes(name), `missing table ${name}`);
   }
@@ -175,13 +204,34 @@ test("schema v2 refuses to migrate a legacy BookStore database in place", () => 
   const path = fixturePath();
   const legacy = new BookStore(path);
   legacy.close();
+  const before = databaseShape(path);
   assert.throws(() => new LosslessBookStore(path), /legacy.*new database/i);
+  assert.deepEqual(databaseShape(path), before);
   const database = new DatabaseSync(path);
   const v2Table = database.prepare(`
     SELECT name FROM sqlite_master WHERE type='table' AND name='source_versions'
   `).get();
   assert.equal(v2Table, undefined);
   database.close();
+});
+
+test("schema v2 rejects unknown and partial databases without changing journal, tables, or version", () => {
+  for (const [kind, initializeDatabase] of [
+    ["unknown", (database: DatabaseSync) => {
+      database.exec("PRAGMA journal_mode=DELETE; PRAGMA user_version=99; CREATE TABLE unrelated(value TEXT)");
+    }],
+    ["partial", (database: DatabaseSync) => {
+      database.exec("PRAGMA journal_mode=DELETE; PRAGMA user_version=2; CREATE TABLE source_versions(source_version TEXT)");
+    }],
+  ] as const) {
+    const path = fixturePath();
+    const database = new DatabaseSync(path);
+    initializeDatabase(database);
+    database.close();
+    const before = databaseShape(path);
+    assert.throws(() => new LosslessBookStore(path), new RegExp(`${kind}|schema`, "i"));
+    assert.deepEqual(databaseShape(path), before);
+  }
 });
 
 test("source and derived plan registration are idempotent but never overwrite mismatched data", () => {
@@ -198,11 +248,81 @@ test("source and derived plan registration are idempotent but never overwrite mi
   assert.throws(() => store.replaceDerivedPlan("source-v1", {
     blocks: [{ ...blocks()[0]!, sourceHash: "changed" }, blocks()[1]!],
     annotations: [],
-  }), /derived plan.*different/i);
+  }), /source hash|derived plan.*different/i);
   assert.throws(() => store.replaceDerivedPlan("source-v1", {
     blocks: blocks("source-v2"), annotations: [],
   }), /block.*source version/i);
   store.close();
+});
+
+test("first derived plan registration verifies block hashes, ids, and reconstructed canonical hash", () => {
+  const canonical = "Alpha.";
+  const sourceVersion = "source-certified";
+  const input: CertifiedSourceInput = {
+    ...sourceInput(sourceVersion),
+    rawSha256: sha256(canonical),
+    canonicalSha256: sha256(canonical),
+    canonicalChars: 6,
+    ranges: [{
+      ...sourceInput(sourceVersion).ranges[0]!,
+      canonicalEnd: 6,
+    }],
+  };
+  const good: LosslessBlock = {
+    id: blockId(sourceVersion, 0, 6, canonical),
+    sourceVersion,
+    canonicalStart: 0,
+    canonicalEnd: 6,
+    sourceText: canonical,
+    sourceHash: sha256(canonical),
+    globalIndex: 0,
+    tokenCount: 2,
+    structureId: null,
+    structureTitle: null,
+  };
+  const cases: Array<[string, LosslessBlock, RegExp]> = [
+    ["different-text", {
+      ...good,
+      id: blockId(sourceVersion, 0, 6, "Omega!"),
+      sourceText: "Omega!",
+      sourceHash: sha256("Omega!"),
+    }, /canonical.*hash/i],
+    ["wrong-hash", { ...good, sourceHash: "0".repeat(64) }, /source hash/i],
+    ["fake-id", { ...good, id: "block-fake" }, /block id/i],
+  ];
+  for (const [suffix, candidate, pattern] of cases) {
+    const path = fixturePath();
+    const store = new LosslessBookStore(path);
+    store.registerSource({ ...input, sourceVersion: `${sourceVersion}-${suffix}` });
+    const rebased = {
+      ...candidate,
+      sourceVersion: `${sourceVersion}-${suffix}`,
+      ...(suffix === "fake-id" ? {} : {
+        id: blockId(
+          `${sourceVersion}-${suffix}`,
+          candidate.canonicalStart,
+          candidate.canonicalEnd,
+          candidate.sourceText,
+        ),
+      }),
+    };
+    let error: unknown;
+    try {
+      store.replaceDerivedPlan(`${sourceVersion}-${suffix}`, { blocks: [rebased], annotations: [] });
+    } catch (caught) {
+      error = caught;
+    }
+    store.close();
+    assert.match(error instanceof Error ? error.message : "", pattern);
+    const database = new DatabaseSync(path);
+    const source = database.prepare(`
+      SELECT plan_fingerprint FROM source_versions WHERE source_version=?
+    `).get(`${sourceVersion}-${suffix}`) as { plan_fingerprint: string | null };
+    assert.equal(source.plan_fingerprint, null);
+    assert.equal((database.prepare("SELECT COUNT(*) AS count FROM logical_blocks").get() as { count: number }).count, 0);
+    assert.equal((database.prepare("SELECT COUNT(*) AS count FROM structure_annotations").get() as { count: number }).count, 0);
+    database.close();
+  }
 });
 
 test("window initialization requires complete unique continuous membership and rolls back failures", () => {
@@ -210,13 +330,14 @@ test("window initialization requires complete unique continuous membership and r
   store.registerSource(sourceInput());
   store.replaceDerivedPlan("source-v1", { blocks: blocks(), annotations: [] });
 
+  const [first, second] = blocks();
   const invalidPlans: Array<[string, BookWindowPlan[], RegExp]> = [
     ["gap", [{ ...windowsApart()[0]!, ordinal: 1 }, windowsApart()[1]!], /ordinal.*continuous/i],
     ["missing", [windowsApart()[0]!], /complete.*membership/i],
-    ["duplicate", [{ ...windowsTogether()[0]!, blockIds: ["block-a", "block-a"], globalIndexes: [0, 0] }], /duplicate.*block/i],
-    ["unknown", [{ ...windowsTogether()[0]!, blockIds: ["block-a", "block-x"], globalIndexes: [0, 2] }], /unknown block/i],
-    ["reversed", [{ ...windowsApart()[0]!, blockIds: ["block-b"], globalIndexes: [1], sourceChars: 5 }, {
-      ...windowsApart()[1]!, blockIds: ["block-a"], globalIndexes: [0], sourceChars: 6,
+    ["duplicate", [{ ...windowsTogether()[0]!, blockIds: [first!.id, first!.id], globalIndexes: [0, 0] }], /duplicate.*block/i],
+    ["unknown", [{ ...windowsTogether()[0]!, blockIds: [first!.id, "block-x"], globalIndexes: [0, 2] }], /unknown block/i],
+    ["reversed", [{ ...windowsApart()[0]!, blockIds: [second!.id], globalIndexes: [1], sourceChars: 5 }, {
+      ...windowsApart()[1]!, blockIds: [first!.id], globalIndexes: [0], sourceChars: 6,
     }], /source order/i],
   ];
   for (const [suffix, invalid, pattern] of invalidPlans) {
@@ -241,24 +362,25 @@ test("database constraints reject cross-window membership and mismatched source 
 
   const database = new DatabaseSync(path);
   database.exec("PRAGMA foreign_keys=ON");
+  const [first] = blocks();
   assert.throws(() => database.prepare(`
     INSERT INTO window_membership(run_id, window_id, source_version, block_id, position)
-    VALUES('run-db', 'window-1', 'source-v1', 'block-a', 1)
-  `).run(), /unique constraint/i);
+    VALUES('run-db', 'window-1', 'source-v1', ?, 1)
+  `).run(first!.id), /unique constraint/i);
   assert.throws(() => database.prepare(`
     INSERT INTO translations(
       run_id, window_id, source_version, block_id, version, source_hash,
       text, result_status, stage_state, active, snapshot_id
-    ) VALUES('run-db', 'window-0', 'source-v1', 'block-a', 1, 'wrong',
+    ) VALUES('run-db', 'window-0', 'source-v1', ?, 1, 'wrong',
       '错误', 'completed', 'staged', 0, 'snapshot-db')
-  `).run(), /foreign key constraint/i);
+  `).run(first!.id), /foreign key constraint/i);
   assert.throws(() => database.prepare(`
     INSERT INTO translations(
       run_id, window_id, source_version, block_id, version, source_hash,
       text, result_status, stage_state, active, snapshot_id
-    ) VALUES('run-db', 'window-0', 'source-v2', 'block-a', 1, 'hash-a',
+    ) VALUES('run-db', 'window-0', 'source-v2', ?, 1, ?,
       '错误', 'completed', 'staged', 0, 'snapshot-db')
-  `).run(), /foreign key constraint/i);
+  `).run(first!.id, first!.sourceHash), /foreign key constraint/i);
   database.close();
 });
 
@@ -284,7 +406,7 @@ test("stage writes only inactive rows and promote commits the complete window at
   assert.equal(store.auditRows("run-a").windows[0]?.status, "staged");
 
   store.promoteStagedWindow("run-a", "window-0");
-  assert.deepEqual(store.activeTranslations("run-a").map((item) => item.blockId), ["block-a", "block-b"]);
+  assert.deepEqual(store.activeTranslations("run-a").map((item) => item.blockId), blocks().map((item) => item.id));
   assert.equal(store.knowledgeHistory("run-a")[0]?.active, true);
   assert.equal(store.auditRows("run-a").windows[0]?.status, "completed");
   store.close();
@@ -313,7 +435,7 @@ test("promotion revalidates every staged row and rolls back after database tampe
 
   const database = new DatabaseSync(path);
   database.exec("PRAGMA foreign_keys=OFF");
-  database.prepare(`UPDATE translations SET text='' WHERE run_id='run-a' AND block_id='block-b'`).run();
+  database.prepare(`UPDATE translations SET text='' WHERE run_id='run-a' AND block_id=?`).run(blocks()[1]!.id);
   database.close();
 
   const reopened = new LosslessBookStore(path);

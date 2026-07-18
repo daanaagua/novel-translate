@@ -4,9 +4,16 @@ import { dirname, resolve } from "node:path";
 import { DatabaseSync, type StatementSync } from "node:sqlite";
 
 import type { BookWindowPlan, BookWindowStatus } from "../fullbook/types.js";
+import { blockId } from "../source/block-builder.js";
 import type { LosslessBlock, StructureAnnotation } from "../source/types.js";
 import { scalarLength } from "../source/types.js";
-import { LOSSLESS_BOOK_SCHEMA_V2 } from "./book-schema-v2.js";
+import {
+  LOSSLESS_BOOK_SCHEMA_FINGERPRINT,
+  LOSSLESS_BOOK_SCHEMA_MARKER,
+  LOSSLESS_BOOK_SCHEMA_TABLES,
+  LOSSLESS_BOOK_SCHEMA_V2,
+  LOSSLESS_BOOK_SCHEMA_VERSION,
+} from "./book-schema-v2.js";
 
 export interface CertifiedSourceRange {
   rangeId: string;
@@ -124,6 +131,7 @@ export interface AuditProjection {
 
 interface SourceVersionRow {
   source_version: string;
+  canonical_sha256: string;
   canonical_chars: number;
   source_fingerprint: string;
   plan_fingerprint: string | null;
@@ -284,18 +292,26 @@ export class LosslessBookStore {
     const absolute = resolve(requireNonempty(path, "database path"));
     mkdirSync(dirname(absolute), { recursive: true });
     this.#database = new DatabaseSync(absolute);
-    this.#database.exec("PRAGMA foreign_keys=ON");
-    this.#database.exec("PRAGMA journal_mode=WAL");
-    const legacyTable = one<{ name: string }>(this.#database.prepare(`
-      SELECT name FROM sqlite_master
-      WHERE type='table' AND name IN ('book_meta', 'book_blocks', 'windows')
-      LIMIT 1
-    `));
-    if (legacyTable !== undefined) {
+    try {
+      this.#database.exec("PRAGMA foreign_keys=ON");
+      const userVersion = one<{ user_version: number }>(
+        this.#database.prepare("PRAGMA user_version"),
+      )?.user_version ?? 0;
+      const tables = all<{ name: string }>(this.#database.prepare(`
+        SELECT name FROM sqlite_master
+        WHERE type='table' AND name NOT LIKE 'sqlite_%'
+        ORDER BY name
+      `)).map((row) => row.name);
+      if (tables.length === 0 && userVersion === 0) {
+        this.#initializeSchema();
+      } else {
+        this.#verifyExistingSchema(userVersion, tables);
+      }
+      this.#database.exec("PRAGMA journal_mode=WAL");
+    } catch (error) {
       this.#database.close();
-      throw new Error("legacy BookStore schema requires a new database for schema v2; in-place migration is forbidden");
+      throw error;
     }
-    this.#database.exec(LOSSLESS_BOOK_SCHEMA_V2);
   }
 
   databaseSettings(): { foreignKeys: boolean; journalMode: string } {
@@ -916,6 +932,52 @@ export class LosslessBookStore {
     this.#database.close();
   }
 
+  #initializeSchema(): void {
+    this.#database.exec("BEGIN IMMEDIATE");
+    try {
+      this.#database.exec(LOSSLESS_BOOK_SCHEMA_V2);
+      const insertMarker = this.#database.prepare(`
+        INSERT INTO lossless_schema_meta(key, value) VALUES(?, ?)
+      `);
+      insertMarker.run("marker", LOSSLESS_BOOK_SCHEMA_MARKER);
+      insertMarker.run("fingerprint", LOSSLESS_BOOK_SCHEMA_FINGERPRINT);
+      this.#database.exec(`PRAGMA user_version=${LOSSLESS_BOOK_SCHEMA_VERSION}`);
+      this.#database.exec("COMMIT");
+    } catch (error) {
+      this.#database.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
+  #verifyExistingSchema(userVersion: number, tables: readonly string[]): void {
+    const legacyNames = new Set(["book_meta", "book_blocks", "windows"]);
+    if (tables.some((table) => legacyNames.has(table))) {
+      throw new Error(
+        "legacy BookStore schema requires a new database for schema v2; in-place migration is forbidden",
+      );
+    }
+    if (userVersion !== LOSSLESS_BOOK_SCHEMA_VERSION) {
+      throw new Error(
+        `unsupported schema user_version ${userVersion}; expected ${LOSSLESS_BOOK_SCHEMA_VERSION}`,
+      );
+    }
+    const expected = [...LOSSLESS_BOOK_SCHEMA_TABLES];
+    if (tables.length !== expected.length
+      || tables.some((table, index) => table !== expected[index])) {
+      throw new Error("schema v2 table set is incomplete or contains unknown tables");
+    }
+    const markers = new Map(all<{ key: string; value: string }>(
+      this.#database.prepare(`
+        SELECT key, value FROM lossless_schema_meta
+        WHERE key IN ('marker', 'fingerprint')
+      `),
+    ).map((row) => [row.key, row.value]));
+    if (markers.get("marker") !== LOSSLESS_BOOK_SCHEMA_MARKER
+      || markers.get("fingerprint") !== LOSSLESS_BOOK_SCHEMA_FINGERPRINT) {
+      throw new Error("schema v2 marker or fingerprint mismatch");
+    }
+  }
+
   #validateSource(input: CertifiedSourceInput): CertifiedSourceInput {
     const sourceVersion = requireNonempty(input.sourceVersion, "sourceVersion");
     const rawSha256 = requireNonempty(input.rawSha256, "rawSha256");
@@ -1017,6 +1079,7 @@ export class LosslessBookStore {
     }
     const blockIds = new Set<string>();
     let cursor = 0;
+    const reconstructedCanonical = createHash("sha256");
     const blocks = plan.blocks.map((block, index) => {
       const id = requireNonempty(block.id, `block[${index}].id`);
       if (blockIds.has(id)) {
@@ -1037,6 +1100,15 @@ export class LosslessBookStore {
         throw new Error(`block ${id} source text length does not match scalar range`);
       }
       requireNonempty(block.sourceHash, `block[${index}].sourceHash`);
+      const expectedSourceHash = hashText(block.sourceText);
+      if (block.sourceHash !== expectedSourceHash) {
+        throw new Error(`block ${id} source hash does not match source text`);
+      }
+      const expectedBlockId = blockId(source.source_version, start, end, block.sourceText);
+      if (id !== expectedBlockId) {
+        throw new Error(`block id does not match certified source identity: ${id}`);
+      }
+      reconstructedCanonical.update(block.sourceText, "utf8");
       const globalIndex = requireSafeInteger(block.globalIndex, `block[${index}].globalIndex`);
       if (globalIndex !== index) {
         throw new Error("logical block global indexes must be unique and continuous");
@@ -1060,6 +1132,9 @@ export class LosslessBookStore {
     });
     if (cursor !== source.canonical_chars) {
       throw new Error(`logical blocks cover ${cursor} canonical characters, expected ${source.canonical_chars}`);
+    }
+    if (reconstructedCanonical.digest("hex") !== source.canonical_sha256) {
+      throw new Error("reconstructed canonical hash does not match certified source");
     }
     return { annotations, blocks };
   }

@@ -1,13 +1,35 @@
+import { createHash } from "node:crypto";
+
 export const LOSSLESS_BOOK_SCHEMA_VERSION = 2;
+export const LOSSLESS_BOOK_SCHEMA_MARKER = "deepnovel-lossless-book-store";
+export const LOSSLESS_BOOK_SCHEMA_TABLES = [
+  "events",
+  "knowledge_records",
+  "knowledge_snapshots",
+  "logical_blocks",
+  "lossless_schema_meta",
+  "migration_candidates",
+  "recovery_runs",
+  "source_ranges",
+  "source_versions",
+  "structure_annotations",
+  "translation_runs",
+  "translations",
+  "window_membership",
+  "window_plans",
+] as const;
 
 /**
  * Schema v2 is intentionally separate from the legacy BookStore schema.
  * Every mutable translation artifact is namespaced by a translation run.
  */
 export const LOSSLESS_BOOK_SCHEMA_V2 = `
-  PRAGMA user_version=${LOSSLESS_BOOK_SCHEMA_VERSION};
+  CREATE TABLE lossless_schema_meta(
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+  ) STRICT;
 
-  CREATE TABLE IF NOT EXISTS source_versions(
+  CREATE TABLE source_versions(
     source_version TEXT PRIMARY KEY CHECK(length(trim(source_version)) > 0),
     raw_sha256 TEXT NOT NULL CHECK(length(trim(raw_sha256)) > 0),
     canonical_sha256 TEXT NOT NULL CHECK(length(trim(canonical_sha256)) > 0),
@@ -22,7 +44,7 @@ export const LOSSLESS_BOOK_SCHEMA_V2 = `
     created_at TEXT NOT NULL DEFAULT (datetime('now'))
   ) STRICT;
 
-  CREATE TABLE IF NOT EXISTS source_ranges(
+  CREATE TABLE source_ranges(
     source_version TEXT NOT NULL REFERENCES source_versions(source_version) ON DELETE RESTRICT,
     range_id TEXT NOT NULL CHECK(length(trim(range_id)) > 0),
     canonical_start INTEGER NOT NULL CHECK(canonical_start >= 0),
@@ -36,7 +58,7 @@ export const LOSSLESS_BOOK_SCHEMA_V2 = `
     UNIQUE(source_version, canonical_start, canonical_end)
   ) STRICT;
 
-  CREATE TABLE IF NOT EXISTS structure_annotations(
+  CREATE TABLE structure_annotations(
     source_version TEXT NOT NULL REFERENCES source_versions(source_version) ON DELETE RESTRICT,
     annotation_id TEXT NOT NULL CHECK(length(trim(annotation_id)) > 0),
     kind TEXT NOT NULL CHECK(kind IN ('volume_heading', 'chapter_heading', 'prose', 'epigraph')),
@@ -47,7 +69,7 @@ export const LOSSLESS_BOOK_SCHEMA_V2 = `
     PRIMARY KEY(source_version, annotation_id)
   ) STRICT;
 
-  CREATE TABLE IF NOT EXISTS logical_blocks(
+  CREATE TABLE logical_blocks(
     source_version TEXT NOT NULL REFERENCES source_versions(source_version) ON DELETE RESTRICT,
     block_id TEXT NOT NULL CHECK(length(trim(block_id)) > 0),
     canonical_start INTEGER NOT NULL CHECK(canonical_start >= 0),
@@ -65,7 +87,7 @@ export const LOSSLESS_BOOK_SCHEMA_V2 = `
       REFERENCES structure_annotations(source_version, annotation_id) ON DELETE RESTRICT
   ) STRICT;
 
-  CREATE TABLE IF NOT EXISTS translation_runs(
+  CREATE TABLE translation_runs(
     run_id TEXT PRIMARY KEY CHECK(length(trim(run_id)) > 0),
     source_version TEXT NOT NULL REFERENCES source_versions(source_version) ON DELETE RESTRICT,
     protocol_version TEXT NOT NULL CHECK(length(trim(protocol_version)) > 0),
@@ -77,7 +99,7 @@ export const LOSSLESS_BOOK_SCHEMA_V2 = `
     UNIQUE(run_id, source_version)
   ) STRICT;
 
-  CREATE TABLE IF NOT EXISTS knowledge_snapshots(
+  CREATE TABLE knowledge_snapshots(
     run_id TEXT NOT NULL REFERENCES translation_runs(run_id) ON DELETE RESTRICT,
     snapshot_id TEXT NOT NULL CHECK(length(trim(snapshot_id)) > 0),
     parent_snapshot_id TEXT,
@@ -90,7 +112,7 @@ export const LOSSLESS_BOOK_SCHEMA_V2 = `
       REFERENCES knowledge_snapshots(run_id, snapshot_id) ON DELETE RESTRICT
   ) STRICT;
 
-  CREATE TABLE IF NOT EXISTS window_plans(
+  CREATE TABLE window_plans(
     run_id TEXT NOT NULL,
     window_id TEXT NOT NULL CHECK(length(trim(window_id)) > 0),
     source_version TEXT NOT NULL,
@@ -120,7 +142,7 @@ export const LOSSLESS_BOOK_SCHEMA_V2 = `
       REFERENCES knowledge_snapshots(run_id, snapshot_id) ON DELETE RESTRICT
   ) STRICT;
 
-  CREATE TABLE IF NOT EXISTS window_membership(
+  CREATE TABLE window_membership(
     run_id TEXT NOT NULL,
     window_id TEXT NOT NULL,
     source_version TEXT NOT NULL,
@@ -136,7 +158,7 @@ export const LOSSLESS_BOOK_SCHEMA_V2 = `
       REFERENCES logical_blocks(source_version, block_id) ON DELETE RESTRICT
   ) STRICT;
 
-  CREATE TABLE IF NOT EXISTS translations(
+  CREATE TABLE translations(
     translation_id INTEGER PRIMARY KEY AUTOINCREMENT,
     run_id TEXT NOT NULL,
     window_id TEXT NOT NULL,
@@ -159,10 +181,10 @@ export const LOSSLESS_BOOK_SCHEMA_V2 = `
       REFERENCES knowledge_snapshots(run_id, snapshot_id) ON DELETE RESTRICT
   ) STRICT;
 
-  CREATE UNIQUE INDEX IF NOT EXISTS idx_v5_lossless_active_translation
+  CREATE UNIQUE INDEX idx_v5_lossless_active_translation
     ON translations(run_id, block_id) WHERE active=1;
 
-  CREATE TABLE IF NOT EXISTS knowledge_records(
+  CREATE TABLE knowledge_records(
     run_id TEXT NOT NULL,
     record_id TEXT NOT NULL CHECK(length(trim(record_id)) > 0),
     revision INTEGER NOT NULL CHECK(revision >= 1),
@@ -182,7 +204,7 @@ export const LOSSLESS_BOOK_SCHEMA_V2 = `
       REFERENCES knowledge_snapshots(run_id, snapshot_id) ON DELETE RESTRICT
   ) STRICT;
 
-  CREATE TABLE IF NOT EXISTS migration_candidates(
+  CREATE TABLE migration_candidates(
     candidate_id TEXT PRIMARY KEY CHECK(length(trim(candidate_id)) > 0),
     run_id TEXT REFERENCES translation_runs(run_id) ON DELETE RESTRICT,
     source_version TEXT NOT NULL REFERENCES source_versions(source_version) ON DELETE RESTRICT,
@@ -193,7 +215,7 @@ export const LOSSLESS_BOOK_SCHEMA_V2 = `
     created_at TEXT NOT NULL DEFAULT (datetime('now'))
   ) STRICT;
 
-  CREATE TABLE IF NOT EXISTS recovery_runs(
+  CREATE TABLE recovery_runs(
     recovery_id TEXT PRIMARY KEY CHECK(length(trim(recovery_id)) > 0),
     run_id TEXT NOT NULL REFERENCES translation_runs(run_id) ON DELETE RESTRICT,
     state TEXT NOT NULL
@@ -207,7 +229,7 @@ export const LOSSLESS_BOOK_SCHEMA_V2 = `
     created_at TEXT NOT NULL DEFAULT (datetime('now'))
   ) STRICT;
 
-  CREATE TABLE IF NOT EXISTS events(
+  CREATE TABLE events(
     sequence INTEGER PRIMARY KEY AUTOINCREMENT,
     run_id TEXT REFERENCES translation_runs(run_id) ON DELETE RESTRICT,
     kind TEXT NOT NULL CHECK(length(trim(kind)) > 0),
@@ -215,3 +237,7 @@ export const LOSSLESS_BOOK_SCHEMA_V2 = `
     created_at TEXT NOT NULL DEFAULT (datetime('now'))
   ) STRICT;
 `;
+
+export const LOSSLESS_BOOK_SCHEMA_FINGERPRINT = createHash("sha256")
+  .update(LOSSLESS_BOOK_SCHEMA_V2, "utf8")
+  .digest("hex");
