@@ -1,4 +1,4 @@
-export type AgentPhase = "research" | "translation" | "repair";
+export type AgentPhase = "research" | "translation" | "repair" | "recovery";
 
 export type VisibilityChannel =
   | "narrative_before_target"

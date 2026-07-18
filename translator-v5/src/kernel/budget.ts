@@ -5,7 +5,9 @@ export type BudgetCounter =
   | "evidenceChars"
   | "translationTurns"
   | "translationToolCalls"
-  | "repairTurns";
+  | "repairTurns"
+  | "recoveryTurns"
+  | "recoveryToolCalls";
 
 export const DEFAULT_BUDGET_LIMITS: Readonly<Record<BudgetCounter, number>> = {
   modelCalls: 20,
@@ -15,6 +17,8 @@ export const DEFAULT_BUDGET_LIMITS: Readonly<Record<BudgetCounter, number>> = {
   translationTurns: 10,
   translationToolCalls: 18,
   repairTurns: 3,
+  recoveryTurns: 1,
+  recoveryToolCalls: 5,
 };
 
 export class BudgetExceeded extends Error {

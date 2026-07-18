@@ -5,15 +5,27 @@ import { pathToFileURL } from "node:url";
 import {
   createDeepSeekModel,
   createDeepSeekStreamFn,
+  PiRuntime,
 } from "./agents/pi-runtime.js";
+import { RecoveryAgent } from "./agents/recovery-agent.js";
 import { loadOpenCodeApiKey, loadPilotConfig } from "./config.js";
 import {
   LOSSLESS_BOOK_PROTOCOL_VERSION,
   preflightBook,
   runBook,
 } from "./fullbook/book-runner.js";
+import { BookContext } from "./fullbook/book-context.js";
 import { planBookWindows, type WindowPlanOptions } from "./fullbook/window-planner.js";
 import { preflightPilot, runPilot } from "./pilot-runner.js";
+import { BudgetLedger } from "./kernel/budget.js";
+import { projectRecoveryRule, isIncidentCode } from "./recovery/registry.js";
+import {
+  createStoreRecoveryIncident,
+  loadAttemptedRecoveryStrategies,
+  RecoveryEngine,
+  StoreRecoveryKernel,
+} from "./recovery/recovery-engine.js";
+import type { IncidentCode } from "./recovery/types.js";
 import {
   auditLosslessBookStore,
   type BookArtifactPaths,
@@ -30,6 +42,7 @@ export type CliCommand =
   | "book-preflight"
   | "book-doctor"
   | "book-audit"
+  | "book-recover"
   | "book-run"
   | "book-status"
   | "book-export";
@@ -40,6 +53,7 @@ export interface CliOptions {
   manifest?: string;
   legacyV4Db?: string;
   runId?: string;
+  incidentCode?: IncidentCode;
   config?: string;
   output?: string;
   store?: string;
@@ -246,6 +260,17 @@ function identifierValue(
   return value;
 }
 
+function incidentCodeValue(
+  values: ReadonlyMap<string, string>,
+  name: string,
+): IncidentCode {
+  const value = identifierValue(values, name, true) as string;
+  if (!isIncidentCode(value)) {
+    throw new Error(`unknown recovery incident code: ${value}`);
+  }
+  return value;
+}
+
 function pathValue(
   values: ReadonlyMap<string, string>,
   name: string,
@@ -325,6 +350,49 @@ export function parseArgs(argv: readonly string[]): CliOptions {
       command: "book-audit",
       store: pathValue(values, "--store"),
       runId: identifierValue(values, "--run", true),
+    };
+  }
+  if (action === "recover") {
+    const { values } = parseFlags(
+      argv.slice(2),
+      "book recover",
+      [
+        "--store", "--run", "--incident", "--manifest", "--config",
+        "--opencode-auth", "--hard-deadline-ms",
+      ],
+    );
+    const config = pathValue(values, "--config", false);
+    const openCodeAuth = pathValue(values, "--opencode-auth", false);
+    const hardDeadlineMs = positiveFlag(values, "--hard-deadline-ms");
+    const incidentCode = incidentCodeValue(values, "--incident");
+    const manifest = pathValue(values, "--manifest", false);
+    const planStrategies = new Set([
+      "flat_partition_rebuild",
+      "rebuild_affected_span",
+      "rebuild_window_membership",
+      "replan_affected_windows",
+      "split_window_boundaries",
+    ]);
+    const recoveryRule = projectRecoveryRule(incidentCode);
+    if ((recoveryRule.deterministic !== null
+      && planStrategies.has(recoveryRule.deterministic))
+      || recoveryRule.allowed.some((strategy) => planStrategies.has(strategy))) {
+      if (manifest === undefined) {
+        throw new Error(`--manifest is required for ${incidentCode} recovery`);
+      }
+    }
+    if (openCodeAuth !== undefined && config === undefined) {
+      throw new Error("--opencode-auth requires --config for book recover");
+    }
+    return {
+      command: "book-recover",
+      store: pathValue(values, "--store"),
+      runId: identifierValue(values, "--run", true),
+      incidentCode,
+      ...(manifest === undefined ? {} : { manifest }),
+      ...(config === undefined ? {} : { config }),
+      ...(openCodeAuth === undefined ? {} : { openCodeAuth }),
+      ...(hardDeadlineMs === undefined ? {} : { hardDeadlineMs }),
     };
   }
   if (action === "run") {
@@ -436,6 +504,65 @@ export async function main(
         );
       }
     } finally {
+      store.close();
+    }
+    return;
+  }
+  if (options.command === "book-recover") {
+    const storePath = requireOption(options, "store");
+    const runId = requireOption(options, "runId");
+    const incidentCode = options.incidentCode;
+    if (incidentCode === undefined) {
+      throw new Error("missing incidentCode");
+    }
+    const store = new LosslessBookStore(storePath);
+    let recoveryContext: BookContext | undefined;
+    try {
+      const incident = createStoreRecoveryIncident(
+        store,
+        runId,
+        incidentCode,
+        loadAttemptedRecoveryStrategies(storePath, runId, incidentCode),
+      );
+      const rule = projectRecoveryRule(incidentCode, incident.attemptedStrategies);
+      if (options.manifest !== undefined) {
+        recoveryContext = BookContext.openLossless({ manifestPath: options.manifest });
+      }
+      let planner: RecoveryAgent | undefined;
+      if (rule.deterministic === null
+        && rule.allowed.length > 0
+        && rule.maxAttempts === 1
+        && options.config !== undefined) {
+        const recoveryRuntime: CliRuntimeDependencies = {
+          createModel: dependencyOverrides.createModel ?? createDeepSeekModel,
+          createStreamFn: dependencyOverrides.createStreamFn ?? createDeepSeekStreamFn,
+        };
+        const config = loadRuntimeConfig(options);
+        planner = new RecoveryAgent(new PiRuntime(), {
+          model: recoveryRuntime.createModel(config),
+          streamFn: recoveryRuntime.createStreamFn(config),
+          budget: new BudgetLedger({
+            modelCalls: 1,
+            recoveryTurns: 1,
+            recoveryToolCalls: 5,
+          }),
+          deadlineMs: options.hardDeadlineMs,
+        });
+      }
+      const result = await new RecoveryEngine({
+        kernel: new StoreRecoveryKernel(store, storePath, recoveryContext === undefined
+          ? undefined
+          : {
+              sourceText: recoveryContext.sourceLedger.sourceText,
+              certifiedSource: recoveryContext.certifiedSource!,
+              annotations: recoveryContext.annotations,
+              rawHashVerified: true,
+            }),
+        ...(planner === undefined ? {} : { planner }),
+      }).recover(incident);
+      console.log(JSON.stringify(result, null, 2));
+    } finally {
+      recoveryContext?.close();
       store.close();
     }
     return;

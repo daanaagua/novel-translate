@@ -45,6 +45,8 @@ const SEQUENTIAL_TOOLS = new Set([
   "finalize_translation_batch",
   "submit_repaired_translation",
   "submit_lexical_anchors",
+  "choose_recovery_strategy",
+  "submit_recovery_result",
 ]);
 
 export interface PiSessionSpec {
@@ -109,6 +111,8 @@ function turnCounter(phase: AgentPhase): BudgetCounter {
       return "translationTurns";
     case "repair":
       return "repairTurns";
+    case "recovery":
+      return "recoveryTurns";
   }
 }
 

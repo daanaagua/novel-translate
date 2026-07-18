@@ -86,6 +86,16 @@ export interface StoredTranslationRun {
   metadata: unknown;
 }
 
+export interface RecoveryMutationPromotion {
+  recoveryId: string;
+  runId: string;
+  kind: "reset_interrupted_windows" | "reset_missing_windows" | "quarantine_old_run";
+  affectedWindowIds: readonly string[];
+  expectedBeforeHash: string;
+  expectedAfterHash: string;
+  result: unknown;
+}
+
 export interface StagedTranslationInput {
   blockId: string;
   sourceHash: string;
@@ -1323,6 +1333,107 @@ export class LosslessBookStore {
         runId, windowIds: interrupted,
       });
       return interrupted;
+    });
+  }
+
+  recoveryProjectionHash(runId: string): string {
+    const state = this.auditState(runId);
+    return hashText(jsonText({
+      runId: state.runId,
+      sourceVersion: state.sourceVersion,
+      canonicalSha256: state.canonicalSha256,
+      runStatus: state.runStatus,
+      windows: state.windows.map((window) => ({
+        windowId: window.windowId,
+        ordinal: window.ordinal,
+        status: window.status,
+        snapshotId: window.snapshotId,
+      })),
+      memberships: state.memberships,
+      translations: state.translations,
+      snapshots: state.snapshots,
+    }, "recovery projection"));
+  }
+
+  promoteRecoveryMutation(input: RecoveryMutationPromotion): void {
+    requireNonempty(input.runId, "runId");
+    requireNonempty(input.recoveryId, "recoveryId");
+    requireNonempty(input.expectedBeforeHash, "expectedBeforeHash");
+    requireNonempty(input.expectedAfterHash, "expectedAfterHash");
+    const windowIds = [...new Set(input.affectedWindowIds.map((windowId) =>
+      requireNonempty(windowId, "windowId")))];
+    if (windowIds.length !== input.affectedWindowIds.length) {
+      throw new Error("duplicate recovery window ID");
+    }
+    this.#transaction(() => {
+      const beforeHash = this.recoveryProjectionHash(input.runId);
+      if (beforeHash !== input.expectedBeforeHash) {
+        throw new Error("recovery promotion precondition changed after shadow audit");
+      }
+      if (input.kind === "reset_interrupted_windows") {
+        const interrupted = all<{ window_id: string }>(this.#database.prepare(`
+          SELECT window_id FROM window_plans
+          WHERE run_id=? AND status IN ('running', 'staged') ORDER BY ordinal
+        `), input.runId).map((row) => row.window_id);
+        if (jsonText(interrupted, "interrupted windows")
+          !== jsonText(windowIds, "recovery windows")) {
+          throw new Error("interrupted window set changed after shadow audit");
+        }
+        for (const windowId of windowIds) {
+          this.#database.prepare(`
+            DELETE FROM translations
+            WHERE run_id=? AND window_id=? AND active=0
+          `).run(input.runId, windowId);
+          this.#database.prepare(`
+            DELETE FROM knowledge_candidates
+            WHERE run_id=? AND window_id=? AND stage_state='staged'
+          `).run(input.runId, windowId);
+          this.#database.prepare(`
+            UPDATE window_plans
+            SET status='pending', result_status=NULL, snapshot_id=NULL,
+                style_tail='', budget_json='{}', warnings_json='[]',
+                last_error='recovered interrupted window', updated_at=datetime('now')
+            WHERE run_id=? AND window_id=? AND status IN ('running', 'staged')
+          `).run(input.runId, windowId);
+        }
+      } else if (input.kind === "reset_missing_windows") {
+        for (const windowId of windowIds) {
+          this.#database.prepare(`
+            UPDATE window_plans
+            SET status='pending', snapshot_id=NULL, result_status=NULL,
+                updated_at=datetime('now')
+            WHERE run_id=? AND window_id=? AND status IN ('pending', 'human_required')
+          `).run(input.runId, windowId);
+        }
+      } else {
+        this.#database.prepare(`
+          UPDATE translation_runs SET status='quarantined' WHERE run_id=?
+        `).run(input.runId);
+      }
+      const afterHash = this.recoveryProjectionHash(input.runId);
+      if (afterHash !== input.expectedAfterHash) {
+        throw new Error("recovery promotion differs from audited shadow state");
+      }
+      const recovery = this.#database.prepare(`
+        UPDATE recovery_runs
+        SET state='resumed', after_hash=?, result_json=?
+        WHERE recovery_id=? AND run_id=? AND state='auditing'
+      `).run(
+        afterHash,
+        jsonText(input.result, "recovery promotion result"),
+        input.recoveryId,
+        input.runId,
+      );
+      if (Number(recovery.changes) !== 1) {
+        throw new Error("recovery state changed before atomic promotion");
+      }
+      this.#appendEvent(input.runId, "recovery_promoted", {
+        recoveryId: input.recoveryId,
+        kind: input.kind,
+        affectedWindowIds: windowIds,
+        beforeHash,
+        afterHash,
+      });
     });
   }
 

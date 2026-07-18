@@ -11,7 +11,12 @@ import { main, parseArgs, resolveRunSelection } from "../src/cli.js";
 import { BookContext } from "../src/fullbook/book-context.js";
 import { planBookWindows } from "../src/fullbook/window-planner.js";
 import { createKnowledgeSnapshot } from "../src/knowledge/snapshot.js";
-import { bookArtifactFileNames } from "../src/report.js";
+import { RECOVERY_RULES } from "../src/recovery/registry.js";
+import {
+  createStoreRecoveryIncident,
+  StoreRecoveryKernel,
+} from "../src/recovery/recovery-engine.js";
+import { auditLosslessBookStore, bookArtifactFileNames } from "../src/report.js";
 import { LosslessBookStore } from "../src/storage/lossless-book-store.js";
 
 function sourceManifest(source: string): string {
@@ -145,6 +150,47 @@ test("CLI parses formal lossless run and optional run selection", () => {
   assert.equal(parseArgs([
     "book", "export", "--store", "state.db", "--output", "out", "--run", "run-1",
   ]).runId, "run-1");
+});
+
+test("CLI parses book recover with a strict structured incident", () => {
+  assert.deepEqual(parseArgs([
+    "book", "recover", "--store", "state.db", "--run", "run-1",
+    "--incident", "RUNNING_AFTER_CRASH",
+  ]), {
+    command: "book-recover",
+    store: resolve("state.db"),
+    runId: "run-1",
+    incidentCode: "RUNNING_AFTER_CRASH",
+  });
+  assert.throws(
+    () => parseArgs(["book", "recover", "--store", "state.db", "--run", "run-1"]),
+    /missing --incident/,
+  );
+  assert.throws(
+    () => parseArgs([
+      "book", "recover", "--store", "state.db", "--run", "run-1",
+      "--incident", "NOT_REGISTERED",
+    ]),
+    /unknown recovery incident code/i,
+  );
+  assert.throws(
+    () => parseArgs([
+      "book", "recover", "--store", "state.db", "--run", "run-1",
+      "--incident", "RUNNING_AFTER_CRASH", "--db", "source.db",
+    ]),
+    /unknown flag for book recover: --db/,
+  );
+  assert.throws(
+    () => parseArgs([
+      "book", "recover", "--store", "state.db", "--run", "run-1",
+      "--incident", "SOURCE_SPAN_GAP",
+    ]),
+    /--manifest is required for SOURCE_SPAN_GAP recovery/,
+  );
+  assert.equal(parseArgs([
+    "book", "recover", "--store", "state.db", "--run", "run-1",
+    "--incident", "SOURCE_SPAN_GAP", "--manifest", "source.json",
+  ]).manifest, resolve("source.json"));
 });
 
 test("CLI rejects duplicate, missing-value, and unknown flags", () => {
@@ -288,6 +334,193 @@ test("book audit recomputes persisted integrity and missing blocks without a pro
   assert.equal(report.complete, false);
   assert.ok(Number(report.missingBlockCount) > 0);
   assert.ok((report.incidentCodes as string[]).includes("SOURCE_HASH_MISMATCH"));
+});
+
+test("book recover returns a structured quarantine and does not construct a provider when no policy is allowed", async () => {
+  const manifest = sourceManifest("Encoding must remain human-certified.");
+  const storePath = auditStore(manifest, "run-recover");
+  const output: string[] = [];
+  let providerConstructions = 0;
+  const originalLog = console.log;
+  console.log = (...values: unknown[]) => output.push(values.join(" "));
+  try {
+    await main([
+      "book", "recover", "--store", storePath, "--run", "run-recover",
+      "--incident", "ENCODING_AMBIGUOUS",
+    ], {
+      createModel: () => {
+        providerConstructions += 1;
+        throw new Error("provider must not be constructed");
+      },
+    });
+  } finally {
+    console.log = originalLog;
+  }
+  assert.equal(providerConstructions, 0);
+  const result = JSON.parse(output.at(-1) ?? "") as Record<string, unknown>;
+  assert.equal(result.schema, "v5-book-recovery-1");
+  assert.equal(result.incidentCode, "ENCODING_AMBIGUOUS");
+  assert.equal(result.status, "quarantined");
+  assert.equal(result.modelCalls, 0);
+  assert.equal(result.attempts, 0);
+  const database = new DatabaseSync(storePath);
+  const recovery = database.prepare(`
+    SELECT state, strategy, before_hash, after_hash, parameters_json, result_json
+    FROM recovery_runs WHERE run_id=?
+  `).get("run-recover") as Record<string, unknown> | undefined;
+  database.close();
+  assert.equal(recovery?.state, "quarantined");
+  assert.equal(recovery?.strategy, "none");
+  assert.ok(typeof recovery?.before_hash === "string");
+  assert.equal(recovery?.after_hash, null);
+  assert.match(String(recovery?.parameters_json), /ENCODING_AMBIGUOUS/);
+  assert.match(String(recovery?.result_json), /human_certification_required/);
+  const quarantinedStore = new LosslessBookStore(storePath);
+  assert.equal(
+    quarantinedStore.listTranslationRuns().find((run) => run.runId === "run-recover")?.status,
+    "quarantined",
+  );
+  quarantinedStore.close();
+});
+
+test("book recover promotes an audited interrupted-window shadow with zero Pi calls", async () => {
+  const manifest = sourceManifest("Interrupted state must recover without touching source.");
+  const storePath = auditStore(manifest, "run-interrupted");
+  let store = new LosslessBookStore(storePath);
+  const windowId = store.allWindows("run-interrupted")[0]?.windowId;
+  assert.ok(windowId);
+  store.claimWindow("run-interrupted", windowId);
+  const sourceHashBefore = store.auditState("run-interrupted").canonicalSha256;
+  store.close();
+
+  const output: string[] = [];
+  let providerConstructions = 0;
+  const originalLog = console.log;
+  console.log = (...values: unknown[]) => output.push(values.join(" "));
+  try {
+    await main([
+      "book", "recover", "--store", storePath, "--run", "run-interrupted",
+      "--incident", "RUNNING_AFTER_CRASH",
+    ], {
+      createModel: () => {
+        providerConstructions += 1;
+        throw new Error("deterministic recovery must not construct a provider");
+      },
+    });
+  } finally {
+    console.log = originalLog;
+  }
+  assert.equal(providerConstructions, 0);
+  const result = JSON.parse(output.at(-1) ?? "") as Record<string, unknown>;
+  assert.equal(result.status, "resumed");
+  assert.equal(result.strategy, "reset_interrupted_windows");
+  assert.equal(result.modelCalls, 0);
+  assert.equal(result.attempts, 1);
+
+  store = new LosslessBookStore(storePath);
+  assert.equal(store.allWindows("run-interrupted")[0]?.status, "pending");
+  assert.equal(store.auditState("run-interrupted").canonicalSha256, sourceHashBefore);
+  store.close();
+  const database = new DatabaseSync(storePath);
+  const recovery = database.prepare(`
+    SELECT state, strategy, before_hash, after_hash, result_json
+    FROM recovery_runs WHERE run_id=?
+  `).get("run-interrupted") as Record<string, unknown> | undefined;
+  database.close();
+  assert.equal(recovery?.state, "resumed");
+  assert.equal(recovery?.strategy, "reset_interrupted_windows");
+  assert.ok(typeof recovery?.before_hash === "string");
+  assert.ok(typeof recovery?.after_hash === "string");
+  assert.match(String(recovery?.result_json), /completed_translations_unchanged/);
+});
+
+test("recovery promotion rolls back when formal state changes after shadow audit", async () => {
+  const source = Array.from({ length: 8 }, (_, index) =>
+    `${String.fromCharCode(65 + index)}${"x".repeat(4_999)}.`).join("\n\n");
+  const manifest = sourceManifest(source);
+  const storePath = auditStore(manifest, "run-race");
+  const store = new LosslessBookStore(storePath);
+  const windows = store.allWindows("run-race");
+  assert.ok(windows.length >= 2);
+  store.claimWindow("run-race", windows[0]!.windowId);
+  const incident = createStoreRecoveryIncident(store, "run-race", "RUNNING_AFTER_CRASH");
+  const kernel = new StoreRecoveryKernel(store, storePath);
+  const shadow = await kernel.createShadow(incident, "reset_interrupted_windows", {});
+  await kernel.applyStrategy(shadow);
+  const audit = await kernel.auditShadow(
+    shadow,
+    RECOVERY_RULES.RUNNING_AFTER_CRASH.requiredAudits,
+  );
+  assert.equal(audit.ok, true);
+
+  store.claimWindow("run-race", windows[1]!.windowId);
+  await assert.rejects(
+    kernel.promoteRecovery(shadow),
+    /precondition changed after shadow audit/,
+  );
+  const after = store.allWindows("run-race");
+  assert.equal(after.find((window) => window.windowId === windows[0]!.windowId)?.status, "running");
+  assert.equal(after.find((window) => window.windowId === windows[1]!.windowId)?.status, "running");
+  await kernel.discardRecovery(shadow, "fault_injection");
+  store.close();
+});
+
+test("book recover rebuilds a source-gap plan without editing old source or translations", async () => {
+  const manifest = sourceManifest("Alpha paragraph.\n\nBeta paragraph.");
+  const storePath = auditStore(manifest, "run-source-gap");
+  const database = new DatabaseSync(storePath);
+  const oldBlock = database.prepare(`
+    SELECT block_id, source_text FROM logical_blocks
+    WHERE source_version=(SELECT source_version FROM translation_runs WHERE run_id=?)
+    ORDER BY global_index LIMIT 1
+  `).get("run-source-gap") as { block_id: string; source_text: string };
+  database.prepare(`
+    UPDATE logical_blocks SET canonical_start=1 WHERE block_id=?
+  `).run(oldBlock.block_id);
+  database.close();
+
+  const output: string[] = [];
+  let providerConstructions = 0;
+  const originalLog = console.log;
+  console.log = (...values: unknown[]) => output.push(values.join(" "));
+  try {
+    await main([
+      "book", "recover", "--store", storePath, "--run", "run-source-gap",
+      "--incident", "SOURCE_SPAN_GAP", "--manifest", manifest,
+    ], {
+      createModel: () => {
+        providerConstructions += 1;
+        throw new Error("deterministic source recovery must not construct a provider");
+      },
+    });
+  } finally {
+    console.log = originalLog;
+  }
+  assert.equal(providerConstructions, 0);
+  const result = JSON.parse(output.at(-1) ?? "") as Record<string, unknown>;
+  assert.equal(result.status, "resumed");
+  assert.equal(result.strategy, "flat_partition_rebuild");
+  assert.equal(result.modelCalls, 0);
+  const recoveredRunId = String(result.replacementRunId);
+  assert.match(recoveredRunId, /^recovery-run-/);
+  assert.equal(result.runId, recoveredRunId);
+  assert.equal(result.recoveredFromRunId, "run-source-gap");
+  assert.match(String(result.replacementSourceVersion), /:recovery:/);
+
+  const store = new LosslessBookStore(storePath);
+  const oldState = store.auditState("run-source-gap");
+  assert.equal(oldState.blocks[0]?.canonicalStart, 1);
+  assert.equal(oldState.blocks[0]?.sourceText, oldBlock.source_text);
+  const recoveredAudit = auditLosslessBookStore(store, recoveredRunId);
+  assert.deepEqual(recoveredAudit.incidentCodes, []);
+  assert.notEqual(recoveredAudit.sourceVersion, oldState.sourceVersion);
+  assert.equal(recoveredAudit.sourceVersion.startsWith(`${oldState.sourceVersion}:recovery:`), true);
+  assert.equal(
+    store.listTranslationRuns().find((run) => run.runId === "run-source-gap")?.status,
+    "quarantined",
+  );
+  assert.equal(resolveRunSelection(store, undefined, "run"), recoveredRunId);
+  store.close();
 });
 
 test("lossless export writes partial names, missing IDs, and run metadata", async () => {

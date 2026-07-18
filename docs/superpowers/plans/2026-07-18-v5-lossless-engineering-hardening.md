@@ -638,7 +638,7 @@ git commit -m "feat: expose lossless book diagnostics"
 - 创建：`translator-v5/test/recovery-engine.test.ts`
 - 修改：`translator-v5/src/cli.ts`
 
-- [ ] **步骤 1：编写确定性恢复、Pi 单次限制和越权拒绝测试**
+- [x] **步骤 1：编写确定性恢复、Pi 单次限制和越权拒绝测试**
 
 ```ts
 test("a source span gap uses flat deterministic rebuild before any Pi call", async () => {
@@ -659,14 +659,14 @@ test("Recovery Pi may choose one registered strategy but cannot mutate raw sourc
 });
 ```
 
-- [ ] **步骤 2：运行测试确认 recovery 模块不存在**
+- [x] **步骤 2：运行测试确认 recovery 模块不存在**
 
 ```powershell
 Set-Location translator-v5
 node --test --import tsx test/recovery-engine.test.ts
 ```
 
-- [ ] **步骤 3：建立单一策略注册表**
+- [x] **步骤 3：建立单一策略注册表**
 
 ```ts
 export const RECOVERY_RULES: Readonly<Record<IncidentCode, RecoveryRule>> = {
@@ -690,15 +690,15 @@ export const RECOVERY_RULES: Readonly<Record<IncidentCode, RecoveryRule>> = {
 
 完整 `INCIDENT_CODES` 同时声明 `SOURCE_SPAN_OVERLAP`、`SOURCE_HASH_MISMATCH`、`BLOCK_MEMBERSHIP_INVALID`、`WINDOW_OVERSIZED`、`SOURCE_VERSION_CHANGED`、`RUN_VERSION_MISMATCH`、`STORAGE_LOCKED`、`STORAGE_CORRUPT` 和 `EXPORT_INCOMPLETE`。测试断言 `Object.keys(RECOVERY_RULES).sort()` 与 `INCIDENT_CODES` 完全相等，避免出现没有恢复政策的新错误码。工具 schema 和 agent prompt 都从此注册表投影，不复制策略文字。
 
-- [ ] **步骤 4：实现影子计划和确定性恢复**
+- [x] **步骤 4：实现影子计划和确定性恢复**
 
 RecoveryEngine 先查唯一 deterministic 策略，在临时 source/plan version 中执行；Auditor 全过后调用 `promoteRecovery()`，失败则删除影子版本并记录 `quarantined`。原始文件、已完成译文和旧 run 不得原地修改。
 
-- [ ] **步骤 5：实现最多一次的 Recovery Pi**
+- [x] **步骤 5：实现最多一次的 Recovery Pi**
 
 Pi 仅暴露 `inspect_incident`、`inspect_source_span`、`inspect_structure_annotations`、`choose_recovery_strategy` 和 `submit_recovery_result`。`choose` 参数必须是当前 incident 注册表中的枚举值；没有允许策略时不启动模型。一次非终止响应后直接返回 `quarantined`，不循环。
 
-- [ ] **步骤 6：接入 `book recover` 并运行测试**
+- [x] **步骤 6：接入 `book recover` 并运行测试**
 
 ```powershell
 Set-Location translator-v5
@@ -706,7 +706,7 @@ node --test --import tsx test/recovery-engine.test.ts test/pi-runtime.test.ts te
 npm run typecheck
 ```
 
-- [ ] **步骤 7：Commit**
+- [x] **步骤 7：Commit**
 
 ```powershell
 git add src/recovery src/agents/recovery-agent.ts src/tools/recovery-tools.ts src/cli.ts test/recovery-engine.test.ts
