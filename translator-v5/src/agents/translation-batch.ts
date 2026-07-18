@@ -8,6 +8,10 @@ import { canonicalJson } from "../knowledge/knowledge-store.js";
 import { getSourceLanguageProfile } from "../language/profiles.js";
 import type { SourceLanguageProfile } from "../language/types.js";
 import type { LosslessBlock } from "../source/types.js";
+import type {
+  EffectiveStyleProjection,
+  StyleObservationSubmission,
+} from "../style/types.js";
 import type { TranslationMemoryCandidate } from "../tools/candidate-collector.js";
 import {
   assertNotAborted,
@@ -22,6 +26,7 @@ export interface FinalizeTranslationBatchArgs {
     translations: Array<{ blockId: string; text: string }>;
     notes: string[];
     memoryCandidates?: TranslationMemoryCandidate[];
+    styleObservation?: StyleObservationSubmission;
   }>;
 }
 
@@ -42,6 +47,7 @@ export interface TranslationBatchInput {
   previousActiveTail?: string;
   sourceLanguageProfile?: SourceLanguageProfile;
   entityLinkWarnings?: readonly string[];
+  effectiveStyleByWindow?: Readonly<Record<string, EffectiveStyleProjection>>;
   signal?: AbortSignal;
   deadlineMs?: number;
 }
@@ -53,6 +59,7 @@ export interface TranslationBatchWindowResult {
   translations: Array<{ blockId: string; text: string }>;
   notes: string[];
   memoryCandidates: TranslationMemoryCandidate[];
+  styleObservation?: StyleObservationSubmission;
   error?: string;
 }
 
@@ -142,6 +149,9 @@ function validateSubmission(
       translations: candidate.translations.map((translation) => ({ ...translation })),
       notes: [...candidate.notes],
       memoryCandidates: copyMemories(candidate.memoryCandidates),
+      ...(candidate.styleObservation === undefined
+        ? {}
+        : { styleObservation: structuredClone(candidate.styleObservation) }),
     };
   });
   return { windows, responseErrors };
@@ -161,7 +171,7 @@ function promptFor(input: TranslationBatchInput): string {
       return { blockId, sourceText: block.sourceText };
     }),
   }));
-  return [
+  const sections: string[] = [
     `PHYSICAL REQUEST ${input.request.requestId}`,
     `KNOWLEDGE SNAPSHOT ${input.snapshot.id}`,
     `SOURCE LANGUAGE ${profile.displayName} (${profile.id}); TARGET LANGUAGE Chinese (zh)`,
@@ -173,12 +183,24 @@ function promptFor(input: TranslationBatchInput): string {
     JSON.stringify(input.stableTerms),
     "UNRESOLVED ENTITY LINKS",
     JSON.stringify(input.entityLinkWarnings ?? []),
-    "PREVIOUS ACTIVE TAIL",
-    input.previousActiveTail ?? "",
-    "STYLE STATE",
-    JSON.stringify(input.styleState ?? {}),
-    "Translate every source block. Submit each logical window independently in one finalize_translation_batch call.",
-  ].join("\n\n");
+  ];
+  if (input.effectiveStyleByWindow !== undefined) {
+    sections.push(
+      "EFFECTIVE STYLE BY WINDOW",
+      canonicalJson(input.effectiveStyleByWindow),
+    );
+  } else {
+    sections.push(
+      "PREVIOUS ACTIVE TAIL",
+      input.previousActiveTail ?? "",
+      "STYLE STATE",
+      JSON.stringify(input.styleState ?? {}),
+    );
+  }
+  sections.push(
+    "Translate every source block. Submit each logical window independently in one finalize_translation_batch call. Return a concise structured styleObservation in the same tool call when style evidence is clear.",
+  );
+  return sections.join("\n\n");
 }
 
 export async function runTranslationBatch(
@@ -208,6 +230,30 @@ export async function runTranslationBatch(
           fact: Type.String(),
           confidence: Type.Number({ minimum: 0, maximum: 1 }),
         }, { additionalProperties: false }), { maxItems: 4 })),
+        styleObservation: Type.Optional(Type.Object({
+          voiceId: Type.Optional(Type.String()),
+          activeRegister: Type.Optional(Type.String()),
+          rhythm: Type.Optional(Type.String()),
+          addressChoices: Type.Optional(Type.Array(Type.Object({
+            subject: Type.String(),
+            target: Type.String(),
+          }, { additionalProperties: false }), { maxItems: 6 })),
+          lexicalChoices: Type.Optional(Type.Array(Type.Object({
+            source: Type.String(),
+            target: Type.String(),
+          }, { additionalProperties: false }), { maxItems: 6 })),
+          continuityNotes: Type.Optional(Type.Array(Type.String(), { maxItems: 4 })),
+          modeWeights: Type.Optional(Type.Object({
+            narrative: Type.Optional(Type.Number({ minimum: 0, maximum: 1 })),
+            dialogue: Type.Optional(Type.Number({ minimum: 0, maximum: 1 })),
+            action: Type.Optional(Type.Number({ minimum: 0, maximum: 1 })),
+            description: Type.Optional(Type.Number({ minimum: 0, maximum: 1 })),
+            technical: Type.Optional(Type.Number({ minimum: 0, maximum: 1 })),
+            documentary: Type.Optional(Type.Number({ minimum: 0, maximum: 1 })),
+            lyrical: Type.Optional(Type.Number({ minimum: 0, maximum: 1 })),
+            interior: Type.Optional(Type.Number({ minimum: 0, maximum: 1 })),
+          }, { additionalProperties: false })),
+        }, { additionalProperties: false })),
       }, { additionalProperties: false })),
     }, { additionalProperties: false }),
     execute: async (rawArgs, signal) => {

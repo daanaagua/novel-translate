@@ -20,6 +20,8 @@ import {
 import { blockId } from "../source/block-builder.js";
 import type { LosslessBlock, StructureAnnotation } from "../source/types.js";
 import { scalarLength } from "../source/types.js";
+import { parseStyleObservation } from "../style/style-observation.js";
+import type { LocalStyleObservation } from "../style/types.js";
 import {
   LOSSLESS_BOOK_SCHEMA_FINGERPRINT,
   LOSSLESS_BOOK_SCHEMA_MARKER,
@@ -1637,6 +1639,35 @@ export class LosslessBookStore {
       payload: JSON.parse(row.payload_json) as unknown,
       stageState: row.stage_state,
     }));
+  }
+
+  styleObservations(runId: string): LocalStyleObservation[] {
+    this.#run(runId);
+    const rows = all<{ window_id: string; ordinal: number; style_tail: string }>(
+      this.#database.prepare(`
+        SELECT window_id, ordinal, style_tail
+        FROM window_plans
+        WHERE run_id=? AND status IN ('completed', 'completed_with_warnings')
+        ORDER BY ordinal
+      `),
+      runId,
+    );
+    return rows.flatMap((row) => {
+      let raw: unknown;
+      try {
+        raw = JSON.parse(row.style_tail) as unknown;
+      } catch {
+        return [];
+      }
+      const observation = parseStyleObservation(raw);
+      if (observation === undefined) {
+        return [];
+      }
+      if (observation.windowId !== row.window_id || observation.ordinal !== row.ordinal) {
+        throw new Error(`style observation provenance mismatch for ${row.window_id}`);
+      }
+      return [observation];
+    });
   }
 
   waveAnchorDecision(runId: string, inputHash: string): unknown | undefined {

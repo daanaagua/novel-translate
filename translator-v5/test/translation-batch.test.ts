@@ -13,6 +13,8 @@ import type { PhysicalRequestPlan } from "../src/fullbook/types.js";
 import { BudgetLedger } from "../src/kernel/budget.js";
 import { canonicalJson } from "../src/knowledge/knowledge-store.js";
 import type { LosslessBlock } from "../src/source/types.js";
+import { createBookStyleConstitution, composeEffectiveStyle } from "../src/style/effective-style.js";
+import { projectEffectiveStyle } from "../src/style/style-projection.js";
 
 function block(id: string, index: number, text: string): LosslessBlock {
   return {
@@ -203,4 +205,58 @@ test("batch accepts only the first terminating submission in one model session",
   assert.deepEqual(result.windows.map((window) => window.status), ["completed", "completed"]);
   assert.ok(result.responseErrors.some((error) => /multiple terminating/i.test(error)));
   assert.equal(budget.snapshot().translationToolCalls, 1);
+});
+
+test("batch projects bounded structured style and returns the same-call style observation", async () => {
+  const faux = fauxProvider();
+  faux.setResponses([fauxAssistantMessage(fauxToolCall(
+    "finalize_translation_batch",
+    { windows: request.windows.map((window) => ({
+      windowId: window.windowId,
+      translations: window.blockIds.map((blockId) => ({ blockId, text: `译文-${blockId}` })),
+      notes: [],
+      styleObservation: {
+        voiceId: "narrator",
+        activeRegister: "冷静克制",
+        rhythm: "长短句交替",
+        continuityNotes: ["不说明叙述者隐瞒的原因"],
+      },
+    })) },
+  ), { stopReason: "toolUse" })]);
+  const constitution = createBookStyleConstitution({ register: "准确、隽永" });
+  const projections = Object.fromEntries(request.windows.map((window) => [
+    window.windowId,
+    projectEffectiveStyle(composeEffectiveStyle({
+      constitution,
+      voices: [{
+        voiceId: "narrator",
+        scope: "main_narrator",
+        instruction: "克制回顾",
+        confidence: 1,
+      }],
+      observations: [],
+      currentOrdinal: window.ordinal,
+      sourceText: blocks[window.ordinal]?.sourceText ?? "",
+      defaultVoiceId: "narrator",
+    })),
+  ]));
+
+  const result = await runTranslationBatch({
+    request,
+    blocks,
+    stableTerms: [],
+    snapshot: { id: "snapshot-0", revisions: [] },
+    effectiveStyleByWindow: projections,
+    model: faux.getModel(),
+    streamFn: faux.provider.streamSimple.bind(faux.provider),
+    budget: new BudgetLedger(),
+  });
+
+  const prompt = (result.run.messages[0] as {
+    content?: Array<{ type: string; text?: string }>;
+  }).content?.[0]?.text ?? "";
+  assert.match(prompt, /EFFECTIVE STYLE BY WINDOW/);
+  assert.match(prompt, /全书文体宪章/);
+  assert.doesNotMatch(prompt, /PREVIOUS ACTIVE TAIL/);
+  assert.equal(result.windows[0]?.styleObservation?.activeRegister, "冷静克制");
 });

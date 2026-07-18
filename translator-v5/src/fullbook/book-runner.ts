@@ -42,6 +42,17 @@ import {
 } from "../storage/lossless-book-store.js";
 import type { TranslationMemoryCandidate } from "../tools/candidate-collector.js";
 import type { StyleState } from "../tools/translation-tools.js";
+import {
+  composeEffectiveStyle,
+  createBookStyleConstitution,
+} from "../style/effective-style.js";
+import { createStyleObservation } from "../style/style-observation.js";
+import { projectEffectiveStyle } from "../style/style-projection.js";
+import type {
+  BookStyleConstitution,
+  EffectiveStyleProjection,
+  VoiceProfile,
+} from "../style/types.js";
 import { BookContext } from "./book-context.js";
 import { CommitCoordinator } from "./commit-coordinator.js";
 import {
@@ -123,6 +134,27 @@ function runMetadataWithLanguageProfile(
       compatibilityMode: context.sourceLedger.sourceLanguageCompatibilityMode,
     },
   };
+}
+
+function losslessStyleConstitution(style: StyleState | undefined): BookStyleConstitution {
+  return createBookStyleConstitution({
+    register: style?.register,
+    sentencePolicy: style?.sentencePolicy,
+    explicitation: style?.explicitation,
+    imagery: style?.imagery,
+    dialogue: style?.dialogue,
+    technicalProse: style?.technicalProse,
+    typography: style?.typography ?? style?.dialogueQuotes,
+  });
+}
+
+function losslessVoiceProfiles(style: StyleState | undefined): VoiceProfile[] {
+  return [{
+    voiceId: "narrator",
+    scope: "main_narrator",
+    instruction: style?.narratorVoice ?? "保持作品主叙述者既定视角、距离和信息显隐",
+    confidence: 1,
+  }];
 }
 const DEFAULT_WARMUP_WINDOWS = 2;
 
@@ -625,6 +657,14 @@ function withoutStructureHeadingLines(
   return sourceText.length === 0 ? undefined : { ...block, sourceText };
 }
 
+function windowSourceText(
+  window: PersistedLosslessWindow,
+  blockById: ReadonlyMap<string, BookContext["losslessBlocks"][number]>,
+): string {
+  return window.blockIds.map((blockId) => blockById.get(blockId)?.sourceText ?? "")
+    .join("\n\n");
+}
+
 function termsFromKnowledge(
   revisions: readonly unknown[],
 ): StableTerm[] {
@@ -868,6 +908,8 @@ async function runLosslessBook(
     store.initializeWindowPlan(runId, planned);
     store.recoverInterruptedWindows(runId);
     const blockById = new Map(context.losslessBlocks.map((block) => [block.id, block]));
+    const styleConstitution = losslessStyleConstitution(options.styleState);
+    const voiceProfiles = losslessVoiceProfiles(options.styleState);
 
     while (processedWindows < maxWindows) {
       assertSourceVersionUnchanged(context);
@@ -898,6 +940,18 @@ async function runLosslessBook(
       }
 
       const snapshot = store.latestKnowledgeSnapshot(runId);
+      const priorStyleObservations = store.styleObservations(runId);
+      const effectiveStyleByWindow = Object.fromEntries(selected.map((window) => [
+        window.windowId,
+        projectEffectiveStyle(composeEffectiveStyle({
+          constitution: styleConstitution,
+          voices: voiceProfiles,
+          observations: priorStyleObservations,
+          currentOrdinal: window.ordinal,
+          sourceText: windowSourceText(window, blockById),
+          defaultVoiceId: "narrator",
+        })),
+      ])) as Record<string, EffectiveStyleProjection>;
       const establishedTerms = uniqueTerms([
         ...context.stableTerms,
         ...termsFromKnowledge(snapshot.revisions),
@@ -1025,6 +1079,10 @@ async function runLosslessBook(
               styleState: options.styleState,
               sourceLanguageProfile: context.languageProfile,
               entityLinkWarnings,
+              effectiveStyleByWindow: Object.fromEntries(request.windows.map((window) => [
+                window.windowId,
+                effectiveStyleByWindow[window.windowId] as EffectiveStyleProjection,
+              ])),
               deadlineMs: options.hardDeadlineMs,
             });
             completionOrder.push({ request, budget, result });
@@ -1126,6 +1184,14 @@ async function runLosslessBook(
             const status = warnings.length > 0
               ? "completed_with_warnings" as const
               : "completed" as const;
+            const styleObservation = createStyleObservation({
+              windowId: window.windowId,
+              ordinal: window.ordinal,
+              sourceText: windowSourceText(window, blockById),
+              translations: window.blockIds.map((blockId) =>
+                translations.find((item) => item.blockId === blockId)?.text ?? ""),
+              submission: windowResult.styleObservation,
+            });
             store.stageWindow({
               runId,
               windowId: window.windowId,
@@ -1133,10 +1199,7 @@ async function runLosslessBook(
               status,
               translations,
               knowledgeCandidates: candidates,
-              styleTail: windowResult.translations
-                .map((translation) => translation.text)
-                .join("\n\n")
-                .slice(-4_000),
+              styleTail: canonicalJson(styleObservation),
               budget: persistedBudgetFor(
                 window,
                 completed.budget.snapshot(),

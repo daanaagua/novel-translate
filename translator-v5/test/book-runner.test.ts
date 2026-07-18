@@ -361,6 +361,9 @@ test("one malformed window in a batch cannot erase its valid earlier sibling", a
     "completed",
     "human_required",
   ]);
+  const store = new LosslessBookStore(fixture.options.storePath);
+  assert.deepEqual(store.styleObservations("run-lossless").map((item) => item.ordinal), [0]);
+  store.close();
 });
 
 test("lossless provider errors stay retryable and never become human incidents", async () => {
@@ -402,6 +405,48 @@ test("lossless runner resumes the same isolated run and promotes the remaining o
   assert.equal(resumed.processedWindows, 1);
   assert.equal(resumed.status.completedWindows, 2);
   assert.deepEqual(resumed.windows.map((window) => window.status), ["completed", "completed"]);
+});
+
+test("lossless resume uses bounded structured style evidence instead of a raw prior tail", async () => {
+  const fixture = losslessFixture("EDGEWOOD\n\nBOOK ONE");
+  const longTranslation = `${"克制样例".repeat(80)}不可回灌尾标`;
+  const firstWindow = structuredClone(fixture.submission.windows[0]!);
+  firstWindow.translations[0]!.text = longTranslation;
+  (firstWindow as typeof firstWindow & { styleObservation: unknown }).styleObservation = {
+    voiceId: "narrator",
+    activeRegister: "冷静克制",
+    rhythm: "长句舒展，短句收束",
+    continuityNotes: ["不要解释叙述者的保留"],
+  };
+  fixture.faux.setResponses([fauxAssistantMessage(fauxToolCall(
+    "finalize_translation_batch",
+    { windows: [firstWindow] },
+  ), { stopReason: "toolUse" })]);
+  const first = await runBook({ ...fixture.options, maxWindows: 1 } as never);
+  assert.equal(first.status.completedWindows, 1);
+
+  const resumedProvider = fauxProvider();
+  resumedProvider.setResponses([(context) => {
+    const prompt = userText(context);
+    assert.match(prompt, /EFFECTIVE STYLE BY WINDOW/);
+    assert.match(prompt, /全书文体宪章/);
+    assert.match(prompt, /冷静克制/);
+    assert.doesNotMatch(prompt, /PREVIOUS ACTIVE TAIL/);
+    assert.doesNotMatch(prompt, /不可回灌尾标/);
+    return losslessBatchResponse(context);
+  }]);
+  const resumed = await runBook({
+    ...fixture.options,
+    model: resumedProvider.getModel(),
+    streamFn: resumedProvider.provider.streamSimple.bind(resumedProvider.provider),
+  } as never);
+
+  assert.equal(resumed.status.completedWindows, 2);
+  const store = new LosslessBookStore(fixture.options.storePath);
+  const observations = store.styleObservations("run-lossless");
+  store.close();
+  assert.equal(observations.length, 2);
+  assert.deepEqual(observations.map((item) => item.ordinal), [0, 1]);
 });
 
 test("lossless runner hydrates full knowledge history when resuming from a revision-two projection", async () => {
@@ -507,6 +552,9 @@ test("reverse physical completion still promotes lossless windows in ordinal ord
     (JSON.parse(row.payload_json) as { windowId: string }).windowId);
   database.close();
   assert.deepEqual(promoted, result.windows.map((window) => window.windowId));
+  const styleStore = new LosslessBookStore(fixture.options.storePath);
+  assert.deepEqual(styleStore.styleObservations("run-lossless").map((item) => item.ordinal), [0, 1]);
+  styleStore.close();
 });
 
 test("book runner warms up, runs a parallel wave, and resumes without model calls", async () => {
