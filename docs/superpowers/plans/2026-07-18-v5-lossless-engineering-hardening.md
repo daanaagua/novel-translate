@@ -464,7 +464,7 @@ git commit -m "feat: persist isolated v5 translation runs"
 - 创建：`translator-v5/src/fullbook/commit-coordinator.ts`
 - 创建：`translator-v5/test/knowledge-snapshot.test.ts`
 
-- [ ] **步骤 1：编写不可变快照和逆序完成测试**
+- [x] **步骤 1：编写不可变快照和逆序完成测试**
 
 ```ts
 test("parallel windows share one immutable snapshot and promote in source order", () => {
@@ -478,14 +478,14 @@ test("parallel windows share one immutable snapshot and promote in source order"
 });
 ```
 
-- [ ] **步骤 2：运行测试确认模块不存在**
+- [x] **步骤 2：运行测试确认模块不存在**
 
 ```powershell
 Set-Location translator-v5
 node --test --import tsx test/knowledge-snapshot.test.ts
 ```
 
-- [ ] **步骤 3：实现知识状态机和活动视图**
+- [x] **步骤 3：实现知识状态机和活动视图**
 
 ```ts
 export type KnowledgeStatus =
@@ -499,11 +499,11 @@ export function transitionAllowed(from: KnowledgeStatus, to: KnowledgeStatus): b
 
 知识写入只追加新 revision；活动视图选取同一 normalized subject 的最新合法 revision。两个并行候选译名不同则追加冲突 revision，并将活动状态置为 `needs_revalidate`，不使用完成时间或最后写入者决胜。
 
-- [ ] **步骤 4：实现快照哈希和 commit coordinator**
+- [x] **步骤 4：实现快照哈希和 commit coordinator**
 
 快照序列化必须按 normalized subject、kind、revision ID 稳定排序；ID 是序列化内容 SHA-256。Coordinator 只晋升当前最小 pending ordinal，窗口引用的 snapshot ID 不存在或不属于同 run 时拒绝提交。
 
-- [ ] **步骤 5：运行测试、typecheck 并 Commit**
+- [x] **步骤 5：运行测试、typecheck 并 Commit**
 
 ```powershell
 Set-Location translator-v5
