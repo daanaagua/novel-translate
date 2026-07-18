@@ -318,6 +318,7 @@ export async function runTranslationWindow(
       allBlocks,
       stableTerms,
       persistedAnchors.map((anchor) => anchor.sourceForm),
+      context.languageProfile,
     );
     let lexicalAnchoring: LexicalAnchorOutcome | undefined;
     let activeTerms = stableTerms;
@@ -329,6 +330,7 @@ export async function runTranslationWindow(
           model: options.model,
           streamFn: options.streamFn,
           budget,
+          sourceLanguageProfile: context.languageProfile,
           signal: controller.signal,
         });
         activeTerms = [...stableTerms, ...lexicalAnchoring.terms];
@@ -420,6 +422,7 @@ export async function runTranslationWindow(
     state.transition("translating");
 
     const translator = new Translator(runtime);
+    const sourceLanguageProfile = context.languageProfile;
     const onDemandEvidenceIndex = options.researchMode === "on_demand"
       ? context.evidenceIndex
       : undefined;
@@ -441,6 +444,7 @@ export async function runTranslationWindow(
           paragraphPolicy: "preserve source paragraph boundaries",
         },
         previousActiveTail: boundedActiveTail(options.previousActiveTail ?? ""),
+        sourceLanguageProfile,
         evidenceIndex: onDemandEvidenceIndex,
         signal: controller.signal,
       }),

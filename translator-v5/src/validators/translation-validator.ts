@@ -1,4 +1,6 @@
 import type { V4Block } from "../domain/types.js";
+import { getSourceLanguageProfile } from "../language/profiles.js";
+import type { SourceLanguageProfile } from "../language/types.js";
 import type { TranslationCandidate } from "../tools/candidate-collector.js";
 import type { ValidationFailure } from "../tools/repair-tools.js";
 
@@ -10,6 +12,7 @@ export interface TranslationValidation {
 export interface TranslationValidationPolicy {
   allowedLatinTokens?: readonly string[];
   requiredTerms?: readonly { sourceForm: string; target: string }[];
+  sourceLanguageProfile?: SourceLanguageProfile;
 }
 
 function paragraphCount(text: string): number {
@@ -79,8 +82,7 @@ export class TranslationValidator {
     }
 
     const blockById = new Map(blocks.map((block) => [block.id, block]));
-    const allowedLatin = new Set((policy.allowedLatinTokens ?? [])
-      .map((token) => token.toLocaleLowerCase()));
+    const profile = policy.sourceLanguageProfile ?? getSourceLanguageProfile("en");
     let sourceLength = 0;
     let targetLength = 0;
     for (const translation of candidate.translations) {
@@ -102,14 +104,16 @@ export class TranslationValidator {
           repairable: true,
         });
       }
-      const untranslated = [...translation.text.matchAll(/[A-Za-z][A-Za-z'-]+/gu)]
-        .map((match) => match[0].toLocaleLowerCase())
-        .filter((token) => !allowedLatin.has(token));
+      const untranslated = profile.detectSourceResidue(translation.text, {
+        preservedSourceForms: policy.allowedLatinTokens ?? [],
+      });
       if (untranslated.length > 0) {
         failures.push({
           code: "untranslated_latin",
           blockId: translation.blockId,
-          message: `unexpected Latin prose tokens: ${[...new Set(untranslated)].join(", ")}`,
+          message: `unexpected source-language prose tokens: ${[
+            ...new Set(untranslated.map((finding) => finding.form)),
+          ].join(", ")}`,
           repairable: true,
         });
       }

@@ -101,7 +101,11 @@ export class BookContext {
 
   static openLossless(options: OpenLosslessBookContextOptions): BookContext {
     const ledger = SourceLedger.open(options.manifestPath);
-    const annotations = annotateStructure(ledger, ledger.sourceVersion);
+    const annotations = annotateStructure(
+      ledger,
+      ledger.sourceVersion,
+      ledger.languageProfile,
+    );
     const blocks = buildLosslessBlocks(ledger, annotations, {
       sourceVersion: ledger.sourceVersion,
     });

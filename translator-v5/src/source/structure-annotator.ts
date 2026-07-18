@@ -1,14 +1,9 @@
 import { createHash } from "node:crypto";
 
-import type {
-  SourceInput,
-  StructureAnnotation,
-  StructureKind,
-} from "./types.js";
+import { getSourceLanguageProfile } from "../language/profiles.js";
+import type { SourceLanguageProfile } from "../language/types.js";
+import type { SourceInput, StructureAnnotation, StructureKind } from "./types.js";
 import { coordinatesFor, sourceTextFor } from "./types.js";
-
-const VOLUME_PATTERN = /^(?:BOOK[ \t]+(?:\d+|[IVXLCDM]+|ONE|TWO|THREE|FOUR|FIVE|SIX|SEVEN|EIGHT|NINE|TEN)|第[^\r\n]{0,40}卷)[ \t]*(?=\r?$)/gimu;
-const CHAPTER_PATTERN = /^(?:CHAPTER(?:[ \t]+(?:\d+|[IVXLCDM]+|ONE|TWO|THREE|FOUR|FIVE|SIX|SEVEN|EIGHT|NINE|TEN))?|[IVXLCDM]+|第[^\r\n]{0,40}章)[ \t]*(?=\r?$)/gimu;
 
 function annotationId(
   sourceVersion: string,
@@ -22,45 +17,37 @@ function annotationId(
     .slice(0, 20)}`;
 }
 
-function collect(
+export function annotateStructure(
   source: SourceInput,
   sourceVersion: string,
-  kind: StructureKind,
-  pattern: RegExp,
-  boundaryWeight: number,
+  profile: SourceLanguageProfile = getSourceLanguageProfile("en"),
 ): StructureAnnotation[] {
+  if (sourceVersion.trim().length === 0) {
+    throw new TypeError("sourceVersion must not be empty");
+  }
   const text = sourceTextFor(source);
   const coordinates = coordinatesFor(source);
   const annotations: StructureAnnotation[] = [];
-  for (const match of text.matchAll(pattern)) {
+  for (const match of text.matchAll(/^.*$/gmu)) {
     if (match.index === undefined || match[0].length === 0) {
+      continue;
+    }
+    const heading = profile.detectStructureHeading(match[0]);
+    if (heading === null) {
       continue;
     }
     const start = coordinates.toScalarIndex(match.index);
     const end = coordinates.toScalarIndex(match.index + match[0].length);
     annotations.push({
-      id: annotationId(sourceVersion, kind, start, end),
-      kind,
+      id: annotationId(sourceVersion, heading.kind, start, end),
+      kind: heading.kind,
       start,
       end,
-      title: match[0].trim(),
-      boundaryWeight,
+      title: heading.title,
+      boundaryWeight: heading.boundaryWeight,
     });
   }
-  return annotations;
-}
-
-export function annotateStructure(
-  source: SourceInput,
-  sourceVersion: string,
-): StructureAnnotation[] {
-  if (sourceVersion.trim().length === 0) {
-    throw new TypeError("sourceVersion must not be empty");
-  }
-  return [
-    ...collect(source, sourceVersion, "volume_heading", VOLUME_PATTERN, 100),
-    ...collect(source, sourceVersion, "chapter_heading", CHAPTER_PATTERN, 80),
-  ].sort((left, right) => (
+  return annotations.sort((left, right) => (
     left.start - right.start
     || left.end - right.end
     || left.kind.localeCompare(right.kind)

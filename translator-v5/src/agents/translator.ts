@@ -6,6 +6,8 @@ import type { StableTerm, V4Block } from "../domain/types.js";
 import type { EvidenceIndex } from "../index/evidence-index.js";
 import type { NarrativeMemoryRecord } from "../fullbook/types.js";
 import type { BudgetLedger } from "../kernel/budget.js";
+import { getSourceLanguageProfile } from "../language/profiles.js";
+import type { SourceLanguageProfile } from "../language/types.js";
 import type {
   CandidateCollector,
   ResolutionCandidate,
@@ -42,6 +44,7 @@ export interface TranslateIslandInput {
   snapshot: ProvisionalSnapshot;
   styleState: StyleState;
   previousActiveTail: string;
+  sourceLanguageProfile?: SourceLanguageProfile;
   signal?: AbortSignal;
   deadlineMs?: number;
   evidenceIndex?: EvidenceIndex;
@@ -195,6 +198,8 @@ export class Translator {
   }
 
   async translateIsland(input: TranslateIslandInput): Promise<TranslationOutcome> {
+    const sourceLanguageProfile = input.sourceLanguageProfile
+      ?? getSourceLanguageProfile("en");
     const terms = relevantTerms(input.island.blocks, input.stableTerms);
     const resolutions = factsAsResolutions(input.snapshot);
     const tools = new TranslationTools({
@@ -211,12 +216,13 @@ export class Translator {
     const run = await this.runtime.run({
       systemPrompt: [
         "Translate the complete source island into polished, accurate Chinese literary prose.",
+        `The source language is ${sourceLanguageProfile.displayName} (${sourceLanguageProfile.id}); the target language is Chinese (zh).`,
         "Preserve meaning, ambiguity, paragraph structure, voice, and all block boundaries.",
         "Use translator-global facts only to disambiguate wording; do not add facts unavailable to the narrator.",
         "Do not leave ordinary source-language prose words untranslated unless the stable terminology explicitly preserves them.",
-        "If and only if a concrete ambiguity can change the Chinese wording, call request_translation_evidence with one to three literal English forms copied from the target island.",
+        "If and only if a concrete ambiguity can change the Chinese wording, call request_translation_evidence with one to three literal source-language forms copied from the target island.",
         "Use narrative_before_target for narrator-visible context and translator_global only for silent lexical disambiguation. Do not research themes, allusions, or general lore.",
-        "With finalize_translation, optionally submit up to four concise English memoryCandidates for explicit source-grounded facts likely to affect later wording. Use literal subjectForms from this island; do not submit themes, predictions, interpretations, or low-confidence guesses.",
+        "With finalize_translation, optionally submit up to four concise language-neutral memoryCandidates for explicit source-grounded facts likely to affect later wording. Use literal source-language subjectForms from this island; do not submit themes, predictions, interpretations, or low-confidence guesses.",
         "Use typed tools only. Submit every block exactly once with finalize_translation.",
       ].join("\n"),
       prompt: initialPrompt,
@@ -245,7 +251,7 @@ export class Translator {
     let validation = this.#validator.validate(
       input.island.blocks,
       candidate ?? emptyCandidate(),
-      { allowedLatinTokens, requiredTerms },
+      { allowedLatinTokens, requiredTerms, sourceLanguageProfile },
     );
     const repairRuns: PiRunResult[] = [];
     let repairAttempts = 0;
@@ -272,7 +278,7 @@ export class Translator {
         validation = this.#validator.validate(
           input.island.blocks,
           candidate,
-          { allowedLatinTokens, requiredTerms },
+          { allowedLatinTokens, requiredTerms, sourceLanguageProfile },
         );
       }
     }
@@ -302,6 +308,7 @@ export class Translator {
       `ISLAND ${input.island.islandId}`,
       `CHAPTER ${input.island.chapterId} ${input.island.chapterTitle ?? ""}`,
       `POSITION ${input.island.blocks[0]?.globalIndex}-${input.island.blocks.at(-1)?.globalIndex}`,
+      `SOURCE LANGUAGE ${input.sourceLanguageProfile?.displayName ?? "English"} (${input.sourceLanguageProfile?.id ?? "en"})`,
       "SOURCE BLOCKS",
       input.island.blocks.map((block) =>
         `[${block.id}]\n${block.sourceText}`,

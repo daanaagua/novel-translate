@@ -9,6 +9,7 @@ import type {
 import { packPhysicalRequests } from "../src/fullbook/request-batcher.js";
 import { buildLosslessBlocks } from "../src/source/block-builder.js";
 import { annotateStructure } from "../src/source/structure-annotator.js";
+import { getSourceLanguageProfile } from "../src/language/profiles.js";
 import type { LosslessBlock } from "../src/source/types.js";
 import {
   nextConcurrency,
@@ -203,6 +204,24 @@ test("annotated short chapters retain positional boundaries through builder and 
   assert.deepEqual(blocks.map((item) => item.structureId), chapterIds);
   assert.deepEqual(windows.map((item) => item.blockIds.length), [1, 1, 1]);
   assert.deepEqual(windows.map((item) => item.chapterId), chapterIds);
+});
+
+test("structure annotation uses the selected source language profile", () => {
+  const source = "LIVRE PREMIER\n\nCHAPITRE PREMIER\n\nLe texte.";
+  const annotations = annotateStructure(
+    source,
+    "source-fr",
+    getSourceLanguageProfile("fr"),
+  );
+  assert.deepEqual(annotations.map((item) => item.kind), [
+    "volume_heading",
+    "chapter_heading",
+  ]);
+  assert.equal(annotateStructure(
+    source,
+    "source-en",
+    getSourceLanguageProfile("en"),
+  ).length, 0);
 });
 
 test("request batcher packs tiny logical windows without merging their identities", () => {

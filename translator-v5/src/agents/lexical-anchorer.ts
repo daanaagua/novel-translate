@@ -5,11 +5,9 @@ import type { Model } from "@earendil-works/pi-ai";
 
 import type { StableTerm, V4Block } from "../domain/types.js";
 import type { BudgetLedger } from "../kernel/budget.js";
-import {
-  assertNotAborted,
-  Type,
-  type TypedToolSpec,
-} from "../tools/tool-spec.js";
+import { getSourceLanguageProfile } from "../language/profiles.js";
+import type { SourceLanguageProfile } from "../language/types.js";
+import { assertNotAborted, Type, type TypedToolSpec } from "../tools/tool-spec.js";
 import { PiRuntime, type PiRunResult } from "./pi-runtime.js";
 
 export interface AnchorCandidate {
@@ -30,6 +28,7 @@ interface LexicalAnchorInput {
   model: Model<any>;
   streamFn: StreamFn;
   budget: BudgetLedger;
+  sourceLanguageProfile?: SourceLanguageProfile;
   signal?: AbortSignal;
   deadlineMs?: number;
 }
@@ -40,150 +39,67 @@ export interface LexicalAnchorOutcome {
   run: PiRunResult;
 }
 
-const COMMON_CAPITALIZED = new Set([
-  "after", "again", "all", "although", "and", "another", "any", "are",
-  "as", "at", "because", "before", "but", "by", "can", "could", "did",
-  "do", "even", "for", "from", "had", "has", "have", "he", "her", "here",
-  "far", "his", "how", "i", "if", "i’m", "in", "instead", "is", "it", "its",
-  "later", "look", "may", "more", "my", "new", "no", "not", "now", "of", "on",
-  "once", "one", "only", "or", "our", "perhaps", "she", "so", "some", "such",
-  "still", "sun", "than", "that", "the", "their", "then",
-  "there", "these", "they", "this", "those", "though", "to", "very", "was",
-  "we", "were", "what", "when", "where", "which", "while", "who", "why",
-  "will", "with", "would", "yes", "yet", "you", "your",
-]);
-
-function compactContext(text: string, offset: number): string {
-  const left = Math.max(
-    text.lastIndexOf(".", offset - 1),
-    text.lastIndexOf("?", offset - 1),
-    text.lastIndexOf("!", offset - 1),
-    text.lastIndexOf("\n", offset - 1),
-  );
-  const endings = [
-    text.indexOf(".", offset),
-    text.indexOf("?", offset),
-    text.indexOf("!", offset),
-    text.indexOf("\n", offset),
-  ].filter((value) => value >= 0);
-  const right = endings.length === 0 ? text.length : Math.min(...endings) + 1;
-  return text.slice(left + 1, right).replace(/\s+/gu, " ").trim().slice(0, 360);
+function establishedForms(stableTerms: readonly StableTerm[]): string[] {
+  return stableTerms.flatMap((term) => [term.sourceForm, term.canonicalSource]);
 }
 
 export function collectRepeatedAnchorCandidates(
   blocks: readonly V4Block[],
   stableTerms: readonly StableTerm[],
+  profile: SourceLanguageProfile = getSourceLanguageProfile("en"),
 ): AnchorCandidate[] {
-  const established = new Set(stableTerms.flatMap((term) => [
-    term.sourceForm.toLocaleLowerCase(),
-    term.canonicalSource.toLocaleLowerCase(),
-    ...term.sourceForm.split(/[^A-Za-z'’-]+/u)
-      .filter((part) => part.length >= 3)
-      .map((part) => part.toLocaleLowerCase()),
-    ...term.canonicalSource.split(/[^A-Za-z'’-]+/u)
-      .filter((part) => part.length >= 3)
-      .map((part) => part.toLocaleLowerCase()),
-  ]));
-  const found = new Map<string, { sourceForm: string; contexts: Set<string>; count: number }>();
-  for (const block of blocks) {
-    for (const match of block.sourceText.matchAll(/\b[A-Z][A-Za-z'’-]{2,}\b/gu)) {
-      const sourceForm = match[0];
-      const key = sourceForm.replace(/[’']s$/u, "").toLocaleLowerCase();
-      if (COMMON_CAPITALIZED.has(key) || established.has(key)) {
-        continue;
-      }
-      const record = found.get(key) ?? {
-        sourceForm: sourceForm.replace(/[’']s$/u, ""),
-        contexts: new Set<string>(),
-        count: 0,
-      };
-      record.count += 1;
-      const context = compactContext(block.sourceText, match.index);
-      if (context.length > 0 && record.contexts.size < 3) {
-        record.contexts.add(context);
-      }
-      found.set(key, record);
-    }
-  }
-  return [...found.values()]
-    .filter((record) => record.count >= 2)
-    .sort((left, right) => right.count - left.count
-      || left.sourceForm.localeCompare(right.sourceForm))
+  return profile.collectAnchorCandidates({
+    targetTexts: blocks.map((block) => block.sourceText),
+    corpusTexts: blocks.map((block) => block.sourceText),
+    establishedSourceForms: establishedForms(stableTerms),
+    limit: 24,
+  }).filter((candidate) => candidate.corpusFrequency >= 2)
     .slice(0, 12)
-    .map((record) => ({
-      sourceForm: record.sourceForm,
-      contexts: [...record.contexts],
+    .map((candidate) => ({
+      sourceForm: candidate.sourceForm,
+      contexts: candidate.contexts,
     }));
 }
 
 /**
- * Finds forms that occur in the current window, but builds their compact
- * translator-global concordance from the whole source corpus. A prior stable
- * or contextual decision suppresses reconsideration.
+ * Finds forms in the current window and builds compact translator-global
+ * concordance from the complete source using the selected language profile.
  */
 export function collectWindowAnchorCandidates(
   targetBlocks: readonly V4Block[],
   corpusBlocks: readonly V4Block[],
   stableTerms: readonly StableTerm[],
   decidedSourceForms: readonly string[] = [],
+  profile: SourceLanguageProfile = getSourceLanguageProfile("en"),
 ): AnchorCandidate[] {
-  const established = new Set([
-    ...stableTerms.flatMap((term) => [term.sourceForm, term.canonicalSource]),
-    ...decidedSourceForms,
-  ].map((form) => form.replace(/[’']s$/u, "").toLocaleLowerCase()));
-  const targets = new Map<string, string>();
-  for (const block of targetBlocks) {
-    for (const match of block.sourceText.matchAll(/\b[A-Z][A-Za-z'’-]{2,}\b/gu)) {
-      const sourceForm = match[0].replace(/[’']s$/u, "");
-      const key = sourceForm.toLocaleLowerCase();
-      if (!COMMON_CAPITALIZED.has(key) && !established.has(key)) {
-        targets.set(key, sourceForm);
-      }
-    }
-  }
-  const found = new Map<string, { count: number; contexts: Set<string> }>();
-  for (const block of corpusBlocks) {
-    for (const match of block.sourceText.matchAll(/\b[A-Z][A-Za-z'’-]{2,}\b/gu)) {
-      const key = match[0].replace(/[’']s$/u, "").toLocaleLowerCase();
-      if (!targets.has(key)) {
-        continue;
-      }
-      const record = found.get(key) ?? { count: 0, contexts: new Set<string>() };
-      record.count += 1;
-      if (record.contexts.size < 3) {
-        const context = compactContext(block.sourceText, match.index);
-        if (context.length > 0) {
-          record.contexts.add(context);
-        }
-      }
-      found.set(key, record);
-    }
-  }
-  return [...found.entries()]
-    .filter(([, record]) => record.count >= 2)
-    .sort((left, right) =>
-      right[1].count - left[1].count
-      || (targets.get(left[0]) as string).localeCompare(targets.get(right[0]) as string))
-    .slice(0, 12)
-    .map(([key, record]) => ({
-      sourceForm: targets.get(key) as string,
-      contexts: [...record.contexts],
-    }));
+  return profile.collectAnchorCandidates({
+    targetTexts: targetBlocks.map((block) => block.sourceText),
+    corpusTexts: corpusBlocks.map((block) => block.sourceText),
+    establishedSourceForms: [
+      ...establishedForms(stableTerms),
+      ...decidedSourceForms,
+    ],
+    limit: 12,
+  }).map((candidate) => ({
+    sourceForm: candidate.sourceForm,
+    contexts: candidate.contexts,
+  }));
 }
 
 export class LexicalAnchorer {
   constructor(private readonly runtime: PiRuntime) {}
 
   async run(input: LexicalAnchorInput): Promise<LexicalAnchorOutcome> {
+    const profile = input.sourceLanguageProfile ?? getSourceLanguageProfile("en");
     const allowed = new Map(input.candidates.map((candidate) => [
-      candidate.sourceForm.toLocaleLowerCase(),
+      profile.normalizeSourceForm(candidate.sourceForm),
       candidate.sourceForm,
     ]));
     let anchors: LexicalAnchor[] = [];
     const tool: TypedToolSpec = {
       name: "submit_lexical_anchors",
       label: "Submit lexical anchors",
-      description: "Classify every repeated source form and bind only context-invariant forms to one Chinese target.",
+      description: "Classify every supplied source-language form and bind only context-invariant forms to one Chinese target.",
       phase: "translation",
       parameters: Type.Object({
         anchors: Type.Array(Type.Object({
@@ -191,7 +107,7 @@ export class LexicalAnchorer {
           target: Type.String(),
           mode: Type.Union([Type.Literal("stable"), Type.Literal("contextual")]),
           confidence: Type.Number({ minimum: 0, maximum: 1 }),
-        }), { maxItems: 12 }),
+        }), { maxItems: 24 }),
       }),
       execute: async (rawArgs, signal) => {
         assertNotAborted(signal);
@@ -201,7 +117,7 @@ export class LexicalAnchorer {
         }
         const seen = new Set<string>();
         for (const anchor of args.anchors) {
-          const key = anchor.sourceForm.toLocaleLowerCase();
+          const key = profile.normalizeSourceForm(anchor.sourceForm);
           if (!allowed.has(key) || seen.has(key)) {
             throw new Error(`unknown or duplicate anchor form: ${anchor.sourceForm}`);
           }
@@ -222,13 +138,14 @@ export class LexicalAnchorer {
     const run = await this.runtime.run({
       systemPrompt: [
         "You establish run-local lexical anchors before parallel literary translation.",
+        `The source language is ${profile.displayName} (${profile.id}).`,
         "Mark proper names, unique titles, and invariant technical terms as stable and choose one concise Chinese target.",
-        "Mark ordinary words, forms whose Chinese rendering changes by discourse role, and address forms such as Archon/阁下 as contextual.",
+        "Mark ordinary words, forms whose Chinese rendering changes by discourse role, and forms of address as contextual.",
         "Do not force surface consistency where Chinese grammar or relationship context requires variation.",
         "Call submit_lexical_anchors exactly once and classify every supplied form.",
       ].join("\n"),
       prompt: [
-        "REPEATED FORMS AND LOCAL CONCORDANCE",
+        "SOURCE-LANGUAGE FORMS AND COMPACT CONCORDANCE",
         JSON.stringify(input.candidates),
         "ESTABLISHED TERMS",
         input.stableTerms.map((term) =>

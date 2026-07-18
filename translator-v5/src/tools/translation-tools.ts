@@ -252,7 +252,7 @@ export class TranslationTools {
       {
         name: "request_translation_evidence",
         label: "Request translation evidence",
-        description: "Search bounded, position-safe whole-book evidence for literal English forms that occur in this target island.",
+        description: "Search bounded, position-safe whole-book evidence for literal source-language forms that occur in this target island.",
         phase: "translation",
         parameters: Type.Object({
           question: Type.String(),

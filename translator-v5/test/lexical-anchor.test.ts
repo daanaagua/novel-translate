@@ -15,6 +15,7 @@ import {
 import { PiRuntime } from "../src/agents/pi-runtime.js";
 import type { StableTerm, V4Block } from "../src/domain/types.js";
 import { BudgetLedger } from "../src/kernel/budget.js";
+import { getSourceLanguageProfile } from "../src/language/profiles.js";
 
 function block(text: string, index = 1): V4Block {
   return {
@@ -62,6 +63,18 @@ test("window anchor candidates use whole-book concordance without reconsidering 
   const candidates = collectWindowAnchorCandidates(target, corpus, [], ["Edgewood"]);
   assert.deepEqual(candidates.map((item) => item.sourceForm), ["Smoky"]);
   assert.equal(candidates[0]?.contexts.length, 2);
+});
+
+test("window anchor candidates delegate first occurrences to the source language profile", () => {
+  const target = [block("Loukianos regarda Lucian.", 0)];
+  const candidates = collectWindowAnchorCandidates(
+    target,
+    target,
+    [],
+    [],
+    getSourceLanguageProfile("fr"),
+  );
+  assert.deepEqual(candidates.map((item) => item.sourceForm), ["Loukianos", "Lucian"]);
 });
 
 test("Pi lexical anchor decisions become run-local stable terms", async () => {

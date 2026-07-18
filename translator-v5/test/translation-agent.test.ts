@@ -18,6 +18,7 @@ import type { ProvisionalSnapshot } from "../src/domain/provisional-snapshot.js"
 import type { V4Block } from "../src/domain/types.js";
 import { EvidenceIndex } from "../src/index/evidence-index.js";
 import { BudgetLedger } from "../src/kernel/budget.js";
+import { getSourceLanguageProfile } from "../src/language/profiles.js";
 import { CandidateCollector } from "../src/tools/candidate-collector.js";
 import { TranslationTools } from "../src/tools/translation-tools.js";
 import { TranslationValidator } from "../src/validators/translation-validator.js";
@@ -331,6 +332,18 @@ test("typography is normalized and untranslated prose words are rejected", () =>
   assert.ok(validation.failures.some((failure) =>
     failure.code === "untranslated_latin"),
   );
+});
+
+test("deterministic validator delegates French residue to its language profile", () => {
+  const block = chapterBlock(0, "Il répondit puis partit.");
+  const validation = new TranslationValidator().validate([block], {
+    translations: [{ blockId: block.id, text: "他回答 bonjour puis 离开。" }],
+    notes: [],
+    repaired: false,
+  }, { sourceLanguageProfile: getSourceLanguageProfile("fr") });
+  assert.ok(validation.failures.some((failure) =>
+    failure.code === "untranslated_latin"
+    && failure.message.includes("bonjour")));
 });
 
 test("quote normalization and validation reject invented closing boundaries", () => {
