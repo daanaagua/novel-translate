@@ -7,6 +7,7 @@ __pycache__/
 env/
 .venv/
 .worktrees/
+.superpowers/
 build/
 develop-eggs/
 dist/
