@@ -340,6 +340,49 @@ test("source importer follows EPUB container, OPF manifest and spine order", asy
   }
 });
 
+test("source importer accepts a standard external XHTML doctype in EPUB spine documents", async () => {
+  const container = `<?xml version="1.0"?><container><rootfiles><rootfile full-path="metadata.opf"/></rootfiles></container>`;
+  const opf = `<package><manifest><item id="front" href="content/FrontPage.html" media-type="application/xhtml+xml"/></manifest><spine><itemref idref="front"/></spine></package>`;
+  const frontPage = `<?xml version="1.0" encoding="utf-8"?>
+    <!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.1//EN" "http://www.w3.org/TR/xhtml11/DTD/xhtml11.dtd">
+    <html xmlns="http://www.w3.org/1999/xhtml"><body><div>Little, Big</div></body></html>`;
+  const fixture = writeFixture("external-doctype.epub", zip([
+    { name: "META-INF/container.xml", data: container },
+    { name: "metadata.opf", data: opf },
+    { name: "content/FrontPage.html", data: frontPage },
+  ]));
+  try {
+    const result = await importSource({
+      sourcePath: fixture.sourcePath,
+      projectDirectory: projectDirectory(fixture.directory),
+      sourceLanguage: "en",
+    });
+    assert.equal(SourceLedger.open(result.manifestPath).sourceText, "Little, Big");
+  } finally {
+    rmSync(fixture.directory, { recursive: true, force: true });
+  }
+});
+
+test("source importer still rejects EPUB spine documents with an internal DTD subset", async () => {
+  const container = `<container><rootfiles><rootfile full-path="metadata.opf"/></rootfiles></container>`;
+  const opf = `<package><manifest><item id="chapter" href="chapter.xhtml"/></manifest><spine><itemref idref="chapter"/></spine></package>`;
+  const chapter = `<!DOCTYPE html [<!ELEMENT html ANY>]><html><body>Unsafe</body></html>`;
+  const fixture = writeFixture("internal-dtd.epub", zip([
+    { name: "META-INF/container.xml", data: container },
+    { name: "metadata.opf", data: opf },
+    { name: "chapter.xhtml", data: chapter },
+  ]));
+  try {
+    await expectImportCode(() => importSource({
+      sourcePath: fixture.sourcePath,
+      projectDirectory: projectDirectory(fixture.directory),
+      sourceLanguage: "en",
+    }), "EPUB_SPINE_INVALID");
+  } finally {
+    rmSync(fixture.directory, { recursive: true, force: true });
+  }
+});
+
 test("source importer preserves EPUB inline order and nested visible blocks exactly once", async () => {
   const container = `<?xml version="1.0"?><container><rootfiles><rootfile full-path="OEBPS/content.opf"/></rootfiles></container>`;
   const opf = `<package><manifest><item id="chapter" href="text/chapter.xhtml" media-type="application/xhtml+xml"/></manifest><spine><itemref idref="chapter"/></spine></package>`;

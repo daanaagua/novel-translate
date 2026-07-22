@@ -249,6 +249,36 @@ function attribute(value: Record<string, unknown>, name: string): string | undef
   return typeof found === "string" ? found : undefined;
 }
 
+function hasDoctypeInternalSubset(xml: string): boolean {
+  const declarations = /<!\s*DOCTYPE\b/giu;
+  for (let match = declarations.exec(xml); match !== null; match = declarations.exec(xml)) {
+    let quote: "\"" | "'" | undefined;
+    let terminated = false;
+    for (let index = declarations.lastIndex; index < xml.length; index += 1) {
+      const character = xml[index]!;
+      if (quote !== undefined) {
+        if (character === quote) {
+          quote = undefined;
+        }
+        continue;
+      }
+      if (character === "\"" || character === "'") {
+        quote = character;
+      } else if (character === "[") {
+        return true;
+      } else if (character === ">") {
+        declarations.lastIndex = index + 1;
+        terminated = true;
+        break;
+      }
+    }
+    if (!terminated) {
+      break;
+    }
+  }
+  return false;
+}
+
 function decodeXml(payload: Buffer, code: SourceImportErrorCode, context: string): string {
   let xml: string;
   try {
@@ -256,8 +286,14 @@ function decodeXml(payload: Buffer, code: SourceImportErrorCode, context: string
   } catch (error) {
     return sourceError(code, error instanceof Error ? error.message : `${context} is not UTF-8 XML`);
   }
-  if (/<!\s*(?:DOCTYPE|ENTITY)\b/iu.test(xml)) {
-    return sourceError(code, `${context} contains a prohibited XML declaration`);
+  if (/<!\s*ENTITY\b/iu.test(xml)) {
+    return sourceError(code, `${context} contains a prohibited XML entity declaration`);
+  }
+  // EPUB 2 commonly uses a public XHTML DTD. fast-xml-parser never resolves
+  // external entities, so that declaration is safe to retain. Internal DTD
+  // subsets remain forbidden because they can define custom entities.
+  if (hasDoctypeInternalSubset(xml)) {
+    return sourceError(code, `${context} contains a prohibited XML DTD internal subset`);
   }
   return xml;
 }
