@@ -10,6 +10,7 @@ import type {
   DesktopProjectRequest,
   DesktopProjectSnapshot,
   DesktopResult,
+  DesktopTrialMode,
   DesktopTrialResult,
 } from "../src/desktop/contracts.js";
 import {
@@ -59,12 +60,15 @@ function snapshotFor(
     },
   }));
   return {
-    manifestPath,
     title: "fixture",
     sourceLanguage: "en",
+    detectedLanguage: "英语",
+    sourceEncoding: "utf-8",
+    encodingConfidence: 1,
+    languageProfileVersion: "source-language-profile-2",
     sourceChars: 1,
     sourceVersion: "source-v1",
-    store: { state: "ready", ...(request.storePath === undefined ? {} : { path: request.storePath }) },
+    store: { state: "ready" },
     runs,
     ...(runs.length === 1 ? { selectedRunId: runs[0]!.runId } : {}),
     runSelection: runs.length <= 1 ? "selected" : "required",
@@ -96,7 +100,7 @@ interface IpcFixture {
     forgotten: readonly unknown[];
   };
   trialCalls: {
-    starts: readonly string[];
+    starts: readonly { manifestPath: string; mode: DesktopTrialMode }[];
     cancellations: number;
   };
   dialogFilters: ReadonlyArray<{ name: string; extensions: string[] }>;
@@ -117,7 +121,7 @@ function registerFixtureHandlers(options: IpcFixtureOptions = {}): IpcFixture {
   const discoveries: unknown[] = [];
   const tests: unknown[] = [];
   const forgotten: unknown[] = [];
-  const trialStarts: string[] = [];
+  const trialStarts: Array<{ manifestPath: string; mode: DesktopTrialMode }> = [];
   let trialCancellations = 0;
   const dialogFilters: Array<{ name: string; extensions: string[] }> = [];
   const trustedEvent = {
@@ -259,7 +263,7 @@ function registerFixtureHandlers(options: IpcFixtureOptions = {}): IpcFixture {
     },
     trialService: {
       async start(request) {
-        trialStarts.push(request.manifestPath);
+        trialStarts.push(request);
         return {
           runId: "trial-run-1",
           sourceText: "The bell rang.",
@@ -343,26 +347,40 @@ test("IPC only registers the desktop allowlist", () => {
   }
 });
 
-test("trial IPC uses the active manuscript, returns only the committed projection, and cancels through a fixed operation", async () => {
+test("trial IPC accepts only an explicit mode, keeps the manuscript main-process-owned, and cancels through a fixed operation", async () => {
   const fixture = registerFixtureHandlers({ existingReadyModel: true });
   try {
-    const started = await handler(fixture, "folioloom:start-trial")(fixture.trustedEvent) as DesktopResult<DesktopTrialResult>;
+    const started = await handler(fixture, "folioloom:start-trial")(fixture.trustedEvent, {
+      mode: "quality",
+    }) as DesktopResult<DesktopTrialResult>;
     assert.deepEqual(started, ok({
       runId: "trial-run-1",
       sourceText: "The bell rang.",
       translationText: "钟声响起。",
     }));
-    assert.deepEqual(fixture.trialCalls.starts, [fixture.manifestPath]);
+    assert.deepEqual(fixture.trialCalls.starts, [{
+      manifestPath: fixture.manifestPath,
+      mode: "quality",
+    }]);
 
     const cancelled = await handler(fixture, "folioloom:cancel-trial")(fixture.trustedEvent) as DesktopResult<void>;
     assert.deepEqual(cancelled, ok(undefined));
     assert.equal(fixture.trialCalls.cancellations, 1);
 
+    const arbitraryMode = await handler(fixture, "folioloom:start-trial")(fixture.trustedEvent, {
+      mode: "cheap",
+    }) as DesktopResult<unknown>;
+    assert.equal(arbitraryMode.ok, false);
+
     const injected = await handler(fixture, "folioloom:start-trial")(fixture.trustedEvent, {
+      mode: "fast",
       manifestPath: "C:\\outside\\source_manifest.json",
     }) as DesktopResult<unknown>;
     assert.equal(injected.ok, false);
-    assert.deepEqual(fixture.trialCalls.starts, [fixture.manifestPath]);
+    assert.deepEqual(fixture.trialCalls.starts, [{
+      manifestPath: fixture.manifestPath,
+      mode: "quality",
+    }]);
   } finally {
     rmSync(fixture.directory, { recursive: true, force: true });
   }

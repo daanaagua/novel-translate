@@ -333,6 +333,7 @@ h2 {
 }
 
 .project-header .quiet-button { flex: 0 0 auto; margin-top: 3px; }
+.project-header .project-diagnostic { margin-top: 4px; }
 
 .setup-workspace-grid {
   display: grid;
@@ -370,6 +371,40 @@ h2 {
   display: grid;
   grid-template-columns: minmax(0, 1fr);
   margin-top: 16px;
+}
+
+.trial-mode-selector {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 20px;
+}
+
+.trial-mode-button {
+  min-width: 104px;
+  padding: 9px 13px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: rgb(255 255 255 / 2%);
+  color: var(--muted);
+  font: inherit;
+  cursor: pointer;
+}
+
+.trial-mode-button.is-selected {
+  border-color: color-mix(in srgb, var(--teal), transparent 35%);
+  background: rgb(116 212 192 / 10%);
+  color: var(--text);
+}
+
+.trial-mode-button:disabled { cursor: default; opacity: 0.55; }
+
+.trial-mode-copy {
+  max-width: 640px;
+  margin: 10px 0 0;
+  color: var(--muted);
+  font-size: 13px;
+  line-height: 1.65;
 }
 
 .placeholder-page { padding-top: clamp(72px, 14vh, 150px); }

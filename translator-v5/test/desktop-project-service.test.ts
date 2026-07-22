@@ -19,6 +19,7 @@ interface DesktopFixtureOptions {
   runIds?: readonly string[];
   completeFirstWindow?: boolean;
   foreignRun?: boolean;
+  sourceLanguage?: string;
 }
 
 interface DesktopFixture {
@@ -65,7 +66,7 @@ function createFixture(options: DesktopFixtureOptions = {}): DesktopFixture {
     source_format: ".txt",
     encoding: "utf-8",
     extractor: "plain-text-v1",
-    sourceLanguage: "en",
+    sourceLanguage: options.sourceLanguage ?? "en",
     canonical_path: "source.txt",
     canonical_chars: [...SOURCE].length,
     canonical_sha256: sha256(source),
@@ -164,7 +165,7 @@ function createFixture(options: DesktopFixtureOptions = {}): DesktopFixture {
   return { directory, manifestPath, storePath, glossaryPath };
 }
 
-test("snapshot opens a manifest without a store", () => {
+test("snapshot exposes reader-facing source diagnostics without internal project paths", () => {
   const fixture = createFixture();
   try {
     const result = new DesktopProjectService().snapshot({
@@ -175,10 +176,34 @@ test("snapshot opens a manifest without a store", () => {
       assert.equal(result.value.store.state, "not_found");
       assert.equal(result.value.runSelection, "none");
       assert.equal(result.value.sourceLanguage, "en");
+      assert.equal(result.value.detectedLanguage, "英语");
+      assert.equal(result.value.sourceEncoding, "utf-8");
+      assert.equal(result.value.encodingConfidence, 1);
+      assert.equal(result.value.languageProfileVersion, "source-language-profile-2");
       assert.equal(result.value.title, "original");
+      assert.equal("manifestPath" in result.value, false);
+      assert.equal("glossaryPath" in result.value, false);
+      assert.equal("path" in result.value.store, false);
     }
   } finally {
     rmSync(fixture.directory, { recursive: true, force: true });
+  }
+});
+
+test("snapshot localizes Japanese and Korean source profiles for the reader", () => {
+  const japanese = createFixture({ sourceLanguage: "ja" });
+  const korean = createFixture({ sourceLanguage: "ko" });
+  try {
+    const service = new DesktopProjectService();
+    const japaneseResult = service.snapshot({ manifestPath: japanese.manifestPath });
+    const koreanResult = service.snapshot({ manifestPath: korean.manifestPath });
+    assert.equal(japaneseResult.ok, true);
+    assert.equal(koreanResult.ok, true);
+    if (japaneseResult.ok) assert.equal(japaneseResult.value.detectedLanguage, "日语");
+    if (koreanResult.ok) assert.equal(koreanResult.value.detectedLanguage, "韩语");
+  } finally {
+    rmSync(japanese.directory, { recursive: true, force: true });
+    rmSync(korean.directory, { recursive: true, force: true });
   }
 });
 
@@ -250,7 +275,7 @@ test("snapshot permits an explicitly selected database outside the project", () 
     });
     assert.equal(result.ok, true);
     if (result.ok) {
-      assert.deepEqual(result.value.store, { state: "ready", path: externalStorePath });
+      assert.deepEqual(result.value.store, { state: "ready" });
     }
   } finally {
     rmSync(fixture.directory, { recursive: true, force: true });

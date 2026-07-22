@@ -11,6 +11,7 @@ import type {
   DesktopResult,
   DesktopTestModelRequest,
   DesktopTestModelResult,
+  DesktopTrialMode,
   DesktopTrialProgress,
   DesktopTrialResult,
 } from "../../contracts.js";
@@ -49,7 +50,7 @@ function unavailableApi(): FolioLoomDesktopApi {
     discoverModels: async () => unavailableResult(),
     testModel: async () => unavailableResult(),
     forgetCredential: async () => unavailableResult(),
-    startTrial: async () => unavailableResult(),
+    startTrial: async (_request) => unavailableResult(),
     cancelTrial: async () => unavailableResult(),
     onTrialProgress: () => () => undefined,
     chooseProject: async () => unavailableResult(),
@@ -241,12 +242,12 @@ export function App({ api }: AppProps): JSX.Element {
     }
   }
 
-  async function startTrial(): Promise<void> {
+  async function startTrial(mode: DesktopTrialMode): Promise<void> {
     setBusyAction("start-trial");
     setTrialResult(undefined);
     setOperationError(undefined);
     try {
-      const result = await desktopApi.startTrial();
+      const result = await desktopApi.startTrial({ mode });
       if (!result.ok) {
         if (result.error.code === "DESKTOP_TRIAL_CANCELLED") {
           setTrialProgress(undefined);

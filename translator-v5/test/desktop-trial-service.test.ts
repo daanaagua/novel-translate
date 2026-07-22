@@ -15,10 +15,12 @@ import {
 import {
   DesktopTrialError,
   DesktopTrialService,
+  type DesktopTrialRuntime,
   type DesktopTrialRuntimeResolver,
   type DesktopTrialServiceOptions,
 } from "../src/desktop/desktop-trial-service.js";
 import { runBook, type LosslessBookRunOptions } from "../src/fullbook/book-runner.js";
+import type { ModelProfile, ProviderEffort } from "../src/providers/types.js";
 import { scalarLength } from "../src/source/types.js";
 
 function fixture(source = "The bell rings above the empty court."): {
@@ -92,14 +94,25 @@ function completedTrialResponse(context: Context) {
   }), { stopReason: "toolUse" });
 }
 
-function runtimeFor(faux: ReturnType<typeof fauxProvider>): DesktopTrialRuntimeResolver {
+function runtimeFor(
+  faux: ReturnType<typeof fauxProvider>,
+  profile: ModelProfile = {
+    providerId: "deepseek",
+    modelId: faux.getModel().id,
+    reasoningEffort: "high",
+  },
+  supportedEfforts: readonly ProviderEffort[] = ["off", "high"],
+): DesktopTrialRuntimeResolver {
+  const createRuntime = (candidate: ModelProfile): DesktopTrialRuntime => ({
+    profile: candidate,
+    model: faux.getModel(),
+    streamFn: faux.provider.streamSimple.bind(faux.provider),
+    supportedEfforts,
+    createWithProfile: createRuntime,
+  });
   return {
     async resolve() {
-      return {
-        profile: { providerId: "deepseek", modelId: faux.getModel().id },
-        model: faux.getModel(),
-        streamFn: faux.provider.streamSimple.bind(faux.provider),
-      };
+      return createRuntime(profile);
     },
   };
 }
@@ -121,12 +134,16 @@ test("desktop trial processes one window serially and projects the committed sou
     };
     const service = new DesktopTrialService(options);
 
-    const result = await service.start({ manifestPath: project.manifestPath });
+    const result = await service.start({ manifestPath: project.manifestPath, mode: "quality" });
 
     assert.equal(seen.length, 1);
     assert.equal(seen[0]?.maxWindows, 1);
     assert.equal(seen[0]?.maxConcurrency, 1);
     assert.equal(seen[0]?.storePath, join(project.projectDirectory, "artifacts", "folioloom", "book.db"));
+    assert.equal(seen[0]?.runtimeSet?.mode, "quality");
+    assert.equal(seen[0]?.runtimeSet?.primary.effort, "high");
+    assert.equal(seen[0]?.runtimeSet?.primary.thinkingLevel, "high");
+    assert.equal(seen[0]?.runtimeSet?.primary, seen[0]?.runtimeSet?.escalation);
     assert.match(result.runId, /^[0-9a-f-]{36}$/u);
     assert.equal(result.sourceText, "The bell rings above the empty court.");
     assert.equal(result.translationText, "钟声在空荡的庭院上空回响，迟迟不散。");
@@ -144,7 +161,7 @@ test("desktop trial rejects an unready model before opening a translation task",
     });
 
     await assert.rejects(
-      service.start({ manifestPath: project.manifestPath }),
+      service.start({ manifestPath: project.manifestPath, mode: "quality" }),
       (error: unknown) => error instanceof DesktopTrialError
         && error.code === "DESKTOP_TRIAL_MODEL_NOT_READY",
     );
@@ -167,11 +184,11 @@ test("desktop trial allows only one active lease for the same project", async ()
   }]);
   try {
     const service = new DesktopTrialService({ runtime: runtimeFor(faux) });
-    const first = service.start({ manifestPath: project.manifestPath });
+    const first = service.start({ manifestPath: project.manifestPath, mode: "quality" });
     await enteredProvider;
 
     await assert.rejects(
-      service.start({ manifestPath: project.manifestPath }),
+      service.start({ manifestPath: project.manifestPath, mode: "quality" }),
       (error: unknown) => error instanceof DesktopTrialError
         && error.code === "DESKTOP_TRIAL_ALREADY_RUNNING",
     );
@@ -191,17 +208,17 @@ test("desktop trial releases a failed lease and reads the latest committed trial
   })]);
   try {
     const failedService = new DesktopTrialService({ runtime: runtimeFor(failing) });
-    await assert.rejects(failedService.start({ manifestPath: project.manifestPath }), /provider unavailable/i);
+    await assert.rejects(failedService.start({ manifestPath: project.manifestPath, mode: "quality" }), /provider unavailable/i);
 
     const succeeding = fauxProvider();
     succeeding.setResponses([completedTrialResponse]);
     const result = await new DesktopTrialService({ runtime: runtimeFor(succeeding) })
-      .start({ manifestPath: project.manifestPath });
+      .start({ manifestPath: project.manifestPath, mode: "quality" });
     assert.equal(succeeding.state.callCount, 1);
 
     const restartedProvider = fauxProvider();
     const restarted = await new DesktopTrialService({ runtime: runtimeFor(restartedProvider) })
-      .start({ manifestPath: project.manifestPath });
+      .start({ manifestPath: project.manifestPath, mode: "quality" });
     assert.equal(restartedProvider.state.callCount, 0);
     assert.equal(restarted.runId, result.runId);
     assert.equal(restarted.translationText, result.translationText);
@@ -222,7 +239,7 @@ test("desktop trial cancellation signals the active run and waits for it to sett
         }, { once: true });
       }),
     });
-    const trial = service.start({ manifestPath: project.manifestPath });
+    const trial = service.start({ manifestPath: project.manifestPath, mode: "quality" });
     const cancelled = service.cancel();
 
     await cancelled;
@@ -231,6 +248,90 @@ test("desktop trial cancellation signals the active run and waits for it to sett
       (error: unknown) => error instanceof DesktopTrialError
         && String(error.code) === "DESKTOP_TRIAL_CANCELLED",
     );
+  } finally {
+    rmSync(project.directory, { recursive: true, force: true });
+  }
+});
+
+test("desktop fast trial chooses the provider's lowest legal effort and retains the tested effort for escalation", async () => {
+  const project = fixture();
+  const faux = fauxProvider();
+  faux.setResponses([completedTrialResponse]);
+  const seen: LosslessBookRunOptions[] = [];
+  try {
+    const service = new DesktopTrialService({
+      runtime: runtimeFor(faux, {
+        providerId: "deepseek",
+        modelId: faux.getModel().id,
+        reasoningEffort: "high",
+      }, ["off", "high"]),
+      runBook: async (options) => {
+        seen.push(options);
+        return runBook(options);
+      },
+    });
+
+    await service.start({ manifestPath: project.manifestPath, mode: "fast" });
+
+    const runtimeSet = seen[0]?.runtimeSet;
+    assert.equal(runtimeSet?.mode, "fast");
+    assert.equal(runtimeSet?.primary.effort, "off");
+    assert.equal(runtimeSet?.primary.thinkingLevel, "off");
+    assert.equal(runtimeSet?.escalation.effort, "high");
+    assert.equal(runtimeSet?.escalation.thinkingLevel, "high");
+    assert.notEqual(runtimeSet?.primary, runtimeSet?.escalation);
+  } finally {
+    rmSync(project.directory, { recursive: true, force: true });
+  }
+});
+
+test("desktop fast trial falls back to minimal when off is not legal for the provider", async () => {
+  const project = fixture();
+  const faux = fauxProvider();
+  faux.setResponses([completedTrialResponse]);
+  const seen: LosslessBookRunOptions[] = [];
+  try {
+    const service = new DesktopTrialService({
+      runtime: runtimeFor(faux, {
+        providerId: "deepseek",
+        modelId: faux.getModel().id,
+        reasoningEffort: "high",
+      }, ["minimal", "high"]),
+      runBook: async (options) => {
+        seen.push(options);
+        return runBook(options);
+      },
+    });
+
+    await service.start({ manifestPath: project.manifestPath, mode: "fast" });
+
+    assert.equal(seen[0]?.runtimeSet?.primary.effort, "minimal");
+    assert.equal(seen[0]?.runtimeSet?.primary.thinkingLevel, "minimal");
+    assert.equal(seen[0]?.runtimeSet?.escalation.effort, "high");
+  } finally {
+    rmSync(project.directory, { recursive: true, force: true });
+  }
+});
+
+test("desktop trial rejects an arbitrary mode before it resolves the model runtime", async () => {
+  const project = fixture();
+  let resolved = 0;
+  try {
+    const service = new DesktopTrialService({
+      runtime: {
+        async resolve() {
+          resolved += 1;
+          return undefined;
+        },
+      },
+    });
+
+    await assert.rejects(
+      service.start({ manifestPath: project.manifestPath, mode: "cheap" as never }),
+      (error: unknown) => error instanceof DesktopTrialError
+        && error.code === "DESKTOP_TRIAL_INPUT_INVALID",
+    );
+    assert.equal(resolved, 0);
   } finally {
     rmSync(project.directory, { recursive: true, force: true });
   }

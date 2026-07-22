@@ -12,7 +12,9 @@ import type {
   DesktopProjectRequest,
   DesktopProjectSnapshot,
   DesktopResult,
+  DesktopStartTrialRequest,
   DesktopTestModelResult,
+  DesktopTrialMode,
   DesktopTrialResult,
 } from "../contracts.js";
 import type {
@@ -104,7 +106,7 @@ export interface DesktopIpcModelService {
 }
 
 export interface DesktopIpcTrialService {
-  start(request: { manifestPath: string }): Promise<DesktopTrialResult>;
+  start(request: { manifestPath: string; mode: DesktopTrialMode }): Promise<DesktopTrialResult>;
   cancel(): Promise<void>;
 }
 
@@ -272,6 +274,15 @@ function confirmSourceEncodingRequest(value: unknown): DesktopConfirmSourceEncod
     pendingImportId,
     encoding: encoding as DesktopConfirmSourceEncodingRequest["encoding"],
   };
+}
+
+function startTrialRequest(value: unknown): DesktopStartTrialRequest {
+  const input = exactRecord(value, "start-trial payload", ["mode"]);
+  const mode = requiredText(input.mode, "mode");
+  if (mode !== "quality" && mode !== "fast") {
+    return inputError("mode must be quality or fast");
+  }
+  return { mode };
 }
 
 function publicProviders(snapshot: DesktopIpcModelSnapshot): readonly DesktopOnboardingProvider[] {
@@ -466,12 +477,15 @@ export function registerDesktopIpc(dependencies: DesktopIpcDependencies): void {
   }));
 
   handleTrusted("folioloom:start-trial", async (_event, ...args) => resultFrom(async () => {
-    noArguments(args, "start-trial");
+    const request = startTrialRequest(oneArgument(args, "start-trial"));
     const current = dependencies.getCurrentRequest();
     if (current === undefined) {
       return failure("DESKTOP_NO_PROJECT", "choose a manuscript before starting a trial");
     }
-    return ok(await dependencies.trialService.start({ manifestPath: current.manifestPath }));
+    return ok(await dependencies.trialService.start({
+      manifestPath: current.manifestPath,
+      mode: request.mode,
+    }));
   }));
 
   handleTrusted("folioloom:cancel-trial", async (_event, ...args) => resultFrom(async () => {

@@ -93,9 +93,12 @@ const providers: DesktopOnboardingState["providers"] = [
 ];
 
 const project: DesktopProjectSnapshot = {
-  manifestPath: "C:\\books\\example\\internal-project-file",
   title: "The Example Book",
   sourceLanguage: "英语",
+  detectedLanguage: "英语",
+  sourceEncoding: "utf-8",
+  encodingConfidence: 0.98,
+  languageProfileVersion: "source-language-profile-2",
   sourceChars: 12840,
   sourceVersion: "source-example",
   store: { state: "ready" },
@@ -213,6 +216,41 @@ describe("FolioLoom desktop onboarding", () => {
 
     await waitFor(() => expect(chooseSource).toHaveBeenCalledTimes(1));
     expect(await screen.findByRole("button", { name: "DeepSeek" })).toBeTruthy();
+  });
+
+  it("shows source diagnostics as reader-facing language and encoding details without internal paths", async () => {
+    const { container } = render(<App api={createApi({
+      getOnboardingState: vi.fn().mockResolvedValue(ok(sourceOnlyOnboarding)),
+    })} />);
+
+    await screen.findByRole("heading", { name: "The Example Book" });
+    expect(screen.getByText("检测语言：英语")).toBeTruthy();
+    expect(screen.getByText("编码：UTF-8 · 置信度 98%")).toBeTruthy();
+    expect(container.textContent).not.toContain("internal-project-file");
+    expect(container.textContent).not.toContain("source_manifest.json");
+    expect(container.textContent).not.toContain("SQLite");
+  });
+
+  it("renders a canonical Japanese or Korean source diagnostic instead of internal profile ids", async () => {
+    const japaneseProject: DesktopProjectSnapshot = {
+      ...project,
+      title: "日本語の本",
+      sourceLanguage: "ja",
+      detectedLanguage: "日语",
+      sourceEncoding: "shift_jis",
+      encodingConfidence: 0.87,
+    };
+    render(<App api={createApi({
+      getOnboardingState: vi.fn().mockResolvedValue(ok({
+        ...sourceOnlyOnboarding,
+        project: japaneseProject,
+      })),
+    })} />);
+
+    await screen.findByRole("heading", { name: "日本語の本" });
+    expect(screen.getByText("检测语言：日语")).toBeTruthy();
+    expect(screen.getByText("编码：Shift-JIS · 置信度 87%")).toBeTruthy();
+    expect(screen.queryByText("ja")).toBeNull();
   });
 
   it("keeps an ambiguous source behind an opaque encoding choice before opening the project", async () => {
@@ -559,7 +597,36 @@ describe("FolioLoom desktop onboarding", () => {
     expect(await screen.findByText("The bell rang above the empty court.")).toBeTruthy();
     expect(screen.getByText("钟声在空旷的庭院上空回响。")).toBeTruthy();
     expect(startTrial).toHaveBeenCalledTimes(1);
+    expect(startTrial).toHaveBeenCalledWith({ mode: "quality" });
     expect(onTrialProgress).toHaveBeenCalledTimes(1);
+  });
+
+  it("defaults to quality trial and sends only the explicit fast mode after the user switches", async () => {
+    const user = userEvent.setup();
+    const startTrial = vi.fn().mockResolvedValue(ok({
+      runId: "trial-run-fast",
+      sourceText: "The bell rang.",
+      translationText: "钟响了。",
+    }));
+    const { container } = render(<App api={createApi({
+      getOnboardingState: vi.fn().mockResolvedValue(ok(readyOnboarding)),
+      startTrial,
+    })} />);
+
+    const quality = await screen.findByRole("button", { name: "精细试译" });
+    const fast = screen.getByRole("button", { name: "快速试译" });
+    expect(quality.getAttribute("aria-pressed")).toBe("true");
+    expect(fast.getAttribute("aria-pressed")).toBe("false");
+
+    await user.click(fast);
+    expect(fast.getAttribute("aria-pressed")).toBe("true");
+    await user.click(await waitFor(() => {
+      const target = container.querySelector<HTMLButtonElement>("[data-action='start-trial']");
+      expect(target?.disabled).toBe(false);
+      return target as HTMLButtonElement;
+    }));
+
+    expect(startTrial).toHaveBeenCalledWith({ mode: "fast" });
   });
 
   it("shows a normal error first and keeps redacted technical detail collapsed", async () => {

@@ -116,19 +116,41 @@ function discoverStorePath(manifestPath: string): string | undefined {
 
 function snapshotBase(
   ledger: SourceLedger,
-  glossaryPath: string | undefined,
 ): Pick<
   DesktopProjectSnapshot,
-  "manifestPath" | "title" | "sourceLanguage" | "sourceChars" | "sourceVersion" | "glossaryPath"
+  | "title"
+  | "sourceLanguage"
+  | "detectedLanguage"
+  | "sourceEncoding"
+  | "encodingConfidence"
+  | "languageProfileVersion"
+  | "sourceChars"
+  | "sourceVersion"
 > {
   return {
-    manifestPath: ledger.manifestPath,
     title: basename(ledger.rawPath, extname(ledger.rawPath)),
     sourceLanguage: ledger.sourceLanguage,
+    detectedLanguage: sourceLanguageLabel(ledger.sourceLanguage, ledger.languageProfile.displayName),
+    sourceEncoding: ledger.encoding,
+    encodingConfidence: ledger.encodingDecision?.confidence ?? 1,
+    languageProfileVersion: ledger.languageProfile.version,
     sourceChars: ledger.canonicalChars,
     sourceVersion: ledger.sourceVersion,
-    ...(glossaryPath === undefined ? {} : { glossaryPath }),
   };
+}
+
+function sourceLanguageLabel(language: string, fallback: string): string {
+  const labels: Readonly<Record<string, string>> = {
+    en: "英语",
+    fr: "法语",
+    de: "德语",
+    es: "西班牙语",
+    ru: "俄语",
+    ja: "日语",
+    ko: "韩语",
+    und: "待确认",
+  };
+  return labels[language] ?? fallback;
 }
 
 function runSummary(store: LosslessBookStore, run: StoredTranslationRun): DesktopRunSummary {
@@ -196,14 +218,14 @@ export class DesktopProjectService {
     try {
       const manifestPath = requireManifestPath(request.manifestPath);
       const ledger = SourceLedger.open(manifestPath);
-      const glossaryPath = request.glossaryPath === undefined
-        ? adjacentGlossaryPath(manifestPath)
-        : requireGlossaryPath(request.glossaryPath);
+      if (request.glossaryPath !== undefined) {
+        requireGlossaryPath(request.glossaryPath);
+      }
       const requestedRunId = requireOptionalRunId(request.runId);
       const candidateStorePath = request.storePath === undefined
         ? discoverStorePath(manifestPath)
         : requireStorePath(request.storePath);
-      const base = snapshotBase(ledger, glossaryPath);
+      const base = snapshotBase(ledger);
       if (candidateStorePath === undefined) {
         return ok({
           ...base,
@@ -222,7 +244,6 @@ export class DesktopProjectService {
             ...base,
             store: {
               state: "invalid",
-              path: candidateStorePath,
               error: sourceVersionMismatchError(ledger.sourceVersion),
             },
             runs: [],
@@ -233,7 +254,7 @@ export class DesktopProjectService {
         if (runs.length === 0) {
           return ok({
             ...base,
-            store: { state: "ready", path: candidateStorePath },
+            store: { state: "ready" },
             runs,
             runSelection: "none",
           });
@@ -241,7 +262,7 @@ export class DesktopProjectService {
         if (runs.length === 1) {
           return ok({
             ...base,
-            store: { state: "ready", path: candidateStorePath },
+            store: { state: "ready" },
             runs,
             selectedRunId: runs[0]!.runId,
             runSelection: "selected",
@@ -252,7 +273,7 @@ export class DesktopProjectService {
           : runs.find((run) => run.runId === requestedRunId);
         return ok({
           ...base,
-          store: { state: "ready", path: candidateStorePath },
+          store: { state: "ready" },
           runs,
           ...(selected === undefined ? {} : { selectedRunId: selected.runId }),
           runSelection: selected === undefined ? "required" : "selected",

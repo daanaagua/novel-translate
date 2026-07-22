@@ -31,7 +31,7 @@ const desktopApi: FolioLoomDesktopApi = {
   discoverModels: (request) => ipcRenderer.invoke("folioloom:discover-models", request),
   testModel: (request) => ipcRenderer.invoke("folioloom:test-model", request),
   forgetCredential: (providerId) => ipcRenderer.invoke("folioloom:forget-credential", providerId),
-  startTrial: () => ipcRenderer.invoke("folioloom:start-trial"),
+  startTrial: (request) => ipcRenderer.invoke("folioloom:start-trial", request),
   cancelTrial: () => ipcRenderer.invoke("folioloom:cancel-trial"),
   onTrialProgress: (listener) => {
     const forward = (_event: IpcRendererEvent, value: unknown): void => {

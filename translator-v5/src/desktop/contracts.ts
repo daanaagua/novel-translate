@@ -26,15 +26,19 @@ export interface DesktopRunSummary {
 }
 
 export interface DesktopProjectSnapshot {
-  manifestPath: string;
   title: string;
   sourceLanguage: string;
+  /** Chinese reader-facing label for the detected source language. */
+  detectedLanguage: string;
+  /** Canonical source encoding, e.g. `utf-8`. */
+  sourceEncoding: string;
+  /** Detector confidence in the canonical encoding, from 0 to 1. */
+  encodingConfidence: number;
+  languageProfileVersion: string;
   sourceChars: number;
   sourceVersion: string;
-  glossaryPath?: string;
   store: {
     state: "not_found" | "ready" | "invalid";
-    path?: string;
     error?: DesktopError;
   };
   runs: DesktopRunSummary[];
@@ -167,6 +171,13 @@ export interface DesktopTestModelRequest {
 export interface DesktopTestModelResult {
   report: DesktopModelProbe;
   onboarding: DesktopOnboardingState;
+}
+
+export type DesktopTrialMode = "quality" | "fast";
+
+/** Renderer-controlled choice; project identity remains in the main process. */
+export interface DesktopStartTrialRequest {
+  mode: DesktopTrialMode;
 }
 
 export type DesktopTrialStage =

@@ -7,6 +7,7 @@ import type {
   DesktopOnboardingState,
   DesktopProjectSnapshot,
   DesktopResult,
+  DesktopStartTrialRequest,
   DesktopTestModelRequest,
   DesktopTestModelResult,
   DesktopTrialProgress,
@@ -22,7 +23,7 @@ export interface FolioLoomDesktopApi {
   discoverModels(request: DesktopDiscoverModelsRequest): Promise<DesktopResult<readonly DesktopModelOption[]>>;
   testModel(request: DesktopTestModelRequest): Promise<DesktopResult<DesktopTestModelResult>>;
   forgetCredential(providerId: string): Promise<DesktopResult<DesktopOnboardingState>>;
-  startTrial(): Promise<DesktopResult<DesktopTrialResult>>;
+  startTrial(request: DesktopStartTrialRequest): Promise<DesktopResult<DesktopTrialResult>>;
   cancelTrial(): Promise<DesktopResult<void>>;
   onTrialProgress(listener: (progress: DesktopTrialProgress) => void): () => void;
   chooseProject(): Promise<DesktopResult<DesktopProjectSnapshot>>;

@@ -14,8 +14,10 @@ import { DesktopModelService } from "../desktop-model-service.js";
 import { DesktopPreferences } from "../desktop-preferences.js";
 import { DesktopProjectService } from "../desktop-project-service.js";
 import { DesktopSourceService } from "../desktop-source-service.js";
-import { DesktopTrialService } from "../desktop-trial-service.js";
+import { DesktopTrialService, type DesktopTrialRuntime } from "../desktop-trial-service.js";
 import { createProviderRuntime } from "../../providers/runtime.js";
+import { providerRegistry } from "../../providers/registry.js";
+import type { ModelProfile } from "../../providers/types.js";
 import { registerDesktopIpc } from "./ipc.js";
 import { createDesktopProviderRegistryAdapter } from "./provider-model-adapter.js";
 import {
@@ -114,8 +116,18 @@ void app.whenReady().then(() => {
         if (profile === undefined) return undefined;
         const credential = credentialStore.read(profile.providerId);
         if (credential.status !== "available") return undefined;
-        const runtime = createProviderRuntime(profile, credential.credential);
-        return { profile, model: runtime.model, streamFn: runtime.streamFn };
+        const createRuntime = (candidate: ModelProfile): DesktopTrialRuntime => {
+          const resolved = providerRegistry.resolve(candidate);
+          const runtime = createProviderRuntime(resolved.profile, credential.credential);
+          return {
+            profile: resolved.profile,
+            model: runtime.model,
+            streamFn: runtime.streamFn,
+            supportedEfforts: resolved.definition.capabilities.efforts,
+            createWithProfile: createRuntime,
+          };
+        };
+        return createRuntime(profile);
       },
     },
     onProgress(stage) {

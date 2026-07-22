@@ -10,6 +10,7 @@ import type {
   DesktopSourceEncodingRequired,
   DesktopTestModelRequest,
   DesktopTestModelResult,
+  DesktopTrialMode,
   DesktopTrialProgress,
   DesktopTrialResult,
 } from "../../../contracts.js";
@@ -17,6 +18,7 @@ import type { BusyAction } from "../types.js";
 import { ProviderSetup } from "./ProviderSetup.js";
 import { EncodingChooser } from "./EncodingChooser.js";
 import { redactTechnicalDetails, TechnicalDetails } from "./TechnicalDetails.js";
+import { lowestLegalFastEffort } from "../../../trial-runtime-policy.js";
 
 interface OnboardingProps {
   onboarding: DesktopOnboardingState;
@@ -30,12 +32,26 @@ interface OnboardingProps {
   onDiscoverModels(request: DesktopDiscoverModelsRequest): Promise<DesktopResult<readonly DesktopModelOption[]>>;
   onTestModel(request: DesktopTestModelRequest): Promise<DesktopResult<DesktopTestModelResult>>;
   onForgetCredential(providerId: string): Promise<DesktopResult<DesktopOnboardingState>>;
-  onStartTrial(): Promise<void>;
+  onStartTrial(mode: DesktopTrialMode): Promise<void>;
   onCancelTrial(): Promise<void>;
 }
 
 function formatChars(value: number): string {
   return new Intl.NumberFormat("zh-CN").format(value);
+}
+
+function formatEncoding(encoding: string): string {
+  return encoding === "shift_jis"
+    ? "Shift-JIS"
+    : encoding.replace(/^utf/u, "UTF").replace(/^windows/u, "Windows");
+}
+
+function formatConfidence(confidence: number): string {
+  return `${Math.round(Math.max(0, Math.min(1, confidence)) * 100)}%`;
+}
+
+function effortLabel(effort: string | undefined): string {
+  return effort === undefined || effort === "off" ? "关闭推理" : effort;
 }
 
 const TRIAL_STAGE_LABELS: Record<DesktopTrialProgress["stage"], string> = {
@@ -62,6 +78,7 @@ export function Onboarding({
   onCancelTrial,
 }: OnboardingProps): JSX.Element {
   const [modelDraftMatchesActive, setModelDraftMatchesActive] = useState(false);
+  const [trialMode, setTrialMode] = useState<DesktopTrialMode>("quality");
   const sourceReady = onboarding.project !== undefined;
   const modelReady = onboarding.activeModel?.capability === "ready";
   const trialEnabled = sourceReady
@@ -70,6 +87,11 @@ export function Onboarding({
     && onboarding.readiness.trial
     && busyAction === undefined;
   const trialRunning = busyAction === "start-trial" || busyAction === "cancel-trial";
+  const activeProvider = onboarding.activeModel === undefined
+    ? undefined
+    : onboarding.providers.find((provider) => provider.id === onboarding.activeModel?.providerId);
+  const qualityEffort = onboarding.activeModel?.reasoningEffort;
+  const fastEffort = lowestLegalFastEffort(activeProvider?.efforts ?? []);
   const errorPanel = operationError === undefined ? null : (
     <section className="operation-error" role="status">
       <p>{redactTechnicalDetails(operationError.message)}</p>
@@ -141,7 +163,9 @@ export function Onboarding({
           <div>
             <p className="eyebrow">项目概览</p>
             <h1>{onboarding.project?.title}</h1>
-            <p className="section-copy">{onboarding.project?.sourceLanguage} · {formatChars(onboarding.project?.sourceChars ?? 0)} 字符</p>
+            <p className="section-copy">检测语言：{onboarding.project?.detectedLanguage}</p>
+            <p className="section-copy project-diagnostic">编码：{formatEncoding(onboarding.project?.sourceEncoding ?? "utf-8")} · 置信度 {formatConfidence(onboarding.project?.encodingConfidence ?? 1)}</p>
+            <p className="section-copy project-diagnostic">{formatChars(onboarding.project?.sourceChars ?? 0)} 字符</p>
           </div>
           <button
             className="quiet-button"
@@ -192,13 +216,38 @@ export function Onboarding({
                 {TRIAL_STAGE_LABELS[trialProgress.stage]}
               </p>
             )}
+            <div className="trial-mode-selector" role="group" aria-label="试译模式">
+              <button
+                className={`trial-mode-button${trialMode === "quality" ? " is-selected" : ""}`}
+                type="button"
+                aria-pressed={trialMode === "quality"}
+                disabled={busyAction !== undefined}
+                onClick={() => setTrialMode("quality")}
+              >
+                精细试译
+              </button>
+              <button
+                className={`trial-mode-button${trialMode === "fast" ? " is-selected" : ""}`}
+                type="button"
+                aria-pressed={trialMode === "fast"}
+                disabled={busyAction !== undefined}
+                onClick={() => setTrialMode("fast")}
+              >
+                快速试译
+              </button>
+            </div>
+            <p className="trial-mode-copy">
+              {trialMode === "quality"
+                ? `精细试译：首译和校对都使用已测试强度（${effortLabel(qualityEffort)}）`
+                : `快速试译：先用 ${effortLabel(fastEffort)}，出现风险或失败时升级为 ${effortLabel(qualityEffort)}`}
+            </p>
             <div className="trial-actions">
               <button
                 className="primary-button"
                 type="button"
                 data-action="start-trial"
                 disabled={!trialEnabled}
-                onClick={() => { void onStartTrial(); }}
+                onClick={() => { void onStartTrial(trialMode); }}
               >
                 {trialRunning ? "试译进行中…" : "开始试译"}
               </button>

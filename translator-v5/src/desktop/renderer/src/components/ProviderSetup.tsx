@@ -89,7 +89,7 @@ export function ProviderSetup({
   const [discoveredModels, setDiscoveredModels] = useState<readonly DesktopModelOption[]>([]);
   const [testingConnection, setTestingConnection] = useState(false);
   const [connectionFeedback, setConnectionFeedback] = useState<ConnectionFeedback>();
-  const synchronizedActiveModel = useRef<string>();
+  const synchronizedActiveModel = useRef<string | undefined>(undefined);
 
   const selectedProvider = providers.find((provider) => provider.id === providerId) ?? directProviders[0] ?? additionalProviders[0];
 

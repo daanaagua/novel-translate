@@ -11,15 +11,22 @@ import {
   type LosslessBookRunOptions,
   type LosslessBookRunResult,
 } from "../fullbook/book-runner.js";
-import type { ModelProfile } from "../providers/types.js";
+import type { TranslationRuntime, TranslationRuntimeSet } from "../fullbook/types.js";
+import type { ModelProfile, ProviderEffort } from "../providers/types.js";
 import { SourceLedger } from "../source/source-ledger.js";
 import {
   LosslessBookStore,
   type LosslessAuditState,
   type StoredTranslationRun,
 } from "../storage/lossless-book-store.js";
+import type { DesktopTrialMode } from "./contracts.js";
+import {
+  explicitThinkingLevel,
+  isProviderEffort,
+  lowestLegalFastEffort,
+} from "./trial-runtime-policy.js";
 
-const TRIAL_SCHEMA = "folioloom-desktop-trial-1";
+const TRIAL_SCHEMA = "folioloom-desktop-trial-2";
 
 export type DesktopTrialErrorCode =
   | "DESKTOP_TRIAL_ALREADY_RUNNING"
@@ -46,6 +53,10 @@ export interface DesktopTrialRuntime {
   profile: ModelProfile;
   model: Model<any>;
   streamFn: StreamFn;
+  /** Efforts the selected provider has declared legal for this profile. */
+  supportedEfforts: readonly ProviderEffort[];
+  /** Create an isolated runtime projection without exposing credentials. */
+  createWithProfile(profile: ModelProfile): DesktopTrialRuntime;
 }
 
 export interface DesktopTrialRuntimeResolver {
@@ -54,6 +65,7 @@ export interface DesktopTrialRuntimeResolver {
 
 export interface DesktopTrialStartRequest {
   manifestPath: string;
+  mode: DesktopTrialMode;
 }
 
 export interface DesktopTrialResult {
@@ -92,6 +104,17 @@ interface NormalizedTrialProfile {
   customBaseUrl?: string;
 }
 
+interface TrialRuntimeFingerprint {
+  mode: DesktopTrialMode;
+  primary: NormalizedTrialProfile;
+  escalation: NormalizedTrialProfile;
+}
+
+interface TrialRuntimePlan {
+  runtimeSet: TranslationRuntimeSet;
+  fingerprint: TrialRuntimeFingerprint;
+}
+
 const ACTIVE_TRIALS = new Map<string, ActiveTrial>();
 
 function nonempty(value: unknown, label: string): string {
@@ -110,6 +133,7 @@ function record(value: unknown): Record<string, unknown> | undefined {
 function manifestAndProject(request: DesktopTrialStartRequest): {
   manifestPath: string;
   projectDirectory: string;
+  mode: DesktopTrialMode;
 } {
   if (typeof request?.manifestPath !== "string" || !isAbsolute(request.manifestPath)) {
     throw new DesktopTrialError(
@@ -124,20 +148,33 @@ function manifestAndProject(request: DesktopTrialStartRequest): {
       "desktop trial requires source_manifest.json",
     );
   }
-  return { manifestPath, projectDirectory: resolve(dirname(manifestPath)) };
+  if (request?.mode !== "quality" && request?.mode !== "fast") {
+    throw new DesktopTrialError(
+      "DESKTOP_TRIAL_INPUT_INVALID",
+      "desktop trial mode must be quality or fast",
+    );
+  }
+  return { manifestPath, projectDirectory: resolve(dirname(manifestPath)), mode: request.mode };
+}
+
+function normalizedModelProfile(
+  raw: ModelProfile,
+  label = "active",
+): NormalizedTrialProfile {
+  return {
+    providerId: nonempty(raw?.providerId, `${label} provider id`),
+    modelId: nonempty(raw?.modelId, `${label} model id`),
+    ...(raw?.reasoningEffort === undefined ? {} : {
+      reasoningEffort: nonempty(raw.reasoningEffort, `${label} reasoning effort`),
+    }),
+    ...(raw?.customBaseUrl === undefined ? {} : {
+      customBaseUrl: nonempty(raw.customBaseUrl, `${label} custom base URL`),
+    }),
+  };
 }
 
 function normalizedProfile(runtime: DesktopTrialRuntime): NormalizedTrialProfile {
-  const profile: NormalizedTrialProfile = {
-    providerId: nonempty(runtime.profile?.providerId, "active provider id"),
-    modelId: nonempty(runtime.profile?.modelId, "active model id"),
-    ...(runtime.profile?.reasoningEffort === undefined ? {} : {
-      reasoningEffort: nonempty(runtime.profile.reasoningEffort, "active reasoning effort"),
-    }),
-    ...(runtime.profile?.customBaseUrl === undefined ? {} : {
-      customBaseUrl: nonempty(runtime.profile.customBaseUrl, "active custom base URL"),
-    }),
-  };
+  const profile = normalizedModelProfile(runtime.profile);
   if (runtime.model === undefined || runtime.model.id !== profile.modelId) {
     throw new DesktopTrialError(
       "DESKTOP_TRIAL_RUNTIME_MISMATCH",
@@ -153,22 +190,120 @@ function normalizedProfile(runtime: DesktopTrialRuntime): NormalizedTrialProfile
   return profile;
 }
 
-function profileFingerprint(profile: NormalizedTrialProfile): string {
-  return JSON.stringify(profile);
+function profileWithEffort(
+  profile: ModelProfile,
+  effort: ProviderEffort | undefined,
+): ModelProfile {
+  return {
+    providerId: profile.providerId,
+    modelId: profile.modelId,
+    ...(effort === undefined ? {} : { reasoningEffort: effort }),
+    ...(profile.customBaseUrl === undefined ? {} : { customBaseUrl: profile.customBaseUrl }),
+  };
+}
+
+function sameProfile(left: NormalizedTrialProfile, right: NormalizedTrialProfile): boolean {
+  return left.providerId === right.providerId
+    && left.modelId === right.modelId
+    && left.reasoningEffort === right.reasoningEffort
+    && left.customBaseUrl === right.customBaseUrl;
+}
+
+function translationRuntime(runtime: DesktopTrialRuntime): TranslationRuntime {
+  return {
+    model: runtime.model,
+    streamFn: runtime.streamFn,
+    ...(runtime.profile.reasoningEffort === undefined ? {} : {
+      effort: runtime.profile.reasoningEffort,
+    }),
+    thinkingLevel: explicitThinkingLevel(runtime.profile.reasoningEffort),
+  };
+}
+
+function runtimeFingerprint(fingerprint: TrialRuntimeFingerprint): string {
+  return JSON.stringify(fingerprint);
+}
+
+function requireSupportedEfforts(runtime: DesktopTrialRuntime): readonly ProviderEffort[] {
+  if (!Array.isArray(runtime.supportedEfforts)
+    || runtime.supportedEfforts.some((effort) => !isProviderEffort(effort))) {
+    throw new DesktopTrialError(
+      "DESKTOP_TRIAL_RUNTIME_MISMATCH",
+      "active translation runtime has invalid provider effort capabilities",
+    );
+  }
+  return runtime.supportedEfforts;
+}
+
+function derivedRuntime(
+  qualityRuntime: DesktopTrialRuntime,
+  profile: ModelProfile,
+): DesktopTrialRuntime {
+  if (typeof qualityRuntime.createWithProfile !== "function") {
+    throw new DesktopTrialError(
+      "DESKTOP_TRIAL_RUNTIME_MISMATCH",
+      "active translation runtime cannot derive a provider-safe effort projection",
+    );
+  }
+  const derived = qualityRuntime.createWithProfile(profile);
+  const expected = normalizedModelProfile(profile, "derived");
+  const actual = normalizedProfile(derived);
+  if (!sameProfile(actual, expected)) {
+    throw new DesktopTrialError(
+      "DESKTOP_TRIAL_RUNTIME_MISMATCH",
+      "derived translation runtime does not match the requested provider profile",
+    );
+  }
+  return derived;
+}
+
+function buildRuntimePlan(
+  mode: DesktopTrialMode,
+  qualityRuntime: DesktopTrialRuntime,
+): TrialRuntimePlan {
+  const qualityProfile = normalizedProfile(qualityRuntime);
+  const quality = translationRuntime(qualityRuntime);
+  if (mode === "quality") {
+    const fingerprint: TrialRuntimeFingerprint = {
+      mode,
+      primary: qualityProfile,
+      escalation: qualityProfile,
+    };
+    return {
+      runtimeSet: { mode, primary: quality, escalation: quality },
+      fingerprint,
+    };
+  }
+
+  const primaryEffort = lowestLegalFastEffort(requireSupportedEfforts(qualityRuntime));
+  const primaryProfile = profileWithEffort(qualityRuntime.profile, primaryEffort);
+  const primaryRuntime = primaryEffort === qualityRuntime.profile.reasoningEffort
+    ? qualityRuntime
+    : derivedRuntime(qualityRuntime, primaryProfile);
+  const primary = translationRuntime(primaryRuntime);
+  const fingerprint: TrialRuntimeFingerprint = {
+    mode,
+    primary: normalizedProfile(primaryRuntime),
+    escalation: qualityProfile,
+  };
+  return {
+    runtimeSet: { mode, primary, escalation: quality },
+    fingerprint,
+  };
 }
 
 function isCompletedTrial(
   run: StoredTranslationRun,
   sourceVersion: string,
-  profile: NormalizedTrialProfile,
+  fingerprint: TrialRuntimeFingerprint,
 ): boolean {
-  if (run.sourceVersion !== sourceVersion || run.modelId !== profile.modelId) {
+  if (run.sourceVersion !== sourceVersion || run.modelId !== fingerprint.primary.modelId) {
     return false;
   }
   const metadata = record(run.metadata);
   const trial = record(metadata?.desktopTrial);
   return trial?.schema === TRIAL_SCHEMA
-    && trial.profileFingerprint === profileFingerprint(profile);
+    && trial.runtimeFingerprint === runtimeFingerprint(fingerprint);
 }
 
 function projectResult(state: LosslessAuditState): DesktopTrialResult | undefined {
@@ -190,7 +325,7 @@ function projectResult(state: LosslessAuditState): DesktopTrialResult | undefine
 function storedTrialResult(
   storePath: string,
   sourceVersion: string,
-  profile: NormalizedTrialProfile,
+  fingerprint: TrialRuntimeFingerprint,
 ): DesktopTrialResult | undefined {
   if (!existsSync(storePath)) {
     return undefined;
@@ -198,7 +333,7 @@ function storedTrialResult(
   const store = LosslessBookStore.openReadOnly(storePath);
   try {
     const matchingRuns = store.listTranslationRuns()
-      .filter((run) => isCompletedTrial(run, sourceVersion, profile));
+      .filter((run) => isCompletedTrial(run, sourceVersion, fingerprint));
     for (let index = matchingRuns.length - 1; index >= 0; index -= 1) {
       const result = projectResult(store.auditState(matchingRuns[index]!.runId));
       if (result !== undefined) {
@@ -250,7 +385,7 @@ export class DesktopTrialService {
     ACTIVE_TRIALS.set(paths.projectDirectory, active);
     this.#ownedTrials.add(active);
     this.#emitProgress("preparing");
-    const running = this.#start(paths.manifestPath, paths.projectDirectory, active.controller)
+    const running = this.#start(paths.manifestPath, paths.projectDirectory, paths.mode, active.controller)
       .then((result) => {
         this.#emitProgress("completed");
         return result;
@@ -287,6 +422,7 @@ export class DesktopTrialService {
   async #start(
     manifestPath: string,
     projectDirectory: string,
+    mode: DesktopTrialMode,
     controller: AbortController,
   ): Promise<DesktopTrialResult> {
     controller.signal.throwIfAborted();
@@ -299,7 +435,7 @@ export class DesktopTrialService {
         "a successfully tested model is required before starting a desktop trial",
       );
     }
-    const profile = normalizedProfile(runtime);
+    const plan = buildRuntimePlan(mode, runtime);
     const afterRuntime = SourceLedger.open(manifestPath);
     if (beforeRuntime.sourceVersion !== afterRuntime.sourceVersion) {
       throw new DesktopTrialError(
@@ -311,7 +447,7 @@ export class DesktopTrialService {
     let previous: DesktopTrialResult | undefined;
     if (existsSync(storePath)) {
       this.#emitProgress("checking");
-      previous = storedTrialResult(storePath, afterRuntime.sourceVersion, profile);
+      previous = storedTrialResult(storePath, afterRuntime.sourceVersion, plan.fingerprint);
     }
     controller.signal.throwIfAborted();
     if (previous !== undefined) {
@@ -328,16 +464,17 @@ export class DesktopTrialService {
       runMeta: {
         runId,
         protocolVersion: LOSSLESS_BOOK_PROTOCOL_VERSION,
-        modelId: profile.modelId,
+        modelId: plan.runtimeSet.primary.model.id,
         metadata: {
           desktopTrial: {
             schema: TRIAL_SCHEMA,
-            profileFingerprint: profileFingerprint(profile),
+            runtimeFingerprint: runtimeFingerprint(plan.fingerprint),
           },
         },
       },
-      model: runtime.model,
-      streamFn: runtime.streamFn,
+      model: plan.runtimeSet.primary.model,
+      streamFn: plan.runtimeSet.primary.streamFn,
+      runtimeSet: plan.runtimeSet,
       maxWindows: 1,
       maxConcurrency: 1,
       maxWindowsPerRequest: 1,
