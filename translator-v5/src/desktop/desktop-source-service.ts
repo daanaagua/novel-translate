@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 import type { Dirent } from "node:fs";
-import { mkdir, readFile, readdir, realpath, rm, stat } from "node:fs/promises";
+import { mkdir, readFile, readdir, realpath, rename, rm, stat } from "node:fs/promises";
 import { basename, extname, isAbsolute, join, resolve } from "node:path";
 
 import {
@@ -8,7 +8,11 @@ import {
   SourceImportError,
   type SourceImportResult,
 } from "../source/source-importer.js";
-import { normalizeEncodingLabel, type CanonicalEncodingLabel } from "../source/encoding-policy.js";
+import {
+  normalizeEncodingLabel,
+  type CanonicalEncodingLabel,
+  type SourceEncodingDecision,
+} from "../source/encoding-policy.js";
 import { SourceLedger } from "../source/source-ledger.js";
 
 export interface DesktopSourceServiceOptions {
@@ -53,6 +57,7 @@ interface PendingImport {
 }
 
 const DEFAULT_PENDING_IMPORT_TTL_MS = 10 * 60 * 1_000;
+const SOURCE_PROBE_PREFIX = ".folioloom-source-probe-";
 
 function sha256(payload: Buffer): string {
   return createHash("sha256").update(payload).digest("hex");
@@ -96,11 +101,56 @@ async function regularAbsoluteFile(path: string): Promise<string> {
   return resolved;
 }
 
-async function existingProjectForHash(
+function encodingDecisionIdentity(decision: SourceEncodingDecision): string {
+  return JSON.stringify([
+    decision.canonicalLabel,
+    decision.decisionSource,
+    decision.confidence,
+    decision.alternatives.map((alternative) => [
+      alternative.canonicalLabel,
+      alternative.confidence,
+      [...alternative.diagnostics],
+    ]),
+    [...decision.diagnostics],
+    decision.policyVersion,
+  ]);
+}
+
+function hasCompleteEncodingDecision(ledger: SourceLedger): boolean {
+  // DOCX/EPUB are decoded from a UTF-8 ZIP container, so they intentionally do
+  // not have a byte-decoding decision. Plain-text imports must retain one.
+  if (ledger.encoding === "zip-container") {
+    return ledger.encodingDecision === undefined;
+  }
+  return !ledger.sourceEncodingCompatibilityMode && ledger.encodingDecision !== undefined;
+}
+
+function matchesFreshImport(existing: SourceLedger, current: SourceLedger): boolean {
+  if (existing.sourceLanguageCompatibilityMode || current.sourceLanguageCompatibilityMode) {
+    return false;
+  }
+  if (existing.languageProfile.id !== current.languageProfile.id
+    || existing.languageProfile.version !== current.languageProfile.version) {
+    return false;
+  }
+  if (existing.encoding !== current.encoding
+    || !hasCompleteEncodingDecision(existing)
+    || !hasCompleteEncodingDecision(current)) {
+    return false;
+  }
+  if (existing.encodingDecision !== undefined || current.encodingDecision !== undefined) {
+    if (existing.encodingDecision === undefined || current.encodingDecision === undefined
+      || encodingDecisionIdentity(existing.encodingDecision) !== encodingDecisionIdentity(current.encodingDecision)) {
+      return false;
+    }
+  }
+  return existing.sourceVersion === current.sourceVersion;
+}
+
+async function existingProjectForFreshImport(
   projectsRoot: string,
   rawSha256: string,
-  sourceLanguage: string,
-  explicitEncoding?: CanonicalEncodingLabel,
+  current: SourceLedger,
 ): Promise<DesktopSourceReadyResult | undefined> {
   let entries: Dirent<string>[];
   try {
@@ -109,7 +159,7 @@ async function existingProjectForHash(
     return undefined;
   }
   for (const entry of entries) {
-    if (!entry.isDirectory()) {
+    if (!entry.isDirectory() || entry.name.startsWith(SOURCE_PROBE_PREFIX)) {
       continue;
     }
     const projectDirectory = join(projectsRoot, entry.name);
@@ -119,13 +169,7 @@ async function existingProjectForHash(
       if (sha256(await readFile(ledger.rawPath)) !== rawSha256) {
         continue;
       }
-      const normalizedLanguage = sourceLanguage.trim().toLocaleLowerCase("en").split("-", 1)[0];
-      if (normalizedLanguage !== "auto" && ledger.sourceLanguage !== normalizedLanguage) {
-        continue;
-      }
-      if (explicitEncoding !== undefined && (
-        ledger.sourceEncodingCompatibilityMode || ledger.encoding !== explicitEncoding
-      )) {
+      if (!matchesFreshImport(ledger, current)) {
         continue;
       }
       return {
@@ -243,30 +287,46 @@ export class DesktopSourceService {
     const explicitEncoding = request.explicitEncoding === undefined
       ? undefined
       : normalizeEncodingLabel(request.explicitEncoding);
-    const existing = await existingProjectForHash(
-      this.#projectsRoot,
-      initialRawSha256,
-      request.sourceLanguage ?? "auto",
-      explicitEncoding,
-    );
-    if (existing !== undefined) {
-      return existing;
+    const probeDirectory = join(this.#projectsRoot, `${SOURCE_PROBE_PREFIX}${randomUUID()}`);
+    try {
+      // Re-import into a private staging directory before considering a raw-hash
+      // match. A hash alone cannot prove that old detection policy, language
+      // profile, and user/automatic encoding decisions still describe these bytes.
+      const imported = await importSource({
+        sourcePath,
+        projectDirectory: probeDirectory,
+        sourceLanguage: request.sourceLanguage ?? "auto",
+        ...(explicitEncoding === undefined ? {} : { explicitEncoding }),
+      });
+      if (imported.rawSha256 !== initialRawSha256) {
+        throw new SourceImportError("SOURCE_CHANGED_DURING_IMPORT", "source bytes changed before project import completed");
+      }
+      const current = SourceLedger.open(imported.manifestPath);
+      const existing = await existingProjectForFreshImport(
+        this.#projectsRoot,
+        initialRawSha256,
+        current,
+      );
+      if (existing !== undefined) {
+        await rm(probeDirectory, { recursive: true, force: true });
+        return existing;
+      }
+      const projectDirectory = await unusedProjectDirectory(
+        this.#projectsRoot,
+        projectName(sourcePath, initialRawSha256),
+      );
+      await rename(probeDirectory, projectDirectory);
+      return {
+        status: "ready",
+        ...imported,
+        manifestPath: join(projectDirectory, "source_manifest.json"),
+        projectDirectory,
+        reused: false,
+      };
+    } catch (error) {
+      await rm(probeDirectory, { recursive: true, force: true });
+      throw error;
     }
-    const projectDirectory = await unusedProjectDirectory(
-      this.#projectsRoot,
-      projectName(sourcePath, initialRawSha256),
-    );
-    const imported = await importSource({
-      sourcePath,
-      projectDirectory,
-      sourceLanguage: request.sourceLanguage ?? "auto",
-      ...(request.explicitEncoding === undefined ? {} : { explicitEncoding: request.explicitEncoding }),
-    });
-    if (imported.rawSha256 !== initialRawSha256) {
-      await rm(projectDirectory, { recursive: true, force: true });
-      throw new SourceImportError("SOURCE_CHANGED_DURING_IMPORT", "source bytes changed before project import completed");
-    }
-    return { status: "ready", ...imported, projectDirectory, reused: false };
   }
 
   #removeExpiredPendingImports(): void {

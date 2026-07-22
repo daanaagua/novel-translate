@@ -69,6 +69,87 @@ test("desktop source service restores a project when the raw source hash was imp
   }
 });
 
+test("desktop source service does not reuse an undetermined Korean project for a fresh auto import", async () => {
+  const directory = fixtureDirectory();
+  const projectsRoot = join(directory, "Projects");
+  const firstPath = join(directory, "legacy-und.txt");
+  const renamedPath = join(directory, "detected-korean.txt");
+  const source = "한국어 문장이 충분히 길어서 언어 감지기가 한국어로 판별할 수 있어야 한다. ".repeat(3);
+  writeFileSync(firstPath, source, "utf8");
+  writeFileSync(renamedPath, source, "utf8");
+  try {
+    const service = new DesktopSourceService({ projectsRoot });
+    const legacy = ready(await service.importSource({ sourcePath: firstPath, sourceLanguage: "und" }));
+    const detected = ready(await service.importSource({ sourcePath: renamedPath, sourceLanguage: "auto" }));
+
+    assert.equal(SourceLedger.open(legacy.manifestPath).sourceLanguage, "und");
+    assert.equal(detected.reused, false);
+    assert.notEqual(detected.projectDirectory, legacy.projectDirectory);
+    assert.equal(SourceLedger.open(detected.manifestPath).sourceLanguage, "ko");
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("desktop source service does not reuse a legacy plain-text manifest without an encoding decision", async () => {
+  const directory = fixtureDirectory();
+  const projectsRoot = join(directory, "Projects");
+  const firstPath = join(directory, "legacy-encoding.txt");
+  const renamedPath = join(directory, "fresh-encoding.txt");
+  const source = "The book is in the house, and the garden is on the hill. We return to the house with a book and a map.";
+  writeFileSync(firstPath, source, "utf8");
+  writeFileSync(renamedPath, source, "utf8");
+  try {
+    const service = new DesktopSourceService({ projectsRoot });
+    const legacy = ready(await service.importSource({ sourcePath: firstPath, sourceLanguage: "auto" }));
+    const manifest = JSON.parse(readFileSync(legacy.manifestPath, "utf8")) as Record<string, unknown>;
+    delete manifest.encodingDecision;
+    writeFileSync(legacy.manifestPath, JSON.stringify(manifest), "utf8");
+
+    assert.equal(SourceLedger.open(legacy.manifestPath).sourceEncodingCompatibilityMode, true);
+    const refreshed = ready(await service.importSource({ sourcePath: renamedPath, sourceLanguage: "auto" }));
+
+    assert.equal(refreshed.reused, false);
+    assert.notEqual(refreshed.projectDirectory, legacy.projectDirectory);
+    assert.equal(SourceLedger.open(refreshed.manifestPath).sourceEncodingCompatibilityMode, false);
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("desktop source service re-evaluates automatic encoding before reusing a manually decoded project", async () => {
+  const directory = fixtureDirectory();
+  const projectsRoot = join(directory, "Projects");
+  const firstPath = join(directory, "manual-legacy.txt");
+  const renamedPath = join(directory, "automatic-legacy.txt");
+  const source = Buffer.concat(Array.from({ length: 3 }, () =>
+    Buffer.from([0xc7, 0xd1, 0xb1, 0xb9, 0xbe, 0xee])));
+  writeFileSync(firstPath, source);
+  writeFileSync(renamedPath, source);
+  try {
+    const service = new DesktopSourceService({ projectsRoot });
+    const manual = ready(await service.importSource({
+      sourcePath: firstPath,
+      sourceLanguage: "auto",
+      explicitEncoding: "euc-kr",
+    }));
+
+    const pending = await service.importSource({ sourcePath: renamedPath, sourceLanguage: "auto" });
+    assert.equal(pending.status, "encoding_required");
+    if (pending.status !== "encoding_required") return;
+    assert.doesNotMatch(JSON.stringify(pending), /[A-Z]:\\/u);
+
+    const confirmed = await service.confirmEncoding({
+      pendingImportId: pending.pendingImportId,
+      encoding: "euc-kr",
+    });
+    assert.equal(confirmed.reused, true);
+    assert.equal(confirmed.projectDirectory, manual.projectDirectory);
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
 test("desktop source service keeps same-title manuscripts with different bytes as independent projects", async () => {
   const directory = fixtureDirectory();
   const projectsRoot = join(directory, "Projects");
