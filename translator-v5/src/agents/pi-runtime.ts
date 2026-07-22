@@ -12,13 +12,14 @@ import {
   type ThinkingLevel,
   type Usage,
 } from "@earendil-works/pi-ai";
-import { openAICompletionsApi } from "@earendil-works/pi-ai/api/openai-completions.lazy";
 
 import type { PilotModelConfig } from "../config.js";
 import type { AgentPhase } from "../domain/types.js";
 import { BudgetLedger, type BudgetCounter } from "../kernel/budget.js";
 import { CapabilityRegistry } from "../kernel/capabilities.js";
 import { MemoryEventLog } from "../kernel/event-log.js";
+import { createProviderRuntime } from "../providers/runtime.js";
+import type { ModelProfile, ProviderEffort } from "../providers/types.js";
 import { asKernelTools, type TypedToolSpec } from "../tools/tool-spec.js";
 
 const ZERO_USAGE: Usage = {
@@ -292,55 +293,35 @@ export class PiRuntime {
   }
 }
 
-function thinkingLevel(value: string): ThinkingLevel {
-  if (value === "minimal" || value === "low" || value === "medium" || value === "high" || value === "xhigh") {
-    return value;
-  }
-  return "high";
+function deepSeekProfile(config: PilotModelConfig): ModelProfile {
+  return {
+    providerId: "deepseek",
+    modelId: config.model,
+    reasoningEffort: config.reasoningEffort as ProviderEffort,
+  };
+}
+
+function deepSeekRuntime(config: PilotModelConfig) {
+  return createProviderRuntime(
+    deepSeekProfile(config),
+    config.apiKeyForRuntime(),
+    {
+      trustedBaseUrl: config.baseUrl,
+      timeoutMs: config.timeoutMs,
+    },
+  );
 }
 
 export function createDeepSeekModel(
   config: PilotModelConfig,
 ): Model<"openai-completions"> {
-  return {
-    id: config.model,
-    name: config.model,
-    provider: "translator-v5-deepseek",
-    api: "openai-completions",
-    baseUrl: config.baseUrl,
-    reasoning: true,
-    input: ["text"],
-    cost: {
-      input: 0,
-      output: 0,
-      cacheRead: 0,
-      cacheWrite: 0,
-    },
-    contextWindow: 128_000,
-    maxTokens: 37_200,
-    thinkingLevelMap: {
-      minimal: "minimal",
-      low: "low",
-      medium: "medium",
-      high: thinkingLevel(config.reasoningEffort),
-      xhigh: "xhigh",
-    },
-    compat: {
-      thinkingFormat: "deepseek",
-      supportsReasoningEffort: true,
-      requiresReasoningContentOnAssistantMessages: true,
-      supportsStrictMode: true,
-    },
-  };
+  const runtime = deepSeekRuntime(config);
+  if (runtime.model.api !== "openai-completions") {
+    throw new TypeError("DeepSeek must use the OpenAI chat-completions runtime");
+  }
+  return runtime.model as Model<"openai-completions">;
 }
 
 export function createDeepSeekStreamFn(config: PilotModelConfig): StreamFn {
-  const api = openAICompletionsApi();
-  return (model, context, options) => api.streamSimple(model, context, {
-    ...options,
-    apiKey: config.apiKeyForRuntime(),
-    timeoutMs: config.timeoutMs,
-    maxTokens: Math.min(model.maxTokens, 37_200),
-    reasoning: thinkingLevel(config.reasoningEffort),
-  });
+  return deepSeekRuntime(config).streamFn;
 }

@@ -20,9 +20,11 @@
   "dependencies": {
     "@earendil-works/pi-agent-core": "0.80.10",
     "@earendil-works/pi-ai": "0.80.10",
+    "fast-xml-parser": "^5.10.1",
     "react": "19.2.8",
     "react-dom": "19.2.8",
-    "yaml": "2.9.0"
+    "yaml": "2.9.0",
+    "yauzl": "^3.4.0"
   },
   "devDependencies": {
     "@testing-library/react": "16.3.2",
@@ -30,6 +32,7 @@
     "@types/node": "24.10.1",
     "@types/react": "19.2.17",
     "@types/react-dom": "19.2.3",
+    "@types/yauzl": "^2.10.3",
     "@vitejs/plugin-react": "5.2.0",
     "electron": "43.2.0",
     "electron-builder": "^26.15.3",
