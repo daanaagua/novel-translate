@@ -1126,7 +1126,8 @@ async function runLosslessBook(
     "tinyWindowTokens",
   );
   const maxRequestTokens = positiveInteger(
-    options.maxRequestTokens ?? 3_200,
+    options.maxRequestTokens
+      ?? (runtimeSet.mode === "fast" ? FAST_MAX_SOURCE_TOKENS : 3_200),
     "maxRequestTokens",
   );
   const maxWindowsPerRequest = positiveInteger(

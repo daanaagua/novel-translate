@@ -116,6 +116,35 @@ test("fast mode uses larger bounded windows unless the caller supplies tighter l
   assert.deepEqual(windowOptionsForRunMode("quality", {}), {});
 });
 
+test("fast mode keeps its default physical request limit aligned with a legal 4,800-token window", async () => {
+  const fixture = losslessFixture([
+    "가".repeat(2_000),
+    "나".repeat(2_000),
+    "다".repeat(2_000),
+  ].join("\n\n"));
+  fixture.faux.setResponses(Array.from({ length: 8 }, () => losslessBatchResponse));
+  const model = fixture.faux.getModel();
+  const streamFn = fixture.faux.provider.streamSimple.bind(fixture.faux.provider);
+
+  const result = await runBook({
+    ...fixture.options,
+    model,
+    streamFn,
+    windowOptions: {},
+    maxRequestTokens: undefined,
+    maxConcurrency: 4,
+    runtimeSet: {
+      mode: "fast",
+      primary: { model, streamFn, effort: "off", thinkingLevel: "off" },
+      escalation: { model, streamFn, effort: "high", thinkingLevel: "high" },
+    },
+  } as never);
+
+  assert.equal(result.status.humanRequiredWindows, 0);
+  assert.equal(result.status.pendingWindows, 0);
+  assert.equal(result.status.completedWindows + result.status.warningWindows, result.status.totalWindows);
+});
+
 function createFixture(path: string, blockCount: number): void {
   const database = new DatabaseSync(path);
   database.exec(`
