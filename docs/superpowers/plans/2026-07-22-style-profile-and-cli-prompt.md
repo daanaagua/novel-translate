@@ -16,7 +16,7 @@
 - 创建：`translator-v5/src/style/style-profile.ts`
 - 创建：`translator-v5/test/style-profile.test.ts`
 
-- [ ] **步骤 1：编写失败测试**
+- [x] **步骤 1：编写失败测试**
 
 ```ts
 test("loads a partial YAML profile and appends the CLI style prompt", () => {
@@ -37,13 +37,13 @@ test("rejects unknown style keys and overlong CLI prompts", () => {
 });
 ```
 
-- [ ] **步骤 2：运行测试并确认红灯**
+- [x] **步骤 2：运行测试并确认红灯**
 
 运行：`node --test --import tsx test/style-profile.test.ts`
 
 预期：失败，原因是 `style-profile.ts` 尚不存在。
 
-- [ ] **步骤 3：实现最小加载器**
+- [x] **步骤 3：实现最小加载器**
 
 ```ts
 export function loadStyleProfile(input: StyleProfileInput): LoadedStyleProfile {
@@ -63,13 +63,13 @@ export function loadStyleProfile(input: StyleProfileInput): LoadedStyleProfile {
 
 使用现有 `yaml` 包解析；按规格验证字段和值，所有 hash 输入使用稳定键排序 JSON。
 
-- [ ] **步骤 4：运行测试并确认绿灯**
+- [x] **步骤 4：运行测试并确认绿灯**
 
 运行：`npm.cmd test -- test/style-profile.test.ts`
 
 预期：所有 style profile 测试通过。
 
-- [ ] **步骤 5：提交该独立变更**
+- [x] **步骤 5：提交该独立变更**
 
 ```bash
 git add translator-v5/src/style/style-profile.ts translator-v5/test/style-profile.test.ts
