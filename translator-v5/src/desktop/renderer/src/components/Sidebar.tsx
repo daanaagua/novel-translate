@@ -16,7 +16,7 @@ export function Sidebar({
   return (
     <aside className="sidebar">
       <div className="brand-lockup">
-        <img className="brand-mark" src="/folioloom-mark.svg" alt="" />
+        <img className="brand-mark" src="./folioloom-mark.svg" alt="" />
         <div>
           <p className="brand-name">FolioLoom</p>
           <p className="brand-subtitle">本地文稿工作台</p>

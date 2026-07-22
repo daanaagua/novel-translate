@@ -13,6 +13,7 @@ import { App } from "./App.js";
 afterEach(() => {
   cleanup();
   vi.restoreAllMocks();
+  vi.unstubAllGlobals();
 });
 
 const snapshot: DesktopProjectSnapshot = {
@@ -97,7 +98,40 @@ const doctorFailureApi = createApi({
   )),
 });
 
+const noStoreSnapshot: DesktopProjectSnapshot = {
+  ...snapshot,
+  store: { state: "not_found" },
+  runs: [],
+  selectedRunId: undefined,
+  runSelection: "none",
+};
+
+const multiRunSnapshot: DesktopProjectSnapshot = {
+  ...snapshot,
+  runs: [
+    {
+      ...snapshot.runs[0]!,
+      runId: "run-left",
+      modelId: "model-left",
+    },
+    {
+      ...snapshot.runs[0]!,
+      runId: "run-right",
+      modelId: "model-right",
+    },
+  ],
+  selectedRunId: undefined,
+  runSelection: "required",
+};
+
 describe("FolioLoom desktop workbench", () => {
+  it("uses a relative production logo asset path for Electron file pages", () => {
+    const { container } = render(<App api={emptyApi} />);
+    const mark = container.querySelector<HTMLImageElement>(".brand-mark");
+
+    expect(mark?.getAttribute("src")).toBe("./folioloom-mark.svg");
+  });
+
   it("empty workbench asks the user to open an initialized project", () => {
     render(<App api={emptyApi} />);
 
@@ -124,6 +158,58 @@ describe("FolioLoom desktop workbench", () => {
 
     expect(await screen.findByText("CANONICAL_HASH_MISMATCH")).toBeTruthy();
     expect(screen.getByText("请恢复与 manifest 匹配的 canonical 原文后重试")).toBeTruthy();
+  });
+
+  it("shows a readable no-store state instead of an invented run status", async () => {
+    const noStoreApi = createApi({
+      refreshProject: vi.fn().mockResolvedValue(ok(noStoreSnapshot)),
+    });
+    render(<App api={noStoreApi} />);
+
+    expect(await screen.findByRole("heading", { name: "尚未开始翻译" })).toBeTruthy();
+    expect(screen.getByRole("button", { name: "选择状态库" })).toBeTruthy();
+  });
+
+  it("renders successful doctor coverage and structural evidence", async () => {
+    const user = userEvent.setup();
+    render(<App api={createApi()} />);
+
+    await user.click(await screen.findByRole("button", { name: "运行检查" }));
+
+    expect(await screen.findByRole("heading", { name: "原文检查已完成" })).toBeTruthy();
+    expect(screen.getByText("已覆盖 12,840 / 12,840 字")).toBeTruthy();
+    expect(screen.getByText("结构块")).toBeTruthy();
+  });
+
+  it("lets the reader choose a concrete run when more than one matches", async () => {
+    const user = userEvent.setup();
+    const selectedSnapshot: DesktopProjectSnapshot = {
+      ...multiRunSnapshot,
+      selectedRunId: "run-right",
+      runSelection: "selected",
+    };
+    const selectRun = vi.fn().mockResolvedValue(ok(selectedSnapshot));
+    const multiRunApi = createApi({
+      refreshProject: vi.fn().mockResolvedValue(ok(multiRunSnapshot)),
+      selectRun,
+    });
+    render(<App api={multiRunApi} />);
+
+    expect(await screen.findByRole("heading", { name: "请选择要查看的运行" })).toBeTruthy();
+    await user.click(screen.getByRole("button", { name: /model-right/ }));
+
+    expect(await screen.findByRole("heading", { name: "model-right" })).toBeTruthy();
+    expect(selectRun).toHaveBeenCalledWith("run-right");
+  });
+
+  it("keeps a safe empty state when the preload bridge is unavailable", async () => {
+    const user = userEvent.setup();
+    vi.stubGlobal("folioLoom", undefined);
+    render(<App />);
+
+    expect(await screen.findByText("尚未打开项目")).toBeTruthy();
+    await user.click(screen.getByRole("button", { name: "打开项目" }));
+    expect(screen.queryByText("DESKTOP_RENDERER_ERROR")).toBeNull();
   });
 
   it("inactive workspace says it is unavailable instead of exposing a fake action", async () => {
