@@ -657,7 +657,7 @@ git commit -m "feat: add secure desktop IPC boundary"
 - 创建：`translator-v5/src/desktop/renderer/public/folioloom-mark.svg`
 - 创建：`translator-v5/vitest.desktop.config.ts`
 
-- [ ] **步骤 1：写渲染层行为测试**
+- [x] **步骤 1：写渲染层行为测试**
 
 在 `App.test.tsx` 用 `vi.stubGlobal("window", ...)` 或 `Object.defineProperty(window, "folioLoom", ...)` 注入固定 API。验证空态、真实项目态和 doctor 失败态：
 
@@ -691,7 +691,7 @@ test("inactive workspace says it is unavailable instead of exposing a fake actio
 });
 ```
 
-- [ ] **步骤 2：运行渲染测试，确认应用入口不存在**
+- [x] **步骤 2：运行渲染测试，确认应用入口不存在**
 
 运行：
 
@@ -702,7 +702,7 @@ npx.cmd vitest run --config vitest.desktop.config.ts
 
 预期：FAIL，`src/desktop/renderer/src/App.tsx` 尚不存在。
 
-- [ ] **步骤 3：实现面向阅读的工作台，而不是产品幻灯片**
+- [x] **步骤 3：实现面向阅读的工作台，而不是产品幻灯片**
 
 `App.tsx` 维护以下内部状态：`activeWorkspace`、`snapshot`、`doctorResult`、`busyAction`。它在初始化时调用 `api.refreshProject()`；空项目时只显示打开入口，成功时默认选中“项目概览”。渲染器中不保存访问路径到 localStorage，不读取 API Key，不访问 Node API。
 
@@ -744,7 +744,7 @@ npx.cmd vitest run --config vitest.desktop.config.ts
 
 界面不出现已删除的引语、“织进中文”或任何伪造的完成比例。未接通页面统一使用 `WorkspacePlaceholder`，只显示工作区用途、已有只读数据和不可用说明。
 
-- [ ] **步骤 4：运行 renderer 测试、桌面类型检查与核心测试**
+- [x] **步骤 4：运行 renderer 测试、桌面类型检查与核心测试**
 
 运行：
 
@@ -757,7 +757,7 @@ npm.cmd test
 
 预期：PASS；渲染测试断言“翻译中”存在，`%` 不存在，且所有现有 V5 Node 测试通过。
 
-- [ ] **步骤 5：提交渲染工作台**
+- [x] **步骤 5：提交渲染工作台**
 
 ```powershell
 git add translator-v5/src/desktop/renderer translator-v5/vitest.desktop.config.ts
