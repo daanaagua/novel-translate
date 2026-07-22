@@ -160,6 +160,48 @@ test("batch isolates one malformed logical window without discarding its valid s
   assert.match(result.windows[1]?.error ?? "", /empty/i);
 });
 
+test("batch normalizes every forbidden double-quote glyph before initial validation", async () => {
+  const quoteBlocks = [
+    block(
+      "block-0",
+      0,
+      "This deliberately long source passage gives the typography regression enough space.",
+    ),
+    blocks[1]!,
+  ];
+  const faux = fauxProvider();
+  faux.setResponses([fauxAssistantMessage(fauxToolCall(
+    "finalize_translation_batch",
+    { windows: [{
+      windowId: "window-0",
+      translations: [{
+        blockId: "block-0",
+        text: "他说：\"阿尔法\"。‛乙。”‟丙。”〝丁〞„戊。”",
+      }],
+      notes: [],
+    }, {
+      windowId: "window-1",
+      translations: [{ blockId: "block-1", text: "贝塔。" }],
+      notes: [],
+    }] },
+  ), { stopReason: "toolUse" })]);
+
+  const result = await runTranslationBatch({
+    request,
+    blocks: quoteBlocks,
+    stableTerms: [],
+    snapshot: { id: "snapshot-0", revisions: [] },
+    model: faux.getModel(),
+    streamFn: faux.provider.streamSimple.bind(faux.provider),
+    budget: new BudgetLedger(),
+  });
+
+  assert.equal(faux.state.callCount, 1);
+  assert.equal(result.windows[0]?.status, "completed");
+  assert.equal(result.windows[0]?.translations[0]?.text, "他说：“阿尔法”。“乙。”“丙。”“丁”“戊。”");
+  assert.equal(/["‛‟〝〞„]/u.test(result.windows[0]?.translations[0]?.text ?? ""), false);
+});
+
 test("batch mechanically corrects one unknown canonical block-id character typo", async () => {
   const expected = block("block-1f85f23a483f9edef746", 0, "Alpha.");
   const mistyped = "block-1f85a23a483f9edef746";
@@ -511,6 +553,50 @@ test("batch validation repairs only the invalid block once and preserves its val
   assert.match(repairPrompts[0] ?? "", /stable_term_mismatch/);
   assert.match(repairPrompts[0] ?? "", /block-0/);
   assert.doesNotMatch(repairPrompts[0] ?? "", /\[block-1\]/);
+});
+
+test("batch normalizes a targeted repair before its final validation", async () => {
+  const faux = fauxProvider();
+  faux.setResponses([
+    fauxAssistantMessage(fauxToolCall("finalize_translation_batch", {
+      windows: [{
+        windowId: "window-0",
+        translations: [{ blockId: "block-0", text: "错误译文。" }],
+        notes: [],
+      }, {
+        windowId: "window-1",
+        translations: [{ blockId: "block-1", text: "贝塔。" }],
+        notes: [],
+      }],
+    }), { stopReason: "toolUse" }),
+    fauxAssistantMessage(fauxToolCall("submit_repaired_translation", {
+      translations: [{ blockId: "block-0", text: "他说：\"阿尔法\"。" }],
+      notes: [],
+    }), { stopReason: "toolUse" }),
+  ]);
+
+  const result = await runTranslationBatch({
+    request,
+    blocks,
+    stableTerms: [{
+      conceptId: "alpha",
+      lexemeId: "alpha-lexeme",
+      sourceForm: "Alpha",
+      canonicalSource: "Alpha",
+      target: "阿尔法",
+      locked: true,
+    }],
+    snapshot: { id: "snapshot-0", revisions: [] },
+    model: faux.getModel(),
+    streamFn: faux.provider.streamSimple.bind(faux.provider),
+    budget: new BudgetLedger(),
+  });
+
+  assert.equal(faux.state.callCount, 2);
+  assert.equal(result.windows[0]?.status, "completed");
+  assert.equal(result.windows[0]?.translations[0]?.text, "他说：“阿尔法”。");
+  assert.equal(/["‛‟〝〞„]/u.test(result.windows[0]?.translations[0]?.text ?? ""), false);
+  assert.equal(result.windows[1]?.status, "completed");
 });
 
 test("batch uses the explicit escalation runtime only for targeted repair", async () => {

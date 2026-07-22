@@ -4,6 +4,7 @@ import type { Model } from "@earendil-works/pi-ai";
 import type { V4Block } from "../domain/types.js";
 import type { BudgetLedger } from "../kernel/budget.js";
 import type { LosslessBlock } from "../source/types.js";
+import { normalizeChineseQuoteTexts } from "../style/chinese-quote-normalization.js";
 import type { StyleObservationSubmission } from "../style/types.js";
 import type {
   TranslationCandidate,
@@ -231,7 +232,7 @@ function validateSubmission(
         : { styleObservation: structuredClone(candidate.styleObservation) }),
     };
   });
-  return { windows, responseErrors };
+  return { windows: normalizeWindowTypography(windows), responseErrors };
 }
 
 function losslessAsV4(block: LosslessBlock): V4Block {
@@ -255,6 +256,26 @@ function candidateFor(window: TranslationBatchWindowResult): TranslationCandidat
     memoryCandidates: copyMemories(window.memoryCandidates),
     repaired: false,
   };
+}
+
+function normalizeWindowTypography(
+  windows: readonly TranslationBatchWindowResult[],
+): TranslationBatchWindowResult[] {
+  let state = { openDoubleQuoteDepth: 0 };
+  return windows.map((window) => {
+    const normalized = normalizeChineseQuoteTexts(
+      window.translations.map((translation) => translation.text),
+      state,
+    );
+    state = normalized.state;
+    return {
+      ...window,
+      translations: window.translations.map((translation, index) => ({
+        ...translation,
+        text: normalized.texts[index] ?? translation.text,
+      })),
+    };
+  });
 }
 
 function failureMessage(failures: readonly ValidationFailure[]): string {
@@ -350,7 +371,7 @@ async function validateAndRepair(
     item,
   ]) ?? []);
   const invalidById = new Map(invalid.map((item) => [item.window.windowId, item]));
-  const windows = initial.windows.map((window): TranslationBatchWindowResult => {
+  const patchedWindows = initial.windows.map((window): TranslationBatchWindowResult => {
     const item = invalidById.get(window.windowId);
     if (item === undefined) {
       return window;
@@ -362,24 +383,32 @@ async function validateAndRepair(
       })),
     };
     delete repairedWindow.styleObservation;
-    const validation = validator.validate(
-      item.blocks,
-      candidateFor(repairedWindow),
-      validationPolicy,
-    );
-    if (!validation.valid) {
-      return {
-        ...repairedWindow,
-        status: "failed",
-        translations: [],
-        memoryCandidates: [],
-        error: `validation failed after one targeted repair: ${failureMessage(validation.failures)}`,
-      };
-    }
     return repairedWindow;
   });
+  const windows = normalizeWindowTypography(patchedWindows);
+  const validatedWindows = windows.map((window): TranslationBatchWindowResult => {
+    const item = invalidById.get(window.windowId);
+    if (item === undefined || window.status === "failed") {
+      return window;
+    }
+    const validation = validator.validate(
+      item.blocks,
+      candidateFor(window),
+      validationPolicy,
+    );
+    if (validation.valid) {
+      return window;
+    }
+    return {
+      ...window,
+      status: "failed",
+      translations: [],
+      memoryCandidates: [],
+      error: `validation failed after one targeted repair: ${failureMessage(validation.failures)}`,
+    };
+  });
   return {
-    windows,
+    windows: validatedWindows,
     responseErrors: initial.responseErrors,
     repairRuns: [repair.run],
   };

@@ -8,6 +8,7 @@ import type { NarrativeMemoryRecord } from "../fullbook/types.js";
 import type { BudgetLedger } from "../kernel/budget.js";
 import { getSourceLanguageProfile } from "../language/profiles.js";
 import type { SourceLanguageProfile } from "../language/types.js";
+import { normalizeChineseQuoteTexts } from "../style/chinese-quote-normalization.js";
 import type {
   CandidateCollector,
   ResolutionCandidate,
@@ -107,26 +108,15 @@ export function trimExactBoundaryOverlaps(
 
 export function normalizeCandidateTypography(
   candidate: TranslationCandidate,
-  styleState: StyleState,
+  _styleState: StyleState,
 ): TranslationCandidate {
-  const useCurlyQuotes = styleState.dialogueQuotes
-    ?.toLocaleLowerCase()
-    .includes("curly") ?? false;
+  const normalized = normalizeChineseQuoteTexts(candidate.translations.map((item) => item.text));
   return {
     ...candidate,
     notes: [...candidate.notes],
-    translations: candidate.translations.map((translation) => ({
+    translations: candidate.translations.map((translation, index) => ({
       ...translation,
-      text: useCurlyQuotes
-        ? translation.text
-          .replace(/(^|\r?\n)([\t ]*)[‛‟〝„]/gu, "$1$2“")
-          .replaceAll("〞", "”")
-          .replace(/"([^"\r\n]+)"/gu, "“$1”")
-          .replaceAll("「", "“")
-          .replaceAll("」", "”")
-          .replaceAll("『", "“")
-          .replaceAll("』", "”")
-        : translation.text,
+      text: normalized.texts[index] ?? translation.text,
     })),
   };
 }

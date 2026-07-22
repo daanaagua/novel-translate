@@ -370,7 +370,7 @@ test("quote normalization and validation reject invented closing boundaries", ()
   const normalized = normalizeCandidateTypography({
     translations: [{
       blockId: block.id,
-      text: "\u201B它可以是你的衣袍。”\n\n\"你好，\"我说。\n\n“尼苏斯呢？”我冷得发抖。”",
+      text: "\u201B它可以是你的衣袍。”\n\n\"你好，\"我说。\n\n“尼苏斯呢？”我冷得发抖。”\n\n尾声。\"",
     }],
     notes: [],
     repaired: false,
@@ -378,7 +378,9 @@ test("quote normalization and validation reject invented closing boundaries", ()
 
   assert.equal(normalized.translations[0]?.text.startsWith("“"), true);
   assert.equal(normalized.translations[0]?.text.includes("“你好，”我说。"), true);
+  assert.equal(normalized.translations[0]?.text.endsWith("尾声。”"), true);
   assert.equal(normalized.translations[0]?.text.includes('"'), false);
+  assert.equal(/["‛‟〝〞„]/u.test(normalized.translations[0]?.text ?? ""), false);
   const validation = new TranslationValidator().validate([block], normalized);
   assert.ok(validation.failures.some((failure) =>
     failure.code === "quote_boundary_mismatch"),
