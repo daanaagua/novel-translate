@@ -755,3 +755,42 @@ test("one invalid repair fails only that logical window and never triggers a sec
   assert.match(result.windows[0]?.error ?? "", /stable_term_mismatch/);
   assert.equal(result.windows[1]?.status, "completed");
 });
+
+test("framed text batch parses raw assistant prose without a tool call", async () => {
+  const prepared = prepareTranslationRequest({
+    request,
+    blocks,
+    stableTerms: [],
+    snapshot: { id: "snapshot-0", revisions: [] },
+    responseProtocol: "framed_text",
+  });
+  const frames = prepared.framedProtocol?.frames ?? [];
+  assert.equal(frames.length, 2);
+  const faux = fauxProvider();
+  faux.setResponses([fauxAssistantMessage([
+    frames[0]!.beginLine,
+    "阿尔法。",
+    frames[0]!.endLine,
+    frames[1]!.beginLine,
+    "贝塔。",
+    frames[1]!.endLine,
+  ].join("\n"))]);
+  const budget = new BudgetLedger();
+
+  const result = await runTranslationBatch({
+    request,
+    blocks,
+    stableTerms: [],
+    snapshot: { id: "snapshot-0", revisions: [] },
+    responseProtocol: "framed_text",
+    model: faux.getModel(),
+    streamFn: faux.provider.streamSimple.bind(faux.provider),
+    budget,
+  });
+
+  assert.equal(faux.state.callCount, 1);
+  assert.deepEqual(result.run.toolNames, []);
+  assert.equal(result.windows[0]?.translations[0]?.text, "阿尔法。");
+  assert.equal(result.windows[1]?.translations[0]?.text, "贝塔。");
+  assert.equal(budget.snapshot().translationToolCalls, 1);
+});

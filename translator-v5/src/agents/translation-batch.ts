@@ -21,6 +21,7 @@ import {
   type TranslationRequestInput,
 } from "./translation-request.js";
 import { TranslationValidator } from "../validators/translation-validator.js";
+import { parseFramedTranslationResponse } from "./framed-translation-protocol.js";
 
 export { translationBatchSystemPrompt } from "./translation-request.js";
 export type {
@@ -293,6 +294,47 @@ function failureMessage(failures: readonly ValidationFailure[]): string {
   return failures.map((failure) => `${failure.code}: ${failure.message}`).join("; ");
 }
 
+function lastAssistantText(run: PiRunResult): string {
+  const message = run.messages.findLast((item) =>
+    "role" in item && item.role === "assistant");
+  if (message === undefined || !("content" in message)) {
+    return "";
+  }
+  if (typeof message.content === "string") {
+    return message.content;
+  }
+  if (!Array.isArray(message.content)) {
+    return "";
+  }
+  return message.content
+    .filter((part): part is { type: "text"; text: string } =>
+      typeof part === "object"
+      && part !== null
+      && "type" in part
+      && part.type === "text"
+      && "text" in part
+      && typeof part.text === "string")
+    .map((part) => part.text)
+    .join("");
+}
+
+function framedSubmission(
+  input: TranslationBatchInput,
+  translations: readonly { blockId: string; text: string }[],
+): FinalizeTranslationBatchArgs {
+  const byId = new Map(translations.map((translation) => [translation.blockId, translation.text]));
+  return {
+    windows: input.request.windows.map((window) => ({
+      windowId: window.windowId,
+      translations: window.blockIds.flatMap((blockId) => {
+        const text = byId.get(blockId);
+        return text === undefined ? [] : [{ blockId, text }];
+      }),
+      notes: [],
+    })),
+  };
+}
+
 async function validateAndRepair(
   input: TranslationBatchInput,
   initial: Pick<TranslationBatchResult, "windows" | "responseErrors">,
@@ -435,6 +477,7 @@ export async function runTranslationBatch(
   nonempty(input.snapshot.id, "snapshotId");
   let submission: FinalizeTranslationBatchArgs | undefined;
   let duplicateTerminalCalls = 0;
+  const responseProtocol = input.responseProtocol ?? "typed_tool";
   const prepared = prepareTranslationRequest(input, {
     onFinalize: async (args) => {
       if (submission !== undefined) {
@@ -453,15 +496,30 @@ export async function runTranslationBatch(
     model: input.model,
     tools: prepared.tools,
     budget: input.budget,
-    terminateTools: ["finalize_translation_batch"],
+    terminateTools: responseProtocol === "typed_tool" ? ["finalize_translation_batch"] : [],
     // A malformed typed-tool call gets one corrective turn. More turns have no
     // new evidence and only turn a provider-format error into a long stall.
-    maxTurns: 2,
+    maxTurns: responseProtocol === "typed_tool" ? 2 : 1,
     signal: input.signal,
     deadlineMs: input.deadlineMs,
     thinkingLevel: input.thinkingLevel,
   }, input.streamFn);
+  const framedErrors: string[] = [];
+  if (responseProtocol === "framed_text") {
+    input.budget.consume("translationToolCalls", 1);
+    const protocol = prepared.framedProtocol;
+    if (protocol === undefined) {
+      framedErrors.push("framed response protocol was not prepared");
+    } else {
+      const parsed = parseFramedTranslationResponse(lastAssistantText(run), protocol);
+      framedErrors.push(...parsed.errors);
+      if (parsed.errors.length === 0) {
+        submission = framedSubmission(input, parsed.translations);
+      }
+    }
+  }
   const validated = validateSubmission(input, submission);
+  validated.responseErrors.push(...framedErrors);
   if (duplicateTerminalCalls > 0) {
     validated.responseErrors.push(
       `multiple terminating submissions rejected: ${duplicateTerminalCalls + 1}`,

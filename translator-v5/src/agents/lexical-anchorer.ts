@@ -13,6 +13,7 @@ import {
 import type { BudgetLedger } from "../kernel/budget.js";
 import { getSourceLanguageProfile } from "../language/profiles.js";
 import type { SourceLanguageProfile } from "../language/types.js";
+import { simplifyChineseTranslation } from "../style/chinese-script-normalization.js";
 import { assertNotAborted, Type, type TypedToolSpec } from "../tools/tool-spec.js";
 import { PiRuntime, type PiRunResult } from "./pi-runtime.js";
 
@@ -59,10 +60,10 @@ interface EntityLinkSubmission {
 }
 
 function canonicalEntityTarget(value: string): string {
-  return (value.trim().split(
+  return simplifyChineseTranslation((value.trim().split(
     /(?:（|\(|\[|【|,|，|;|；|\s+(?:又称|亦称|即|alias)\s+)/iu,
     1,
-  )[0] ?? "").trim();
+  )[0] ?? "").trim());
 }
 
 function establishedForms(stableTerms: readonly StableTerm[]): string[] {
@@ -221,7 +222,10 @@ export class LexicalAnchorer {
           });
         });
         input.budget.consume("translationToolCalls", 1);
-        anchors = args.anchors.map((anchor) => ({ ...anchor }));
+        anchors = args.anchors.map((anchor) => ({
+          ...anchor,
+          target: simplifyChineseTranslation(anchor.target.trim()),
+        }));
         return {
           accepted: true,
           anchors: anchors.length,
@@ -234,6 +238,7 @@ export class LexicalAnchorer {
         "You establish run-local lexical anchors before parallel literary translation.",
         `The source language is ${profile.displayName} (${profile.id}).`,
         "Mark proper names, unique titles, and invariant technical terms as stable and choose one concise Chinese target.",
+        "Write every Chinese target in Simplified Chinese (zh-Hans); the harness will normalize model-created targets before persistence.",
         "Mark ordinary words, forms whose Chinese rendering changes by discourse role, and forms of address as contextual.",
         "Do not force surface consistency where Chinese grammar or relationship context requires variation.",
         "When compact evidence explicitly links two supplied forms to one entity, submit an entityLinks item and quote the exact supplied context. Leave uncertain relationships unconfirmed.",

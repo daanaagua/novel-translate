@@ -101,7 +101,7 @@ test("Pi lexical anchor decisions become run-local stable terms", async () => {
       fauxToolCall("submit_lexical_anchors", {
         anchors: [{
           sourceForm: "Conciliator",
-          target: "调和者",
+          target: "調和者",
           mode: "stable",
           confidence: 0.95,
         }],
@@ -140,7 +140,7 @@ test("Pi lexical anchor evidence can confirm two surface forms as one entity", a
     })),
     entityLinks: [{
       sourceForms: ["Loukianos", "Lucian"],
-      proposedTarget: "卢奇安",
+      proposedTarget: "盧奇安",
       evidenceKind: "explicit_naming",
       evidenceQuote: "Loukianos, whom they called Lucian the Scoffer, laughed.",
       confidence: 0.95,
@@ -156,6 +156,7 @@ test("Pi lexical anchor evidence can confirm two surface forms as one entity", a
   });
 
   assert.equal(outcome.entityLinks[0]?.status, "confirmed");
+  assert.equal(outcome.entityLinks[0]?.preferredTarget, "卢奇安");
   assert.equal(new Set(outcome.terms
     .filter((term) => ["Loukianos", "Lucian"].includes(term.sourceForm))
     .map((term) => term.conceptId)).size, 1);

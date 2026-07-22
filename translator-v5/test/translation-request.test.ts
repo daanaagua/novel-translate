@@ -102,6 +102,23 @@ test("one request builder serializes all translator-visible projections and one 
   );
 });
 
+test("framed text requests expose exact nonce markers and no translation tool schema", () => {
+  const prepared = prepareTranslationRequest({
+    ...fixture(),
+    responseProtocol: "framed_text",
+  });
+
+  assert.deepEqual(prepared.tools, []);
+  assert.equal(prepared.serializedToolSchemas, "[]");
+  assert.ok(prepared.framedProtocol);
+  assert.match(prepared.systemPrompt, /request-specific framed text protocol/u);
+  assert.match(prepared.prompt, /Return no prose, Markdown, or code fences outside those frames/u);
+  for (const frame of prepared.framedProtocol?.frames ?? []) {
+    assert.match(prepared.prompt, new RegExp(frame.beginLine.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&"), "u"));
+    assert.match(prepared.prompt, new RegExp(frame.endLine.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&"), "u"));
+  }
+});
+
 function revision(
   revisionId: string,
   normalizedSubject: string,

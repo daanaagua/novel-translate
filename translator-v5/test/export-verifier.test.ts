@@ -11,6 +11,7 @@ import { BookContext } from "../src/fullbook/book-context.js";
 import { planBookWindows } from "../src/fullbook/window-planner.js";
 import { createKnowledgeSnapshot } from "../src/knowledge/snapshot.js";
 import {
+  renderTranslation,
   writeLosslessBookArtifacts,
   type LosslessBookArtifactPaths,
 } from "../src/report.js";
@@ -119,6 +120,20 @@ function storedZipEntry(name: string, payload: Buffer): Buffer {
   header.writeUInt16LE(nameBytes.length, 26);
   return Buffer.concat([header, nameBytes, payload]);
 }
+
+test("lossless translation rendering does not leak or duplicate source-language headings", () => {
+  const rendered = renderTranslation([{
+    blockId: "block-heading",
+    globalIndex: 0,
+    chapterId: "chapter-at-0",
+    chapterTitle: "■ 운명의 시작 □",
+    sourceText: "■ 운명의 시작 □",
+    text: "■ 命运的开端 □",
+  }], { includeChapterMetadata: false });
+
+  assert.equal(rendered, "■ 命运的开端 □\n");
+  assert.doesNotMatch(rendered, /운명의 시작|chapter-at-0/u);
+});
 
 test("lossless export writes stable lineage sidecars and verifier detects tampering", () => {
   const item = fixture();

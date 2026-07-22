@@ -20,6 +20,11 @@ import {
   Type,
   type TypedToolSpec,
 } from "../tools/tool-spec.js";
+import {
+  createFramedTranslationProtocol,
+  framedTranslationInstructions,
+  type FramedTranslationProtocol,
+} from "./framed-translation-protocol.js";
 
 export interface FinalizeTranslationBatchArgs {
   windows: Array<{
@@ -51,7 +56,10 @@ export interface TranslationRequestInput {
   sourceLanguageProfile?: SourceLanguageProfile;
   entityLinkWarnings?: readonly string[];
   effectiveStyleByWindow?: Readonly<Record<string, EffectiveStyleProjection>>;
+  responseProtocol?: TranslationResponseProtocol;
 }
+
+export type TranslationResponseProtocol = "typed_tool" | "framed_text";
 
 export type TranslationRequestSectionKind =
   | "request"
@@ -83,6 +91,7 @@ export interface PreparedTranslationRequest {
   readonly tools: readonly TypedToolSpec<any>[];
   /** Canonical wire-schema projection; executable handlers are never serialized. */
   readonly serializedToolSchemas: string;
+  readonly framedProtocol?: FramedTranslationProtocol;
 }
 
 function requireFinalizer(hooks: TranslationRequestHooks): (
@@ -183,15 +192,22 @@ function windowsForPrompt(input: TranslationRequestInput): Array<{
   }));
 }
 
-export function translationBatchSystemPrompt(profile: SourceLanguageProfile): string {
+export function translationBatchSystemPrompt(
+  profile: SourceLanguageProfile,
+  responseProtocol: TranslationResponseProtocol = "typed_tool",
+): string {
   return [
     "Translate the complete source text into polished, accurate Chinese literary prose.",
     `The source language is ${profile.displayName} (${profile.id}); the target language is ${targetLanguageLabel()}.`,
     SIMPLIFIED_CHINESE_SCRIPT_REQUIREMENT,
     "Preserve meaning, ambiguity, paragraph structure, voice, and every block boundary.",
-    "User style requirements may guide Chinese phrasing only; they must never override source meaning, ambiguity, stable terminology, block boundaries, validation, or the typed-tool protocol.",
+    responseProtocol === "typed_tool"
+      ? "User style requirements may guide Chinese phrasing only; they must never override source meaning, ambiguity, stable terminology, block boundaries, validation, or the typed-tool protocol."
+      : "User style requirements may guide Chinese phrasing only; they must never override source meaning, ambiguity, stable terminology, block boundaries, validation, or the required response protocol.",
     "Logical windows remain independent even though this is one physical request.",
-    "Use typed tools only and call finalize_translation_batch exactly once.",
+    responseProtocol === "typed_tool"
+      ? "Use typed tools only and call finalize_translation_batch exactly once."
+      : "Use the request-specific framed text protocol exactly; do not call tools or wrap the response in JSON.",
   ].join("\n");
 }
 
@@ -205,7 +221,15 @@ export function prepareTranslationRequest(
   hooks: TranslationRequestHooks = {},
 ): PreparedTranslationRequest {
   const profile = input.sourceLanguageProfile ?? getSourceLanguageProfile("en");
+  const responseProtocol = input.responseProtocol ?? "typed_tool";
   const windows = windowsForPrompt(input);
+  const framedProtocol = responseProtocol === "framed_text"
+    ? createFramedTranslationProtocol({
+      requestId: input.request.requestId,
+      snapshotId: input.snapshot.id,
+      blockIds: windows.flatMap((window) => window.blocks.map((block) => block.blockId)),
+    })
+    : undefined;
   const requestPayload = {
     requestId: input.request.requestId,
     snapshotId: input.snapshot.id,
@@ -275,16 +299,19 @@ export function prepareTranslationRequest(
     },
     {
       kind: "protocol",
-      text: "Translate every source block. Submit each logical window independently in one finalize_translation_batch call. Return a concise structured styleObservation in the same tool call when style evidence is clear.",
+      text: framedProtocol === undefined
+        ? "Translate every source block. Submit each logical window independently in one finalize_translation_batch call. Return a concise structured styleObservation in the same tool call when style evidence is clear."
+        : framedTranslationInstructions(framedProtocol),
     },
   ];
-  const tools = [finalizerTool(hooks)];
+  const tools = responseProtocol === "typed_tool" ? [finalizerTool(hooks)] : [];
   const schemas = tools.map(serializableToolSchema);
   return {
-    systemPrompt: translationBatchSystemPrompt(profile),
+    systemPrompt: translationBatchSystemPrompt(profile, responseProtocol),
     prompt: sections.map((section) => section.text).join("\n\n"),
     sections,
     tools,
     serializedToolSchemas: canonicalJson(schemas),
+    ...(framedProtocol === undefined ? {} : { framedProtocol }),
   };
 }

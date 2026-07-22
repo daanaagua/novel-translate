@@ -753,7 +753,44 @@ git commit -m "test: add private CJK translation benchmark"
 
 ---
 
-### 任务 10：阶段集成审查、真实 API 验证与发行构建
+### 任务 10：以分帧正文协议消除快速模式的大型 JSON 瓶颈
+
+**文件：**
+- 创建：`translator-v5/src/agents/framed-translation-protocol.ts`
+- 创建：`translator-v5/test/framed-translation-protocol.test.ts`
+- 修改：`translator-v5/src/agents/translation-request.ts`
+- 修改：`translator-v5/src/agents/translation-batch.ts`
+- 修改：`translator-v5/src/fullbook/book-runner.ts`
+- 修改：`translator-v5/test/translation-request.test.ts`
+- 修改：`translator-v5/test/translation-batch.test.ts`
+- 修改：`translator-v5/test/book-runner.test.ts`
+
+- [ ] **步骤 1：先写失败测试**
+
+覆盖请求专属 nonce、含中文引号和换行的原始正文、错误 nonce 不能注入、重复/未知/缺失 block 拒绝、fast 无工具、quality 仍使用工具、归一化与锁定术语不回归。
+
+- [ ] **步骤 2：实现唯一协议构造与严格解析器**
+
+`TranslationRequestInput` 增加默认值为 `typed_tool` 的响应协议。`prepareTranslationRequest` 是提示、工具列表与预算的唯一构造入口；分帧模式返回空工具列表和请求专属标记说明。解析器只把当前请求已知 block 映射回其逻辑 window，随后复用同一个 submission 校验器。
+
+- [ ] **步骤 3：接入快速模式与有限恢复**
+
+runner 只在 `runtimeSet.mode === "fast"` 时选择 `framed_text`。Pi runtime 单轮、无工具执行；结构错误只对失败单窗口按不可变 block 切分，次数和深度有界。质量模式和其他代理工具协议不变。
+
+- [ ] **步骤 4：运行定向回归和真实 20k 韩语 pilot**
+
+预期覆盖率 100%、0 人工任务、0 协议违规；模型调用接近一次锚定加物理请求数，并比深层 JSON 方案明显降低墙钟时间。达不到门槛时不得扩大样本。
+
+- [ ] **步骤 5：提交**
+
+```powershell
+git add translator-v5/src/agents translator-v5/src/fullbook/book-runner.ts translator-v5/test docs/superpowers STATE.md
+git commit -m "perf: stream fast translations in nonce frames"
+```
+
+---
+
+### 任务 11：阶段集成审查、真实 API 验证与发行构建
 
 **文件：**
 - 创建：`docs/superpowers/reports/2026-07-22-cjk-desktop-validation.md`
@@ -775,7 +812,7 @@ npm run desktop:build
 
 - [ ] **步骤 2：分派一次综合审查并处理阻塞问题**
 
-向一个独立审查代理提供规格、计划、base/head、测试输出和已知风险，同时检查：规格覆盖、探针 wire、源账本/编码、token 预算、并发恢复、密钥安全、GUI 状态和测试有效性。只有包含位置、复现和原因的 Critical/Important 阻塞。修复后运行原复现，并让原审查代理仅做一次定向复核。
+向独立审查代理提供规格、计划、base/head、测试输出和已知风险，同时检查：规格覆盖、探针 wire、源账本/编码、token 预算、分帧协议与并发恢复、密钥安全、GUI 状态和测试有效性。只有包含位置、复现和原因的 Critical/Important 阻塞。修复后运行原复现，并让原审查代理仅做一次定向复核。
 
 - [ ] **步骤 3：用真实 DeepSeek V4 Flash/high 复测桌面能力探针**
 
@@ -829,7 +866,7 @@ git commit -m "test: validate FolioLoom CJK desktop workflow"
 
 ## 计划自检
 
-- 规格目标均有任务映射：探针（任务 1）、GUI 状态（任务 2/5/8）、日韩画像（任务 3）、编码（任务 4/5）、完整预算（任务 6）、快速模式和自适应调度（任务 7）、真实基准与质量（任务 9/10）。
+- 规格目标均有任务映射：探针（任务 1）、GUI 状态（任务 2/5/8）、日韩画像（任务 3）、编码（任务 4/5）、完整预算（任务 6）、快速模式和自适应调度（任务 7）、真实基准（任务 9）、快速正文协议（任务 10）、最终质量与发行验证（任务 11）。
 - 没有把全书 GUI、EPUB 生成或外部 tokenizer 扩入本轮。
 - 每项生产代码均在对应失败测试之后；真实付费调用只在无付费门禁和综合审查之后。
 - 数据格式、IPC、并发、密钥和旧项目兼容均设置阶段检查点。

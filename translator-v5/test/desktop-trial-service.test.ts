@@ -82,7 +82,7 @@ function completedTrialResponse(context: Context) {
     windowId: string;
     blocks: Array<{ blockId: string }>;
   }>;
-  return fauxAssistantMessage(fauxToolCall("finalize_translation_batch", {
+  const submission = {
     windows: windows.map((window) => ({
       windowId: window.windowId,
       translations: window.blocks.map((block) => ({
@@ -91,7 +91,24 @@ function completedTrialResponse(context: Context) {
       })),
       notes: [],
     })),
-  }), { stopReason: "toolUse" });
+  };
+  if (prompt.includes("EXACT FRAME PAIRS")) {
+    const promptLines = prompt.split(/\r?\n/gu).map((line) =>
+      line.replace(/^\d+\.\s+/u, "").trimStart());
+    const responseLines = submission.windows.flatMap((window) =>
+      window.translations.flatMap((translation) => {
+        const begin = promptLines.find((line) => line.startsWith("@@FOLIOLOOM:")
+          && line.endsWith(`:BEGIN:${translation.blockId}@@`));
+        const end = promptLines.find((line) => line.startsWith("@@FOLIOLOOM:")
+          && line.endsWith(`:END:${translation.blockId}@@`));
+        assert.ok(begin && end);
+        return [begin, translation.text, end];
+      }));
+    return fauxAssistantMessage(responseLines.join("\n"));
+  }
+  return fauxAssistantMessage(fauxToolCall("finalize_translation_batch", submission), {
+    stopReason: "toolUse",
+  });
 }
 
 function runtimeFor(

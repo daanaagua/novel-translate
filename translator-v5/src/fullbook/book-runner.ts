@@ -63,6 +63,7 @@ import {
 } from "../style/effective-style.js";
 import { createStyleObservation } from "../style/style-observation.js";
 import { projectEffectiveStyle } from "../style/style-projection.js";
+import { simplifyChineseTranslation } from "../style/chinese-script-normalization.js";
 import type {
   BookStyleConstitution,
   EffectiveStyleProjection,
@@ -717,7 +718,24 @@ function parseWaveAnchorSnapshot(
     || !Array.isArray(candidate.terms)) {
     throw new Error("corrupt cached wave anchor decision");
   }
-  return structuredClone(candidate as WaveAnchorSnapshot);
+  const snapshot = structuredClone(candidate as WaveAnchorSnapshot);
+  return {
+    ...snapshot,
+    anchors: snapshot.anchors.map((anchor) => ({
+      ...anchor,
+      target: simplifyChineseTranslation(anchor.target),
+    })),
+    terms: snapshot.terms.map((term) => ({
+      ...term,
+      target: simplifyChineseTranslation(term.target),
+    })),
+    entityLinks: snapshot.entityLinks.map((link) => ({
+      ...link,
+      preferredTarget: link.preferredTarget === null
+        ? null
+        : simplifyChineseTranslation(link.preferredTarget),
+    })),
+  };
 }
 
 function unresolvedEntityWarnings(snapshot: WaveAnchorSnapshot | undefined): string[] {
@@ -809,7 +827,10 @@ function uniqueTerms(
   context: BookContext,
 ): StableTerm[] {
   const byForm = new Map<string, StableTerm>();
-  for (const term of terms) {
+  for (const sourceTerm of terms) {
+    const term = sourceTerm.origin === "knowledge"
+      ? { ...sourceTerm, target: simplifyChineseTranslation(sourceTerm.target) }
+      : sourceTerm;
     const normalized = context.languageProfile.normalizeSourceForm(term.sourceForm);
     const previous = byForm.get(normalized);
     const priority = (value: StableTerm): number => {
@@ -870,7 +891,7 @@ function waveKnowledgeCandidates(
     if (entityForms.has(context.languageProfile.normalizeSourceForm(term.sourceForm))) {
       continue;
     }
-    const payload = { ...term };
+    const payload = { ...term, target: simplifyChineseTranslation(term.target) };
     result.push({
       candidate: {
         recordId: `wave-anchor-${createHash("sha256")
@@ -885,15 +906,21 @@ function waveKnowledgeCandidates(
     });
   }
   for (const link of outcome.entityLinks) {
+    const payload = {
+      ...link,
+      preferredTarget: link.preferredTarget === null
+        ? null
+        : simplifyChineseTranslation(link.preferredTarget),
+    };
     result.push({
       candidate: {
         recordId: `wave-entity-${createHash("sha256")
-          .update(`${runId}\0${canonicalJson(link)}`)
+          .update(`${runId}\0${canonicalJson(payload)}`)
           .digest("hex")
           .slice(0, 24)}`,
         normalizedSubject: `entity-alias:${link.linkId}`,
         kind: "entity_alias_link",
-        payload: link,
+        payload,
       },
       sourceForms: link.sourceForms,
     });
@@ -1025,6 +1052,7 @@ function outputReserveTokens(request: PhysicalRequestPlan, runtime: TranslationR
 const CONTEXT_FRAGMENT_PROTOCOL_VERSION = "v5-context-fragment-1";
 const MAX_CONTEXT_SPLIT_DEPTH = 16;
 const MAX_CONTEXT_SPLIT_ATTEMPTS = 32;
+const MAX_PROTOCOL_SPLIT_ATTEMPTS = 16;
 
 interface AdmittedRequestFragment<TInput> {
   request: PhysicalRequestPlan;
@@ -1254,6 +1282,29 @@ interface FragmentTranslationExecution {
 interface MergedTranslationResult {
   windows: TranslationBatchWindowResult[];
   responseErrors: string[];
+}
+
+const RECOVERABLE_STRUCTURAL_SUBMISSION_ERROR = /^(?:missing window submission|duplicate windowId|unknown blockId|duplicate blockId|empty translation|block set mismatch|missing block translations while merging context fragments|duplicate block translation while merging context fragments)/u;
+
+function recoverableStructuralWindowIds(result: TranslationBatchResult): Set<string> {
+  return new Set(result.windows.flatMap((window) => (
+    window.status === "failed"
+      && RECOVERABLE_STRUCTURAL_SUBMISSION_ERROR.test(window.error ?? "")
+      ? [window.windowId]
+      : []
+  )));
+}
+
+function requestWithWindows(
+  request: PhysicalRequestPlan,
+  windowIds: ReadonlySet<string>,
+): PhysicalRequestPlan {
+  const windows = request.windows.filter((window) => windowIds.has(window.windowId));
+  return {
+    ...request,
+    windows,
+    sourceTokens: windows.reduce((total, window) => total + window.sourceTokens, 0),
+  };
 }
 
 function mergeFragmentTranslationResults(
@@ -1729,6 +1780,7 @@ async function runLosslessBook(
             window.windowId,
             effectiveStyleByWindow[window.windowId] as EffectiveStyleProjection,
           ])),
+          responseProtocol: runtimeSet.mode === "fast" ? "framed_text" : "typed_tool",
         });
         const requestInputs = admitTranslationRequests(
           requests,
@@ -1774,9 +1826,11 @@ async function runLosslessBook(
             const budget = new BudgetLedger();
             let observedContextOverflow = false;
             let contextSplitAttempts = 0;
+            let protocolSplitAttempts = 0;
             const executeFragments = async (
               pendingFragments: readonly AdmittedRequestFragment<TranslationRequestInput>[],
-              retryingAfterContext = false,
+              activeRuntime: TranslationRuntime = executionRuntime,
+              retryingLocally = false,
             ): Promise<FragmentTranslationExecution[]> => {
               const completed: FragmentTranslationExecution[] = [];
               for (const fragment of pendingFragments) {
@@ -1784,14 +1838,14 @@ async function runLosslessBook(
                   throwIfAborted(options.signal);
                   const result = await runTranslationBatch({
                     ...fragment.input,
-                    model: executionRuntime.model,
-                    streamFn: executionRuntime.streamFn,
-                    thinkingLevel: executionRuntime.thinkingLevel,
-                    repairRuntime: retryingAfterContext
+                    model: activeRuntime.model,
+                    streamFn: activeRuntime.streamFn,
+                    thinkingLevel: activeRuntime.thinkingLevel,
+                    repairRuntime: retryingLocally
                       ? {
-                        model: executionRuntime.model,
-                        streamFn: executionRuntime.streamFn,
-                        thinkingLevel: executionRuntime.thinkingLevel,
+                        model: activeRuntime.model,
+                        streamFn: activeRuntime.streamFn,
+                        thinkingLevel: activeRuntime.thinkingLevel,
                       }
                       : {
                         model: runtimeSet.escalation.model,
@@ -1806,12 +1860,51 @@ async function runLosslessBook(
                     && fragment.assessment.inputTokens > 0
                     && result.run.usage.input > 0) {
                     const observation: UsageObservation = {
-                      modelId: executionRuntime.model.id,
+                      modelId: activeRuntime.model.id,
                       profile: context.languageProfile,
                       estimatedTokens: fragment.assessment.inputTokens,
                       actualInputTokens: result.run.usage.input,
                     };
                     estimator.observeUsage(observation);
+                  }
+                  const recoverableWindowIds = recoverableStructuralWindowIds(result);
+                  if (recoverableWindowIds.size > 0
+                    && fragment.request.windows.length === 1
+                    && fragment.depth < MAX_CONTEXT_SPLIT_DEPTH
+                    && protocolSplitAttempts < MAX_PROTOCOL_SPLIT_ATTEMPTS) {
+                    const failedRequest = requestWithWindows(
+                      fragment.request,
+                      recoverableWindowIds,
+                    );
+                    const children = splitPhysicalRequestAtBoundaries(
+                      failedRequest,
+                      blockById,
+                    );
+                    if (children.length > 0) {
+                      protocolSplitAttempts += 1;
+                      const validWindows = result.windows.filter((window) =>
+                        !recoverableWindowIds.has(window.windowId));
+                      if (validWindows.length > 0) {
+                        completed.push({
+                          fragment,
+                          result: { ...result, windows: validWindows },
+                        });
+                      }
+                      const admittedChildren = admitTranslationFragments(
+                        children,
+                        runtimeSet.escalation,
+                        estimator,
+                        blockById,
+                        buildTranslationInput,
+                        fragment.depth + 1,
+                      );
+                      completed.push(...await executeFragments(
+                        admittedChildren,
+                        runtimeSet.escalation,
+                        true,
+                      ));
+                      continue;
+                    }
                   }
                   completed.push({ fragment, result });
                 } catch (error) {
@@ -1839,13 +1932,17 @@ async function runLosslessBook(
                   }
                   const admittedChildren = admitTranslationFragments(
                     children,
-                    executionRuntime,
+                    activeRuntime,
                     estimator,
                     blockById,
                     buildTranslationInput,
                     fragment.depth + 1,
                   );
-                  completed.push(...await executeFragments(admittedChildren, true));
+                  completed.push(...await executeFragments(
+                    admittedChildren,
+                    activeRuntime,
+                    true,
+                  ));
                 }
               }
               return completed;

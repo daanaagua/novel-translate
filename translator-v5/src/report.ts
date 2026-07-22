@@ -23,11 +23,19 @@ export interface PilotTranslation {
   text: string;
 }
 
-export function renderTranslation(translations: readonly PilotTranslation[]): string {
+export interface RenderTranslationOptions {
+  /** Lossless source headings are themselves translated blocks; repeating source metadata leaks residue. */
+  includeChapterMetadata?: boolean;
+}
+
+export function renderTranslation(
+  translations: readonly PilotTranslation[],
+  options: RenderTranslationOptions = {},
+): string {
   const lines: string[] = [];
   let chapter: string | null | undefined;
   for (const item of translations) {
-    if (item.chapterId !== chapter) {
+    if (options.includeChapterMetadata !== false && item.chapterId !== chapter) {
       chapter = item.chapterId;
       lines.push(
         lines.length === 0 ? "" : "\n",
@@ -484,7 +492,9 @@ export function writeLosslessBookArtifacts(
     });
   mkdirSync(outputDirectory, { recursive: true });
   const paths = losslessBookArtifactPaths(outputDirectory, audit.complete);
-  writeFileSync(paths.translation, renderTranslation(translations), "utf8");
+  writeFileSync(paths.translation, renderTranslation(translations, {
+    includeChapterMetadata: false,
+  }), "utf8");
   writeFileSync(paths.bilingual, renderBilingual(translations), "utf8");
   writeFileSync(paths.audit, `${JSON.stringify(audit, null, 2)}\n`, "utf8");
   writeFileSync(paths.metrics, `${JSON.stringify({

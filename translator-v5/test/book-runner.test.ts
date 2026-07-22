@@ -222,6 +222,41 @@ test("fast waves fall back to one scheduler horizon after a retry", async () => 
   assert.equal(result.status.completedWindows, result.status.totalWindows);
 });
 
+test("a missing framed submission is retried as smaller lossless block fragments", async () => {
+  const fixture = losslessFixture([
+    "the ".repeat(1_700),
+    "and ".repeat(1_700),
+  ].join("\n\n"));
+  const model = fixture.faux.getModel();
+  const streamFn = fixture.faux.provider.streamSimple.bind(fixture.faux.provider);
+  fixture.faux.setResponses([
+    fauxAssistantMessage("I could not submit the structured result."),
+    ...Array.from({ length: 10 }, () => losslessBatchResponse),
+  ]);
+
+  const result = await runBook({
+    ...fixture.options,
+    model,
+    streamFn,
+    windowOptions: { maxBlocks: 2, maxSourceTokens: 4_000 },
+    maxRequestTokens: 4_000,
+    maxConcurrency: 1,
+    maxWindowsPerRequest: 1,
+    runtimeSet: {
+      mode: "fast",
+      primary: { model, streamFn, effort: "off", thinkingLevel: "off" },
+      escalation: { model, streamFn, effort: "high", thinkingLevel: "high" },
+    },
+  } as never);
+
+  assert.equal(result.status.humanRequiredWindows, 0);
+  assert.equal(result.status.completedWindows + result.status.warningWindows, result.status.totalWindows);
+  assert.ok(result.windows.some((window) => window.blockIds.length >= 2));
+  assert.ok(result.windows.every((window) => window.attemptCount === 1));
+  assert.ok(fixture.faux.state.callCount >= 3);
+  assert.ok(fixture.faux.state.callCount <= 6);
+});
+
 function createFixture(path: string, blockCount: number): void {
   const database = new DatabaseSync(path);
   database.exec(`
@@ -306,7 +341,7 @@ function losslessBatchResponse(context: Context) {
     sourceForm: string;
     target: string;
   }>;
-  return fauxAssistantMessage(fauxToolCall("finalize_translation_batch", {
+  const submission = {
     windows: windows.map((window) => ({
       windowId: window.windowId,
       translations: window.blocks.map((block) => ({
@@ -319,7 +354,26 @@ function losslessBatchResponse(context: Context) {
       })),
       notes: [],
     })),
-  }), { stopReason: "toolUse" });
+  };
+  if (prompt.includes("EXACT FRAME PAIRS")) {
+    const promptLines = prompt.split(/\r?\n/gu).map((line) =>
+      line.replace(/^\d+\.\s+/u, "").trimStart());
+    const responseLines = submission.windows.flatMap((window) =>
+      window.translations.flatMap((translation) => {
+        const begin = promptLines.find((line) =>
+          line.startsWith("@@FOLIOLOOM:")
+          && line.endsWith(`:BEGIN:${translation.blockId}@@`));
+        const end = promptLines.find((line) =>
+          line.startsWith("@@FOLIOLOOM:")
+          && line.endsWith(`:END:${translation.blockId}@@`));
+        assert.ok(begin && end, `missing frame markers for ${translation.blockId}`);
+        return [begin, translation.text, end];
+      }));
+    return fauxAssistantMessage(responseLines.join("\n"));
+  }
+  return fauxAssistantMessage(fauxToolCall("finalize_translation_batch", submission), {
+    stopReason: "toolUse",
+  });
 }
 
 function promptBatchWindows(context: Context): Array<{
@@ -885,10 +939,7 @@ test("fast mode retries an invalid physical request with only the escalation run
     "finalize_translation_batch",
     { windows: [] },
   ), { stopReason: "toolUse" })]);
-  escalation.setResponses([fauxAssistantMessage(fauxToolCall(
-    "finalize_translation_batch",
-    fixture.submission,
-  ), { stopReason: "toolUse" })]);
+  escalation.setResponses([losslessBatchResponse]);
   const primaryModel = primary.getModel();
   const primaryStream = primary.provider.streamSimple.bind(primary.provider);
 
