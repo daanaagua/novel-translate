@@ -33,6 +33,9 @@ export function projectEffectiveStyle(
     `对白：${style.constitution.dialogue}`,
     `技术文：${style.constitution.technicalProse}`,
     `排版：${style.constitution.typography}`,
+    ...(style.constitution.additionalInstruction.length === 0
+      ? []
+      : [`用户附加文风要求：${style.constitution.additionalInstruction}`]),
     `当前声音 ${style.voice.voiceId}：${style.voice.instruction}`,
     ...modeRules,
     ...style.local.registers.map((item) => `近期语域：${item.value}`),

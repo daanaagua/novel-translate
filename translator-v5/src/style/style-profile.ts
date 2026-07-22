@@ -22,7 +22,7 @@ type StyleField = typeof STYLE_FIELDS[number];
 const STYLE_FIELD_SET = new Set<string>(STYLE_FIELDS);
 const STANDARD_FIELD_LIMIT = 180;
 const ADDITIONAL_INSTRUCTION_LIMIT = 600;
-const COMBINED_ADDITIONAL_INSTRUCTION_LIMIT = 1_200;
+const COMBINED_ADDITIONAL_INSTRUCTION_LIMIT = 600;
 
 export interface StyleProfileInput {
   readonly profilePath?: string;

@@ -147,6 +147,7 @@ function losslessStyleConstitution(style: StyleState | undefined): BookStyleCons
     dialogue: style?.dialogue,
     technicalProse: style?.technicalProse,
     typography: style?.typography ?? style?.dialogueQuotes,
+    additionalInstruction: style?.additionalInstruction,
   });
 }
 

@@ -53,7 +53,7 @@ style:
 
 系统提示词继续拥有更高优先级，明确要求：用户文风要求只可改变中文行文选择，绝不可改变原文含义、歧义显隐、术语锁定、块边界、工具调用和校验协议。
 
-每个普通文风字段最多 180 个 Unicode 标量；`additionalInstruction` 与 `--prompt` 分别最多 600 个 Unicode 标量。CLI prompt 与配置中的附加指令合并后最多 1,200 个 Unicode 标量。空白文本、未知字段、错误 YAML 和超限输入均在模型调用前报错。
+每个普通文风字段最多 180 个 Unicode 标量；`additionalInstruction` 与 `--prompt` 分别最多 600 个 Unicode 标量。CLI prompt 与配置中的附加指令合并后仍最多 600 个 Unicode 标量，避免文风控制挤占翻译上下文。空白文本、未知字段、错误 YAML 和超限输入均在模型调用前报错。
 
 ## 可复现性
 

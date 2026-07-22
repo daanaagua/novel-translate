@@ -83,9 +83,9 @@ git commit -m "feat: add validated style profile loader"
 - 修改：`translator-v5/src/style/effective-style.ts`
 - 修改：`translator-v5/src/style/style-projection.ts`
 - 修改：`translator-v5/src/fullbook/book-runner.ts`
-- 修改：`translator-v5/test/style.test.ts`
+- 修改：`translator-v5/test/structured-style.test.ts`
 
-- [ ] **步骤 1：编写失败测试**
+- [x] **步骤 1：编写失败测试**
 
 ```ts
 test("effective style projects the user additional instruction without replacing the constitution", () => {
@@ -95,7 +95,15 @@ test("effective style projects the user additional instruction without replacing
   });
   const projection = projectEffectiveStyle(composeEffectiveStyle({
     constitution,
-    voices: [narratorVoice()],
+    voices: [{
+      id: "narrator",
+      label: "叙述者",
+      markers: ["I"],
+      sentenceRhythm: "节奏克制",
+      diction: "准确",
+      dialogueProfile: "少量对话",
+      confidence: 1,
+    }],
     observations: [],
     currentOrdinal: 0,
     sourceText: "A short source paragraph.",
@@ -106,13 +114,13 @@ test("effective style projects the user additional instruction without replacing
 });
 ```
 
-- [ ] **步骤 2：运行测试并确认红灯**
+- [x] **步骤 2：运行测试并确认红灯**
 
 运行：`node --test --import tsx test/structured-style.test.ts`
 
 预期：失败，因为 `additionalInstruction` 尚未属于样式宪章或投影。
 
-- [ ] **步骤 3：实现最小投影**
+- [x] **步骤 3：实现最小投影**
 
 ```ts
 export interface BookStyleConstitution {
@@ -128,16 +136,16 @@ export interface BookStyleConstitution {
 
 默认值为空字符串，`losslessStyleConstitution()` 从 `styleState.additionalInstruction` 传入该字段。
 
-- [ ] **步骤 4：运行测试并确认绿灯**
+- [x] **步骤 4：运行测试并确认绿灯**
 
 运行：`node --test --import tsx test/structured-style.test.ts`
 
 预期：样式测试全部通过。
 
-- [ ] **步骤 5：提交该独立变更**
+- [x] **步骤 5：提交该独立变更**
 
 ```bash
-git add translator-v5/src/style translator-v5/src/fullbook/book-runner.ts translator-v5/test/style.test.ts
+git add translator-v5/src/style translator-v5/src/fullbook/book-runner.ts translator-v5/test/structured-style.test.ts
 git commit -m "feat: project user style instructions"
 ```
 

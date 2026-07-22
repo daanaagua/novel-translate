@@ -126,3 +126,26 @@ test("effective style projection is bounded and selects only compatible accepted
   assert.ok(!projection.text.includes("这段不应出现"));
   assert.ok(projection.modeRules.length <= 2);
 });
+
+test("effective style projects a user additional instruction without replacing the constitution", () => {
+  const constitution = createBookStyleConstitution({
+    register: "准确、克制",
+    additionalInstruction: "对白避免网络流行语",
+  });
+  const projection = projectEffectiveStyle(composeEffectiveStyle({
+    constitution,
+    voices: [{
+      voiceId: "narrator",
+      scope: "main_narrator",
+      instruction: "保持叙述距离",
+      confidence: 1,
+    }],
+    observations: [],
+    currentOrdinal: 0,
+    sourceText: "A short source paragraph.",
+    defaultVoiceId: "narrator",
+  }));
+
+  assert.match(projection.text, /用户附加文风要求：对白避免网络流行语/u);
+  assert.match(projection.text, /基调：准确、克制/u);
+});

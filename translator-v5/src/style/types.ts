@@ -22,6 +22,7 @@ export interface BookStyleConstitution {
   readonly dialogue: string;
   readonly technicalProse: string;
   readonly typography: string;
+  readonly additionalInstruction: string;
 }
 
 export type VoiceScope =

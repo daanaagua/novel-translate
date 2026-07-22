@@ -20,6 +20,7 @@ const DEFAULT_CONSTITUTION: Omit<BookStyleConstitution, "schemaVersion" | "versi
   dialogue: "对白符合人物关系和场景，不机械追求字面对齐",
   technicalProse: "科学和技术说明优先准确、清楚、术语一致",
   typography: "使用规范中文标点、引号和段落格式",
+  additionalInstruction: "",
 };
 
 function bounded(value: string | undefined, fallback: string, max = 180): string {
@@ -44,6 +45,11 @@ export function createBookStyleConstitution(
     dialogue: bounded(overrides.dialogue, DEFAULT_CONSTITUTION.dialogue),
     technicalProse: bounded(overrides.technicalProse, DEFAULT_CONSTITUTION.technicalProse),
     typography: bounded(overrides.typography, DEFAULT_CONSTITUTION.typography),
+    additionalInstruction: bounded(
+      overrides.additionalInstruction,
+      DEFAULT_CONSTITUTION.additionalInstruction,
+      600,
+    ),
   });
 }
 
