@@ -914,6 +914,14 @@ async function runLosslessBook(
       ? {}
       : { legacyV4DbPath: options.legacyV4DbPath }),
   });
+  const glossaryExpectedSourceVersion = context.sourceLedger.sourceVersion;
+  if (options.glossary?.sourceVersion !== undefined
+    && options.glossary.sourceVersion !== glossaryExpectedSourceVersion) {
+    context.close();
+    throw new Error(
+      `glossary snapshot source version mismatch: expected ${glossaryExpectedSourceVersion}, found ${options.glossary.sourceVersion}`,
+    );
+  }
   const modelId = options.runMeta.modelId ?? options.model.id;
   if (modelId !== options.model.id) {
     context.close();

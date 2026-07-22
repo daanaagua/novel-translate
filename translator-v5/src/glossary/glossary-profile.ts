@@ -52,6 +52,7 @@ export interface GlossaryImportReport {
 
 export interface LoadedGlossary {
   readonly hash: string;
+  readonly sourceVersion?: string;
   readonly stableTerms: readonly StableTerm[];
   readonly report: GlossaryImportReport;
   readonly occurrenceIndexesByLexeme: Readonly<Record<string, readonly number[]>>;
@@ -383,6 +384,10 @@ function evidenceForTerm(
  */
 export function loadGlossary(input: LoadGlossaryInput): LoadedGlossary {
   const terms = parseGlossary(input.glossaryPath);
+  const sourceVersions = new Set(input.blocks.map((block) => block.sourceVersion));
+  if (sourceVersions.size > 1) {
+    throw new Error("glossary source blocks do not share one source version");
+  }
   assertNoDuplicateForms(terms, input.profile);
   const stableTerms = stableTermsFor(terms, input.profile);
   assertNoExistingConflict(stableTerms, input.existingStableTerms ?? [], input.profile);
@@ -412,6 +417,7 @@ export function loadGlossary(input: LoadGlossaryInput): LoadedGlossary {
   };
   return {
     hash,
+    ...(sourceVersions.size === 0 ? {} : { sourceVersion: [...sourceVersions][0] }),
     stableTerms,
     report,
     occurrenceIndexesByLexeme,

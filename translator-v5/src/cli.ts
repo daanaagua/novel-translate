@@ -15,6 +15,11 @@ import {
   runBook,
 } from "./fullbook/book-runner.js";
 import { BookContext } from "./fullbook/book-context.js";
+import {
+  loadGlossary,
+  type GlossaryImportReport,
+  type LoadedGlossary,
+} from "./glossary/glossary-profile.js";
 import { planBookWindows, type WindowPlanOptions } from "./fullbook/window-planner.js";
 import { preflightPilot, runPilot } from "./pilot-runner.js";
 import { BudgetLedger } from "./kernel/budget.js";
@@ -84,6 +89,7 @@ export interface CliOptions {
   hardDeadlineMs?: number;
   styleProfile?: string;
   prompt?: string;
+  glossary?: string;
 }
 
 export interface BookDoctorReport {
@@ -97,6 +103,7 @@ export interface BookDoctorReport {
   incidentCodes: string[];
   sourceAnomalies: SourceAnomalyReport;
   modelCallsAllowed: false;
+  glossary?: GlossaryImportReport;
 }
 
 interface CliRuntimeDependencies {
@@ -143,9 +150,10 @@ export function cliErrorPayload(error: unknown): CliErrorPayload {
 export function doctorBook(
   manifestPath: string,
   windowOptions: WindowPlanOptions = {},
+  glossaryPath?: string,
 ): BookDoctorReport {
   const ledger = SourceLedger.open(manifestPath);
-  const annotations = annotateStructure(ledger, ledger.sourceVersion);
+  const annotations = annotateStructure(ledger, ledger.sourceVersion, ledger.languageProfile);
   const blocks = buildLosslessBlocks(ledger, annotations, {
     sourceVersion: ledger.sourceVersion,
   });
@@ -164,7 +172,37 @@ export function doctorBook(
     incidentCodes: [...new Set(audit.incidents.map((incident) => incident.code))].sort(),
     sourceAnomalies: analyzeSourceAnomalies(ledger.sourceText),
     modelCallsAllowed: false,
+    ...(glossaryPath === undefined ? {} : {
+      glossary: loadGlossary({
+        glossaryPath,
+        blocks,
+        profile: ledger.languageProfile,
+      }).report,
+    }),
   };
+}
+
+function loadGlossaryForManifest(options: {
+  manifestPath: string;
+  legacyV4DbPath?: string;
+  glossaryPath: string;
+}): LoadedGlossary {
+  const context = BookContext.openLossless({
+    manifestPath: options.manifestPath,
+    ...(options.legacyV4DbPath === undefined
+      ? {}
+      : { legacyV4DbPath: options.legacyV4DbPath }),
+  });
+  try {
+    return loadGlossary({
+      glossaryPath: options.glossaryPath,
+      blocks: context.losslessBlocks,
+      profile: context.languageProfile,
+      existingStableTerms: context.stableTerms,
+    });
+  } finally {
+    context.close();
+  }
 }
 
 export function resolveRunSelection(
@@ -329,6 +367,14 @@ function hasStyleProfileMetadata(metadata: unknown): boolean {
     && typeof (metadata as Record<string, unknown>).styleProfileHash === "string";
 }
 
+function glossaryHashFromMetadata(metadata: unknown): string | undefined {
+  if (metadata === null || typeof metadata !== "object" || Array.isArray(metadata)) {
+    return undefined;
+  }
+  const value = (metadata as Record<string, unknown>).glossaryHash;
+  return typeof value === "string" && value.trim().length > 0 ? value : undefined;
+}
+
 function runMetadataForStyle(
   style: LoadedStyleProfile,
   previousMetadata: unknown | undefined,
@@ -354,6 +400,50 @@ function runMetadataForStyle(
     ...metadataRecord(previousMetadata),
     styleProfileHash: style.profileHash,
     styleProfileSource: style.source,
+  };
+}
+
+function glossarySummary(glossary: LoadedGlossary): Record<string, unknown> {
+  return {
+    schema: glossary.report.schema,
+    termCount: glossary.report.totalTerms,
+    formCount: glossary.report.totalForms,
+    matchedTerms: glossary.report.matchedTerms,
+    unmatchedTerms: glossary.report.unmatchedTerms,
+    sourceLanguage: glossary.report.sourceLanguage,
+  };
+}
+
+function runMetadataForGlossary(
+  glossary: LoadedGlossary | undefined,
+  previousMetadata: unknown | undefined,
+): unknown {
+  const previousHash = glossaryHashFromMetadata(previousMetadata);
+  if (previousMetadata === undefined) {
+    return {
+      createdBy: "book-cli",
+      ...(glossary === undefined ? {} : {
+        glossaryHash: glossary.hash,
+        glossarySummary: glossarySummary(glossary),
+      }),
+    };
+  }
+  if (glossary === undefined) {
+    if (previousHash !== undefined) {
+      throw new Error("resuming a glossary-configured run requires the same --glossary");
+    }
+    return previousMetadata;
+  }
+  if (previousHash === undefined) {
+    throw new Error("resuming a run without a glossary cannot add --glossary");
+  }
+  if (previousHash !== glossary.hash) {
+    throw new Error("resuming a glossary-configured run requires the same glossary content");
+  }
+  return {
+    ...metadataRecord(previousMetadata),
+    glossaryHash: glossary.hash,
+    glossarySummary: glossarySummary(glossary),
   };
 }
 
@@ -400,7 +490,7 @@ export function parseArgs(argv: readonly string[]): CliOptions {
     const { values } = parseFlags(
       argv.slice(2),
       "book doctor",
-      ["--manifest", "--max-blocks", "--max-source-tokens"],
+      ["--manifest", "--max-blocks", "--max-source-tokens", "--glossary"],
     );
     const maxBlocks = positiveFlag(values, "--max-blocks");
     const maxSourceTokens = positiveFlag(values, "--max-source-tokens");
@@ -409,6 +499,9 @@ export function parseArgs(argv: readonly string[]): CliOptions {
       manifest: pathValue(values, "--manifest"),
       ...(maxBlocks === undefined ? {} : { maxBlocks }),
       ...(maxSourceTokens === undefined ? {} : { maxSourceTokens }),
+      ...(pathValue(values, "--glossary", false) === undefined
+        ? {}
+        : { glossary: pathValue(values, "--glossary", false) }),
     };
   }
   if (action === "audit") {
@@ -503,6 +596,7 @@ export function parseArgs(argv: readonly string[]): CliOptions {
         "--opencode-auth", "--run", "--max-windows", "--max-concurrency",
         "--max-attempts", "--max-blocks", "--max-source-tokens",
         "--hard-deadline-ms", "--style-profile", "--prompt",
+        "--glossary",
       ],
     );
     return {
@@ -522,6 +616,7 @@ export function parseArgs(argv: readonly string[]): CliOptions {
       maxSourceTokens: positiveFlag(values, "--max-source-tokens"),
       styleProfile: pathValue(values, "--style-profile", false),
       prompt: identifierValue(values, "--prompt"),
+      glossary: pathValue(values, "--glossary", false),
     };
   }
   if (action === "status") {
@@ -587,7 +682,7 @@ export async function main(
     console.log(JSON.stringify(doctorBook(requireOption(options, "manifest"), {
       maxBlocks: options.maxBlocks,
       maxSourceTokens: options.maxSourceTokens,
-    }), null, 2));
+    }, options.glossary), null, 2));
     return;
   }
   if (options.command === "book-audit") {
@@ -757,6 +852,19 @@ export async function main(
       ...(options.styleProfile === undefined ? {} : { profilePath: options.styleProfile }),
       ...(options.prompt === undefined ? {} : { cliPrompt: options.prompt }),
     });
+    const glossary = options.glossary === undefined
+      ? undefined
+      : loadGlossaryForManifest({
+        manifestPath: requireOption(options, "manifest"),
+        ...(options.legacyV4Db === undefined
+          ? {}
+          : { legacyV4DbPath: options.legacyV4Db }),
+        glossaryPath: options.glossary,
+      });
+    const runMetadata = runMetadataForStyle(
+      style,
+      runMetadataForGlossary(glossary, selectedRun?.metadata),
+    );
     const config = loadRuntimeConfig(options);
     const model = runtime.createModel(config);
     const streamFn = runtime.createStreamFn(config);
@@ -770,17 +878,18 @@ export async function main(
             runId,
             protocolVersion: LOSSLESS_BOOK_PROTOCOL_VERSION,
             modelId: config.model,
-            metadata: runMetadataForStyle(style, undefined),
+            metadata: runMetadata,
           }
         : {
             runId,
             protocolVersion: selectedRun.protocolVersion,
             modelId: selectedRun.modelId,
-            metadata: runMetadataForStyle(style, selectedRun.metadata),
+            metadata: runMetadata,
           },
       model,
       streamFn,
       styleState: style.styleState,
+      ...(glossary === undefined ? {} : { glossary }),
       windowOptions: {
         maxBlocks: options.maxBlocks,
         maxSourceTokens: options.maxSourceTokens,

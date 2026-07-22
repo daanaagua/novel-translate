@@ -82,7 +82,12 @@ function auditStore(manifestPath: string, runId = "run-audit"): string {
   return storePath;
 }
 
-function addRun(storePath: string, manifestPath: string, runId: string): void {
+function addRun(
+  storePath: string,
+  manifestPath: string,
+  runId: string,
+  metadata?: unknown,
+): void {
   const context = BookContext.openLossless({ manifestPath });
   const store = new LosslessBookStore(storePath);
   try {
@@ -99,6 +104,7 @@ function addRun(storePath: string, manifestPath: string, runId: string): void {
       modelId: "test-model",
       initialSnapshotId: initialSnapshot.id,
       initialSnapshot,
+      ...(metadata === undefined ? {} : { metadata }),
     });
     store.initializeWindowPlan(runId, planBookWindows(context.losslessBlocks, {
       protocolVersion: "lossless-v5-1",
@@ -164,6 +170,23 @@ test("CLI parses a style profile and a bounded style prompt for book run", () =>
   assert.equal(run.command, "book-run");
   assert.equal(run.styleProfile, resolve("style.yaml"));
   assert.equal(run.prompt, "对白避免网络流行语");
+});
+
+test("CLI parses a JSON glossary for lossless doctor and book run", () => {
+  const doctor = parseArgs([
+    "book", "doctor", "--manifest", "source_manifest.json", "--glossary", "terms.json",
+  ]);
+  assert.equal(doctor.command, "book-doctor");
+  assert.equal(doctor.glossary, resolve("terms.json"));
+  const run = parseArgs([
+    "book", "run",
+    "--manifest", "source_manifest.json",
+    "--store", "state.db",
+    "--config", "config.yaml",
+    "--glossary", "terms.json",
+  ]);
+  assert.equal(run.command, "book-run");
+  assert.equal(run.glossary, resolve("terms.json"));
 });
 
 test("CLI parses book recover with a strict structured incident", () => {
@@ -307,6 +330,97 @@ test("book doctor audits the lossless pipeline without constructing a provider",
   });
   assert.ok(Number(report.blockCount) > 0);
   assert.ok(Number(report.windowCount) > 0);
+});
+
+test("book doctor returns deterministic glossary evidence without constructing a provider", async () => {
+  const manifest = sourceManifest("Typhon watched.");
+  const glossaryPath = join(dirname(manifest), "glossary.json");
+  writeFileSync(glossaryPath, JSON.stringify({ Typhon: "提丰" }), "utf8");
+  const output: string[] = [];
+  let providerConstructions = 0;
+  const originalLog = console.log;
+  console.log = (...values: unknown[]) => output.push(values.join(" "));
+  try {
+    await main(["book", "doctor", "--manifest", manifest, "--glossary", glossaryPath], {
+      createModel: () => {
+        providerConstructions += 1;
+        throw new Error("provider must not be constructed");
+      },
+    });
+  } finally {
+    console.log = originalLog;
+  }
+  assert.equal(providerConstructions, 0);
+  const report = JSON.parse(output.at(-1) ?? "") as {
+    glossary?: { matchedTerms?: number; terms?: Array<{ source: string; occurrenceCount: number }> };
+  };
+  assert.equal(report.glossary?.matchedTerms, 1);
+  assert.deepEqual(report.glossary?.terms, [{
+    source: "Typhon",
+    target: "提丰",
+    policy: "preferred",
+    forms: ["Typhon"],
+    occurrenceCount: 1,
+    globalIndexes: [0],
+    unmatchedForms: [],
+  }]);
+});
+
+test("book run rejects a malformed glossary before constructing a provider", async () => {
+  const manifest = sourceManifest("Typhon watched.");
+  const directory = dirname(manifest);
+  const glossaryPath = join(directory, "glossary.json");
+  writeFileSync(glossaryPath, JSON.stringify({ schema: "folioloom-glossary-1", terms: "bad" }), "utf8");
+  let providerConstructions = 0;
+  await assert.rejects(
+    main([
+      "book", "run",
+      "--manifest", manifest,
+      "--store", join(directory, "book.db"),
+      "--config", join(directory, "missing-config.yaml"),
+      "--glossary", glossaryPath,
+    ], {
+      createModel: () => {
+        providerConstructions += 1;
+        throw new Error("provider must not be constructed");
+      },
+    }),
+    /glossary\.terms must be an array/i,
+  );
+  assert.equal(providerConstructions, 0);
+});
+
+test("book run refuses to resume with a missing or changed glossary before constructing a provider", async () => {
+  const manifest = sourceManifest("Typhon watched.");
+  const directory = dirname(manifest);
+  const storePath = join(directory, "resume.db");
+  const glossaryPath = join(directory, "glossary.json");
+  writeFileSync(glossaryPath, JSON.stringify({ Typhon: "提丰" }), "utf8");
+  addRun(storePath, manifest, "run-missing-glossary", { glossaryHash: "known" });
+  addRun(storePath, manifest, "run-changed-glossary", { glossaryHash: "different" });
+  let providerConstructions = 0;
+  const dependencies = {
+    createModel: () => {
+      providerConstructions += 1;
+      throw new Error("provider must not be constructed");
+    },
+  };
+  await assert.rejects(
+    main([
+      "book", "run", "--manifest", manifest, "--store", storePath,
+      "--config", join(directory, "missing-config.yaml"), "--run", "run-missing-glossary",
+    ], dependencies),
+    /requires the same --glossary/i,
+  );
+  await assert.rejects(
+    main([
+      "book", "run", "--manifest", manifest, "--store", storePath,
+      "--config", join(directory, "missing-config.yaml"), "--run", "run-changed-glossary",
+      "--glossary", glossaryPath,
+    ], dependencies),
+    /requires the same glossary content/i,
+  );
+  assert.equal(providerConstructions, 0);
 });
 
 test("book run validates a style profile before constructing a provider", async () => {
