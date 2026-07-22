@@ -18,10 +18,10 @@ FolioLoom 是一个面向长篇小说的开源 AI 翻译引擎。它把原文完
 
 ## 当前限制
 
-- 当前主要通过命令行使用，没有统一的 V1.0 GUI；
+- 提供本地开发用 Electron 桌面 Alpha，但尚未发布可下载的 Windows 安装包或 portable ZIP；
 - V4 的本地裁决页和旧 Streamlit 页面仍保留，但不是 V1.0 主入口；
 - 已完成离线回归和真实模型的一窗口、三窗口门禁，尚未发布最新版架构的全书质量基准；
-- 配置和错误信息仍偏向开发者，尚无桌面安装包；
+- 桌面 Alpha 目前只读既有项目状态与诊断报告，不运行模型、翻译或知识库写入；
 - 示例配置以 DeepSeek 为主，其他服务需要兼容相同的聊天接口和配置语义。
 
 ## 安装
@@ -80,6 +80,20 @@ npm.cmd run folioloom -- book status `
 ```
 
 确认试译后，重复 `book run` 并移除 `--max-windows 1` 即可继续。运行器会跳过已经提交的窗口。
+
+## 本地桌面 Alpha（开发预览）
+
+桌面 Alpha 用于查看已经由上述流程初始化的项目，而不是替代原文导入或命令行翻译。它只打开现有的 `source_manifest.json`，并可选择相应的 V5 `book.db` 以显示真实运行状态。
+
+```powershell
+Set-Location translator-v5
+npm.cmd install
+npm.cmd run desktop:dev
+```
+
+打开后可查看原文长度、源语言、窗口状态，并运行不调用模型的 coverage、结构、异常和术语检查。它不会把 API Key 打包进应用，不会读取你的模型配置，也不会写入原文、`book.db`、术语库或译文；最近项目偏好仅保存在应用自己的 userData 目录。
+
+当前阶段不运行 `desktop:dist`。该命令只为未来 Windows x64 portable 构建保留配置，Alpha 既不生成也不发布 `.exe`、`.zip` 或安装包。桌面端的更完整说明见 [`translator-v5/README.md`](translator-v5/README.md)。
 
 ## 调整翻译文风
 

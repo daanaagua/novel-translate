@@ -777,7 +777,7 @@ git commit -m "feat: add folioloom desktop workbench"
 - 创建：`translator-v5/README.md`
 - 修改：`README.md:55-115`
 
-- [ ] **步骤 1：先写构建配置的文件级验证测试**
+- [x] **步骤 1：先写构建配置的文件级验证测试**
 
 在 `translator-v5/test/desktop-build-config.test.ts` 读取 package JSON、Builder YAML 和 resource JSON，不启动 Electron。断言脚本、构建目标和资源边界完整：
 
@@ -797,7 +797,7 @@ test("desktop package scripts and portable metadata stay explicit", () => {
 });
 ```
 
-- [ ] **步骤 2：运行构建配置测试，确认尚未配置桌面脚本**
+- [x] **步骤 2：运行构建配置测试，确认尚未配置桌面脚本**
 
 运行：
 
@@ -808,7 +808,7 @@ npm.cmd test -- --test-name-pattern="desktop package scripts"
 
 预期：FAIL，`desktop:dist` 未定义且 Builder 配置文件不存在。
 
-- [ ] **步骤 3：添加 Builder 依赖、portable 命令与元数据**
+- [x] **步骤 3：添加 Builder 依赖、portable 命令与元数据**
 
 以 `npm.cmd install --save-dev` 安装 Builder，并让 npm 更新 `package-lock.json`：
 
@@ -875,7 +875,7 @@ translator-v5/out/
 translator-v5/release/
 ```
 
-- [ ] **步骤 4：运行全部自动验证与人工烟雾检查**
+- [x] **步骤 4：运行自动验证**
 
 运行：
 
@@ -888,7 +888,11 @@ npm.cmd run typecheck
 npm.cmd run desktop:build
 ```
 
-预期：五个命令均 PASS，`out/main/index.js`、`out/preload/index.js` 和 `out/renderer/index.html` 存在。
+预期：五个命令均 PASS，`out/main/index.js`、`out/preload/index.mjs` 和 `out/renderer/index.html` 存在。
+
+### 人工烟雾检查（与工作台集成收尾）
+
+- [ ] 使用已完成的桌面工作台选择真实 `source_manifest.json` 与可选 `book.db`，完成下列交互验收后退出应用，不保留开发服务器或额外浏览器窗口。
 
 随后运行：
 
@@ -898,7 +902,7 @@ npm.cmd run desktop:dev
 
 人工验收：选择真实 `source_manifest.json` 后能看到原文长度和源语言；选择真实 V5 `book.db` 后能看到 run 状态；点击“运行检查”只出现 coverage/结构/术语报告；切换四个未接通工作区不会暴露写入按钮；关闭应用后再次启动会恢复最近项目或明确回到空态。完成检查后退出 Electron，不保留开发服务器或额外浏览器窗口。
 
-- [ ] **步骤 5：提交构建配置、文档与验证完成状态**
+- [x] **步骤 5：提交构建配置、文档与验证完成状态**
 
 ```powershell
 git add .gitignore translator-v5/package.json translator-v5/package-lock.json translator-v5/tsconfig.desktop.json translator-v5/electron-builder.yml translator-v5/desktop/resources/app-info.json translator-v5/test/desktop-build-config.test.ts translator-v5/README.md README.md

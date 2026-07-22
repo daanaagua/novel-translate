@@ -1,0 +1,6 @@
+{
+  "schema": "folioloom-desktop-resource-1",
+  "apiKeyPolicy": "never-packaged",
+  "projectDataPolicy": "user-selected",
+  "translationWritePolicy": "disabled-in-alpha"
+}

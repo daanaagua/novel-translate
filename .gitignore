@@ -52,4 +52,6 @@ translator-v5/node_modules/
 translator-v5/dist/
 translator-v5/.pilot/
 translator-v5/coverage/
+translator-v5/out/
+translator-v5/release/
 用于测试的模型.txt
