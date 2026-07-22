@@ -123,6 +123,20 @@ test("Japanese blocks prefer a full stop without following whitespace", () => {
   assert.equal(blocks[0]?.estimatorVersion, WEIGHTED_TOKEN_ESTIMATOR_VERSION);
 });
 
+test("embedded scene separators force a lossless block boundary even below the token cap", () => {
+  const source = "첫 번째 장면은 여기에서 끝난다.[[]]두 번째 장면은 반드시 별도 블록에서 시작한다.";
+  const blocks = buildLosslessBlocks(source, [], {
+    maxSourceTokens: 10_000,
+    sourceVersion: "ko-scene-boundary-v1",
+    languageProfile: getSourceLanguageProfile("ko"),
+  });
+
+  assert.equal(blocks.length, 2);
+  assert.equal(blocks[0]?.sourceText.endsWith("[[]]"), true);
+  assert.equal(blocks[1]?.sourceText.startsWith("두 번째"), true);
+  assert.equal(blocks.map((block) => block.sourceText).join(""), source);
+});
+
 function manifestFor(source: string, label: string): string {
   const directory = mkdtempSync(join(tmpdir(), `v5-acceptance-${label}-`));
   const hasBom = source.startsWith("\uFEFF");

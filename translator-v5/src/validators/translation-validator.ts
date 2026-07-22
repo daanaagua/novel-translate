@@ -1,6 +1,7 @@
 import type { V4Block } from "../domain/types.js";
 import { getSourceLanguageProfile } from "../language/profiles.js";
 import type { SourceLanguageProfile } from "../language/types.js";
+import { normalizeSourceSceneSeparators } from "../source/layout-separators.js";
 import type { TranslationCandidate } from "../tools/candidate-collector.js";
 import type { ValidationFailure } from "../tools/repair-tools.js";
 
@@ -16,7 +17,7 @@ export interface TranslationValidationPolicy {
 }
 
 function paragraphCount(text: string): number {
-  return text
+  return normalizeSourceSceneSeparators(text)
     .split(/(?:\r?\n)[\t ]*(?:\r?\n)+/u)
     .map((item) => item.trim())
     .filter(Boolean)
@@ -24,7 +25,18 @@ function paragraphCount(text: string): number {
 }
 
 function meaningfulLength(text: string): number {
-  return text.replace(/\s+/gu, "").length;
+  return [...text.replace(/\s+/gu, "")].length;
+}
+
+const MIN_CROSS_BLOCK_PARAGRAPH_CHARACTERS = 72;
+
+function normalizedLongParagraphs(text: string): Set<string> {
+  return new Set(text
+    .split(/(?:\r?\n)[\t ]*(?:\r?\n)+/u)
+    .map((paragraph) => paragraph.replace(/\s+/gu, "").trim())
+    .filter((paragraph) => (
+      [...paragraph].length >= MIN_CROSS_BLOCK_PARAGRAPH_CHARACTERS
+    )));
 }
 
 const SYSTEM_LEAK_PATTERNS = [
@@ -48,6 +60,59 @@ function isolatedSourceIdentifiers(sourceText: string): string[] {
 }
 
 export class TranslationValidator {
+  validateCrossBlockAlignment(
+    blocks: readonly V4Block[],
+    candidate: TranslationCandidate,
+  ): TranslationValidation {
+    const sourceParagraphs = new Map(blocks.map((block) => [
+      block.id,
+      normalizedLongParagraphs(block.sourceText),
+    ]));
+    const occurrences = new Map<string, Set<string>>();
+    for (const translation of candidate.translations) {
+      for (const paragraph of normalizedLongParagraphs(translation.text)) {
+        const blockIds = occurrences.get(paragraph) ?? new Set<string>();
+        blockIds.add(translation.blockId);
+        occurrences.set(paragraph, blockIds);
+      }
+    }
+    const overlaps = new Map<string, Set<string>>();
+    for (const blockIds of occurrences.values()) {
+      const ids = [...blockIds];
+      if (ids.length < 2) {
+        continue;
+      }
+      for (let leftIndex = 0; leftIndex < ids.length; leftIndex += 1) {
+        for (let rightIndex = leftIndex + 1; rightIndex < ids.length; rightIndex += 1) {
+          const left = ids[leftIndex] as string;
+          const right = ids[rightIndex] as string;
+          const leftSource = sourceParagraphs.get(left) ?? new Set<string>();
+          const rightSource = sourceParagraphs.get(right) ?? new Set<string>();
+          const sourceAlsoRepeats = [...leftSource].some((paragraph) =>
+            rightSource.has(paragraph));
+          if (sourceAlsoRepeats) {
+            continue;
+          }
+          const leftPeers = overlaps.get(left) ?? new Set<string>();
+          const rightPeers = overlaps.get(right) ?? new Set<string>();
+          leftPeers.add(right);
+          rightPeers.add(left);
+          overlaps.set(left, leftPeers);
+          overlaps.set(right, rightPeers);
+        }
+      }
+    }
+    const failures = [...overlaps.entries()].map(([blockId, peers]): ValidationFailure => ({
+      code: "cross_block_translation_overlap",
+      blockId,
+      message: `target repeats a long paragraph assigned to distinct block(s): ${[
+        ...peers,
+      ].sort().join(", ")}`,
+      repairable: true,
+    }));
+    return { valid: failures.length === 0, failures };
+  }
+
   validate(
     blocks: readonly V4Block[],
     candidate: TranslationCandidate,
@@ -159,9 +224,33 @@ export class TranslationValidator {
           repairable: true,
         });
       }
-      sourceLength += meaningfulLength(source.sourceText);
-      targetLength += meaningfulLength(translation.text);
+      const blockSourceLength = meaningfulLength(source.sourceText);
+      const blockTargetLength = meaningfulLength(translation.text);
+      const ratioBounds = profile.translationLengthRatioBounds;
+      if (ratioBounds !== undefined
+        && blockSourceLength >= ratioBounds.minSourceCharacters) {
+        const ratio = blockTargetLength / blockSourceLength;
+        if (ratio < ratioBounds.min) {
+          failures.push({
+            code: "abnormal_block_shortening",
+            blockId: translation.blockId,
+            message: `target/source character ratio ${ratio.toFixed(3)} is below ${ratioBounds.min.toFixed(2)} for ${profile.id}`,
+            repairable: true,
+          });
+        } else if (ratio > ratioBounds.max) {
+          failures.push({
+            code: "abnormal_block_expansion",
+            blockId: translation.blockId,
+            message: `target/source character ratio ${ratio.toFixed(3)} exceeds ${ratioBounds.max.toFixed(2)} for ${profile.id}`,
+            repairable: true,
+          });
+        }
+      }
+      sourceLength += blockSourceLength;
+      targetLength += blockTargetLength;
     }
+
+    failures.push(...this.validateCrossBlockAlignment(blocks, candidate).failures);
 
     if (sourceLength > 0 && targetLength / sourceLength < 0.15) {
       failures.push({

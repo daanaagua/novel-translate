@@ -5,7 +5,13 @@ export type SourceScript = "latin" | "cyrillic" | "kana" | "hangul" | "han" | "u
 export interface BoundaryCandidate {
   scalarOffset: number;
   weight: number;
-  kind: "paragraph" | "sentence" | "heading";
+  kind: "paragraph" | "sentence" | "heading" | "layout";
+}
+
+export interface TranslationLengthRatioBounds {
+  min: number;
+  max: number;
+  minSourceCharacters: number;
 }
 
 export interface ScriptStats {
@@ -65,6 +71,7 @@ export interface SourceLanguageProfile {
   readonly displayName: string;
   readonly locale: string;
   readonly scripts: readonly SourceScript[];
+  readonly translationLengthRatioBounds?: TranslationLengthRatioBounds;
   detectStructureHeading(line: string): StructureHeading | null;
   collectBoundaryCandidates(text: string): BoundaryCandidate[];
   collectScriptStats(text: string): ScriptStats;

@@ -346,7 +346,12 @@ function losslessBatchResponse(context: Context) {
       windowId: window.windowId,
       translations: window.blocks.map((block) => ({
         blockId: block.blockId,
-        text: `${terms.filter((term) => block.sourceText.toLocaleLowerCase()
+        text: `${[...block.blockId.slice(-8)].map((digit) => ({
+          "0": "零", "1": "一", "2": "二", "3": "三",
+          "4": "四", "5": "五", "6": "六", "7": "七",
+          "8": "八", "9": "九", a: "甲", b: "乙", c: "丙",
+          d: "丁", e: "戊", f: "己",
+        })[digit] ?? "庚").join("")}${terms.filter((term) => block.sourceText.toLocaleLowerCase()
           .includes(term.sourceForm.toLocaleLowerCase()))
           .map((term) => term.target).join("、")}${"完整译文".repeat(
             Math.max(1, Math.ceil([...block.sourceText].length / 12)),
@@ -528,7 +533,7 @@ test("two tiny logical windows use one physical model session and commit indepen
     assert.deepEqual(store.listTranslationRuns()[0]?.metadata, {
       sourceLanguageProfile: {
         id: "en",
-        version: "source-language-profile-2",
+        version: "source-language-profile-3",
         compatibilityMode: false,
       },
       sourceAnomalies: {

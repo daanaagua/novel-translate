@@ -204,6 +204,99 @@ test("batch normalizes every forbidden double-quote glyph before initial validat
   assert.equal(/["‛‟〝〞„]/u.test(result.windows[0]?.translations[0]?.text ?? ""), false);
 });
 
+test("batch converts embedded source scene markers into ordinary paragraph boundaries", async () => {
+  const sourceBlocks = [block(
+    "block-0",
+    0,
+    "A long first scene ends.[[]]A second scene begins.[[]]A third scene begins.",
+  )];
+  const sourceRequest = singleWindowRequest(sourceBlocks);
+  const faux = fauxProvider();
+  faux.setResponses([fauxAssistantMessage(fauxToolCall(
+    "finalize_translation_batch",
+    { windows: [{
+      windowId: sourceRequest.windows[0]?.windowId,
+      translations: [{ blockId: "block-0", text: "前一场景结束。[[]]后一场景开始。[]第三场景开始。" }],
+      notes: [],
+    }] },
+  ), { stopReason: "toolUse" })]);
+
+  const result = await runTranslationBatch({
+    request: sourceRequest,
+    blocks: sourceBlocks,
+    stableTerms: [],
+    snapshot: { id: "snapshot-0", revisions: [] },
+    model: faux.getModel(),
+    streamFn: faux.provider.streamSimple.bind(faux.provider),
+    budget: new BudgetLedger(),
+  });
+
+  assert.equal(result.windows[0]?.status, "completed");
+  assert.equal(
+    result.windows[0]?.translations[0]?.text,
+    "前一场景结束。\n\n后一场景开始。\n\n第三场景开始。",
+  );
+});
+
+test("batch repairs long translated paragraphs duplicated across logical windows", async () => {
+  const sourceBlocks = [
+    block("block-0", 0, "가나다라마바사".repeat(100)),
+    block("block-1", 1, "아자차카타파하".repeat(100)),
+  ];
+  const sourceRequest: PhysicalRequestPlan = {
+    requestId: "request-cross-window-overlap",
+    sourceTokens: 4,
+    windows: sourceBlocks.map((item, ordinal) => ({
+      windowId: `window-${ordinal}`,
+      ordinal,
+      chapterId: "chapter-0",
+      chapterTitle: null,
+      blockIds: [item.id],
+      globalIndexes: [ordinal],
+      sourceTokens: item.tokenCount,
+      sourceChars: item.sourceText.length,
+      oversized: false,
+    })),
+  };
+  const duplicated = "这是一段被错误复制到相邻逻辑窗口的完整中文内容".repeat(5);
+  const faux = fauxProvider();
+  faux.setResponses([
+    fauxAssistantMessage(fauxToolCall("finalize_translation_batch", {
+      windows: sourceRequest.windows.map((window, index) => ({
+        windowId: window.windowId,
+        translations: [{
+          blockId: window.blockIds[0],
+          text: `${index === 0 ? "甲" : "乙"}`.repeat(400) + `\n\n${duplicated}`,
+        }],
+        notes: [],
+      })),
+    }), { stopReason: "toolUse" }),
+    fauxAssistantMessage(fauxToolCall("submit_repaired_translation", {
+      translations: [
+        { blockId: "block-0", text: "甲".repeat(500) },
+        { blockId: "block-1", text: "乙".repeat(500) },
+      ],
+      notes: [],
+    }), { stopReason: "toolUse" }),
+  ]);
+
+  const result = await runTranslationBatch({
+    request: sourceRequest,
+    blocks: sourceBlocks,
+    stableTerms: [],
+    snapshot: { id: "snapshot-0", revisions: [] },
+    sourceLanguageProfile: getSourceLanguageProfile("ko"),
+    model: faux.getModel(),
+    streamFn: faux.provider.streamSimple.bind(faux.provider),
+    budget: new BudgetLedger(),
+  });
+
+  assert.equal(faux.state.callCount, 2);
+  assert.deepEqual(result.windows.map((window) => window.status), ["completed", "completed"]);
+  assert.equal(result.windows[0]?.translations[0]?.text, "甲".repeat(500));
+  assert.equal(result.windows[1]?.translations[0]?.text, "乙".repeat(500));
+});
+
 test("batch normalizes traditional prose before validation and preserves locked targets", async () => {
   const sourceBlocks = [block("block-0", 0, "Dragon completed the training.")];
   const sourceRequest = singleWindowRequest(sourceBlocks);

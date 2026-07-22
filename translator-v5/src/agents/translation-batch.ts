@@ -4,6 +4,7 @@ import type { Model } from "@earendil-works/pi-ai";
 import type { V4Block } from "../domain/types.js";
 import type { BudgetLedger } from "../kernel/budget.js";
 import type { LosslessBlock } from "../source/types.js";
+import { normalizeTranslatedSceneSeparators } from "../source/layout-separators.js";
 import { normalizeChineseQuoteTexts } from "../style/chinese-quote-normalization.js";
 import { simplifyChineseTranslation } from "../style/chinese-script-normalization.js";
 import type { StyleObservationSubmission } from "../style/types.js";
@@ -273,7 +274,8 @@ function normalizeWindowTypography(
   let state = { openDoubleQuoteDepth: 0 };
   return windows.map((window) => {
     const normalized = normalizeChineseQuoteTexts(
-      window.translations.map((translation) => translation.text),
+      window.translations.map((translation) =>
+        normalizeTranslatedSceneSeparators(translation.text)),
       state,
     );
     state = normalized.state;
@@ -350,16 +352,63 @@ async function validateAndRepair(
       .map((term) => ({ sourceForm: term.sourceForm, target: term.target })),
     sourceLanguageProfile: input.sourceLanguageProfile,
   };
-  const invalid = initial.windows.flatMap((window) => {
-    if (window.status === "failed") {
-      return [];
+  type InvalidWindow = {
+    window: TranslationBatchWindowResult;
+    blocks: V4Block[];
+    failures: ValidationFailure[];
+  };
+  const blocksByWindowId = new Map(input.request.windows.map((window) => [
+    window.windowId,
+    window.blockIds.map((blockId) => blockById.get(blockId))
+      .filter((block): block is V4Block => block !== undefined),
+  ]));
+  const invalidByWindowId = new Map<string, InvalidWindow>();
+  const addFailures = (
+    window: TranslationBatchWindowResult,
+    failures: readonly ValidationFailure[],
+  ): void => {
+    if (failures.length === 0) {
+      return;
     }
-    const blocks = input.request.windows.find((item) => item.windowId === window.windowId)
-      ?.blockIds.map((blockId) => blockById.get(blockId))
-      .filter((block): block is V4Block => block !== undefined) ?? [];
+    const previous = invalidByWindowId.get(window.windowId);
+    const merged = [...(previous?.failures ?? []), ...failures];
+    const unique = [...new Map(merged.map((failure) => [
+      `${failure.code}\u0000${failure.blockId ?? ""}\u0000${failure.message}`,
+      failure,
+    ])).values()];
+    invalidByWindowId.set(window.windowId, {
+      window,
+      blocks: blocksByWindowId.get(window.windowId) ?? [],
+      failures: unique,
+    });
+  };
+  for (const window of initial.windows) {
+    if (window.status === "failed") {
+      continue;
+    }
+    const blocks = blocksByWindowId.get(window.windowId) ?? [];
     const validation = validator.validate(blocks, candidateFor(window), validationPolicy);
-    return validation.valid ? [] : [{ window, blocks, failures: validation.failures }];
-  });
+    addFailures(window, validation.failures);
+  }
+  const successfulWindows = initial.windows.filter((window) => window.status !== "failed");
+  const successfulBlocks = successfulWindows.flatMap((window) =>
+    blocksByWindowId.get(window.windowId) ?? []);
+  const crossWindowValidation = validator.validateCrossBlockAlignment(
+    successfulBlocks,
+    {
+      translations: successfulWindows.flatMap((window) => window.translations),
+      notes: [],
+      repaired: false,
+    },
+  );
+  for (const failure of crossWindowValidation.failures) {
+    const window = successfulWindows.find((candidate) =>
+      candidate.translations.some((translation) => translation.blockId === failure.blockId));
+    if (window !== undefined) {
+      addFailures(window, [failure]);
+    }
+  }
+  const invalid = [...invalidByWindowId.values()];
   if (invalid.length === 0) {
     return { ...initial, repairRuns: [] };
   }
@@ -463,8 +512,37 @@ async function validateAndRepair(
       error: `validation failed after one targeted repair: ${failureMessage(validation.failures)}`,
     };
   });
+  const postRepairWindows = validatedWindows.filter((window) => window.status !== "failed");
+  const postRepairCrossValidation = validator.validateCrossBlockAlignment(
+    postRepairWindows.flatMap((window) => blocksByWindowId.get(window.windowId) ?? []),
+    {
+      translations: postRepairWindows.flatMap((window) => window.translations),
+      notes: [],
+      repaired: true,
+    },
+  );
+  const postRepairFailures = new Map<string, ValidationFailure[]>();
+  for (const failure of postRepairCrossValidation.failures) {
+    const failures = postRepairFailures.get(failure.blockId ?? "") ?? [];
+    failures.push(failure);
+    postRepairFailures.set(failure.blockId ?? "", failures);
+  }
+  const finalWindows = validatedWindows.map((window): TranslationBatchWindowResult => {
+    const failures = window.translations.flatMap((translation) =>
+      postRepairFailures.get(translation.blockId) ?? []);
+    if (failures.length === 0 || window.status === "failed") {
+      return window;
+    }
+    return {
+      ...window,
+      status: "failed",
+      translations: [],
+      memoryCandidates: [],
+      error: `cross-block validation failed after one targeted repair: ${failureMessage(failures)}`,
+    };
+  });
   return {
-    windows: validatedWindows,
+    windows: finalWindows,
     responseErrors: initial.responseErrors,
     repairRuns: [repair.run],
   };

@@ -319,6 +319,10 @@ export function buildLosslessBlocks(
   const estimatorVersionValue = estimatorVersion(estimator);
   const estimationCursor = estimatorCursorFor(estimator, text, profile);
   const cuts = candidateCuts(source, annotations, profile);
+  const layoutStarts = [...new Set(
+    cuts.filter((candidate) => candidate.kind === "layout")
+      .map((candidate) => candidate.scalarOffset),
+  )].filter((start) => start > 0);
   const sortedAnnotations = [...annotations].sort((left, right) => (
     left.start - right.start || left.end - right.end || left.id.localeCompare(right.id)
   ));
@@ -331,6 +335,7 @@ export function buildLosslessBlocks(
   const blocks: LosslessBlock[] = [];
   let cursor = 0;
   let structureIndex = 0;
+  let layoutIndex = 0;
   let candidateIndex = 0;
   let annotationIndex = 0;
   let activeStructure: StructureAnnotation | undefined;
@@ -350,10 +355,17 @@ export function buildLosslessBlocks(
     while ((structureStarts[structureIndex] ?? Number.POSITIVE_INFINITY) <= cursor) {
       structureIndex += 1;
     }
+    while ((layoutStarts[layoutIndex] ?? Number.POSITIVE_INFINITY) <= cursor) {
+      layoutIndex += 1;
+    }
     const nextStructureStart = structureStarts[structureIndex];
-    const end = nextStructureStart !== undefined && nextStructureStart <= maximumEnd
-      ? nextStructureStart
-      : preferredCandidateEnd(cuts, candidateIndex, cursor, maximumEnd) ?? maximumEnd;
+    const nextLayoutStart = layoutStarts[layoutIndex];
+    const nextHardBoundary = [nextStructureStart, nextLayoutStart]
+      .filter((value): value is number => value !== undefined && value <= maximumEnd)
+      .sort((left, right) => left - right)[0];
+    const end = nextHardBoundary
+      ?? preferredCandidateEnd(cuts, candidateIndex, cursor, maximumEnd)
+      ?? maximumEnd;
     const blockText = coordinates.slice(cursor, end);
     const sourceHash = sha256(blockText);
     while ((sortedAnnotations[annotationIndex]?.start ?? Number.POSITIVE_INFINITY) < end) {

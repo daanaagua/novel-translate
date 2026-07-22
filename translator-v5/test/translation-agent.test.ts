@@ -412,6 +412,54 @@ test("run-local stable anchors are deterministic validation constraints", () => 
   );
 });
 
+test("CJK literary blocks reject implausible per-block shortening and expansion", () => {
+  const korean = getSourceLanguageProfile("ko");
+  const source = "가나다라마바사".repeat(100);
+  const shortBlock = chapterBlock(0, source);
+  const expandedBlock = chapterBlock(1, source);
+  const validation = new TranslationValidator().validate(
+    [shortBlock, expandedBlock],
+    {
+      translations: [
+        { blockId: shortBlock.id, text: "短".repeat(350) },
+        { blockId: expandedBlock.id, text: "长".repeat(900) },
+      ],
+      notes: [],
+      repaired: false,
+    },
+    { sourceLanguageProfile: korean },
+  );
+
+  assert.ok(validation.failures.some((failure) =>
+    failure.code === "abnormal_block_shortening" && failure.blockId === shortBlock.id));
+  assert.ok(validation.failures.some((failure) =>
+    failure.code === "abnormal_block_expansion" && failure.blockId === expandedBlock.id));
+});
+
+test("validator rejects long target paragraphs copied across distinct source blocks", () => {
+  const korean = getSourceLanguageProfile("ko");
+  const first = chapterBlock(0, "가나다라마바사".repeat(100));
+  const second = chapterBlock(1, "아자차카타파하".repeat(100));
+  const duplicated = "这是一段被错误复制到相邻文本块的完整中文内容".repeat(5);
+  const validation = new TranslationValidator().validate(
+    [first, second],
+    {
+      translations: [
+        { blockId: first.id, text: `${"甲".repeat(400)}\n\n${duplicated}` },
+        { blockId: second.id, text: `${"乙".repeat(400)}\n\n${duplicated}` },
+      ],
+      notes: [],
+      repaired: false,
+    },
+    { sourceLanguageProfile: korean },
+  );
+
+  assert.ok(validation.failures.some((failure) =>
+    failure.code === "cross_block_translation_overlap" && failure.blockId === first.id));
+  assert.ok(validation.failures.some((failure) =>
+    failure.code === "cross_block_translation_overlap" && failure.blockId === second.id));
+});
+
 test("one repair pass can replace an invalid island candidate", async () => {
   const blocks = [
     chapterBlock(0, "Typhon raised his head and looked at Severian."),
