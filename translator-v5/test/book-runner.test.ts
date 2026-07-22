@@ -613,6 +613,102 @@ test("fast mode retries an invalid physical request with only the escalation run
   assert.equal(result.status.completedWindows, 2);
 });
 
+test("fast mode resolves lexical anchors on the primary runtime and leaves high effort for escalation", async () => {
+  const fixture = losslessFixture(
+    "Loukianos, whom they called Lucian the Scoffer, laughed.\n\nBOOK ONE",
+  );
+  const primary = fauxProvider();
+  const escalation = fauxProvider();
+  primary.setResponses([
+    (context) => lexicalAnchorResponse(context, {
+      sourceForms: ["Loukianos", "Lucian"],
+      proposedTarget: "卢基阿诺斯",
+      evidenceQuote: "Loukianos, whom they called Lucian the Scoffer, laughed.",
+    }),
+    losslessBatchResponse,
+    losslessBatchResponse,
+  ]);
+  const primaryModel = primary.getModel();
+  const primaryStream = primary.provider.streamSimple.bind(primary.provider);
+
+  const result = await runBook({
+    ...fixture.options,
+    model: primaryModel,
+    streamFn: primaryStream,
+    tinyWindowTokens: 1,
+    maxWindowsPerRequest: 1,
+    runtimeSet: {
+      mode: "fast",
+      primary: {
+        model: primaryModel,
+        streamFn: primaryStream,
+        effort: "off",
+        thinkingLevel: "off",
+      },
+      escalation: {
+        model: escalation.getModel(),
+        streamFn: escalation.provider.streamSimple.bind(escalation.provider),
+        effort: "high",
+        thinkingLevel: "high",
+      },
+    },
+  } as never);
+
+  assert.equal(primary.state.callCount, 3);
+  assert.equal(escalation.state.callCount, 0);
+  assert.equal(result.status.completedWindows, 2);
+});
+
+test("fast mode escalates only a failed lexical-anchor call and resumes translation on the primary runtime", async () => {
+  const fixture = losslessFixture(
+    "Loukianos, whom they called Lucian the Scoffer, laughed.\n\nBOOK ONE",
+  );
+  const primary = fauxProvider();
+  const escalation = fauxProvider();
+  primary.setResponses([
+    fauxAssistantMessage([], {
+      stopReason: "error",
+      errorMessage: "503: primary anchor unavailable",
+    }),
+    losslessBatchResponse,
+    losslessBatchResponse,
+  ]);
+  escalation.setResponses([(context) => lexicalAnchorResponse(context, {
+    sourceForms: ["Loukianos", "Lucian"],
+    proposedTarget: "卢基阿诺斯",
+    evidenceQuote: "Loukianos, whom they called Lucian the Scoffer, laughed.",
+  })]);
+  const primaryModel = primary.getModel();
+  const primaryStream = primary.provider.streamSimple.bind(primary.provider);
+
+  const result = await runBook({
+    ...fixture.options,
+    model: primaryModel,
+    streamFn: primaryStream,
+    tinyWindowTokens: 1,
+    maxWindowsPerRequest: 1,
+    runtimeSet: {
+      mode: "fast",
+      primary: {
+        model: primaryModel,
+        streamFn: primaryStream,
+        effort: "off",
+        thinkingLevel: "off",
+      },
+      escalation: {
+        model: escalation.getModel(),
+        streamFn: escalation.provider.streamSimple.bind(escalation.provider),
+        effort: "high",
+        thinkingLevel: "high",
+      },
+    },
+  } as never);
+
+  assert.equal(primary.state.callCount, 3);
+  assert.equal(escalation.state.callCount, 1);
+  assert.equal(result.status.completedWindows, 2);
+});
+
 test("lossless runner resumes the same isolated run and promotes the remaining ordinal", async () => {
   const fixture = losslessFixture("EDGEWOOD\n\nBOOK ONE");
   fixture.faux.setResponses([fauxAssistantMessage(fauxToolCall(

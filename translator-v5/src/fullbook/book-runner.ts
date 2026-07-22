@@ -1320,16 +1320,38 @@ async function runLosslessBook(
           waveAnchorSnapshot = parseWaveAnchorSnapshot(cached, inputHash);
         } else {
           throwIfAborted(options.signal);
-          const outcome: LexicalAnchorOutcome = await new LexicalAnchorer(new PiRuntime()).run({
-            candidates: anchorCandidates,
-            stableTerms: anchorStableTerms,
-            model: runtimeSet.escalation.model,
-            streamFn: runtimeSet.escalation.streamFn,
-            budget: anchorBudget,
-            sourceLanguageProfile: context.languageProfile,
-            signal: options.signal,
-            deadlineMs: options.hardDeadlineMs,
-          });
+          const anchorRuntime = runtimeSet.mode === "fast"
+            ? runtimeSet.primary
+            : runtimeSet.escalation;
+          const resolveAnchors = (runtime: TranslationRuntime) =>
+            new LexicalAnchorer(new PiRuntime()).run({
+              candidates: anchorCandidates,
+              stableTerms: anchorStableTerms,
+              model: runtime.model,
+              streamFn: runtime.streamFn,
+              budget: anchorBudget,
+              sourceLanguageProfile: context.languageProfile,
+              signal: options.signal,
+              deadlineMs: options.hardDeadlineMs,
+            });
+          let outcome: LexicalAnchorOutcome;
+          try {
+            outcome = await resolveAnchors(anchorRuntime);
+          } catch (error) {
+            throwIfAborted(options.signal);
+            const escalationIsDistinct = anchorRuntime.model !== runtimeSet.escalation.model
+              || anchorRuntime.streamFn !== runtimeSet.escalation.streamFn
+              || anchorRuntime.effort !== runtimeSet.escalation.effort
+              || anchorRuntime.thinkingLevel !== runtimeSet.escalation.thinkingLevel;
+            const cannotBenefitFromEscalation = error instanceof ModelProviderError
+              && (error.kind === "auth" || error.kind === "quota");
+            if (runtimeSet.mode !== "fast"
+              || !escalationIsDistinct
+              || cannotBenefitFromEscalation) {
+              throw error;
+            }
+            outcome = await resolveAnchors(runtimeSet.escalation);
+          }
           waveAnchorSnapshot = {
             schemaVersion: "v5-wave-anchor-1",
             inputHash,
