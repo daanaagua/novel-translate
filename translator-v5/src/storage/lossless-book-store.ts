@@ -266,6 +266,8 @@ export interface LosslessAuditState {
   snapshots: LosslessAuditSnapshot[];
 }
 
+type LosslessStoreOpenMode = "read-write" | "read-only";
+
 interface SourceVersionRow {
   source_version: string;
   canonical_sha256: string;
@@ -438,11 +440,20 @@ export class LosslessBookStore {
   readonly #database: DatabaseSync;
   readonly #faultInjector: FaultInjector | undefined;
 
-  constructor(path: string, faultInjector?: FaultInjector) {
+  constructor(
+    path: string,
+    faultInjector?: FaultInjector,
+    mode: LosslessStoreOpenMode = "read-write",
+  ) {
     const absolute = resolve(requireNonempty(path, "database path"));
     this.#faultInjector = faultInjector;
-    mkdirSync(dirname(absolute), { recursive: true });
-    this.#database = new DatabaseSync(absolute);
+    if (mode === "read-write") {
+      mkdirSync(dirname(absolute), { recursive: true });
+    }
+    this.#database = new DatabaseSync(
+      absolute,
+      mode === "read-only" ? { readOnly: true } : {},
+    );
     try {
       this.#database.exec("PRAGMA foreign_keys=ON");
       const userVersion = one<{ user_version: number }>(
@@ -454,15 +465,24 @@ export class LosslessBookStore {
         ORDER BY name
       `)).map((row) => row.name);
       if (tables.length === 0 && userVersion === 0) {
+        if (mode === "read-only") {
+          throw new Error("lossless book store does not exist");
+        }
         this.#initializeSchema();
       } else {
         this.#verifyExistingSchema(userVersion, tables);
       }
-      this.#database.exec("PRAGMA journal_mode=WAL");
+      if (mode === "read-write") {
+        this.#database.exec("PRAGMA journal_mode=WAL");
+      }
     } catch (error) {
       this.#database.close();
       throw error;
     }
+  }
+
+  static openReadOnly(path: string): LosslessBookStore {
+    return new LosslessBookStore(path, undefined, "read-only");
   }
 
   databaseSettings(): { foreignKeys: boolean; journalMode: string } {

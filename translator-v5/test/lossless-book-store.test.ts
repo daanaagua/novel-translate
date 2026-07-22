@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { mkdtempSync } from "node:fs";
+import { existsSync, mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
@@ -223,6 +223,42 @@ test("schema v2 enables foreign keys and WAL and creates every audit table", () 
     assert.ok(names.includes(name), `missing table ${name}`);
   }
   database.close();
+});
+
+test("read-only store refuses a missing path without creating a database", () => {
+  const path = fixturePath();
+  assert.equal(existsSync(path), false);
+  assert.throws(
+    () => LosslessBookStore.openReadOnly(path),
+    /unable to open database file|no such file/i,
+  );
+  assert.equal(existsSync(path), false);
+});
+
+test("read-only store preserves schema and exposes run status", () => {
+  const path = fixturePath();
+  const writable = new LosslessBookStore(path);
+  const runId = initialize(writable);
+  writable.close();
+  const before = databaseShape(path);
+
+  const readOnly = LosslessBookStore.openReadOnly(path);
+  assert.equal(readOnly.listTranslationRuns()[0]?.runId, runId);
+  assert.equal(readOnly.statusSummary(runId).totalWindows, 1);
+  readOnly.close();
+
+  assert.deepEqual(databaseShape(path), before);
+});
+
+test("read-only store rejects mutations", () => {
+  const path = fixturePath();
+  const writable = new LosslessBookStore(path);
+  const runId = initialize(writable);
+  writable.close();
+
+  const readOnly = LosslessBookStore.openReadOnly(path);
+  assert.throws(() => readOnly.claimWindow(runId, "window-0"), /readonly|read-only/i);
+  readOnly.close();
 });
 
 test("schema v2 refuses to migrate a legacy BookStore database in place", () => {

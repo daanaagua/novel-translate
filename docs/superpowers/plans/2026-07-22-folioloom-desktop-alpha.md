@@ -64,7 +64,7 @@ translator-v5/
 - 修改：`translator-v5/src/storage/lossless-book-store.ts:437-466`
 - 修改：`translator-v5/test/lossless-book-store.test.ts:1-230`
 
-- [ ] **步骤 1：先写只读打开的失败测试**
+- [x] **步骤 1：先写只读打开的失败测试**
 
 在 `lossless-book-store.test.ts` 的 schema 测试后加入以下三个测试，并把 `existsSync` 加入现有 `node:fs` import。第一项确保不存在的路径不会被创建；第二项用已初始化数据库验证查询仍可用且 journal mode 未被改写；第三项验证写方法在只读连接上失败。
 
@@ -103,7 +103,7 @@ test("read-only store rejects mutations", () => {
 });
 ```
 
-- [ ] **步骤 2：运行新测试，确认 API 尚不存在**
+- [x] **步骤 2：运行新测试，确认 API 尚不存在**
 
 运行：
 
@@ -114,7 +114,7 @@ npm.cmd test -- --test-name-pattern="read-only store"
 
 预期：FAIL，报错包含 `LosslessBookStore.openReadOnly is not a function`。
 
-- [ ] **步骤 3：将构造逻辑拆为读写和只读两种明确模式**
+- [x] **步骤 3：将构造逻辑拆为读写和只读两种明确模式**
 
 保留公共构造器的默认读写行为，新增第三个内部模式参数与静态工厂。读写模式才允许 `mkdirSync`、空数据库 schema 初始化以及 `PRAGMA journal_mode=WAL`；只读模式直接以 `DatabaseSync(absolute, { readOnly: true })` 打开现有文件，验证现有 schema，但不写 WAL PRAGMA。两种模式均设置连接级 `foreign_keys=ON`；如果 SQLite 拒绝该 PRAGMA，关闭连接并重新抛出错误。
 
@@ -168,7 +168,7 @@ export class LosslessBookStore {
 
 该模式参数只由 `openReadOnly()` 传入；现有 `new LosslessBookStore(path, faultInjector)` 调用维持编译兼容。所有 GUI 代码只能调用静态工厂，不可传入第三参数。
 
-- [ ] **步骤 4：运行定向测试与原有 schema 测试**
+- [x] **步骤 4：运行定向测试与原有 schema 测试**
 
 运行：
 
@@ -180,7 +180,7 @@ npm.cmd run typecheck
 
 预期：所有命名测试 PASS，原有 `schema v2 enables foreign keys and WAL` 仍看到 `journalMode: "wal"`。
 
-- [ ] **步骤 5：提交只读存储改动**
+- [x] **步骤 5：提交只读存储改动**
 
 ```powershell
 git add translator-v5/src/storage/lossless-book-store.ts translator-v5/test/lossless-book-store.test.ts
