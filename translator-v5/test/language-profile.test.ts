@@ -73,6 +73,23 @@ test("Japanese and Korean profiles expose headings, sentence boundaries, and bou
   assert.ok(koreanCandidates.length <= 24);
 });
 
+test("structure annotation requires layout evidence for ambiguous Japanese numeral headings", () => {
+  const japanese = getSourceLanguageProfile("ja");
+  const inline = annotateStructure(
+    ["彼は一とだけ答えた。", "一", "それから歩き去った。"].join("\n"),
+    "source-ja-inline-number",
+    japanese,
+  );
+  const isolated = annotateStructure(
+    ["前の節。", "", "　一", "", "次の節。"].join("\n"),
+    "source-ja-isolated-number",
+    japanese,
+  );
+
+  assert.equal(inline.length, 0);
+  assert.deepEqual(isolated.map((annotation) => annotation.title), ["一"]);
+});
+
 test("Korean boundary collection does not repeatedly rescan UTF-16 prefixes", () => {
   const source = new String("\uac00\n\n".repeat(512));
   let sliceCalls = 0;

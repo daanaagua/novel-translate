@@ -5,6 +5,17 @@ import type { SourceLanguageProfile } from "../language/types.js";
 import type { SourceInput, StructureAnnotation, StructureKind } from "./types.js";
 import { coordinatesFor, sourceTextFor } from "./types.js";
 
+const AMBIGUOUS_JAPANESE_NUMERAL_HEADING = /^(?:[一二三四五六七八九十百千〇零]+|\d{1,4})$/u;
+
+function hasStrongLayoutEvidence(
+  lines: readonly RegExpMatchArray[],
+  index: number,
+): boolean {
+  const previousIsBlank = index === 0 || lines[index - 1]?.[0].trim().length === 0;
+  const nextIsBlank = index === lines.length - 1 || lines[index + 1]?.[0].trim().length === 0;
+  return previousIsBlank && nextIsBlank;
+}
+
 function annotationId(
   sourceVersion: string,
   kind: StructureKind,
@@ -28,12 +39,18 @@ export function annotateStructure(
   const text = sourceTextFor(source);
   const coordinates = coordinatesFor(source);
   const annotations: StructureAnnotation[] = [];
-  for (const match of text.matchAll(/^.*$/gmu)) {
+  const lines = [...text.matchAll(/^.*$/gmu)];
+  for (const [lineIndex, match] of lines.entries()) {
     if (match.index === undefined || match[0].length === 0) {
       continue;
     }
     const heading = profile.detectStructureHeading(match[0]);
     if (heading === null) {
+      continue;
+    }
+    if (profile.id === "ja"
+      && AMBIGUOUS_JAPANESE_NUMERAL_HEADING.test(match[0].trim())
+      && !hasStrongLayoutEvidence(lines, lineIndex)) {
       continue;
     }
     const start = coordinates.toScalarIndex(match.index);
