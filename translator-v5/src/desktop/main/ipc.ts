@@ -46,6 +46,7 @@ export interface DesktopIpcDependencies {
   ipcMain: DesktopIpcMain;
   dialog: DesktopDialog;
   projectService: DesktopIpcProjectService;
+  isTrustedEvent(event: unknown): boolean;
   getCurrentRequest(): DesktopProjectRequest | undefined;
   setCurrentRequest(request: DesktopProjectRequest): void;
 }
@@ -67,6 +68,10 @@ function canceledSelection(): DesktopResult<DesktopProjectSnapshot> {
 
 function invalidSelection(message: string): DesktopResult<DesktopProjectSnapshot> {
   return failure("DESKTOP_INPUT_INVALID", message);
+}
+
+function untrustedEvent(): DesktopResult<DesktopProjectSnapshot> {
+  return failure("DESKTOP_UNTRUSTED_IPC", "IPC caller is not the trusted FolioLoom renderer");
 }
 
 async function resultFrom<T>(
@@ -92,6 +97,19 @@ async function chooseSingleFile(
 export function registerDesktopIpc(dependencies: DesktopIpcDependencies): void {
   let activeSnapshot: DesktopProjectSnapshot | undefined;
 
+  const handleTrusted = (channel: DesktopIpcChannel, handler: DesktopIpcHandler): void => {
+    dependencies.ipcMain.handle(channel, async (event, ...args) => {
+      try {
+        if (!dependencies.isTrustedEvent(event)) {
+          return untrustedEvent();
+        }
+      } catch {
+        return untrustedEvent();
+      }
+      return handler(event, ...args);
+    });
+  };
+
   const snapshot = (request: DesktopProjectRequest): DesktopResult<DesktopProjectSnapshot> => {
     const result = dependencies.projectService.snapshot(request);
     if (result.ok) {
@@ -100,7 +118,7 @@ export function registerDesktopIpc(dependencies: DesktopIpcDependencies): void {
     return result;
   };
 
-  dependencies.ipcMain.handle("folioloom:choose-project", async () => resultFrom(async () => {
+  handleTrusted("folioloom:choose-project", async () => resultFrom(async () => {
     const manifestPath = await chooseSingleFile(dependencies.dialog, manifestFilter);
     if (manifestPath === undefined) {
       return canceledSelection();
@@ -116,7 +134,7 @@ export function registerDesktopIpc(dependencies: DesktopIpcDependencies): void {
     return result;
   }));
 
-  dependencies.ipcMain.handle("folioloom:choose-store", async () => resultFrom(async () => {
+  handleTrusted("folioloom:choose-store", async () => resultFrom(async () => {
     const current = dependencies.getCurrentRequest();
     if (current === undefined) {
       return noOpenProject();
@@ -133,12 +151,12 @@ export function registerDesktopIpc(dependencies: DesktopIpcDependencies): void {
     return result;
   }));
 
-  dependencies.ipcMain.handle("folioloom:refresh-project", async () => resultFrom(() => {
+  handleTrusted("folioloom:refresh-project", async () => resultFrom(() => {
     const current = dependencies.getCurrentRequest();
     return current === undefined ? noOpenProject() : snapshot(current);
   }));
 
-  dependencies.ipcMain.handle("folioloom:select-run", async (_event, runId) => resultFrom(() => {
+  handleTrusted("folioloom:select-run", async (_event, runId) => resultFrom(() => {
     const current = dependencies.getCurrentRequest();
     if (current === undefined || activeSnapshot === undefined) {
       return noOpenProject();
@@ -154,7 +172,7 @@ export function registerDesktopIpc(dependencies: DesktopIpcDependencies): void {
     return result;
   }));
 
-  dependencies.ipcMain.handle("folioloom:doctor", async () => resultFrom(() => {
+  handleTrusted("folioloom:doctor", async () => resultFrom(() => {
     const current = dependencies.getCurrentRequest();
     if (current === undefined) {
       return failure("DESKTOP_NO_PROJECT", "open an initialized project first");

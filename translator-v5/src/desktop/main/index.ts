@@ -8,10 +8,23 @@ import type { DesktopProjectRequest } from "../contracts.js";
 import { DesktopPreferences } from "../desktop-preferences.js";
 import { DesktopProjectService } from "../desktop-project-service.js";
 import { registerDesktopIpc } from "./ipc.js";
+import {
+  installNavigationGuards,
+  isTrustedDesktopIpcEvent,
+  preloadEntryPath,
+  resolveDesktopRendererTarget,
+} from "./runtime.js";
 
 const currentDirectory = dirname(fileURLToPath(import.meta.url));
+const trustedRendererUrls = new Map<number, string>();
 
 function createWindow(): BrowserWindow {
+  const rendererFilePath = join(currentDirectory, "../renderer/index.html");
+  const rendererTarget = resolveDesktopRendererTarget({
+    isPackaged: app.isPackaged,
+    rendererFilePath,
+    rendererUrl: process.env.ELECTRON_RENDERER_URL,
+  });
   const window = new BrowserWindow({
     width: 1440,
     height: 920,
@@ -20,17 +33,22 @@ function createWindow(): BrowserWindow {
     backgroundColor: "#101318",
     title: "FolioLoom",
     webPreferences: {
-      preload: join(currentDirectory, "../preload/index.js"),
+      preload: preloadEntryPath(currentDirectory),
       contextIsolation: true,
       nodeIntegration: false,
       sandbox: true,
     },
   });
-  const rendererUrl = process.env.ELECTRON_RENDERER_URL;
-  if (rendererUrl === undefined) {
-    void window.loadFile(join(currentDirectory, "../renderer/index.html"));
+  const webContentsId = window.webContents.id;
+  trustedRendererUrls.set(webContentsId, rendererTarget.expectedUrl);
+  window.once("closed", () => {
+    trustedRendererUrls.delete(webContentsId);
+  });
+  installNavigationGuards(window.webContents);
+  if (rendererTarget.kind === "development") {
+    void window.loadURL(rendererTarget.url);
   } else {
-    void window.loadURL(rendererUrl);
+    void window.loadFile(rendererTarget.filePath);
   }
   return window;
 }
@@ -65,6 +83,9 @@ void app.whenReady().then(() => {
       },
     },
     projectService,
+    isTrustedEvent(event) {
+      return isTrustedDesktopIpcEvent(event, trustedRendererUrls);
+    },
     getCurrentRequest() {
       return currentRequest;
     },

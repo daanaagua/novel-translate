@@ -439,9 +439,14 @@ git commit -m "feat: add read-only desktop project service"
 - 创建：`translator-v5/vitest.desktop.config.ts`
 - 创建：`translator-v5/src/desktop/main/index.ts`
 - 创建：`translator-v5/src/desktop/main/ipc.ts`
+- 创建：`translator-v5/src/desktop/main/runtime.ts`
 - 创建：`translator-v5/src/desktop/preload/index.ts`
 - 创建：`translator-v5/src/desktop/preload/folioloom-api.d.ts`
+- 创建：`translator-v5/src/desktop/renderer/index.html`（仅安全窗口入口；任务 4 扩展内容）
 - 创建：`translator-v5/test/desktop-ipc.test.ts`
+- 创建：`translator-v5/test/desktop-main-security.test.ts`
+- 创建：`translator-v5/test/desktop-toolchain.test.ts`
+- 创建：`translator-v5/test/verify-desktop-build.test.ts`
 
 - [x] **步骤 1：安装桌面运行时与测试基础设施**
 
@@ -461,9 +466,9 @@ npm.cmd install react@19.2.8 react-dom@19.2.8
 {
   "scripts": {
     "desktop:dev": "electron-vite dev",
-    "desktop:build": "electron-vite build",
+    "desktop:build": "electron-vite build && node --test --import tsx test/verify-desktop-build.test.ts",
     "desktop:typecheck": "tsc --noEmit -p tsconfig.desktop.json",
-    "desktop:test": "vitest run --config vitest.desktop.config.ts"
+    "desktop:test": "node --test --import tsx test/desktop-*.test.ts && vitest run --config vitest.desktop.config.ts --passWithNoTests"
   }
 }
 ```
@@ -551,6 +556,7 @@ export default defineConfig({
   renderer: {
     root: resolve(root, "src/desktop/renderer"),
     plugins: [react()],
+    build: { rollupOptions: { input: resolve(root, "src/desktop/renderer/index.html") } },
   },
 });
 ```
@@ -566,7 +572,7 @@ const window = new BrowserWindow({
   backgroundColor: "#101318",
   title: "FolioLoom",
   webPreferences: {
-    preload: join(__dirname, "../preload/index.js"),
+    preload: preloadEntryPath(currentDirectory),
     contextIsolation: true,
     nodeIntegration: false,
     sandbox: true,
@@ -574,7 +580,7 @@ const window = new BrowserWindow({
 });
 ```
 
-开发模式只加载 electron-vite 注入的 `ELECTRON_RENDERER_URL`；打包模式只加载 `../renderer/index.html`。应用的当前 `DesktopProjectRequest` 放在主进程闭包中；`DesktopPreferences` 的位置为 `join(app.getPath("userData"), "desktop-preferences.json")`。启动时若最近 manifest 已不存在，清除偏好并显示空项目，而不是向 renderer 发出路径错误。
+`preloadEntryPath()` 固定指向 electron-vite 实际产出的 `../preload/index.mjs`，并由构建后断言验证文件存在。仅当 `app.isPackaged === false` 且 `ELECTRON_RENDERER_URL` 是无凭据的 loopback `http://localhost`、`127.0.0.1` 或 `[::1]` URL 时才加载开发 renderer；所有其他情况（包括打包环境中的任意环境变量）只加载本地 `../renderer/index.html`。每个窗口在 `will-navigate` 时阻止导航、拒绝全部 `window.open`，并将自身 `webContents.id` 与目标 renderer URL 登记为可信 IPC 来源。应用的当前 `DesktopProjectRequest` 放在主进程闭包中；`DesktopPreferences` 的位置为 `join(app.getPath("userData"), "desktop-preferences.json")`。启动时若最近 manifest 已不存在，清除偏好并显示空项目，而不是向 renderer 发出路径错误。
 
 `ipc.ts` 的对话框过滤器必须是：
 
@@ -595,7 +601,7 @@ export interface FolioLoomDesktopApi {
 }
 ```
 
-预加载层逐个包装 `ipcRenderer.invoke()`，不导出 `ipcRenderer`、`fs`、`process`、`require` 或泛用 `invoke(channel, payload)`。`folioloom-api.d.ts` 将该接口附到 `Window`：
+`registerDesktopIpc()` 的每个固定 handler 先检查调用 event：sender 必须是已登记窗口、`senderFrame.parent === null`（主 frame）且 URL 与该窗口的目标 renderer 一致；否则在触及项目服务或对话框前返回 `DESKTOP_UNTRUSTED_IPC`。预加载层逐个包装 `ipcRenderer.invoke()`，不导出 `ipcRenderer`、`fs`、`process`、`require` 或泛用 `invoke(channel, payload)`。`folioloom-api.d.ts` 将该接口附到 `Window`：
 
 ```ts
 declare global {
@@ -613,24 +619,32 @@ export {};
 ```powershell
 Set-Location translator-v5
 npm.cmd test -- --test-name-pattern="IPC only registers|select-run accepts|choose-store rejects|snapshot opens|read-only store"
+npm.cmd run desktop:test
 npm.cmd run typecheck
 npm.cmd run desktop:typecheck
+npm.cmd run desktop:build
 ```
 
-预期：PASS；测试中不存在可调用的任意 channel，也没有 renderer 端文件系统入口。
+预期：PASS；`desktop:test` 先运行 `test/desktop-*.test.ts`，再运行可为空的 renderer Vitest 套件；测试中不存在可调用的任意 channel，也没有 renderer 端文件系统入口；`desktop:build` 实际生成 `out/preload/index.mjs` 与 `out/renderer/index.html`。
 
 - [x] **步骤 6：提交 Electron 安全边界与基础工具链**
 
 ```powershell
-git add translator-v5/package.json translator-v5/package-lock.json translator-v5/electron.vite.config.ts translator-v5/tsconfig.desktop.json translator-v5/vitest.desktop.config.ts translator-v5/src/desktop/main translator-v5/src/desktop/preload translator-v5/test/desktop-ipc.test.ts
+git add translator-v5/package.json translator-v5/package-lock.json translator-v5/electron.vite.config.ts translator-v5/tsconfig.desktop.json translator-v5/vitest.desktop.config.ts translator-v5/src/desktop/main translator-v5/src/desktop/preload translator-v5/src/desktop/renderer/index.html translator-v5/test/desktop-ipc.test.ts translator-v5/test/desktop-main-security.test.ts translator-v5/test/desktop-toolchain.test.ts translator-v5/test/verify-desktop-build.test.ts
 git commit -m "feat: add secure desktop IPC boundary"
 ```
+
+### 审查修复（2026-07-22）
+
+- [x] 复现并锁定 electron-vite 产出 `.mjs` preload、无 renderer test suite 退出 1，以及缺少显式 renderer HTML input 的构建失败。
+- [x] 以纯函数和注入式 IPC 测试覆盖 preload 路径、打包环境远程 URL、远程导航、`window.open`、外部 IPC event 与构建产物。
+- [x] 提交审查修复。
 
 ## 任务 4：实现“翻译中”文稿工作台与可验证的渲染状态
 
 **文件：**
 
-- 创建：`translator-v5/src/desktop/renderer/index.html`
+- 修改：`translator-v5/src/desktop/renderer/index.html`
 - 创建：`translator-v5/src/desktop/renderer/src/main.tsx`
 - 创建：`translator-v5/src/desktop/renderer/src/types.ts`
 - 创建：`translator-v5/src/desktop/renderer/src/App.tsx`
@@ -771,8 +785,8 @@ git commit -m "feat: add folioloom desktop workbench"
 test("desktop package scripts and portable metadata stay explicit", () => {
   const pkg = JSON.parse(readFileSync(packagePath, "utf8")) as { scripts: Record<string, string> };
   assert.equal(pkg.scripts["desktop:dev"], "electron-vite dev");
-  assert.equal(pkg.scripts["desktop:build"], "electron-vite build");
-  assert.equal(pkg.scripts["desktop:test"], "vitest run --config vitest.desktop.config.ts");
+  assert.equal(pkg.scripts["desktop:build"], "electron-vite build && node --test --import tsx test/verify-desktop-build.test.ts");
+  assert.equal(pkg.scripts["desktop:test"], "node --test --import tsx test/desktop-*.test.ts && vitest run --config vitest.desktop.config.ts --passWithNoTests");
   assert.equal(pkg.scripts["desktop:dist"], "npm run desktop:build && electron-builder --win portable --x64");
   const builder = readFileSync(builderPath, "utf8");
   assert.match(builder, /target:\s*portable/);

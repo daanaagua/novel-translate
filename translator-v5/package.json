@@ -11,9 +11,9 @@
     "pilot": "tsx src/cli.ts",
     "book": "tsx src/cli.ts book",
     "desktop:dev": "electron-vite dev",
-    "desktop:build": "electron-vite build",
+    "desktop:build": "electron-vite build && node --test --import tsx test/verify-desktop-build.test.ts",
     "desktop:typecheck": "tsc --noEmit -p tsconfig.desktop.json",
-    "desktop:test": "vitest run --config vitest.desktop.config.ts"
+    "desktop:test": "node --test --import tsx test/desktop-*.test.ts && vitest run --config vitest.desktop.config.ts --passWithNoTests"
   },
   "dependencies": {
     "@earendil-works/pi-agent-core": "0.80.10",

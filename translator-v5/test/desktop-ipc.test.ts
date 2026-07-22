@@ -76,6 +76,8 @@ interface IpcFixture {
   directory: string;
   textPath: string;
   handlers: Map<string, DesktopIpcHandler>;
+  trustedEvent: unknown;
+  snapshotCalls: number;
 }
 
 function registerFixtureHandlers(options: IpcFixtureOptions = {}): IpcFixture {
@@ -84,6 +86,11 @@ function registerFixtureHandlers(options: IpcFixtureOptions = {}): IpcFixture {
   const textPath = join(directory, "not-a-store.txt");
   const activeRunIds = options.activeRunIds ?? [];
   const handlers = new Map<string, DesktopIpcHandler>();
+  const trustedEvent = {
+    sender: { id: 7 },
+    senderFrame: { url: "file:///folioloom/index.html", parent: null },
+  };
+  let snapshotCalls = 0;
   let currentRequest: DesktopProjectRequest | undefined = { manifestPath };
 
   const dependencies: DesktopIpcDependencies = {
@@ -109,6 +116,7 @@ function registerFixtureHandlers(options: IpcFixtureOptions = {}): IpcFixture {
     },
     projectService: {
       snapshot(request) {
+        snapshotCalls += 1;
         if (request.storePath === directory || request.storePath === textPath) {
           return fail("DESKTOP_INPUT_INVALID", "storePath must identify a .db file");
         }
@@ -118,6 +126,9 @@ function registerFixtureHandlers(options: IpcFixtureOptions = {}): IpcFixture {
         return ok(EMPTY_DOCTOR_REPORT);
       },
     },
+    isTrustedEvent(event) {
+      return event === trustedEvent;
+    },
     getCurrentRequest() {
       return currentRequest;
     },
@@ -126,7 +137,15 @@ function registerFixtureHandlers(options: IpcFixtureOptions = {}): IpcFixture {
     },
   };
   registerDesktopIpc(dependencies);
-  return { directory, textPath, handlers };
+  return {
+    directory,
+    textPath,
+    handlers,
+    trustedEvent,
+    get snapshotCalls() {
+      return snapshotCalls;
+    },
+  };
 }
 
 function handler(fixture: IpcFixture, channel: string): DesktopIpcHandler {
@@ -155,11 +174,11 @@ test("IPC only registers the desktop allowlist", () => {
 test("select-run accepts only a run id from the active snapshot", async () => {
   const fixture = registerFixtureHandlers({ activeRunIds: ["run-a"] });
   try {
-    await handler(fixture, "folioloom:refresh-project")({});
-    const selected = await handler(fixture, "folioloom:select-run")({}, "run-a") as DesktopResult<DesktopProjectSnapshot>;
+    await handler(fixture, "folioloom:refresh-project")(fixture.trustedEvent);
+    const selected = await handler(fixture, "folioloom:select-run")(fixture.trustedEvent, "run-a") as DesktopResult<DesktopProjectSnapshot>;
     assert.equal(selected.ok, true);
 
-    const rejected = await handler(fixture, "folioloom:select-run")({}, "..\\outside") as DesktopResult<DesktopProjectSnapshot>;
+    const rejected = await handler(fixture, "folioloom:select-run")(fixture.trustedEvent, "..\\outside") as DesktopResult<DesktopProjectSnapshot>;
     assert.equal(rejected.ok, false);
   } finally {
     rmSync(fixture.directory, { recursive: true, force: true });
@@ -169,7 +188,7 @@ test("select-run accepts only a run id from the active snapshot", async () => {
 test("choose-store rejects a directory and a non-db selection", async () => {
   const directoryFixture = registerFixtureHandlers({ pickedStore: "directory" });
   try {
-    const directoryResult = await handler(directoryFixture, "folioloom:choose-store")({}) as DesktopResult<DesktopProjectSnapshot>;
+    const directoryResult = await handler(directoryFixture, "folioloom:choose-store")(directoryFixture.trustedEvent) as DesktopResult<DesktopProjectSnapshot>;
     assert.equal(directoryResult.ok, false);
   } finally {
     rmSync(directoryFixture.directory, { recursive: true, force: true });
@@ -177,9 +196,26 @@ test("choose-store rejects a directory and a non-db selection", async () => {
 
   const textFixture = registerFixtureHandlers({ pickedStore: "text" });
   try {
-    const textResult = await handler(textFixture, "folioloom:choose-store")({}) as DesktopResult<DesktopProjectSnapshot>;
+    const textResult = await handler(textFixture, "folioloom:choose-store")(textFixture.trustedEvent) as DesktopResult<DesktopProjectSnapshot>;
     assert.equal(textResult.ok, false);
   } finally {
     rmSync(textFixture.directory, { recursive: true, force: true });
+  }
+});
+
+test("IPC rejects a foreign renderer event before it reads project state", async () => {
+  const fixture = registerFixtureHandlers();
+  try {
+    const result = await handler(fixture, "folioloom:refresh-project")({
+      sender: { id: 999 },
+      senderFrame: { url: "https://attacker.example/", parent: null },
+    }) as DesktopResult<DesktopProjectSnapshot>;
+    assert.equal(result.ok, false);
+    if (!result.ok) {
+      assert.equal(result.error.code, "DESKTOP_UNTRUSTED_IPC");
+    }
+    assert.equal(fixture.snapshotCalls, 0);
+  } finally {
+    rmSync(fixture.directory, { recursive: true, force: true });
   }
 });
