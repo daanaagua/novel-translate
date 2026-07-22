@@ -1,0 +1,237 @@
+import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import test from "node:test";
+
+import {
+  fauxAssistantMessage,
+  fauxProvider,
+  fauxToolCall,
+  type Context,
+} from "@earendil-works/pi-ai";
+
+import {
+  DesktopTrialError,
+  DesktopTrialService,
+  type DesktopTrialRuntimeResolver,
+  type DesktopTrialServiceOptions,
+} from "../src/desktop/desktop-trial-service.js";
+import { runBook, type LosslessBookRunOptions } from "../src/fullbook/book-runner.js";
+import { scalarLength } from "../src/source/types.js";
+
+function fixture(source = "The bell rings above the empty court."): {
+  directory: string;
+  projectDirectory: string;
+  manifestPath: string;
+} {
+  const directory = mkdtempSync(join(tmpdir(), "folioloom-desktop-trial-"));
+  const projectDirectory = join(directory, "project");
+  const sourceDirectory = join(projectDirectory, "source");
+  const rawPath = join(sourceDirectory, "original.txt");
+  const canonicalPath = join(sourceDirectory, "source.txt");
+  const manifestPath = join(projectDirectory, "source_manifest.json");
+  mkdirSync(sourceDirectory, { recursive: true });
+  const raw = Buffer.from(source, "utf8");
+  const hash = createHash("sha256").update(raw).digest("hex");
+  writeFileSync(rawPath, raw);
+  writeFileSync(canonicalPath, raw);
+  writeFileSync(manifestPath, JSON.stringify({
+    schema_version: "v5-source-ledger-1",
+    coordinate_unit: "unicode_scalar",
+    raw_path: "source/original.txt",
+    raw_size: raw.length,
+    raw_sha256: hash,
+    source_format: ".txt",
+    encoding: "utf-8",
+    extractor: "plain-text-v1",
+    sourceLanguage: "en",
+    canonical_path: "source/source.txt",
+    canonical_chars: scalarLength(source),
+    canonical_sha256: hash,
+    canonical_segments: [{
+      canonical_start: 0,
+      canonical_end: scalarLength(source),
+      origin_kind: "decoded_bytes",
+      origin_ref: "source/original.txt",
+      raw_start: 0,
+      raw_end: raw.length,
+      transformation: "decode+newline-normalize",
+    }],
+    excluded_raw_ranges: [],
+  }), "utf8");
+  return { directory, projectDirectory, manifestPath };
+}
+
+function userText(context: Context): string {
+  const message = context.messages.findLast((item) => item.role === "user");
+  assert.ok(message?.role === "user");
+  return typeof message.content === "string"
+    ? message.content
+    : message.content.filter((item) => item.type === "text").map((item) => item.text).join("\n");
+}
+
+function completedTrialResponse(context: Context) {
+  const prompt = userText(context);
+  const match = /WINDOWS\n\n(\[[\s\S]*?\])\n\nSTABLE TERMS/u.exec(prompt);
+  assert.ok(match?.[1], prompt.slice(0, 500));
+  const windows = JSON.parse(match[1]) as Array<{
+    windowId: string;
+    blocks: Array<{ blockId: string }>;
+  }>;
+  return fauxAssistantMessage(fauxToolCall("finalize_translation_batch", {
+    windows: windows.map((window) => ({
+      windowId: window.windowId,
+      translations: window.blocks.map((block) => ({
+        blockId: block.blockId,
+        text: "钟声在空荡的庭院上空回响，迟迟不散。",
+      })),
+      notes: [],
+    })),
+  }), { stopReason: "toolUse" });
+}
+
+function runtimeFor(faux: ReturnType<typeof fauxProvider>): DesktopTrialRuntimeResolver {
+  return {
+    async resolve() {
+      return {
+        profile: { providerId: "deepseek", modelId: faux.getModel().id },
+        model: faux.getModel(),
+        streamFn: faux.provider.streamSimple.bind(faux.provider),
+      };
+    },
+  };
+}
+
+test("desktop trial processes one window serially and projects the committed source and translation", async () => {
+  const project = fixture();
+  const faux = fauxProvider();
+  faux.setResponses([completedTrialResponse]);
+  const seen: LosslessBookRunOptions[] = [];
+  const stages: string[] = [];
+  try {
+    const options: DesktopTrialServiceOptions = {
+      runtime: runtimeFor(faux),
+      runBook: async (options) => {
+        seen.push(options);
+        return runBook(options);
+      },
+      onProgress: (stage: string) => stages.push(stage),
+    };
+    const service = new DesktopTrialService(options);
+
+    const result = await service.start({ manifestPath: project.manifestPath });
+
+    assert.equal(seen.length, 1);
+    assert.equal(seen[0]?.maxWindows, 1);
+    assert.equal(seen[0]?.maxConcurrency, 1);
+    assert.equal(seen[0]?.storePath, join(project.projectDirectory, "artifacts", "folioloom", "book.db"));
+    assert.match(result.runId, /^[0-9a-f-]{36}$/u);
+    assert.equal(result.sourceText, "The bell rings above the empty court.");
+    assert.equal(result.translationText, "钟声在空荡的庭院上空回响，迟迟不散。");
+    assert.deepEqual(stages, ["preparing", "translating", "checking", "completed"]);
+  } finally {
+    rmSync(project.directory, { recursive: true, force: true });
+  }
+});
+
+test("desktop trial rejects an unready model before opening a translation task", async () => {
+  const project = fixture();
+  try {
+    const service = new DesktopTrialService({
+      runtime: { async resolve() { return undefined; } },
+    });
+
+    await assert.rejects(
+      service.start({ manifestPath: project.manifestPath }),
+      (error: unknown) => error instanceof DesktopTrialError
+        && error.code === "DESKTOP_TRIAL_MODEL_NOT_READY",
+    );
+  } finally {
+    rmSync(project.directory, { recursive: true, force: true });
+  }
+});
+
+test("desktop trial allows only one active lease for the same project", async () => {
+  const project = fixture();
+  const faux = fauxProvider();
+  let release!: () => void;
+  const paused = new Promise<void>((resolvePaused) => { release = resolvePaused; });
+  let entered!: () => void;
+  const enteredProvider = new Promise<void>((resolveEntered) => { entered = resolveEntered; });
+  faux.setResponses([async (context) => {
+    entered();
+    await paused;
+    return completedTrialResponse(context);
+  }]);
+  try {
+    const service = new DesktopTrialService({ runtime: runtimeFor(faux) });
+    const first = service.start({ manifestPath: project.manifestPath });
+    await enteredProvider;
+
+    await assert.rejects(
+      service.start({ manifestPath: project.manifestPath }),
+      (error: unknown) => error instanceof DesktopTrialError
+        && error.code === "DESKTOP_TRIAL_ALREADY_RUNNING",
+    );
+    release();
+    await first;
+  } finally {
+    rmSync(project.directory, { recursive: true, force: true });
+  }
+});
+
+test("desktop trial releases a failed lease and reads the latest committed trial after restart", async () => {
+  const project = fixture();
+  const failing = fauxProvider();
+  failing.setResponses([fauxAssistantMessage([], {
+    stopReason: "error",
+    errorMessage: "fixture provider unavailable",
+  })]);
+  try {
+    const failedService = new DesktopTrialService({ runtime: runtimeFor(failing) });
+    await assert.rejects(failedService.start({ manifestPath: project.manifestPath }), /provider unavailable/i);
+
+    const succeeding = fauxProvider();
+    succeeding.setResponses([completedTrialResponse]);
+    const result = await new DesktopTrialService({ runtime: runtimeFor(succeeding) })
+      .start({ manifestPath: project.manifestPath });
+    assert.equal(succeeding.state.callCount, 1);
+
+    const restartedProvider = fauxProvider();
+    const restarted = await new DesktopTrialService({ runtime: runtimeFor(restartedProvider) })
+      .start({ manifestPath: project.manifestPath });
+    assert.equal(restartedProvider.state.callCount, 0);
+    assert.equal(restarted.runId, result.runId);
+    assert.equal(restarted.translationText, result.translationText);
+  } finally {
+    rmSync(project.directory, { recursive: true, force: true });
+  }
+});
+
+test("desktop trial cancellation signals the active run and waits for it to settle", async () => {
+  const project = fixture();
+  const faux = fauxProvider();
+  try {
+    const service = new DesktopTrialService({
+      runtime: runtimeFor(faux),
+      runBook: async (options) => new Promise((_, reject) => {
+        options.signal?.addEventListener("abort", () => {
+          reject(options.signal?.reason);
+        }, { once: true });
+      }),
+    });
+    const trial = service.start({ manifestPath: project.manifestPath });
+    const cancelled = service.cancel();
+
+    await cancelled;
+    await assert.rejects(
+      trial,
+      (error: unknown) => error instanceof DesktopTrialError
+        && String(error.code) === "DESKTOP_TRIAL_CANCELLED",
+    );
+  } finally {
+    rmSync(project.directory, { recursive: true, force: true });
+  }
+});

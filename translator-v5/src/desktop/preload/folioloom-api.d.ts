@@ -7,6 +7,8 @@ import type {
   DesktopResult,
   DesktopTestModelRequest,
   DesktopTestModelResult,
+  DesktopTrialProgress,
+  DesktopTrialResult,
 } from "../contracts.js";
 
 export interface FolioLoomDesktopApi {
@@ -15,6 +17,9 @@ export interface FolioLoomDesktopApi {
   discoverModels(request: DesktopDiscoverModelsRequest): Promise<DesktopResult<readonly DesktopModelOption[]>>;
   testModel(request: DesktopTestModelRequest): Promise<DesktopResult<DesktopTestModelResult>>;
   forgetCredential(providerId: string): Promise<DesktopResult<DesktopOnboardingState>>;
+  startTrial(): Promise<DesktopResult<DesktopTrialResult>>;
+  cancelTrial(): Promise<DesktopResult<void>>;
+  onTrialProgress(listener: (progress: DesktopTrialProgress) => void): () => void;
   chooseProject(): Promise<DesktopResult<DesktopProjectSnapshot>>;
   chooseStore(): Promise<DesktopResult<DesktopProjectSnapshot>>;
   refreshProject(): Promise<DesktopResult<DesktopProjectSnapshot>>;

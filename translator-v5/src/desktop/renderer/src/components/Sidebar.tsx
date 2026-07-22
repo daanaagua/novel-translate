@@ -1,54 +1,51 @@
 import type { JSX } from "react";
 
-import { WORKSPACES, type WorkspaceId } from "../types.js";
+import type { DesktopOnboardingState } from "../../../contracts.js";
 
 interface SidebarProps {
-  activeWorkspace: WorkspaceId;
-  hasProject: boolean;
-  onSelectWorkspace(workspace: WorkspaceId): void;
+  onboarding: DesktopOnboardingState;
 }
 
-export function Sidebar({
-  activeWorkspace,
-  hasProject,
-  onSelectWorkspace,
-}: SidebarProps): JSX.Element {
+interface StepProps {
+  index: number;
+  label: string;
+  ready: boolean;
+}
+
+function Step({ index, label, ready }: StepProps): JSX.Element {
+  return (
+    <li className={`sidebar-step${ready ? " is-ready" : ""}`}>
+      <span className="sidebar-step-index">{index}</span>
+      <span>{label}</span>
+    </li>
+  );
+}
+
+export function Sidebar({ onboarding }: SidebarProps): JSX.Element {
+  const sourceReady = onboarding.project !== undefined;
+  const modelReady = onboarding.activeModel?.capability === "ready";
   return (
     <aside className="sidebar">
       <div className="brand-lockup">
         <img className="brand-mark" src="./folioloom-mark.svg" alt="" />
         <div>
           <p className="brand-name">FolioLoom</p>
-          <p className="brand-subtitle">本地文稿工作台</p>
+          <p className="brand-subtitle">长篇翻译</p>
         </div>
       </div>
 
-      <nav className="workspace-nav" aria-label="工作区">
-        <p className="nav-label">工作区</p>
-        {WORKSPACES.map((workspace, index) => {
-          const selected = workspace.id === activeWorkspace;
-          return (
-            <button
-              className={`nav-item${selected ? " is-active" : ""}`}
-              type="button"
-              key={workspace.id}
-              aria-label={workspace.label}
-              aria-current={selected ? "page" : undefined}
-              onClick={() => onSelectWorkspace(workspace.id)}
-            >
-              <span className="nav-index" aria-hidden="true">0{index + 1}</span>
-              <span>
-                <span className="nav-name">{workspace.label}</span>
-                <span className="nav-detail">{workspace.detail}</span>
-              </span>
-            </button>
-          );
-        })}
+      <nav className="setup-nav" aria-label="准备步骤">
+        <p className="nav-label">准备</p>
+        <ol>
+          <Step index={1} label="书稿" ready={sourceReady} />
+          <Step index={2} label="模型" ready={modelReady} />
+          <Step index={3} label="试译" ready={sourceReady && modelReady} />
+        </ol>
       </nav>
 
       <div className="sidebar-footnote">
-        <span className={`connection-dot${hasProject ? " is-ready" : ""}`} aria-hidden="true" />
-        <span>{hasProject ? "已打开本地项目" : "等待打开项目"}</span>
+        <span className={`connection-dot${sourceReady ? " is-ready" : ""}`} aria-hidden="true" />
+        <span>{sourceReady ? "书稿已就绪" : "等待书稿"}</span>
       </div>
     </aside>
   );

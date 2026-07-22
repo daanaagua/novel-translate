@@ -141,3 +141,22 @@ export interface DesktopTestModelResult {
   report: DesktopModelProbe;
   onboarding: DesktopOnboardingState;
 }
+
+export type DesktopTrialStage =
+  | "preparing"
+  | "translating"
+  | "checking"
+  | "completed"
+  | "failed";
+
+export const DESKTOP_TRIAL_PROGRESS_CHANNEL = "folioloom:trial-progress" as const;
+
+export interface DesktopTrialProgress {
+  stage: DesktopTrialStage;
+}
+
+export interface DesktopTrialResult {
+  runId: string;
+  sourceText: string;
+  translationText: string;
+}

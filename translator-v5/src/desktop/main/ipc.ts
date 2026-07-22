@@ -11,6 +11,7 @@ import type {
   DesktopProjectSnapshot,
   DesktopResult,
   DesktopTestModelResult,
+  DesktopTrialResult,
 } from "../contracts.js";
 import type {
   DesktopDiscoverModelsRequest as ServiceDiscoverModelsRequest,
@@ -26,6 +27,8 @@ export const DESKTOP_IPC_CHANNELS = [
   "folioloom:discover-models",
   "folioloom:test-model",
   "folioloom:forget-credential",
+  "folioloom:start-trial",
+  "folioloom:cancel-trial",
   // Legacy project controls remain for existing developer workspaces.
   "folioloom:choose-project",
   "folioloom:choose-store",
@@ -89,12 +92,18 @@ export interface DesktopIpcModelService {
   forgetCredential(providerId: ProviderId): void;
 }
 
+export interface DesktopIpcTrialService {
+  start(request: { manifestPath: string }): Promise<DesktopTrialResult>;
+  cancel(): Promise<void>;
+}
+
 export interface DesktopIpcDependencies {
   ipcMain: DesktopIpcMain;
   dialog: DesktopDialog;
   projectService: DesktopIpcProjectService;
   sourceService: DesktopIpcSourceService;
   modelService: DesktopIpcModelService;
+  trialService: DesktopIpcTrialService;
   isTrustedEvent(event: unknown): boolean;
   getCurrentRequest(): DesktopProjectRequest | undefined;
   setCurrentRequest(request: DesktopProjectRequest): void;
@@ -401,6 +410,21 @@ export function registerDesktopIpc(dependencies: DesktopIpcDependencies): void {
     const providerId = requiredProviderId(oneArgument(args, "forget-credential"));
     dependencies.modelService.forgetCredential(providerId);
     return currentOnboarding();
+  }));
+
+  handleTrusted("folioloom:start-trial", async (_event, ...args) => resultFrom(async () => {
+    noArguments(args, "start-trial");
+    const current = dependencies.getCurrentRequest();
+    if (current === undefined) {
+      return failure("DESKTOP_NO_PROJECT", "choose a manuscript before starting a trial");
+    }
+    return ok(await dependencies.trialService.start({ manifestPath: current.manifestPath }));
+  }));
+
+  handleTrusted("folioloom:cancel-trial", async (_event, ...args) => resultFrom(async () => {
+    noArguments(args, "cancel-trial");
+    await dependencies.trialService.cancel();
+    return ok(undefined);
   }));
 
   handleTrusted("folioloom:choose-project", async () => resultFrom(async () => {

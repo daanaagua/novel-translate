@@ -365,6 +365,86 @@ test("failed lossless doctor blocks every model call", async () => {
   assert.equal(fixture.faux.state.callCount, 0);
 });
 
+test("lossless book aborts before selecting a new wave and reaches no provider call", async () => {
+  const fixture = losslessFixture("The bell rings above the empty court.");
+  const controller = new AbortController();
+  controller.abort(new Error("test requested abort"));
+
+  await assert.rejects(
+    runBook({ ...fixture.options, signal: controller.signal } as never),
+    /test requested abort/i,
+  );
+  assert.equal(fixture.faux.state.callCount, 0);
+});
+
+test("lossless book forwards cancellation into its active Pi request and commits no translation", async () => {
+  const fixture = losslessFixture("The bell rings above the empty court.");
+  const controller = new AbortController();
+  let release!: () => void;
+  const releaseProvider = new Promise<void>((resolveProvider) => { release = resolveProvider; });
+  let entered!: () => void;
+  const enteredProvider = new Promise<void>((resolveEntered) => { entered = resolveEntered; });
+  let providerSignal: AbortSignal | undefined;
+  fixture.faux.setResponses([async (context, options) => {
+    providerSignal = options?.signal;
+    entered();
+    await releaseProvider;
+    return losslessBatchResponse(context);
+  }]);
+
+  const running = runBook({ ...fixture.options, signal: controller.signal } as never);
+  await enteredProvider;
+  controller.abort(new Error("midflight abort"));
+  assert.equal(providerSignal?.aborted, true);
+  release();
+
+  await assert.rejects(running, /midflight abort/i);
+  const store = new LosslessBookStore(fixture.options.storePath);
+  try {
+    const status = store.statusSummary("run-lossless");
+    assert.equal(status.completedWindows, 0);
+    assert.equal(status.runningWindows, 1);
+    assert.deepEqual(store.auditState("run-lossless").translations, []);
+  } finally {
+    store.close();
+  }
+});
+
+test("lossless book forwards cancellation into its lexical-anchor Pi request", async () => {
+  const fixture = losslessFixture("Loukianos, whom they called Lucian the Scoffer, laughed.");
+  const controller = new AbortController();
+  let release!: () => void;
+  const releaseProvider = new Promise<void>((resolveProvider) => { release = resolveProvider; });
+  let entered!: () => void;
+  const enteredProvider = new Promise<void>((resolveEntered) => { entered = resolveEntered; });
+  let providerSignal: AbortSignal | undefined;
+  fixture.faux.setResponses([async (context, options) => {
+    providerSignal = options?.signal;
+    entered();
+    await releaseProvider;
+    return lexicalAnchorResponse(context, {
+      sourceForms: ["Loukianos", "Lucian"],
+      proposedTarget: "卢基阿诺斯",
+      evidenceQuote: "Loukianos, whom they called Lucian the Scoffer, laughed.",
+    });
+  }]);
+
+  const running = runBook({ ...fixture.options, signal: controller.signal } as never);
+  await enteredProvider;
+  controller.abort(new Error("anchor abort"));
+  assert.equal(providerSignal?.aborted, true);
+  release();
+
+  await assert.rejects(running, /anchor abort/i);
+  const store = new LosslessBookStore(fixture.options.storePath);
+  try {
+    assert.equal(store.statusSummary("run-lossless").pendingWindows, 1);
+    assert.deepEqual(store.auditState("run-lossless").translations, []);
+  } finally {
+    store.close();
+  }
+});
+
 test("lossless runner injects only glossary terms relevant to each physical request", async () => {
   const fixture = losslessFixture("BOOK ONE\n\nTyphon spoke.\n\nCHAPTER ONE\n\nSeverian listened.");
   const glossaryPath = join(dirname(fixture.canonicalPath), "glossary.json");

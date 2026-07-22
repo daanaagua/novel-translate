@@ -29,6 +29,20 @@ test("desktop errors redact credentials and URL queries from technical details",
   assert.doesNotMatch(result.technicalDetails ?? "", /api_key=/u);
 });
 
+test("desktop errors redact JSON and header-style API key fields", () => {
+  const secrets = ["json-header-secret-123", "camel-case-secret-456", "authorization-secret-789"];
+  const error = new Error([
+    `headers={"x-api-key":"${secrets[0]}","apiKey":"${secrets[1]}"}`,
+    `{"Authorization":"Bearer ${secrets[2]}"}`,
+  ].join(" "));
+
+  const result = toDesktopError(error);
+  for (const secret of secrets) {
+    assert.doesNotMatch(JSON.stringify(result), new RegExp(secret));
+  }
+  assert.match(result.technicalDetails ?? "", /\[REDACTED\]/u);
+});
+
 test("unknown desktop errors keep a stable public code and sanitized details", () => {
   const result = toDesktopError(new Error("unexpected internal failure"));
 

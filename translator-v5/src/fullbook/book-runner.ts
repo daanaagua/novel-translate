@@ -233,6 +233,11 @@ export interface LosslessBookRunOptions {
   tinyWindowTokens?: number;
   maxRequestTokens?: number;
   maxWindowsPerRequest?: number;
+  /**
+   * Stops between durable window operations. A promotion that has already
+   * entered the store remains atomic and is never interrupted mid-transaction.
+   */
+  signal?: AbortSignal;
 }
 
 export interface LosslessBookRunResult {
@@ -870,6 +875,10 @@ function combinedBudget(
   return combined;
 }
 
+function throwIfAborted(signal: AbortSignal | undefined): void {
+  signal?.throwIfAborted();
+}
+
 async function runLosslessBook(
   options: LosslessBookRunOptions,
 ): Promise<LosslessBookRunResult> {
@@ -976,6 +985,7 @@ async function runLosslessBook(
     const voiceProfiles = losslessVoiceProfiles(options.styleState);
 
     while (processedWindows < maxWindows) {
+      throwIfAborted(options.signal);
       assertSourceVersionUnchanged(context);
       const allWindows = store.allWindows(runId);
       const barrier = firstUncommitted(allWindows);
@@ -1050,6 +1060,7 @@ async function runLosslessBook(
         if (cached !== undefined) {
           waveAnchorSnapshot = parseWaveAnchorSnapshot(cached, inputHash);
         } else {
+          throwIfAborted(options.signal);
           const outcome: LexicalAnchorOutcome = await new LexicalAnchorer(new PiRuntime()).run({
             candidates: anchorCandidates,
             stableTerms: anchorStableTerms,
@@ -1057,6 +1068,7 @@ async function runLosslessBook(
             streamFn: options.streamFn,
             budget: anchorBudget,
             sourceLanguageProfile: context.languageProfile,
+            signal: options.signal,
             deadlineMs: options.hardDeadlineMs,
           });
           waveAnchorSnapshot = {
@@ -1114,6 +1126,7 @@ async function runLosslessBook(
         return combinedBudget(window.budget, increment);
       };
       while (retryWindows.length > 0 && providerFailure === undefined) {
+        throwIfAborted(options.signal);
         store.bindWindowsToSnapshot(
           runId,
           retryWindows.map((window) => window.windowId),
@@ -1127,6 +1140,7 @@ async function runLosslessBook(
           initialRequestCount = requests.length;
         }
         const claimed = new Map<string, PersistedLosslessWindow>();
+        throwIfAborted(options.signal);
         for (const request of requests) {
           for (const window of request.windows) {
             claimed.set(window.windowId, store.claimWindow(runId, window.windowId));
@@ -1143,6 +1157,7 @@ async function runLosslessBook(
         await Promise.all(requests.map(async (request) => {
           const budget = new BudgetLedger();
           try {
+            throwIfAborted(options.signal);
             const result = await runTranslationBatch({
               request,
               blocks: context.losslessBlocks,
@@ -1163,6 +1178,7 @@ async function runLosslessBook(
                 window.windowId,
                 effectiveStyleByWindow[window.windowId] as EffectiveStyleProjection,
               ])),
+              signal: options.signal,
               deadlineMs: options.hardDeadlineMs,
             });
             completionOrder.push({ request, budget, result });
@@ -1170,6 +1186,8 @@ async function runLosslessBook(
             completionOrder.push({ request, budget, error });
           }
         }));
+
+        throwIfAborted(options.signal);
 
         const successfulWindowIds = new Set(completionOrder.flatMap((completed) =>
           completed.result?.windows
@@ -1272,6 +1290,7 @@ async function runLosslessBook(
                 translations.find((item) => item.blockId === blockId)?.text ?? ""),
               submission: windowResult.styleObservation,
             });
+            throwIfAborted(options.signal);
             store.stageWindow({
               runId,
               windowId: window.windowId,
@@ -1294,6 +1313,7 @@ async function runLosslessBook(
               snapshotId: snapshot.id,
               candidates,
             });
+            throwIfAborted(options.signal);
             coordinator.promoteReady();
           }
         }

@@ -1,5 +1,6 @@
 import type { DesktopError, DesktopResult } from "./contracts.js";
 import { SourceIntegrityError } from "../source/source-ledger.js";
+import { redactSecrets } from "./secret-redaction.js";
 
 export class DesktopInputError extends Error {
   readonly code: string;
@@ -63,14 +64,36 @@ const PUBLIC_ERRORS: Readonly<Record<string, PublicErrorDefinition>> = Object.fr
     nextAction: "请重新选择正确的编码后导入。",
     retryable: false,
   },
+  DESKTOP_TRIAL_ALREADY_RUNNING: {
+    message: "这本书正在试译",
+    nextAction: "请等待当前试译结束，或先取消它。",
+    retryable: true,
+  },
+  DESKTOP_TRIAL_MODEL_NOT_READY: {
+    message: "模型还没有准备好",
+    nextAction: "请先完成模型连接测试。",
+    retryable: false,
+  },
+  DESKTOP_TRIAL_SOURCE_CHANGED: {
+    message: "书稿在试译前发生了变化",
+    nextAction: "请重新选择书稿后再试。",
+    retryable: true,
+  },
+  DESKTOP_TRIAL_RESULT_UNAVAILABLE: {
+    message: "本次试译没有生成可用译文",
+    nextAction: "请检查模型设置后重试。",
+    retryable: true,
+  },
+  DESKTOP_TRIAL_CANCELLED: {
+    message: "试译已取消",
+    retryable: true,
+  },
 });
 
 export function redactDesktopTechnicalDetails(value: string): string {
-  return value
-    .replace(/Authorization\s*:\s*Bearer\s+[^\s;,]+/giu, "Authorization: Bearer [REDACTED]")
-    .replace(/\b(?:api[_-]?key|access[_-]?token|token)\s*[:=]\s*[^\s;,]+/giu, "credential=[REDACTED]")
+  const bounded = value.slice(0, 8_000);
+  return redactSecrets(bounded)
     .replace(/https?:\/\/[^\s;,?#]+\?[^\s;,]*/giu, (url) => url.slice(0, url.indexOf("?")))
-    .replace(/\bsk-[A-Za-z0-9_-]{8,}\b/gu, "[REDACTED]")
     .slice(0, 2_000);
 }
 

@@ -9,6 +9,7 @@ import type {
   DesktopProjectRequest,
   DesktopProjectSnapshot,
   DesktopResult,
+  DesktopTrialResult,
 } from "../src/desktop/contracts.js";
 import {
   registerDesktopIpc,
@@ -91,6 +92,10 @@ interface IpcFixture {
     tests: readonly unknown[];
     forgotten: readonly unknown[];
   };
+  trialCalls: {
+    starts: readonly string[];
+    cancellations: number;
+  };
   dialogFilters: ReadonlyArray<{ name: string; extensions: string[] }>;
   currentRequest: DesktopProjectRequest | undefined;
 }
@@ -108,6 +113,8 @@ function registerFixtureHandlers(options: IpcFixtureOptions = {}): IpcFixture {
   const discoveries: unknown[] = [];
   const tests: unknown[] = [];
   const forgotten: unknown[] = [];
+  const trialStarts: string[] = [];
+  let trialCancellations = 0;
   const dialogFilters: Array<{ name: string; extensions: string[] }> = [];
   const trustedEvent = {
     sender: { id: 7 },
@@ -235,6 +242,19 @@ function registerFixtureHandlers(options: IpcFixtureOptions = {}): IpcFixture {
         activeModelProfile = undefined;
       },
     },
+    trialService: {
+      async start(request) {
+        trialStarts.push(request.manifestPath);
+        return {
+          runId: "trial-run-1",
+          sourceText: "The bell rang.",
+          translationText: "钟声响起。",
+        } satisfies DesktopTrialResult;
+      },
+      async cancel() {
+        trialCancellations += 1;
+      },
+    },
     isTrustedEvent(event) {
       return event === trustedEvent;
     },
@@ -261,6 +281,9 @@ function registerFixtureHandlers(options: IpcFixtureOptions = {}): IpcFixture {
     },
     get modelCalls() {
       return { discoveries, tests, forgotten };
+    },
+    get trialCalls() {
+      return { starts: trialStarts, cancellations: trialCancellations };
     },
     get dialogFilters() {
       return dialogFilters;
@@ -293,7 +316,34 @@ test("IPC only registers the desktop allowlist", () => {
       "folioloom:refresh-project",
       "folioloom:select-run",
       "folioloom:test-model",
+      "folioloom:start-trial",
+      "folioloom:cancel-trial",
     ].sort());
+  } finally {
+    rmSync(fixture.directory, { recursive: true, force: true });
+  }
+});
+
+test("trial IPC uses the active manuscript, returns only the committed projection, and cancels through a fixed operation", async () => {
+  const fixture = registerFixtureHandlers({ existingReadyModel: true });
+  try {
+    const started = await handler(fixture, "folioloom:start-trial")(fixture.trustedEvent) as DesktopResult<DesktopTrialResult>;
+    assert.deepEqual(started, ok({
+      runId: "trial-run-1",
+      sourceText: "The bell rang.",
+      translationText: "钟声响起。",
+    }));
+    assert.deepEqual(fixture.trialCalls.starts, [fixture.manifestPath]);
+
+    const cancelled = await handler(fixture, "folioloom:cancel-trial")(fixture.trustedEvent) as DesktopResult<void>;
+    assert.deepEqual(cancelled, ok(undefined));
+    assert.equal(fixture.trialCalls.cancellations, 1);
+
+    const injected = await handler(fixture, "folioloom:start-trial")(fixture.trustedEvent, {
+      manifestPath: "C:\\outside\\source_manifest.json",
+    }) as DesktopResult<unknown>;
+    assert.equal(injected.ok, false);
+    assert.deepEqual(fixture.trialCalls.starts, [fixture.manifestPath]);
   } finally {
     rmSync(fixture.directory, { recursive: true, force: true });
   }

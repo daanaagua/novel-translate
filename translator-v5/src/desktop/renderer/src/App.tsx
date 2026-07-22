@@ -1,86 +1,99 @@
 import { useEffect, useMemo, useState, type JSX } from "react";
 
 import type {
-  DesktopDoctorReport,
+  DesktopDiscoverModelsRequest,
   DesktopError,
+  DesktopModelOption,
+  DesktopOnboardingState,
   DesktopProjectSnapshot,
   DesktopResult,
+  DesktopTestModelRequest,
+  DesktopTestModelResult,
+  DesktopTrialProgress,
+  DesktopTrialResult,
 } from "../../contracts.js";
 import type { FolioLoomDesktopApi } from "../../preload/folioloom-api.js";
-import { ProjectOverview } from "./components/ProjectOverview.js";
+import { Onboarding } from "./components/Onboarding.js";
 import { Sidebar } from "./components/Sidebar.js";
 import { WindowTitlebar } from "./components/WindowTitlebar.js";
-import { WorkspacePlaceholder } from "./components/WorkspacePlaceholder.js";
-import type { BusyAction, WorkspaceId } from "./types.js";
+import type { BusyAction } from "./types.js";
 
 interface AppProps {
   api?: FolioLoomDesktopApi;
 }
 
-function noProjectResult<T = never>(): DesktopResult<T> {
+const emptyOnboarding: DesktopOnboardingState = {
+  providers: [],
+  readiness: { source: false, model: false, trial: false },
+};
+
+function unavailableResult<T = never>(): DesktopResult<T> {
   return {
     ok: false,
     error: {
-      code: "DESKTOP_NO_PROJECT",
-      message: "open an initialized project first",
-      retryable: false,
+      code: "DESKTOP_UNAVAILABLE",
+      message: "此功能暂时不可用。",
+      retryable: true,
     },
   };
 }
 
 function unavailableApi(): FolioLoomDesktopApi {
   return {
-    chooseProject: async () => noProjectResult(),
-    chooseStore: async () => noProjectResult(),
-    refreshProject: async () => noProjectResult(),
-    selectRun: async () => noProjectResult(),
-    runDoctor: async () => noProjectResult(),
+    chooseSource: async () => unavailableResult(),
+    getOnboardingState: async () => unavailableResult(),
+    discoverModels: async () => unavailableResult(),
+    testModel: async () => unavailableResult(),
+    forgetCredential: async () => unavailableResult(),
+    startTrial: async () => unavailableResult(),
+    cancelTrial: async () => unavailableResult(),
+    onTrialProgress: () => () => undefined,
+    chooseProject: async () => unavailableResult(),
+    chooseStore: async () => unavailableResult(),
+    refreshProject: async () => unavailableResult(),
+    selectRun: async () => unavailableResult(),
+    runDoctor: async () => unavailableResult(),
   };
 }
 
 function browserApi(): FolioLoomDesktopApi {
-  if (typeof window === "undefined" || window.folioLoom === undefined) {
-    return unavailableApi();
-  }
+  if (typeof window === "undefined" || window.folioLoom === undefined) return unavailableApi();
   return window.folioLoom;
 }
 
 function errorFromUnknown(error: unknown): DesktopError {
-  if (error instanceof Error) {
-    return { code: "DESKTOP_RENDERER_ERROR", message: error.message, retryable: false };
-  }
-  return { code: "DESKTOP_RENDERER_ERROR", message: "unexpected renderer error", retryable: false };
+  return {
+    code: "DESKTOP_RENDERER_ERROR",
+    message: "操作未完成，请重试。",
+    retryable: true,
+    ...(error instanceof Error && error.message !== "" ? { technicalDetails: error.message } : {}),
+  };
 }
 
 export function App({ api }: AppProps): JSX.Element {
   const fallbackApi = useMemo(browserApi, []);
   const desktopApi = api ?? fallbackApi;
-  const [activeWorkspace, setActiveWorkspace] = useState<WorkspaceId>("overview");
-  const [snapshot, setSnapshot] = useState<DesktopProjectSnapshot>();
-  const [doctorResult, setDoctorResult] = useState<DesktopResult<DesktopDoctorReport>>();
+  const [onboarding, setOnboarding] = useState<DesktopOnboardingState>(emptyOnboarding);
   const [busyAction, setBusyAction] = useState<BusyAction>();
   const [operationError, setOperationError] = useState<DesktopError>();
+  const [trialProgress, setTrialProgress] = useState<DesktopTrialProgress>();
+  const [trialResult, setTrialResult] = useState<DesktopTrialResult>();
 
-  function acceptSnapshot(result: DesktopResult<DesktopProjectSnapshot>): void {
-    if (result.ok) {
-      setSnapshot(result.value);
-      setDoctorResult(undefined);
-      setOperationError(undefined);
-      return;
+  function acceptOnboarding(result: DesktopResult<DesktopOnboardingState>): boolean {
+    if (!result.ok) {
+      setOperationError(result.error);
+      return false;
     }
-    if (result.error.code === "DESKTOP_NO_PROJECT") {
-      setSnapshot(undefined);
-      setOperationError(undefined);
-      return;
-    }
-    setOperationError(result.error);
+    setOnboarding(result.value);
+    setOperationError(undefined);
+    return true;
   }
 
   useEffect(() => {
     let disposed = false;
-    void desktopApi.refreshProject()
+    void desktopApi.getOnboardingState()
       .then((result) => {
-        if (!disposed) acceptSnapshot(result);
+        if (!disposed) acceptOnboarding(result);
       })
       .catch((error: unknown) => {
         if (!disposed) setOperationError(errorFromUnknown(error));
@@ -90,13 +103,32 @@ export function App({ api }: AppProps): JSX.Element {
     };
   }, [desktopApi]);
 
-  async function runProjectAction(
-    action: Exclude<BusyAction, "doctor" | undefined>,
-    operation: () => Promise<DesktopResult<DesktopProjectSnapshot>>,
-  ): Promise<void> {
-    setBusyAction(action);
+  useEffect(() => desktopApi.onTrialProgress((progress) => {
+    setTrialProgress(progress);
+  }), [desktopApi]);
+
+  async function chooseSource(): Promise<void> {
+    setBusyAction("choose-source");
     try {
-      acceptSnapshot(await operation());
+      const sourceResult = await desktopApi.chooseSource();
+      if (!sourceResult.ok) {
+        setOperationError(sourceResult.error);
+        return;
+      }
+
+      const stateResult = await desktopApi.getOnboardingState();
+      if (!stateResult.ok) {
+        setOnboarding((current) => ({
+          ...current,
+          project: sourceResult.value,
+          readiness: { ...current.readiness, source: true, trial: false },
+        }));
+        setOperationError(stateResult.error);
+        return;
+      }
+      acceptOnboarding(stateResult);
+      setTrialProgress(undefined);
+      setTrialResult(undefined);
     } catch (error) {
       setOperationError(errorFromUnknown(error));
     } finally {
@@ -104,31 +136,93 @@ export function App({ api }: AppProps): JSX.Element {
     }
   }
 
-  async function chooseProject(): Promise<void> {
-    setActiveWorkspace("overview");
-    await runProjectAction("choose-project", () => desktopApi.chooseProject());
-  }
-
-  async function chooseStore(): Promise<void> {
-    await runProjectAction("choose-store", () => desktopApi.chooseStore());
-  }
-
-  async function refreshProject(): Promise<void> {
-    await runProjectAction("refresh", () => desktopApi.refreshProject());
-  }
-
-  async function selectRun(runId: string): Promise<void> {
-    await runProjectAction("select-run", () => desktopApi.selectRun(runId));
-  }
-
-  async function runDoctor(): Promise<void> {
-    setBusyAction("doctor");
+  async function discoverModels(request: DesktopDiscoverModelsRequest): Promise<DesktopResult<readonly DesktopModelOption[]>> {
+    setBusyAction("discover-models");
     try {
-      const result = await desktopApi.runDoctor();
-      setDoctorResult(result);
-      if (result.ok) setOperationError(undefined);
+      const result = await desktopApi.discoverModels(request);
+      if (!result.ok) setOperationError(result.error);
+      else setOperationError(undefined);
+      return result;
     } catch (error) {
-      setDoctorResult({ ok: false, error: errorFromUnknown(error) });
+      const rendererError = errorFromUnknown(error);
+      setOperationError(rendererError);
+      return { ok: false, error: rendererError };
+    } finally {
+      setBusyAction(undefined);
+    }
+  }
+
+  async function testModel(request: DesktopTestModelRequest): Promise<DesktopResult<DesktopTestModelResult>> {
+    setBusyAction("test-model");
+    try {
+      const result = await desktopApi.testModel(request);
+      if (!result.ok) {
+        setOperationError(result.error);
+        return result;
+      }
+      setOnboarding(result.value.onboarding);
+      setOperationError(undefined);
+      return result;
+    } catch (error) {
+      const rendererError = errorFromUnknown(error);
+      setOperationError(rendererError);
+      return { ok: false, error: rendererError };
+    } finally {
+      setBusyAction(undefined);
+    }
+  }
+
+  async function forgetCredential(providerId: string): Promise<DesktopResult<DesktopOnboardingState>> {
+    setBusyAction("forget-credential");
+    try {
+      const result = await desktopApi.forgetCredential(providerId);
+      if (!result.ok) {
+        setOperationError(result.error);
+        return result;
+      }
+      setOnboarding(result.value);
+      setOperationError(undefined);
+      return result;
+    } catch (error) {
+      const rendererError = errorFromUnknown(error);
+      setOperationError(rendererError);
+      return { ok: false, error: rendererError };
+    } finally {
+      setBusyAction(undefined);
+    }
+  }
+
+  async function startTrial(): Promise<void> {
+    setBusyAction("start-trial");
+    setTrialResult(undefined);
+    setOperationError(undefined);
+    try {
+      const result = await desktopApi.startTrial();
+      if (!result.ok) {
+        if (result.error.code === "DESKTOP_TRIAL_CANCELLED") {
+          setTrialProgress(undefined);
+        } else {
+          setOperationError(result.error);
+        }
+        return;
+      }
+      setTrialResult(result.value);
+      setTrialProgress({ stage: "completed" });
+    } catch (error) {
+      setOperationError(errorFromUnknown(error));
+    } finally {
+      setBusyAction(undefined);
+    }
+  }
+
+  async function cancelTrial(): Promise<void> {
+    setBusyAction("cancel-trial");
+    try {
+      const result = await desktopApi.cancelTrial();
+      if (!result.ok) setOperationError(result.error);
+      else setTrialProgress(undefined);
+    } catch (error) {
+      setOperationError(errorFromUnknown(error));
     } finally {
       setBusyAction(undefined);
     }
@@ -137,31 +231,21 @@ export function App({ api }: AppProps): JSX.Element {
   return (
     <div className="workbench-shell">
       <WindowTitlebar />
-      <Sidebar
-        activeWorkspace={activeWorkspace}
-        hasProject={snapshot !== undefined}
-        onSelectWorkspace={setActiveWorkspace}
-      />
+      <Sidebar onboarding={onboarding} />
       <div className="workbench-main">
-        {activeWorkspace === "overview" ? (
-          <ProjectOverview
-            snapshot={snapshot}
-            doctorResult={doctorResult}
-            busyAction={busyAction}
-            operationError={operationError}
-            onChooseProject={() => { void chooseProject(); }}
-            onChooseStore={() => { void chooseStore(); }}
-            onRefresh={() => { void refreshProject(); }}
-            onSelectRun={(runId) => { void selectRun(runId); }}
-            onRunDoctor={() => { void runDoctor(); }}
-          />
-        ) : (
-          <WorkspacePlaceholder
-            workspace={activeWorkspace}
-            snapshot={snapshot}
-            onChooseProject={() => { void chooseProject(); }}
-          />
-        )}
+        <Onboarding
+          onboarding={onboarding}
+          busyAction={busyAction}
+          operationError={operationError}
+          trialProgress={trialProgress}
+          trialResult={trialResult}
+          onChooseSource={chooseSource}
+          onDiscoverModels={discoverModels}
+          onTestModel={testModel}
+          onForgetCredential={forgetCredential}
+          onStartTrial={startTrial}
+          onCancelTrial={cancelTrial}
+        />
       </div>
     </div>
   );

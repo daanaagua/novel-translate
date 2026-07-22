@@ -132,9 +132,13 @@ test("preload exposes named onboarding operations without a generic IPC or crede
     "discoverModels",
     "testModel",
     "forgetCredential",
+    "startTrial",
+    "cancelTrial",
+    "onTrialProgress",
   ]) {
     assert.match(preloadSource, new RegExp(`\\b${operation}\\s*:`));
   }
+  assert.match(preloadSource, /removeListener\s*\(\s*DESKTOP_TRIAL_PROGRESS_CHANNEL/u);
   assert.doesNotMatch(preloadSource, /invoke\s*\(\s*(?:channel|name|method)\b/u);
   assert.doesNotMatch(preloadSource, /\b(?:getCredential|readCredential|readFile|globalThis\.fetch)\b/u);
 });

@@ -4,12 +4,18 @@ import { fileURLToPath } from "node:url";
 
 import { app, BrowserWindow, dialog, ipcMain, Menu, safeStorage } from "electron";
 
-import type { DesktopProjectRequest } from "../contracts.js";
+import {
+  DESKTOP_TRIAL_PROGRESS_CHANNEL,
+  type DesktopProjectRequest,
+  type DesktopTrialProgress,
+} from "../contracts.js";
 import { DesktopCredentialStore } from "../desktop-credential-store.js";
 import { DesktopModelService } from "../desktop-model-service.js";
 import { DesktopPreferences } from "../desktop-preferences.js";
 import { DesktopProjectService } from "../desktop-project-service.js";
 import { DesktopSourceService } from "../desktop-source-service.js";
+import { DesktopTrialService } from "../desktop-trial-service.js";
+import { createProviderRuntime } from "../../providers/runtime.js";
 import { registerDesktopIpc } from "./ipc.js";
 import { createDesktopProviderRegistryAdapter } from "./provider-model-adapter.js";
 import {
@@ -23,6 +29,16 @@ import {
 const currentDirectory = dirname(fileURLToPath(import.meta.url));
 const trustedRendererUrls = new Map<number, string>();
 const desktopChrome = desktopWindowChrome();
+let trialServiceForShutdown: DesktopTrialService | undefined;
+let quitAfterTrialSettles = false;
+let quitSettlementStarted = false;
+
+function broadcastTrialProgress(progress: DesktopTrialProgress): void {
+  for (const window of BrowserWindow.getAllWindows()) {
+    if (window.isDestroyed() || !trustedRendererUrls.has(window.webContents.id)) continue;
+    window.webContents.send(DESKTOP_TRIAL_PROGRESS_CHANNEL, progress);
+  }
+}
 
 function createWindow(): BrowserWindow {
   const rendererFilePath = join(currentDirectory, "../renderer/index.html");
@@ -91,6 +107,22 @@ void app.whenReady().then(() => {
     preferences,
     credentials: credentialStore,
   });
+  const trialService = new DesktopTrialService({
+    runtime: {
+      async resolve() {
+        const profile = preferences.loadState().activeModelProfile;
+        if (profile === undefined) return undefined;
+        const credential = credentialStore.read(profile.providerId);
+        if (credential.status !== "available") return undefined;
+        const runtime = createProviderRuntime(profile, credential.credential);
+        return { profile, model: runtime.model, streamFn: runtime.streamFn };
+      },
+    },
+    onProgress(stage) {
+      broadcastTrialProgress({ stage });
+    },
+  });
+  trialServiceForShutdown = trialService;
   let currentRequest = loadRecentRequest(preferences);
 
   registerDesktopIpc({
@@ -107,6 +139,7 @@ void app.whenReady().then(() => {
     projectService,
     sourceService,
     modelService,
+    trialService,
     isTrustedEvent(event) {
       return isTrustedDesktopIpcEvent(event, trustedRendererUrls);
     },
@@ -132,4 +165,15 @@ app.on("window-all-closed", () => {
   if (process.platform !== "darwin") {
     app.quit();
   }
+});
+
+app.on("before-quit", (event) => {
+  if (quitAfterTrialSettles || trialServiceForShutdown === undefined) return;
+  event.preventDefault();
+  if (quitSettlementStarted) return;
+  quitSettlementStarted = true;
+  void trialServiceForShutdown.cancel().finally(() => {
+    quitAfterTrialSettles = true;
+    app.quit();
+  });
 });

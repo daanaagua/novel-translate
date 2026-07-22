@@ -1,11 +1,13 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { cleanup, render, screen } from "@testing-library/react";
+import { cleanup, render, screen, waitFor } from "@testing-library/react";
 import { userEvent } from "@testing-library/user-event";
 
 import type {
-  DesktopDoctorReport,
+  DesktopOnboardingState,
   DesktopProjectSnapshot,
   DesktopResult,
+  DesktopTestModelResult,
+  DesktopTrialProgress,
 } from "../../contracts.js";
 import type { FolioLoomDesktopApi } from "../../preload/folioloom-api.js";
 import { App } from "./App.js";
@@ -16,216 +18,286 @@ afterEach(() => {
   vi.unstubAllGlobals();
 });
 
-const snapshot: DesktopProjectSnapshot = {
-  manifestPath: "C:\\books\\example\\source_manifest.json",
+const providers: DesktopOnboardingState["providers"] = [
+  {
+    id: "deepseek",
+    displayName: "DeepSeek",
+    keyPlaceholder: "DeepSeek API Key",
+    efforts: ["off", "high", "max"],
+    fallbackModelIds: ["deepseek-chat", "deepseek-reasoner"],
+    allowManualModel: true,
+    allowCustomBaseUrl: false,
+    credentialStatus: "missing",
+  },
+  {
+    id: "kimi-cn",
+    displayName: "Kimi",
+    keyPlaceholder: "Kimi API Key",
+    efforts: ["off", "high"],
+    fallbackModelIds: ["moonshot-v1-8k"],
+    allowManualModel: true,
+    allowCustomBaseUrl: false,
+    credentialStatus: "missing",
+  },
+  {
+    id: "bailian",
+    displayName: "阿里云百炼",
+    keyPlaceholder: "百炼 API Key",
+    efforts: ["off", "high"],
+    fallbackModelIds: ["qwen-plus"],
+    allowManualModel: true,
+    allowCustomBaseUrl: false,
+    credentialStatus: "missing",
+  },
+  {
+    id: "volcengine",
+    displayName: "火山方舟",
+    keyPlaceholder: "火山 API Key",
+    efforts: ["off", "high"],
+    fallbackModelIds: ["doubao-seed"],
+    allowManualModel: true,
+    allowCustomBaseUrl: false,
+    credentialStatus: "missing",
+  },
+  {
+    id: "openai",
+    displayName: "OpenAI",
+    keyPlaceholder: "OpenAI API Key",
+    efforts: ["low", "medium", "high"],
+    fallbackModelIds: ["gpt-5-mini"],
+    allowManualModel: true,
+    allowCustomBaseUrl: false,
+    credentialStatus: "missing",
+  },
+  {
+    id: "siliconflow",
+    displayName: "硅基流动",
+    keyPlaceholder: "硅基流动 API Key",
+    efforts: [],
+    fallbackModelIds: ["deepseek-ai/DeepSeek-V3"],
+    allowManualModel: true,
+    allowCustomBaseUrl: false,
+    credentialStatus: "missing",
+  },
+  {
+    id: "openai-compatible",
+    displayName: "自定义 OpenAI-compatible",
+    keyPlaceholder: "兼容接口 API Key",
+    efforts: ["on", "off"],
+    fallbackModelIds: [],
+    allowManualModel: true,
+    allowCustomBaseUrl: true,
+    credentialStatus: "missing",
+  },
+];
+
+const project: DesktopProjectSnapshot = {
+  manifestPath: "C:\\books\\example\\internal-project-file",
   title: "The Example Book",
-  sourceLanguage: "en",
+  sourceLanguage: "英语",
   sourceChars: 12840,
   sourceVersion: "source-example",
-  store: {
-    state: "ready",
-    path: "C:\\books\\example\\book.db",
-  },
-  runs: [
-    {
-      runId: "run-example",
-      sourceVersion: "source-example",
-      modelId: "deepseek-v4-flash",
-      status: "running",
-      progress: {
-        totalWindows: 4,
-        pendingWindows: 3,
-        completedWindows: 1,
-        warningWindows: 0,
-        humanRequiredWindows: 0,
-        failedWindows: 0,
-      },
-    },
-  ],
-  selectedRunId: "run-example",
-  runSelection: "selected",
+  store: { state: "ready" },
+  runs: [],
+  runSelection: "none",
 };
 
-const doctorReport: DesktopDoctorReport = {
-  sourceVersion: "source-example",
-  sourceChars: 12840,
-  coveredChars: 12840,
-  annotationCount: 12,
-  blockCount: 8,
-  windowCount: 4,
-  incidentCodes: [],
-  anomalyCount: 0,
-  glossary: {
-    path: "C:\\books\\example\\glossary.json",
-    totalTerms: 3,
-    matchedTerms: 3,
-    unmatchedTerms: 0,
-    unmatchedForms: [],
+const emptyOnboarding: DesktopOnboardingState = {
+  providers,
+  readiness: { source: false, model: false, trial: false },
+};
+
+const readyOnboarding: DesktopOnboardingState = {
+  ...emptyOnboarding,
+  project,
+  activeModel: {
+    providerId: "deepseek",
+    modelId: "deepseek-reasoner",
+    reasoningEffort: "max",
+    capability: "ready",
   },
+  latestProbe: { status: "ready", message: "连接检查已通过" },
+  readiness: { source: true, model: true, trial: true },
 };
 
 function ok<T>(value: T): DesktopResult<T> {
   return { ok: true, value };
 }
 
-function failure<T = never>(code: string, message: string): DesktopResult<T> {
-  return { ok: false, error: { code, message, retryable: false } };
+function failure<T = never>(
+  code: string,
+  message: string,
+  technicalDetails?: string,
+): DesktopResult<T> {
+  return {
+    ok: false,
+    error: {
+      code,
+      message,
+      retryable: false,
+      ...(technicalDetails === undefined ? {} : { technicalDetails }),
+    },
+  };
+}
+
+function testResult(onboarding: DesktopOnboardingState = readyOnboarding): DesktopTestModelResult {
+  return {
+    report: { status: "ready", message: "连接检查已通过" },
+    onboarding,
+  };
 }
 
 function createApi(overrides: Partial<FolioLoomDesktopApi> = {}): FolioLoomDesktopApi {
   return {
-    chooseProject: vi.fn().mockResolvedValue(ok(snapshot)),
-    chooseStore: vi.fn().mockResolvedValue(ok(snapshot)),
-    refreshProject: vi.fn().mockResolvedValue(ok(snapshot)),
-    selectRun: vi.fn().mockResolvedValue(ok(snapshot)),
-    runDoctor: vi.fn().mockResolvedValue(ok(doctorReport)),
+    chooseSource: vi.fn().mockResolvedValue(failure("DESKTOP_SELECTION_CANCELLED", "已取消选择")),
+    getOnboardingState: vi.fn().mockResolvedValue(ok(emptyOnboarding)),
+    discoverModels: vi.fn().mockResolvedValue(ok([])),
+    testModel: vi.fn().mockResolvedValue(ok(testResult())),
+    forgetCredential: vi.fn().mockResolvedValue(ok(emptyOnboarding)),
+    startTrial: vi.fn().mockResolvedValue(failure("DESKTOP_TRIAL_NOT_READY", "试译尚未准备好")),
+    cancelTrial: vi.fn().mockResolvedValue(ok(undefined)),
+    onTrialProgress: vi.fn().mockReturnValue(() => undefined),
+    chooseProject: vi.fn().mockResolvedValue(failure("DESKTOP_NO_PROJECT", "没有可打开的书稿")),
+    chooseStore: vi.fn().mockResolvedValue(failure("DESKTOP_NO_PROJECT", "没有可打开的书稿")),
+    refreshProject: vi.fn().mockResolvedValue(failure("DESKTOP_NO_PROJECT", "没有可打开的书稿")),
+    selectRun: vi.fn().mockResolvedValue(failure("DESKTOP_NO_PROJECT", "没有可打开的书稿")),
+    runDoctor: vi.fn().mockResolvedValue(failure("DESKTOP_NO_PROJECT", "没有可打开的书稿")),
     ...overrides,
   };
 }
 
-const emptyApi = createApi({
-  refreshProject: vi.fn().mockResolvedValue(failure("DESKTOP_NO_PROJECT", "open an initialized project first")),
-});
+describe("FolioLoom desktop onboarding", () => {
+  it("starts with a reader-facing manuscript choice instead of an engineering project picker", async () => {
+    render(<App api={createApi()} />);
 
-const projectApi = createApi({
-  refreshProject: vi.fn().mockResolvedValue(failure("DESKTOP_NO_PROJECT", "open an initialized project first")),
-});
-
-const doctorFailureApi = createApi({
-  runDoctor: vi.fn().mockResolvedValue(failure(
-    "CANONICAL_HASH_MISMATCH",
-    "canonical source hash does not match the manifest",
-  )),
-});
-
-const noStoreSnapshot: DesktopProjectSnapshot = {
-  ...snapshot,
-  store: { state: "not_found" },
-  runs: [],
-  selectedRunId: undefined,
-  runSelection: "none",
-};
-
-const multiRunSnapshot: DesktopProjectSnapshot = {
-  ...snapshot,
-  runs: [
-    {
-      ...snapshot.runs[0]!,
-      runId: "run-left",
-      modelId: "model-left",
-    },
-    {
-      ...snapshot.runs[0]!,
-      runId: "run-right",
-      modelId: "model-right",
-    },
-  ],
-  selectedRunId: undefined,
-  runSelection: "required",
-};
-
-describe("FolioLoom desktop workbench", () => {
-  it("renders one integrated application titlebar", () => {
-    render(<App api={emptyApi} />);
-
-    expect(screen.getByRole("banner", { name: "应用标题栏" })).toBeTruthy();
-    expect(screen.getByText("FolioLoom · 翻译中")).toBeTruthy();
+    expect(await screen.findByRole("heading", { name: "开始翻译一本书" })).toBeTruthy();
+    expect(screen.getByRole("button", { name: "选择书稿" })).toBeTruthy();
   });
 
-  it("uses a relative production logo asset path for Electron file pages", () => {
-    const { container } = render(<App api={emptyApi} />);
-    const mark = container.querySelector<HTMLImageElement>(".brand-mark");
-
-    expect(mark?.getAttribute("src")).toBe("./folioloom-mark.svg");
-  });
-
-  it("empty workbench asks the user to open an initialized project", () => {
-    render(<App api={emptyApi} />);
-
-    expect(screen.getByRole("button", { name: "打开项目" })).toBeTruthy();
-    expect(screen.getByText("尚未打开项目")).toBeTruthy();
-  });
-
-  it("project overview renders 翻译中 and real counters without a fake percentage", async () => {
-    const user = userEvent.setup();
-    render(<App api={projectApi} />);
-
-    await user.click(screen.getByRole("button", { name: "打开项目" }));
-
-    expect(await screen.findByRole("heading", { name: "翻译中" })).toBeTruthy();
-    expect(screen.getByText("已完成 1 / 4 窗口")).toBeTruthy();
-    expect(screen.queryByText(/%/)).toBeNull();
-  });
-
-  it("doctor failure keeps a structured next step visible", async () => {
-    const user = userEvent.setup();
-    render(<App api={doctorFailureApi} />);
-
-    await user.click(await screen.findByRole("button", { name: "运行检查" }));
-
-    expect(await screen.findByText("CANONICAL_HASH_MISMATCH")).toBeTruthy();
-    expect(screen.getByText("请恢复与 manifest 匹配的 canonical 原文后重试")).toBeTruthy();
-  });
-
-  it("shows a readable no-store state instead of an invented run status", async () => {
-    const noStoreApi = createApi({
-      refreshProject: vi.fn().mockResolvedValue(ok(noStoreSnapshot)),
-    });
-    render(<App api={noStoreApi} />);
-
-    expect(await screen.findByRole("heading", { name: "尚未开始翻译" })).toBeTruthy();
-    expect(screen.getByRole("button", { name: "选择状态库" })).toBeTruthy();
-  });
-
-  it("renders successful doctor coverage and structural evidence", async () => {
+  it("renders six direct providers and keeps the custom interface under more services", async () => {
     const user = userEvent.setup();
     render(<App api={createApi()} />);
 
-    await user.click(await screen.findByRole("button", { name: "运行检查" }));
+    for (const name of ["DeepSeek", "Kimi", "阿里云百炼", "火山方舟", "OpenAI", "硅基流动"]) {
+      expect(await screen.findByRole("button", { name })).toBeTruthy();
+    }
+    expect(screen.getByRole("button", { name: "更多服务" })).toBeTruthy();
+    expect(screen.queryByLabelText("Base URL")).toBeNull();
 
-    expect(await screen.findByRole("heading", { name: "原文检查已完成" })).toBeTruthy();
-    expect(screen.getByText("已覆盖 12,840 / 12,840 字")).toBeTruthy();
-    expect(screen.getByText("结构块")).toBeTruthy();
+    await user.click(screen.getByRole("button", { name: "更多服务" }));
+    await user.click(screen.getByRole("button", { name: "自定义 OpenAI-compatible" }));
+
+    expect(screen.getByLabelText("Base URL")).toBeTruthy();
+    expect(screen.getByRole("button", { name: "on" })).toBeTruthy();
+    expect(screen.getByRole("button", { name: "off" })).toBeTruthy();
   });
 
-  it("lets the reader choose a concrete run when more than one matches", async () => {
+  it("uses raw provider effort values without translating or normalizing them", async () => {
     const user = userEvent.setup();
-    const selectedSnapshot: DesktopProjectSnapshot = {
-      ...multiRunSnapshot,
-      selectedRunId: "run-right",
-      runSelection: "selected",
+    render(<App api={createApi()} />);
+
+    await user.click(await screen.findByRole("button", { name: "DeepSeek" }));
+
+    expect(screen.getByRole("button", { name: "high" })).toBeTruthy();
+    expect(screen.getByRole("button", { name: "max" })).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "最大" })).toBeNull();
+  });
+
+  it("clears the API Key field after the connection promise settles", async () => {
+    const user = userEvent.setup();
+    const testModel = vi.fn().mockResolvedValue(ok(testResult()));
+    render(<App api={createApi({ testModel })} />);
+
+    const apiKey = await screen.findByLabelText("API Key");
+    await user.type(apiKey, "sk-temporary-key");
+    await user.click(screen.getByRole("button", { name: "测试连接" }));
+
+    await waitFor(() => expect(testModel).toHaveBeenCalledWith(expect.objectContaining({
+      providerId: "deepseek",
+      apiKey: "sk-temporary-key",
+    })));
+    await waitFor(() => expect((apiKey as HTMLInputElement).value).toBe(""));
+  });
+
+  it("keeps the trial action disabled until the model is ready", async () => {
+    const sourceOnly: DesktopOnboardingState = {
+      ...emptyOnboarding,
+      project,
+      readiness: { source: true, model: false, trial: false },
+      activeModel: {
+        providerId: "deepseek",
+        modelId: "deepseek-reasoner",
+        capability: "limited",
+      },
+      latestProbe: { status: "limited", message: "这个模型还不能用于完整翻译流程" },
     };
-    const selectRun = vi.fn().mockResolvedValue(ok(selectedSnapshot));
-    const multiRunApi = createApi({
-      refreshProject: vi.fn().mockResolvedValue(ok(multiRunSnapshot)),
-      selectRun,
+    render(<App api={createApi({ getOnboardingState: vi.fn().mockResolvedValue(ok(sourceOnly)) })} />);
+
+    expect((await screen.findByRole("button", { name: "开始试译" }) as HTMLButtonElement).disabled).toBe(true);
+  });
+
+  it("runs one real trial and renders the committed source beside its translation", async () => {
+    const user = userEvent.setup();
+    let publishProgress: ((progress: DesktopTrialProgress) => void) | undefined;
+    const startTrial = vi.fn().mockImplementation(async () => {
+      publishProgress?.({ stage: "translating" });
+      publishProgress?.({ stage: "checking" });
+      publishProgress?.({ stage: "completed" });
+      return ok({
+        runId: "trial-run-1",
+        sourceText: "The bell rang above the empty court.",
+        translationText: "钟声在空旷的庭院上空回响。",
+      });
     });
-    render(<App api={multiRunApi} />);
+    const onTrialProgress = vi.fn().mockImplementation((listener: (progress: DesktopTrialProgress) => void) => {
+      publishProgress = listener;
+      return () => { publishProgress = undefined; };
+    });
+    const { container } = render(<App api={createApi({
+      getOnboardingState: vi.fn().mockResolvedValue(ok(readyOnboarding)),
+      startTrial,
+      onTrialProgress,
+    })} />);
 
-    expect(await screen.findByRole("heading", { name: "请选择要查看的运行" })).toBeTruthy();
-    await user.click(screen.getByRole("button", { name: /model-right/ }));
+    const button = await waitFor(() => {
+      const target = container.querySelector<HTMLButtonElement>('[data-action="start-trial"]');
+      expect(target?.disabled).toBe(false);
+      return target as HTMLButtonElement;
+    });
+    await user.click(button);
 
-    expect(await screen.findByRole("heading", { name: "model-right" })).toBeTruthy();
-    expect(selectRun).toHaveBeenCalledWith("run-right");
+    expect(await screen.findByText("The bell rang above the empty court.")).toBeTruthy();
+    expect(screen.getByText("钟声在空旷的庭院上空回响。")).toBeTruthy();
+    expect(startTrial).toHaveBeenCalledTimes(1);
+    expect(onTrialProgress).toHaveBeenCalledTimes(1);
   });
 
-  it("keeps a safe empty state when the preload bridge is unavailable", async () => {
+  it("shows a normal error first and keeps redacted technical detail collapsed", async () => {
     const user = userEvent.setup();
-    vi.stubGlobal("folioLoom", undefined);
-    render(<App />);
+    const secret = "json-header-secret-should-not-reach-the-dom";
+    const testModel = vi.fn().mockResolvedValue(failure(
+      "AUTH_INVALID",
+      "API Key 未被接受，请检查后重试。",
+      `headers={"x-api-key":"${secret}"}`,
+    ));
+    const { container } = render(<App api={createApi({ testModel })} />);
 
-    expect(await screen.findByText("尚未打开项目")).toBeTruthy();
-    await user.click(screen.getByRole("button", { name: "打开项目" }));
-    expect(screen.queryByText("DESKTOP_RENDERER_ERROR")).toBeNull();
+    await user.type(await screen.findByLabelText("API Key"), secret);
+    await user.click(screen.getByRole("button", { name: "测试连接" }));
+
+    expect(await screen.findByText("API Key 未被接受，请检查后重试。")).toBeTruthy();
+    const details = screen.getByText("技术详情").closest("details");
+    expect(details?.open).toBe(false);
+    expect(container.textContent).not.toContain(secret);
   });
 
-  it("inactive workspace says it is unavailable instead of exposing a fake action", async () => {
-    const user = userEvent.setup();
-    render(<App api={createApi()} />);
+  it("does not put internal workflow jargon in the default visible interface", async () => {
+    const { container } = render(<App api={createApi()} />);
+    await screen.findByRole("heading", { name: "开始翻译一本书" });
+    const visibleText = container.textContent ?? "";
 
-    await user.click(await screen.findByRole("button", { name: "审阅队列" }));
-
-    expect(await screen.findByText("将在运行控制阶段接入")).toBeTruthy();
-    expect(screen.queryByRole("button", { name: "开始审阅" })).toBeNull();
+    for (const forbidden of ["V5", "source_manifest.json", "book.db", "canonical", "SQLite", "状态库", "协议"]) {
+      expect(visibleText).not.toContain(forbidden);
+    }
   });
 });
