@@ -153,3 +153,34 @@ test("complete-request budgeting remains compatible with a text-only source toke
   assert.equal(budget.decision, "accepted");
   assert.ok(budget.components.some((component) => component.kind === "tool_schemas"));
 });
+
+test("request budgeting applies usage calibration only to the matching model scope", () => {
+  const estimator = new WeightedTokenEstimator();
+  estimator.observeUsage({
+    modelId: "model-a",
+    profile: fixture().sourceLanguageProfile,
+    estimatedTokens: 100,
+    actualInputTokens: 125,
+  });
+  const options = {
+    contextWindowTokens: 10_000,
+    outputTokens: 400,
+    reasoningReserveTokens: 200,
+    safetyMarginTokens: 100,
+  } as const;
+
+  const calibrated = new RequestBudgeter(estimator, {
+    ...options,
+    modelId: "model-a",
+  }).assess(fixture());
+  const unrelated = new RequestBudgeter(estimator, {
+    ...options,
+    modelId: "model-b",
+  }).assess(fixture());
+
+  assert.ok(calibrated.inputTokens > unrelated.inputTokens);
+  assert.equal(
+    new RequestBudgeter(estimator, options).assess(fixture()).inputTokens,
+    unrelated.inputTokens,
+  );
+});

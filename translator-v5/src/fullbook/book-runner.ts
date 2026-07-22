@@ -30,7 +30,10 @@ import {
 } from "../knowledge/knowledge-store.js";
 import { createKnowledgeSnapshot } from "../knowledge/snapshot.js";
 import { SourceLedger } from "../source/source-ledger.js";
-import { WeightedTokenEstimator } from "../source/token-estimator.js";
+import {
+  WeightedTokenEstimator,
+  type UsageObservation,
+} from "../source/token-estimator.js";
 import { analyzeSourceAnomalies } from "../source/anomaly-report.js";
 import {
   runTranslationWindow,
@@ -285,6 +288,8 @@ export interface LosslessBookRunOptions {
   tinyWindowTokens?: number;
   maxRequestTokens?: number;
   maxWindowsPerRequest?: number;
+  /** Optional shared estimator keeps provider/language calibration across waves and test runs. */
+  tokenEstimator?: WeightedTokenEstimator;
   /**
    * Stops between durable window operations. A promotion that has already
    * entered the store remains atomic and is never interrupted mid-transaction.
@@ -1024,6 +1029,7 @@ function admitTranslationRequests<TInput extends TranslationRequestInput>(
     const request = queue.shift() as PhysicalRequestPlan;
     const input = buildInput(request);
     const assessment = new RequestBudgeter(estimator, {
+      modelId: runtime.model.id,
       contextWindowTokens: runtime.model.contextWindow,
       outputTokens: outputReserveTokens(request, runtime),
       reasoningReserveTokens: Math.min(
@@ -1232,7 +1238,7 @@ async function runLosslessBook(
     });
     store.initializeWindowPlan(runId, planned);
     store.recoverInterruptedWindows(runId);
-    const estimator = new WeightedTokenEstimator();
+    const estimator = options.tokenEstimator ?? new WeightedTokenEstimator();
     const schedulerSnapshot = store.latestSchedulerSnapshot(runId);
     const scheduler = new AdaptiveScheduler({
       initialConcurrency: Math.min(2, maxConcurrency),
@@ -1474,7 +1480,7 @@ async function runLosslessBook(
         const completionOrder = await runWithAdaptiveScheduler(
           requestInputs,
           scheduler,
-          async ({ request, input }): Promise<ScheduledResult<CompletedRequest>> => {
+          async ({ request, input, assessment }): Promise<ScheduledResult<CompletedRequest>> => {
             const budget = new BudgetLedger();
             try {
               throwIfAborted(options.signal);
@@ -1492,6 +1498,17 @@ async function runLosslessBook(
                 signal: options.signal,
                 deadlineMs: options.hardDeadlineMs,
               });
+              if (result.run.modelCalls === 1
+                && assessment.inputTokens > 0
+                && result.run.usage.input > 0) {
+                const observation: UsageObservation = {
+                  modelId: executionRuntime.model.id,
+                  profile: context.languageProfile,
+                  estimatedTokens: assessment.inputTokens,
+                  actualInputTokens: result.run.usage.input,
+                };
+                estimator.observeUsage(observation);
+              }
               return {
                 value: { request, budget, result },
                 status: "success",

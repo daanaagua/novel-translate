@@ -14,12 +14,22 @@ export interface RequestTokenEstimate {
 }
 
 export interface RequestTokenEstimator {
-  estimateText(text: string, profile: SourceLanguageProfile): RequestTokenEstimate;
+  estimateText(
+    text: string,
+    profile: SourceLanguageProfile,
+    options?: { readonly modelId?: string },
+  ): RequestTokenEstimate;
   /** Optional while the source estimator is text-only; JSON falls back to its wire text. */
-  estimateJson?(value: unknown, profile: SourceLanguageProfile): RequestTokenEstimate;
+  estimateJson?(
+    value: unknown,
+    profile: SourceLanguageProfile,
+    options?: { readonly modelId?: string },
+  ): RequestTokenEstimate;
 }
 
 export interface RequestBudgetOptions {
+  /** Calibration scope for the provider/model that will execute this request. */
+  readonly modelId?: string;
   /** Provider context capacity reserved for this complete request. */
   readonly contextWindowTokens: number;
   /** Expected completion budget, including all translated source blocks. */
@@ -117,6 +127,7 @@ export class RequestBudgeter {
   constructor(estimator: RequestTokenEstimator, options: RequestBudgetOptions) {
     this.#estimator = estimator;
     this.#options = {
+      ...(options.modelId === undefined ? {} : { modelId: options.modelId }),
       contextWindowTokens: positiveInteger(options.contextWindowTokens, "contextWindowTokens"),
       outputTokens: nonNegativeInteger(options.outputTokens, "outputTokens"),
       reasoningReserveTokens: nonNegativeInteger(
@@ -137,18 +148,26 @@ export class RequestBudgeter {
       jsonPayload?: unknown,
     ): void => {
       const textual = normalizeEstimate(
-        this.#estimator.estimateText(text, profile),
+        this.#estimator.estimateText(text, profile, { modelId: this.#options.modelId }),
         `estimateText(${kind})`,
       );
       const structured = jsonPayload === undefined
         ? undefined
         : this.#estimator.estimateJson === undefined
           ? normalizeEstimate(
-            this.#estimator.estimateText(JSON.stringify(jsonPayload) ?? "null", profile),
+            this.#estimator.estimateText(
+              JSON.stringify(jsonPayload) ?? "null",
+              profile,
+              { modelId: this.#options.modelId },
+            ),
             `estimateText(json:${kind})`,
           )
           : normalizeEstimate(
-            this.#estimator.estimateJson(jsonPayload, profile),
+            this.#estimator.estimateJson(
+              jsonPayload,
+              profile,
+              { modelId: this.#options.modelId },
+            ),
             `estimateJson(${kind})`,
           );
       components.push({

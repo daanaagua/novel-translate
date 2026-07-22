@@ -27,6 +27,19 @@ import { annotateStructure } from "../src/source/structure-annotator.js";
 import { BookStore } from "../src/storage/book-store.js";
 import { LosslessBookStore } from "../src/storage/lossless-book-store.js";
 import { scalarLength } from "../src/source/types.js";
+import {
+  WeightedTokenEstimator,
+  type UsageObservation,
+} from "../src/source/token-estimator.js";
+
+class TrackingTokenEstimator extends WeightedTokenEstimator {
+  readonly observations: UsageObservation[] = [];
+
+  override observeUsage(sample: UsageObservation): void {
+    this.observations.push(sample);
+    super.observeUsage(sample);
+  }
+}
 
 function losslessFixture(source: string) {
   const directory = mkdtempSync(join(tmpdir(), "v5-lossless-runner-"));
@@ -419,6 +432,23 @@ test("failed lossless doctor blocks every model call", async () => {
 
   await assert.rejects(runBook(fixture.options as never), /HASH_MISMATCH/);
   assert.equal(fixture.faux.state.callCount, 0);
+});
+
+test("lossless runner feeds single-call provider usage back into model-scoped calibration", async () => {
+  const fixture = losslessFixture("A plain sentence without named entities.");
+  fixture.faux.setResponses([losslessBatchResponse]);
+  const estimator = new TrackingTokenEstimator();
+
+  const result = await runBook({
+    ...fixture.options,
+    tokenEstimator: estimator,
+  } as never);
+
+  assert.equal(result.status.completedWindows + result.status.warningWindows, 1);
+  assert.equal(estimator.observations.length, 1);
+  assert.equal(estimator.observations[0]?.modelId, fixture.faux.getModel().id);
+  assert.equal(estimator.observations[0]?.profile.id, "en");
+  assert.ok((estimator.observations[0]?.actualInputTokens ?? 0) > 0);
 });
 
 test("complete request admission rejects a tiny context before any provider call", async () => {
