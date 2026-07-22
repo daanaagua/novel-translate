@@ -76,12 +76,85 @@ function copyMemories(
   }));
 }
 
+const CANONICAL_BLOCK_ID = /^block-[0-9a-f]{20}$/u;
+
+interface BlockIdCorrection {
+  blockId: string;
+  hexOffset: number;
+  submittedCharacter: string;
+  canonicalCharacter: string;
+}
+
+function singleCharacterDifferenceIndex(left: string, right: string): number | undefined {
+  if (left.length !== right.length) {
+    return undefined;
+  }
+  let differenceIndex: number | undefined;
+  for (let index = 0; index < left.length; index += 1) {
+    if (left[index] !== right[index]) {
+      if (differenceIndex !== undefined) {
+        return undefined;
+      }
+      differenceIndex = index;
+    }
+  }
+  return differenceIndex;
+}
+
+/**
+ * Model output occasionally copies one hexadecimal character of an opaque
+ * lossless block ID incorrectly.  This is deliberately a very narrow repair:
+ * the submitted value itself must not name any real block, and exactly one
+ * real ID in the whole input may be one character away. That target must be
+ * canonical and expected by the current logical window.
+ */
+function correctUnknownCanonicalBlockId(
+  submittedId: string,
+  expectedIds: ReadonlySet<string>,
+  realBlockIds: ReadonlySet<string>,
+): BlockIdCorrection | undefined {
+  if (!CANONICAL_BLOCK_ID.test(submittedId) || realBlockIds.has(submittedId)) {
+    return undefined;
+  }
+  let candidate: { blockId: string; differenceIndex: number } | undefined;
+  for (const realBlockId of realBlockIds) {
+    const differenceIndex = singleCharacterDifferenceIndex(submittedId, realBlockId);
+    if (differenceIndex === undefined) {
+      continue;
+    }
+    if (candidate !== undefined) {
+      return undefined;
+    }
+    candidate = { blockId: realBlockId, differenceIndex };
+  }
+  if (
+    candidate === undefined
+    || !CANONICAL_BLOCK_ID.test(candidate.blockId)
+    || !expectedIds.has(candidate.blockId)
+  ) {
+    return undefined;
+  }
+  return {
+    blockId: candidate.blockId,
+    hexOffset: candidate.differenceIndex - "block-".length + 1,
+    submittedCharacter: submittedId.charAt(candidate.differenceIndex),
+    canonicalCharacter: candidate.blockId.charAt(candidate.differenceIndex),
+  };
+}
+
+function correctedBlockIdWarning(windowId: string, correction: BlockIdCorrection): string {
+  return "warning: mechanically corrected opaque blockId"
+    + ` in window ${windowId} at hex offset ${correction.hexOffset}`
+    + ` (${correction.submittedCharacter} -> ${correction.canonicalCharacter})`;
+}
+
 function validateSubmission(
   input: TranslationBatchInput,
   submission: FinalizeTranslationBatchArgs | undefined,
 ): Pick<TranslationBatchResult, "windows" | "responseErrors"> {
   const expected = new Map(input.request.windows.map((window) => [window.windowId, window]));
   const blockById = new Map(input.blocks.map((block) => [block.id, block]));
+  const realBlockIds = new Set(blockById.keys());
   const entries = submission?.windows ?? [];
   const byWindow = new Map<string, FinalizeTranslationBatchArgs["windows"]>();
   const responseErrors: string[] = [];
@@ -115,27 +188,42 @@ function validateSubmission(
     const candidate = submitted[0] as FinalizeTranslationBatchArgs["windows"][number];
     const expectedIds = new Set(window.blockIds);
     const seen = new Set<string>();
+    const translations: Array<{ blockId: string; text: string }> = [];
+    const correctionWarnings: string[] = [];
     for (const translation of candidate.translations) {
-      if (!expectedIds.has(translation.blockId) || !blockById.has(translation.blockId)) {
+      const correction = expectedIds.has(translation.blockId)
+        ? undefined
+        : correctUnknownCanonicalBlockId(
+          translation.blockId,
+          expectedIds,
+          realBlockIds,
+        );
+      const blockId = correction?.blockId ?? translation.blockId;
+      if (!expectedIds.has(blockId) || !blockById.has(blockId)) {
         return failed(`unknown blockId for ${window.windowId}: ${translation.blockId}`);
       }
-      if (seen.has(translation.blockId)) {
+      if (seen.has(blockId)) {
         return failed(`duplicate blockId for ${window.windowId}: ${translation.blockId}`);
       }
-      seen.add(translation.blockId);
+      seen.add(blockId);
       if (translation.text.trim().length === 0) {
-        return failed(`empty translation for block ${translation.blockId}`);
+        return failed(`empty translation for block ${blockId}`);
+      }
+      translations.push({ blockId, text: translation.text });
+      if (correction !== undefined) {
+        correctionWarnings.push(correctedBlockIdWarning(window.windowId, correction));
       }
     }
     const missing = window.blockIds.filter((blockId) => !seen.has(blockId));
     if (missing.length > 0 || candidate.translations.length !== window.blockIds.length) {
       return failed(`block set mismatch for ${window.windowId}: missing ${missing.join(", ")}`);
     }
+    responseErrors.push(...correctionWarnings);
     return {
       windowId: window.windowId,
       ordinal: window.ordinal,
       status: candidate.notes.length > 0 ? "completed_with_warnings" : "completed",
-      translations: candidate.translations.map((translation) => ({ ...translation })),
+      translations,
       notes: [...candidate.notes],
       memoryCandidates: copyMemories(candidate.memoryCandidates),
       ...(candidate.styleObservation === undefined

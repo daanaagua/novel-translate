@@ -53,6 +53,24 @@ const request: PhysicalRequestPlan = {
   })),
 };
 
+function singleWindowRequest(sourceBlocks: readonly LosslessBlock[]): PhysicalRequestPlan {
+  return {
+    requestId: "request-canonical-id-fixture",
+    sourceTokens: sourceBlocks.reduce((total, item) => total + item.tokenCount, 0),
+    windows: [{
+      windowId: "window-canonical-id-fixture",
+      ordinal: 0,
+      chapterId: "chapter-0",
+      chapterTitle: null,
+      blockIds: sourceBlocks.map((item) => item.id),
+      globalIndexes: sourceBlocks.map((item) => item.globalIndex),
+      sourceTokens: sourceBlocks.reduce((total, item) => total + item.tokenCount, 0),
+      sourceChars: sourceBlocks.reduce((total, item) => total + item.sourceText.length, 0),
+      oversized: false,
+    }],
+  };
+}
+
 function promptText(context: Context): string {
   const message = context.messages.findLast((item) => item.role === "user");
   assert.ok(message?.role === "user");
@@ -140,6 +158,117 @@ test("batch isolates one malformed logical window without discarding its valid s
   assert.equal(result.windows[0]?.status, "completed");
   assert.equal(result.windows[1]?.status, "failed");
   assert.match(result.windows[1]?.error ?? "", /empty/i);
+});
+
+test("batch mechanically corrects one unknown canonical block-id character typo", async () => {
+  const expected = block("block-1f85f23a483f9edef746", 0, "Alpha.");
+  const mistyped = "block-1f85a23a483f9edef746";
+  const canonicalRequest = singleWindowRequest([expected]);
+  const faux = fauxProvider();
+  faux.setResponses([fauxAssistantMessage(fauxToolCall(
+    "finalize_translation_batch",
+    { windows: [{
+      windowId: canonicalRequest.windows[0]!.windowId,
+      translations: [{ blockId: mistyped, text: "阿尔法。" }],
+      notes: [],
+    }] },
+  ), { stopReason: "toolUse" })]);
+
+  const result = await runTranslationBatch({
+    request: canonicalRequest,
+    blocks: [expected],
+    stableTerms: [],
+    snapshot: { id: "snapshot-0", revisions: [] },
+    model: faux.getModel(),
+    streamFn: faux.provider.streamSimple.bind(faux.provider),
+    budget: new BudgetLedger(),
+  });
+
+  assert.equal(faux.state.callCount, 1);
+  assert.equal(result.windows[0]?.status, "completed");
+  assert.equal(result.windows[0]?.translations[0]?.blockId, expected.id);
+  assert.equal(result.windows[0]?.translations[0]?.text, "阿尔法。");
+  assert.deepEqual(result.responseErrors, [
+    "warning: mechanically corrected opaque blockId in window window-canonical-id-fixture at hex offset 5 (a -> f)",
+  ]);
+});
+
+test("batch never corrects a submitted identifier that is a real other block", async () => {
+  const expected = block("block-1f85f23a483f9edef746", 0, "Alpha.");
+  const realOther = block("block-1f85a23a483f9edef746", 1, "Beta.");
+  const canonicalRequest = singleWindowRequest([expected]);
+  const faux = fauxProvider();
+  faux.setResponses([fauxAssistantMessage(fauxToolCall(
+    "finalize_translation_batch",
+    { windows: [{
+      windowId: canonicalRequest.windows[0]!.windowId,
+      translations: [{ blockId: realOther.id, text: "阿尔法。" }],
+      notes: [],
+    }] },
+  ), { stopReason: "toolUse" })]);
+
+  const result = await runTranslationBatch({
+    request: canonicalRequest,
+    blocks: [expected, realOther],
+    stableTerms: [],
+    snapshot: { id: "snapshot-0", revisions: [] },
+    model: faux.getModel(),
+    streamFn: faux.provider.streamSimple.bind(faux.provider),
+    budget: new BudgetLedger(),
+  });
+
+  assert.equal(result.windows[0]?.status, "failed");
+  assert.match(result.windows[0]?.error ?? "", /unknown blockId/i);
+  assert.deepEqual(result.responseErrors, []);
+});
+
+test("batch rejects multi-character and ambiguous canonical block-id corrections", async () => {
+  const expected = block("block-1f85f23a483f9edef746", 0, "Alpha.");
+  const ambiguousOther = block("block-1f85a23a483f9edef747", 1, "Beta.");
+  const canonicalRequest = singleWindowRequest([expected]);
+  const cases = [
+    {
+      name: "a same-length non-hex identifier",
+      submittedId: "block-1f85f23a483f9edef74g",
+      inputBlocks: [expected],
+    },
+    {
+      name: "two character differences",
+      submittedId: "block-1f85a23a483f9edef747",
+      inputBlocks: [expected],
+    },
+    {
+      name: "two equally near real block identifiers",
+      submittedId: "block-1f85a23a483f9edef746",
+      inputBlocks: [expected, ambiguousOther],
+    },
+  ];
+
+  for (const fixture of cases) {
+    const faux = fauxProvider();
+    faux.setResponses([fauxAssistantMessage(fauxToolCall(
+      "finalize_translation_batch",
+      { windows: [{
+        windowId: canonicalRequest.windows[0]!.windowId,
+        translations: [{ blockId: fixture.submittedId, text: "阿尔法。" }],
+        notes: [],
+      }] },
+    ), { stopReason: "toolUse" })]);
+
+    const result = await runTranslationBatch({
+      request: canonicalRequest,
+      blocks: fixture.inputBlocks,
+      stableTerms: [],
+      snapshot: { id: "snapshot-0", revisions: [] },
+      model: faux.getModel(),
+      streamFn: faux.provider.streamSimple.bind(faux.provider),
+      budget: new BudgetLedger(),
+    });
+
+    assert.equal(result.windows[0]?.status, "failed", fixture.name);
+    assert.match(result.windows[0]?.error ?? "", /unknown blockId/i, fixture.name);
+    assert.deepEqual(result.responseErrors, [], fixture.name);
+  }
 });
 
 test("batch prompt includes only the bounded current knowledge projection behind one sentinel", async () => {
