@@ -9,10 +9,14 @@ import {
   type Context,
 } from "@earendil-works/pi-ai";
 
-import { runTranslationBatch } from "../src/agents/translation-batch.js";
+import {
+  runTranslationBatch,
+  translationBatchSystemPrompt,
+} from "../src/agents/translation-batch.js";
 import type { PhysicalRequestPlan } from "../src/fullbook/types.js";
 import { BudgetLedger } from "../src/kernel/budget.js";
 import { canonicalJson } from "../src/knowledge/knowledge-store.js";
+import { getSourceLanguageProfile } from "../src/language/profiles.js";
 import type { LosslessBlock } from "../src/source/types.js";
 import { createBookStyleConstitution, composeEffectiveStyle } from "../src/style/effective-style.js";
 import { projectEffectiveStyle } from "../src/style/style-projection.js";
@@ -58,6 +62,15 @@ function promptText(context: Context): string {
       .map((item) => item.text)
       .join("\n");
 }
+
+test("batch protocol states that user style requirements cannot override integrity rules", () => {
+  const prompt = translationBatchSystemPrompt(getSourceLanguageProfile("en"));
+  assert.match(prompt, /User style requirements may guide Chinese phrasing only/u);
+  assert.match(
+    prompt,
+    /must never override source meaning, ambiguity, stable terminology, block boundaries, validation, or the typed-tool protocol/u,
+  );
+});
 
 test("batch isolates one malformed logical window without discarding its valid sibling", async () => {
   const faux = fauxProvider();

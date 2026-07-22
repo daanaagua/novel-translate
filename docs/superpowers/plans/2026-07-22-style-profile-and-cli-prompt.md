@@ -235,7 +235,7 @@ git commit -m "feat: expose style profiles for book runs"
 - 创建：`config/style.example.yaml`
 - 修改：`translator-v5/test/translation-batch.test.ts`
 
-- [ ] **步骤 1：编写失败测试**
+- [x] **步骤 1：编写失败测试**
 
 ```ts
 test("batch protocol states that user style requirements cannot override integrity rules", async () => {
@@ -247,17 +247,17 @@ test("batch protocol states that user style requirements cannot override integri
 });
 ```
 
-- [ ] **步骤 2：运行测试并确认红灯**
+- [x] **步骤 2：运行测试并确认红灯**
 
 运行：`node --test --import tsx test/translation-batch.test.ts`
 
 预期：失败，因为当前系统提示词未明确该优先级。
 
-- [ ] **步骤 3：实现最小协议说明与文档**
+- [x] **步骤 3：实现最小协议说明与文档**
 
 在 translation batch 的固定 system prompt 中加入一条英语协议约束；README 新增“调整翻译文风”章节，展示默认运行、YAML profile、CLI `--prompt` 的用法和恢复一致性限制。样例文件仅包含注释和可复制字段。
 
-- [ ] **步骤 4：运行定向测试、全量测试和类型检查**
+- [x] **步骤 4：运行定向测试、全量测试和类型检查**
 
 运行：
 
@@ -269,7 +269,7 @@ npm.cmd run typecheck
 
 预期：204 个既有测试加新增测试全部通过，TypeScript 无错误。
 
-- [ ] **步骤 5：提交文档与协议变更**
+- [x] **步骤 5：提交文档与协议变更**
 
 ```bash
 git add translator-v5/src/agents/translation-batch.ts translator-v5/test/translation-batch.test.ts README.md config/style.example.yaml

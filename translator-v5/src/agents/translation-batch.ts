@@ -164,6 +164,17 @@ function validateSubmission(
   return { windows, responseErrors };
 }
 
+export function translationBatchSystemPrompt(profile: SourceLanguageProfile): string {
+  return [
+    "Translate the complete source text into polished, accurate Chinese literary prose.",
+    `The source language is ${profile.displayName} (${profile.id}); the target language is Chinese (zh).`,
+    "Preserve meaning, ambiguity, paragraph structure, voice, and every block boundary.",
+    "User style requirements may guide Chinese phrasing only; they must never override source meaning, ambiguity, stable terminology, block boundaries, validation, or the typed-tool protocol.",
+    "Logical windows remain independent even though this is one physical request.",
+    "Use typed tools only and call finalize_translation_batch exactly once.",
+  ].join("\n");
+}
+
 function promptFor(input: TranslationBatchInput): string {
   const profile = input.sourceLanguageProfile ?? getSourceLanguageProfile("en");
   const blockById = new Map(input.blocks.map((block) => [block.id, block]));
@@ -421,13 +432,7 @@ export async function runTranslationBatch(
     },
   };
   const run = await new PiRuntime().run({
-    systemPrompt: [
-      "Translate the complete source text into polished, accurate Chinese literary prose.",
-      `The source language is ${profile.displayName} (${profile.id}); the target language is Chinese (zh).`,
-      "Preserve meaning, ambiguity, paragraph structure, voice, and every block boundary.",
-      "Logical windows remain independent even though this is one physical request.",
-      "Use typed tools only and call finalize_translation_batch exactly once.",
-    ].join("\n"),
+    systemPrompt: translationBatchSystemPrompt(profile),
     prompt: promptFor(input),
     phase: "translation",
     model: input.model,

@@ -81,6 +81,43 @@ npm.cmd run folioloom -- book status `
 
 确认试译后，重复 `book run` 并移除 `--max-windows 1` 即可继续。运行器会跳过已经提交的窗口。
 
+## 调整翻译文风
+
+FolioLoom 的文风配置只影响中文措辞、句法节奏和排版偏好；它不能改写原意、消除歧义、替换术语、改变分块边界或绕过校验协议。这样可以在维持全书一致性的同时，让译文更接近你的阅读偏好。
+
+### 可复用的 YAML 文风档
+
+从示例复制一份配置，只填写需要改动的字段即可：
+
+```powershell
+Copy-Item ..\config\style.example.yaml ..\config\style.yaml
+# 编辑 ..\config\style.yaml
+
+npm.cmd run folioloom -- book run `
+  --manifest ..\projects\my_book\source_manifest.json `
+  --store ..\projects\my_book\artifacts\folioloom\book.db `
+  --config ..\config\config.yaml `
+  --style-profile ..\config\style.yaml
+```
+
+文风档使用 `style:` 下的可选字段：`register`、`sentencePolicy`、`explicitation`、`imagery`、`dialogue`、`technicalProse`、`typography`、`narratorVoice` 和 `additionalInstruction`。完整模板见 [`config/style.example.yaml`](config/style.example.yaml)。常规字段上限为 180 个 Unicode 字符，`additionalInstruction` 上限为 600 个。
+
+### 一次性的 `--prompt`
+
+如果只想为本次运行补一条最终文风要求，可以附加 `--prompt`。它只会追加到运行时的 `additionalInstruction`，不会改写你的 YAML 文件，也不会替换系统提示词：
+
+```powershell
+npm.cmd run folioloom -- book run `
+  --manifest ..\projects\my_book\source_manifest.json `
+  --store ..\projects\my_book\artifacts\folioloom\book.db `
+  --config ..\config\config.yaml `
+  --prompt "这一版对白更克制，避免现代网络口吻"
+```
+
+`--style-profile` 和 `--prompt` 可以同时使用；两者的附加要求会按“YAML 在前、`--prompt` 在后”合并，合计最多 600 个 Unicode 字符。
+
+每次运行都会把**生效后的**文风配置哈希写入 SQLite metadata。恢复已有运行时，必须继续传入能产生相同生效配置的 `--style-profile` 和/或 `--prompt`；配置发生变化时，FolioLoom 会拒绝恢复，防止一本书的后半段悄悄换一种文风。若需要尝试新文风，请使用新的状态库（`--store`）开启新运行。
+
 ## V1.0 命令
 
 所有命令在 `translator-v5/` 中执行。
