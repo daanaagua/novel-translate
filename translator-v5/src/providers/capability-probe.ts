@@ -620,7 +620,7 @@ export async function probeProviderCapabilities(request: ProviderCapabilityProbe
   };
   let second: StreamResult;
   try {
-    second = await secondAttempt(initialOutputTokens);
+    second = await withTruncationRetry(initialOutputTokens, secondAttempt);
   } catch (error) {
     const failure = error instanceof ProbeFailure
       ? error

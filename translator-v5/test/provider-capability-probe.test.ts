@@ -16,6 +16,8 @@ type FakeMode =
   | "timeout"
   | "truncated-once"
   | "truncated-always"
+  | "second-truncated-once"
+  | "second-truncated-always"
   | "off-omits-reasoning";
 
 interface FakeProviderOptions {
@@ -98,6 +100,15 @@ function truncatedChatToolEvents(): readonly unknown[] {
   }];
 }
 
+function truncatedChatReadyEvents(): readonly unknown[] {
+  return [{
+    choices: [{
+      delta: { content: "FOLIOLOOM_REA" },
+      finish_reason: "length",
+    }],
+  }];
+}
+
 function responsesToolEvents(): readonly unknown[] {
   return [
     {
@@ -133,6 +144,7 @@ function isSecondResponsesTurn(body: Record<string, unknown>): boolean {
 async function startFakeProvider(options: FakeProviderOptions = {}): Promise<FakeProvider> {
   const requests: CapturedRequest[] = [];
   let firstTurnCount = 0;
+  let secondTurnCount = 0;
   const server: Server = createServer(async (request, response) => {
     const body = await bodyOf(request);
     const path = request.url ?? "/";
@@ -162,6 +174,16 @@ async function startFakeProvider(options: FakeProviderOptions = {}): Promise<Fak
       return;
     }
     if (secondTurn) {
+      if (options.mode === "second-truncated-always"
+        || (options.mode === "second-truncated-once" && secondTurnCount++ === 0)) {
+        sse(response, responses
+          ? [{ type: "response.output_text.delta", delta: "FOLIOLOOM_REA" }, {
+            type: "response.completed",
+            response: { status: "incomplete", incomplete_details: { reason: "max_output_tokens" } },
+          }]
+          : truncatedChatReadyEvents());
+        return;
+      }
       sse(response, responses
         ? [{ type: "response.output_text.delta", delta: "FOLIOLOOM_READY" }, { type: "response.completed" }]
         : [{ choices: [{ delta: { content: "FOLIOLOOM_READY" } }] }]);
@@ -263,6 +285,30 @@ test("two length terminations return PROBE_OUTPUT_TRUNCATED", async (t) => {
   assert.equal(report.status, "failed");
   assert.equal(report.code, "PROBE_OUTPUT_TRUNCATED");
   assert.equal(provider.requests.length, 2);
+});
+
+test("a length-truncated second tool turn retries once with the bounded output budget", async (t) => {
+  const provider = await startFakeProvider({ mode: "second-truncated-once" });
+  t.after(() => provider.close());
+
+  const report = await probe("deepseek", provider);
+
+  assert.equal(report.status, "ready");
+  assert.equal(provider.requests.length, 3);
+  assert.equal(provider.requests[0]?.body.max_completion_tokens, 512);
+  assert.equal(provider.requests[1]?.body.max_completion_tokens, 512);
+  assert.equal(provider.requests[2]?.body.max_completion_tokens, 2048);
+});
+
+test("two length-truncated second tool turns return PROBE_OUTPUT_TRUNCATED rather than tool-call unsupported", async (t) => {
+  const provider = await startFakeProvider({ mode: "second-truncated-always" });
+  t.after(() => provider.close());
+
+  const report = await probe("deepseek", provider);
+
+  assert.equal(report.status, "failed");
+  assert.equal(report.code, "PROBE_OUTPUT_TRUNCATED");
+  assert.equal(provider.requests.length, 3);
 });
 
 test("DeepSeek off skips reasoning continuity and remains ready", async (t) => {
