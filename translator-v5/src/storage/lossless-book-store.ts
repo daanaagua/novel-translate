@@ -1,6 +1,13 @@
 import { createHash, randomUUID } from "node:crypto";
-import { mkdirSync } from "node:fs";
-import { dirname, resolve } from "node:path";
+import {
+  copyFileSync,
+  mkdirSync,
+  mkdtempSync,
+  rmSync,
+  statSync,
+} from "node:fs";
+import { tmpdir } from "node:os";
+import { dirname, join, resolve } from "node:path";
 import { DatabaseSync, type StatementSync } from "node:sqlite";
 
 import type { CommitPromotion } from "../fullbook/commit-coordinator.js";
@@ -268,6 +275,107 @@ export interface LosslessAuditState {
 
 type LosslessStoreOpenMode = "read-write" | "read-only";
 
+interface ReadOnlySourceFileState {
+  size: number;
+  mtimeMs: number;
+}
+
+interface ReadOnlySnapshotState {
+  database: ReadOnlySourceFileState;
+  wal: ReadOnlySourceFileState | undefined;
+}
+
+interface ReadOnlySnapshot {
+  databasePath: string;
+  directory: string;
+}
+
+const READ_ONLY_SNAPSHOT_ATTEMPTS = 3;
+
+export class LosslessReadSnapshotError extends Error {
+  readonly code = "LOSSLESS_READ_SNAPSHOT_UNSTABLE";
+
+  constructor() {
+    super(
+      "source database changed while preparing a read-only snapshot; try again after the writer is idle",
+    );
+    this.name = "LosslessReadSnapshotError";
+  }
+}
+
+function sameReadOnlySourceFileState(
+  left: ReadOnlySourceFileState | undefined,
+  right: ReadOnlySourceFileState | undefined,
+): boolean {
+  return left?.size === right?.size && left?.mtimeMs === right?.mtimeMs;
+}
+
+function sameReadOnlySnapshotState(
+  left: ReadOnlySnapshotState,
+  right: ReadOnlySnapshotState,
+): boolean {
+  return sameReadOnlySourceFileState(left.database, right.database)
+    && sameReadOnlySourceFileState(left.wal, right.wal);
+}
+
+function isMissingPath(error: unknown): boolean {
+  return error !== null
+    && typeof error === "object"
+    && (error as { code?: unknown }).code === "ENOENT";
+}
+
+function readOnlySourceFileState(path: string): ReadOnlySourceFileState {
+  const stats = statSync(path);
+  if (!stats.isFile()) {
+    throw new Error(`read-only snapshot source must be a regular file: ${path}`);
+  }
+  return { size: stats.size, mtimeMs: stats.mtimeMs };
+}
+
+function optionalReadOnlySourceFileState(path: string): ReadOnlySourceFileState | undefined {
+  try {
+    return readOnlySourceFileState(path);
+  } catch (error) {
+    if (isMissingPath(error)) {
+      return undefined;
+    }
+    throw error;
+  }
+}
+
+function readOnlySnapshotState(path: string): ReadOnlySnapshotState {
+  return {
+    database: readOnlySourceFileState(path),
+    wal: optionalReadOnlySourceFileState(`${path}-wal`),
+  };
+}
+
+function createReadOnlySnapshot(path: string): ReadOnlySnapshot {
+  for (let attempt = 0; attempt < READ_ONLY_SNAPSHOT_ATTEMPTS; attempt += 1) {
+    const before = readOnlySnapshotState(path);
+    const directory = mkdtempSync(join(tmpdir(), "folioloom-readonly-"));
+    const databasePath = join(directory, "book.db");
+    try {
+      copyFileSync(path, databasePath);
+      if (before.wal !== undefined) {
+        copyFileSync(`${path}-wal`, `${databasePath}-wal`);
+      }
+      const after = readOnlySnapshotState(path);
+      if (sameReadOnlySnapshotState(before, after)) {
+        return { databasePath, directory };
+      }
+    } catch (error) {
+      rmSync(directory, { recursive: true, force: true });
+      if (!isMissingPath(error)) {
+        throw error;
+      }
+      continue;
+    }
+    rmSync(directory, { recursive: true, force: true });
+  }
+  throw new LosslessReadSnapshotError();
+}
+
 interface SourceVersionRow {
   source_version: string;
   canonical_sha256: string;
@@ -439,14 +547,17 @@ function windowFromRow(row: WindowRow, blockIds: string[]): PersistedLosslessWin
 export class LosslessBookStore {
   readonly #database: DatabaseSync;
   readonly #faultInjector: FaultInjector | undefined;
+  readonly #temporarySnapshotDirectory: string | undefined;
 
   constructor(
     path: string,
     faultInjector?: FaultInjector,
     mode: LosslessStoreOpenMode = "read-write",
+    temporarySnapshotDirectory?: string,
   ) {
     const absolute = resolve(requireNonempty(path, "database path"));
     this.#faultInjector = faultInjector;
+    this.#temporarySnapshotDirectory = temporarySnapshotDirectory;
     if (mode === "read-write") {
       mkdirSync(dirname(absolute), { recursive: true });
     }
@@ -477,12 +588,27 @@ export class LosslessBookStore {
       }
     } catch (error) {
       this.#database.close();
+      if (this.#temporarySnapshotDirectory !== undefined) {
+        rmSync(this.#temporarySnapshotDirectory, { recursive: true, force: true });
+      }
       throw error;
     }
   }
 
   static openReadOnly(path: string): LosslessBookStore {
-    return new LosslessBookStore(path, undefined, "read-only");
+    const sourcePath = resolve(requireNonempty(path, "database path"));
+    const snapshot = createReadOnlySnapshot(sourcePath);
+    try {
+      return new LosslessBookStore(
+        snapshot.databasePath,
+        undefined,
+        "read-only",
+        snapshot.directory,
+      );
+    } catch (error) {
+      rmSync(snapshot.directory, { recursive: true, force: true });
+      throw error;
+    }
   }
 
   databaseSettings(): { foreignKeys: boolean; journalMode: string } {
@@ -1892,7 +2018,13 @@ export class LosslessBookStore {
   }
 
   close(): void {
-    this.#database.close();
+    try {
+      this.#database.close();
+    } finally {
+      if (this.#temporarySnapshotDirectory !== undefined) {
+        rmSync(this.#temporarySnapshotDirectory, { recursive: true, force: true });
+      }
+    }
   }
 
   #initializeSchema(): void {

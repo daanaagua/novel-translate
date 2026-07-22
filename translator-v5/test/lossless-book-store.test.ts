@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { existsSync, mkdtempSync } from "node:fs";
+import { existsSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
@@ -248,6 +248,45 @@ test("read-only store preserves schema and exposes run status", () => {
   readOnly.close();
 
   assert.deepEqual(databaseShape(path), before);
+});
+
+test("read-only store does not create WAL sidecars beside the project database", () => {
+  const path = fixturePath();
+  const writable = new LosslessBookStore(path);
+  const runId = initialize(writable);
+  writable.close();
+  const walPath = `${path}-wal`;
+  const shmPath = `${path}-shm`;
+  rmSync(walPath, { force: true });
+  rmSync(shmPath, { force: true });
+  assert.equal(existsSync(walPath), false);
+  assert.equal(existsSync(shmPath), false);
+
+  const readOnly = LosslessBookStore.openReadOnly(path);
+  assert.equal(readOnly.statusSummary(runId).totalWindows, 1);
+  readOnly.close();
+
+  assert.equal(existsSync(walPath), false);
+  assert.equal(existsSync(shmPath), false);
+});
+
+test("read-only store reads the newest state held in the source WAL", () => {
+  const path = fixturePath();
+  const writable = new LosslessBookStore(path);
+  const runId = initialize(writable);
+  try {
+    assert.equal(existsSync(`${path}-wal`), true);
+
+    const readOnly = LosslessBookStore.openReadOnly(path);
+    try {
+      assert.equal(readOnly.listTranslationRuns()[0]?.runId, runId);
+      assert.equal(readOnly.statusSummary(runId).totalWindows, 1);
+    } finally {
+      readOnly.close();
+    }
+  } finally {
+    writable.close();
+  }
 });
 
 test("read-only store rejects mutations", () => {

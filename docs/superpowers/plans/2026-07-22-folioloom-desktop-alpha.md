@@ -410,6 +410,24 @@ git add translator-v5/src/desktop translator-v5/test/desktop-project-service.tes
 git commit -m "feat: add read-only desktop project service"
 ```
 
+## 审查后回归修正：只读快照与自动发现路径
+
+- [x] **步骤 1：复现并选择安全的 SQLite 读取机制**
+
+在 Node 24 中，`DatabaseSync(path, { readOnly: true })` 仍会在 WAL 数据库旁创建 `-wal` 与 `-shm`。SQLite URI 的 `immutable=1` 虽可避免这些副作用，但不会读取尚在 WAL 中的新状态，因此不作为项目状态读取机制。
+
+- [x] **步骤 2：把 `openReadOnly()` 改为外部稳定快照**
+
+只读入口在系统临时目录复制 `.db` 与可选 `-wal`，不复制 `-shm`；复制前后比较 source `.db` 与 `-wal` 的 `size` 和 `mtime`，变化时清理快照并有限重试。仍不稳定时抛出带 `LOSSLESS_READ_SNAPSHOT_UNSTABLE` code 的结构化错误。SQLite 只会在临时副本旁重建自己的 sidecar，`close()` 后删除整个临时目录。
+
+- [x] **步骤 3：收紧自动发现的规范路径**
+
+自动发现先在 `realpath` 后重复 `requireStorePath()` 校验，再拒绝任何落到 manifest 项目目录之外的 reparse point；显式选择的已有 `.db` 路径保留原行为。
+
+- [x] **步骤 4：回归验证与提交审查修复**
+
+运行只读 WAL、最新 WAL 状态、Windows junction、显式外部数据库的定向测试，再运行全量 V5 测试和类型检查；作为独立 `fix` 提交。
+
 ## 任务 3：接入 Electron 主进程、最小预加载 API 与受限 IPC
 
 **文件：**

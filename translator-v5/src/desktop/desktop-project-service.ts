@@ -1,5 +1,5 @@
 import { statSync, realpathSync } from "node:fs";
-import { basename, dirname, extname, isAbsolute, join } from "node:path";
+import { basename, dirname, extname, isAbsolute, join, relative, sep } from "node:path";
 
 import { doctorBook, type BookDoctorReport } from "../cli.js";
 import { SourceLedger } from "../source/source-ledger.js";
@@ -85,6 +85,14 @@ function adjacentGlossaryPath(manifestPath: string): string | undefined {
   return regularFile(candidate) ? realpathSync(candidate) : undefined;
 }
 
+function pathIsWithinDirectory(path: string, directory: string): boolean {
+  const pathFromDirectory = relative(directory, path);
+  return pathFromDirectory.length > 0
+    && pathFromDirectory !== ".."
+    && !pathFromDirectory.startsWith(`..${sep}`)
+    && !isAbsolute(pathFromDirectory);
+}
+
 function discoverStorePath(manifestPath: string): string | undefined {
   const directory = dirname(manifestPath);
   const candidates = [
@@ -93,7 +101,14 @@ function discoverStorePath(manifestPath: string): string | undefined {
   ];
   for (const candidate of candidates) {
     if (regularFile(candidate)) {
-      return realpathSync(candidate);
+      const storePath = requireStorePath(candidate);
+      if (!pathIsWithinDirectory(storePath, directory)) {
+        throw new DesktopInputError(
+          "DESKTOP_INPUT_INVALID",
+          "automatically discovered storePath must remain within the project directory",
+        );
+      }
+      return storePath;
     }
   }
   return undefined;

@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -179,6 +179,82 @@ test("snapshot opens a manifest without a store", () => {
     }
   } finally {
     rmSync(fixture.directory, { recursive: true, force: true });
+  }
+});
+
+test("snapshot rejects an automatically discovered database reparse point outside the project", () => {
+  const fixture = createFixture();
+  const externalDirectory = mkdtempSync(join(tmpdir(), "folioloom-external-store-"));
+  try {
+    const externalStoreDirectory = join(externalDirectory, "folioloom");
+    const externalStorePath = join(externalStoreDirectory, "book.db");
+    mkdirSync(externalStoreDirectory, { recursive: true });
+    const externalStore = new LosslessBookStore(externalStorePath);
+    externalStore.close();
+    symlinkSync(externalDirectory, join(fixture.directory, "artifacts"), "junction");
+
+    const result = new DesktopProjectService().snapshot({
+      manifestPath: fixture.manifestPath,
+    });
+    assert.equal(result.ok, false);
+    if (!result.ok) {
+      assert.equal(result.error.code, "DESKTOP_INPUT_INVALID");
+      assert.match(result.error.message, /project directory/);
+    }
+  } finally {
+    rmSync(fixture.directory, { recursive: true, force: true });
+    rmSync(externalDirectory, { recursive: true, force: true });
+  }
+});
+
+test("snapshot validates a discovered database suffix after resolving a file link", (t) => {
+  const fixture = createFixture();
+  const nonDatabasePath = join(fixture.directory, "outside-store.txt");
+  try {
+    writeFileSync(nonDatabasePath, "not a SQLite database", "utf8");
+    try {
+      symlinkSync(nonDatabasePath, fixture.storePath, "file");
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "EPERM"
+        || (error as NodeJS.ErrnoException).code === "EACCES") {
+        t.skip("file symlinks are unavailable in this Windows environment");
+        return;
+      }
+      throw error;
+    }
+
+    const result = new DesktopProjectService().snapshot({
+      manifestPath: fixture.manifestPath,
+    });
+    assert.equal(result.ok, false);
+    if (!result.ok) {
+      assert.equal(result.error.code, "DESKTOP_INPUT_INVALID");
+      assert.match(result.error.message, /storePath must identify a \\.db file/);
+    }
+  } finally {
+    rmSync(fixture.directory, { recursive: true, force: true });
+  }
+});
+
+test("snapshot permits an explicitly selected database outside the project", () => {
+  const fixture = createFixture();
+  const externalDirectory = mkdtempSync(join(tmpdir(), "folioloom-external-store-"));
+  const externalStorePath = join(externalDirectory, "book.db");
+  try {
+    const externalStore = new LosslessBookStore(externalStorePath);
+    externalStore.close();
+
+    const result = new DesktopProjectService().snapshot({
+      manifestPath: fixture.manifestPath,
+      storePath: externalStorePath,
+    });
+    assert.equal(result.ok, true);
+    if (result.ok) {
+      assert.deepEqual(result.value.store, { state: "ready", path: externalStorePath });
+    }
+  } finally {
+    rmSync(fixture.directory, { recursive: true, force: true });
+    rmSync(externalDirectory, { recursive: true, force: true });
   }
 });
 
