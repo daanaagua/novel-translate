@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { cleanup, render, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, render, screen, waitFor } from "@testing-library/react";
 import { userEvent } from "@testing-library/user-event";
 
 import type {
@@ -134,6 +134,17 @@ function ok<T>(value: T): DesktopResult<T> {
   return { ok: true, value };
 }
 
+function deferred<T>(): {
+  promise: Promise<T>;
+  resolve: (value: T) => void;
+} {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((settle) => {
+    resolve = settle;
+  });
+  return { promise, resolve };
+}
+
 function failure<T = never>(
   code: string,
   message: string,
@@ -218,6 +229,40 @@ describe("FolioLoom desktop onboarding", () => {
     expect(await screen.findByRole("button", { name: "DeepSeek" })).toBeTruthy();
   });
 
+  it("ignores a stale startup snapshot that resolves after a newly imported manuscript", async () => {
+    const user = userEvent.setup();
+    const startup = deferred<DesktopResult<DesktopOnboardingState>>();
+    const refreshed = deferred<DesktopResult<DesktopOnboardingState>>();
+    const replacement = {
+      ...project,
+      title: "New Project",
+      sourceVersion: "source-new-project",
+    };
+    const replacementOnboarding = {
+      ...sourceOnlyOnboarding,
+      project: replacement,
+    };
+    const getOnboardingState = vi.fn()
+      .mockReturnValueOnce(startup.promise)
+      .mockReturnValueOnce(refreshed.promise);
+    render(<App api={createApi({
+      getOnboardingState,
+      chooseSource: vi.fn().mockResolvedValue(ok({
+        status: "ready",
+        project: replacement,
+      } satisfies DesktopChooseSourceResult)),
+    })} />);
+
+    await user.click(screen.getByRole("button", { name: "选择书稿" }));
+    await act(async () => refreshed.resolve(ok(replacementOnboarding)));
+    expect(await screen.findByRole("heading", { name: "New Project" })).toBeTruthy();
+
+    await act(async () => startup.resolve(ok(emptyOnboarding)));
+    await waitFor(() => {
+      expect(screen.getByRole("heading", { name: "New Project" })).toBeTruthy();
+    });
+  });
+
   it("shows source diagnostics as reader-facing language and encoding details without internal paths", async () => {
     const { container } = render(<App api={createApi({
       getOnboardingState: vi.fn().mockResolvedValue(ok(sourceOnlyOnboarding)),
@@ -229,6 +274,24 @@ describe("FolioLoom desktop onboarding", () => {
     expect(container.textContent).not.toContain("internal-project-file");
     expect(container.textContent).not.toContain("source_manifest.json");
     expect(container.textContent).not.toContain("SQLite");
+  });
+
+  it("describes EPUB and DOCX container extraction without exposing zip-container as an encoding", async () => {
+    render(<App api={createApi({
+      getOnboardingState: vi.fn().mockResolvedValue(ok({
+        ...sourceOnlyOnboarding,
+        project: {
+          ...project,
+          title: "Container Book",
+          sourceEncoding: "zip-container",
+          encodingConfidence: 1,
+        },
+      })),
+    })} />);
+
+    await screen.findByRole("heading", { name: "Container Book" });
+    expect(screen.getByText("格式：电子书/文档容器（正文已提取）")).toBeTruthy();
+    expect(document.body.textContent).not.toContain("zip-container");
   });
 
   it("renders a canonical Japanese or Korean source diagnostic instead of internal profile ids", async () => {

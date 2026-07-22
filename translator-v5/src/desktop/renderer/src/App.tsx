@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState, type JSX } from "react";
+import { useEffect, useMemo, useRef, useState, type JSX } from "react";
 
 import type {
   DesktopChooseSourceResult,
@@ -85,6 +85,16 @@ export function App({ api }: AppProps): JSX.Element {
   const [trialProgress, setTrialProgress] = useState<DesktopTrialProgress>();
   const [trialResult, setTrialResult] = useState<DesktopTrialResult>();
   const [pendingEncoding, setPendingEncoding] = useState<DesktopSourceEncodingRequired>();
+  const onboardingGeneration = useRef(0);
+
+  function beginOnboardingRefresh(): number {
+    onboardingGeneration.current += 1;
+    return onboardingGeneration.current;
+  }
+
+  function isCurrentOnboardingRefresh(generation: number): boolean {
+    return generation === onboardingGeneration.current;
+  }
 
   function acceptOnboarding(result: DesktopResult<DesktopOnboardingState>): boolean {
     if (!result.ok) {
@@ -98,12 +108,15 @@ export function App({ api }: AppProps): JSX.Element {
 
   useEffect(() => {
     let disposed = false;
+    const generation = beginOnboardingRefresh();
     void desktopApi.getOnboardingState()
       .then((result) => {
-        if (!disposed) acceptOnboarding(result);
+        if (!disposed && isCurrentOnboardingRefresh(generation)) acceptOnboarding(result);
       })
       .catch((error: unknown) => {
-        if (!disposed) setOperationError(errorFromUnknown(error));
+        if (!disposed && isCurrentOnboardingRefresh(generation)) {
+          setOperationError(errorFromUnknown(error));
+        }
       });
     return () => {
       disposed = true;
@@ -127,7 +140,9 @@ export function App({ api }: AppProps): JSX.Element {
     // when refreshing the richer onboarding snapshot subsequently fails.
     setTrialProgress(undefined);
     setTrialResult(undefined);
+    const generation = beginOnboardingRefresh();
     const stateResult = await desktopApi.getOnboardingState();
+    if (!isCurrentOnboardingRefresh(generation)) return;
     if (!stateResult.ok) {
       setOnboarding((current) => ({
         ...current,
@@ -210,6 +225,7 @@ export function App({ api }: AppProps): JSX.Element {
         setOperationError(result.error);
         return result;
       }
+      beginOnboardingRefresh();
       setOnboarding(result.value.onboarding);
       setOperationError(undefined);
       return result;
@@ -230,6 +246,7 @@ export function App({ api }: AppProps): JSX.Element {
         setOperationError(result.error);
         return result;
       }
+      beginOnboardingRefresh();
       setOnboarding(result.value);
       setOperationError(undefined);
       return result;

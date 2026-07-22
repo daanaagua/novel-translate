@@ -50,6 +50,12 @@ function formatConfidence(confidence: number): string {
   return `${Math.round(Math.max(0, Math.min(1, confidence)) * 100)}%`;
 }
 
+function sourceEncodingDiagnostic(encoding: string, confidence: number): string {
+  return encoding === "zip-container"
+    ? "格式：电子书/文档容器（正文已提取）"
+    : `编码：${formatEncoding(encoding)} · 置信度 ${formatConfidence(confidence)}`;
+}
+
 function effortLabel(effort: string | undefined): string {
   return effort === undefined || effort === "off" ? "关闭推理" : effort;
 }
@@ -164,7 +170,10 @@ export function Onboarding({
             <p className="eyebrow">项目概览</p>
             <h1>{onboarding.project?.title}</h1>
             <p className="section-copy">检测语言：{onboarding.project?.detectedLanguage}</p>
-            <p className="section-copy project-diagnostic">编码：{formatEncoding(onboarding.project?.sourceEncoding ?? "utf-8")} · 置信度 {formatConfidence(onboarding.project?.encodingConfidence ?? 1)}</p>
+            <p className="section-copy project-diagnostic">{sourceEncodingDiagnostic(
+              onboarding.project?.sourceEncoding ?? "utf-8",
+              onboarding.project?.encodingConfidence ?? 1,
+            )}</p>
             <p className="section-copy project-diagnostic">{formatChars(onboarding.project?.sourceChars ?? 0)} 字符</p>
           </div>
           <button
