@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { pathToFileURL } from "node:url";
@@ -117,4 +118,23 @@ test("trusted IPC requires the app window, expected renderer URL, and main frame
     sender: trustedEvent.sender,
     senderFrame: { ...trustedEvent.senderFrame, parent: {} },
   }, trustedRenderers), false);
+});
+
+test("preload exposes named onboarding operations without a generic IPC or credential reader", () => {
+  const preloadSource = readFileSync(
+    new URL("../src/desktop/preload/index.ts", import.meta.url),
+    "utf8",
+  );
+
+  for (const operation of [
+    "chooseSource",
+    "getOnboardingState",
+    "discoverModels",
+    "testModel",
+    "forgetCredential",
+  ]) {
+    assert.match(preloadSource, new RegExp(`\\b${operation}\\s*:`));
+  }
+  assert.doesNotMatch(preloadSource, /invoke\s*\(\s*(?:channel|name|method)\b/u);
+  assert.doesNotMatch(preloadSource, /\b(?:getCredential|readCredential|readFile|globalThis\.fetch)\b/u);
 });

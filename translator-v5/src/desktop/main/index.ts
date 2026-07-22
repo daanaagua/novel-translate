@@ -1,13 +1,17 @@
-import { existsSync, rmSync } from "node:fs";
+import { existsSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { app, BrowserWindow, dialog, ipcMain, Menu } from "electron";
+import { app, BrowserWindow, dialog, ipcMain, Menu, safeStorage } from "electron";
 
 import type { DesktopProjectRequest } from "../contracts.js";
+import { DesktopCredentialStore } from "../desktop-credential-store.js";
+import { DesktopModelService } from "../desktop-model-service.js";
 import { DesktopPreferences } from "../desktop-preferences.js";
 import { DesktopProjectService } from "../desktop-project-service.js";
+import { DesktopSourceService } from "../desktop-source-service.js";
 import { registerDesktopIpc } from "./ipc.js";
+import { createDesktopProviderRegistryAdapter } from "./provider-model-adapter.js";
 import {
   desktopWindowChrome,
   installNavigationGuards,
@@ -56,13 +60,15 @@ function createWindow(): BrowserWindow {
   return window;
 }
 
-function loadRecentRequest(preferences: DesktopPreferences, preferencesPath: string): DesktopProjectRequest | undefined {
+function loadRecentRequest(preferences: DesktopPreferences): DesktopProjectRequest | undefined {
   const recent = preferences.load();
   if (recent === undefined) {
     return undefined;
   }
   if (!existsSync(recent.manifestPath)) {
-    rmSync(preferencesPath, { force: true });
+    // The preferences file also carries model metadata; discard only the stale
+    // recent-project pointer instead of erasing a verified model setup.
+    preferences.saveState({ ...preferences.loadState(), recent: undefined });
     return undefined;
   }
   return recent;
@@ -73,7 +79,19 @@ void app.whenReady().then(() => {
   const preferencesPath = join(app.getPath("userData"), "desktop-preferences.json");
   const preferences = new DesktopPreferences(preferencesPath);
   const projectService = new DesktopProjectService();
-  let currentRequest = loadRecentRequest(preferences, preferencesPath);
+  const sourceService = new DesktopSourceService({
+    projectsRoot: join(app.getPath("documents"), "FolioLoom", "Projects"),
+  });
+  const credentialStore = new DesktopCredentialStore({
+    path: join(app.getPath("userData"), "desktop-credentials.json"),
+    secretBox: safeStorage,
+  });
+  const modelService = new DesktopModelService({
+    providers: createDesktopProviderRegistryAdapter(),
+    preferences,
+    credentials: credentialStore,
+  });
+  let currentRequest = loadRecentRequest(preferences);
 
   registerDesktopIpc({
     ipcMain: {
@@ -87,6 +105,8 @@ void app.whenReady().then(() => {
       },
     },
     projectService,
+    sourceService,
+    modelService,
     isTrustedEvent(event) {
       return isTrustedDesktopIpcEvent(event, trustedRendererUrls);
     },

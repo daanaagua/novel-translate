@@ -1,14 +1,32 @@
-import { basename } from "node:path";
+import { basename, extname } from "node:path";
 
 import type {
   DesktopDoctorReport,
+  DesktopModelOption,
+  DesktopModelProbe,
+  DesktopModelSummary,
+  DesktopOnboardingProvider,
+  DesktopOnboardingState,
   DesktopProjectRequest,
   DesktopProjectSnapshot,
   DesktopResult,
+  DesktopTestModelResult,
 } from "../contracts.js";
-import { fail, toDesktopError } from "../desktop-errors.js";
+import type {
+  DesktopDiscoverModelsRequest as ServiceDiscoverModelsRequest,
+  DesktopTestModelRequest as ServiceTestModelRequest,
+} from "../desktop-model-service.js";
+import type { DesktopSourceImportRequest, DesktopSourceImportResult } from "../desktop-source-service.js";
+import type { ProviderEffort, ProviderId } from "../../providers/types.js";
+import { DesktopInputError, fail, ok, toDesktopError } from "../desktop-errors.js";
 
 export const DESKTOP_IPC_CHANNELS = [
+  "folioloom:choose-source",
+  "folioloom:onboarding-state",
+  "folioloom:discover-models",
+  "folioloom:test-model",
+  "folioloom:forget-credential",
+  // Legacy project controls remain for existing developer workspaces.
   "folioloom:choose-project",
   "folioloom:choose-store",
   "folioloom:refresh-project",
@@ -42,17 +60,50 @@ export interface DesktopIpcProjectService {
   ): DesktopResult<DesktopDoctorReport>;
 }
 
+export interface DesktopIpcSourceService {
+  importSource(
+    request: Pick<DesktopSourceImportRequest, "sourcePath" | "sourceLanguage" | "explicitEncoding">,
+  ): Promise<Pick<DesktopSourceImportResult, "manifestPath">>;
+}
+
+export interface DesktopIpcModelSnapshot {
+  providers: readonly DesktopOnboardingProvider[];
+  activeModelProfile?: {
+    providerId: string;
+    modelId: string;
+    reasoningEffort?: string;
+    customBaseUrl?: string;
+  };
+  latestProbe?: DesktopModelProbe;
+}
+
+export interface DesktopIpcModelTestResult {
+  report: DesktopModelProbe;
+  snapshot: DesktopIpcModelSnapshot;
+}
+
+export interface DesktopIpcModelService {
+  snapshot(): DesktopIpcModelSnapshot;
+  discoverModels(request: ServiceDiscoverModelsRequest): Promise<readonly { id: string; displayName: string }[]>;
+  testAndSave(request: ServiceTestModelRequest): Promise<DesktopIpcModelTestResult>;
+  forgetCredential(providerId: ProviderId): void;
+}
+
 export interface DesktopIpcDependencies {
   ipcMain: DesktopIpcMain;
   dialog: DesktopDialog;
   projectService: DesktopIpcProjectService;
+  sourceService: DesktopIpcSourceService;
+  modelService: DesktopIpcModelService;
   isTrustedEvent(event: unknown): boolean;
   getCurrentRequest(): DesktopProjectRequest | undefined;
   setCurrentRequest(request: DesktopProjectRequest): void;
 }
 
+const manuscriptFilter = [{ name: "书稿", extensions: ["txt", "md", "markdown", "epub", "docx"] }];
 const manifestFilter = [{ name: "FolioLoom 项目", extensions: ["json"] }];
 const storeFilter = [{ name: "FolioLoom 状态库", extensions: ["db"] }];
+const PROVIDER_ID = /^[a-z][a-z0-9-]{0,63}$/u;
 
 function failure<T = never>(code: string, message: string): DesktopResult<T> {
   return fail({ code, message, retryable: false });
@@ -94,6 +145,166 @@ async function chooseSingleFile(
     : selection.filePaths[0];
 }
 
+function isManuscriptPath(path: string): boolean {
+  return manuscriptFilter[0].extensions.includes(extname(path).toLocaleLowerCase("en").slice(1));
+}
+
+function inputError(message: string): never {
+  throw new DesktopInputError("DESKTOP_INPUT_INVALID", message);
+}
+
+function oneArgument(args: readonly unknown[], label: string): unknown {
+  if (args.length !== 1) {
+    return inputError(`${label} requires exactly one payload`);
+  }
+  return args[0];
+}
+
+function noArguments(args: readonly unknown[], label: string): void {
+  if (args.length !== 0) {
+    inputError(`${label} does not accept a payload`);
+  }
+}
+
+function exactRecord(value: unknown, label: string, allowed: readonly string[]): Record<string, unknown> {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) {
+    return inputError(`${label} must be a JSON object`);
+  }
+  const record = value as Record<string, unknown>;
+  if (Object.keys(record).some((key) => !allowed.includes(key))) {
+    return inputError(`${label} contains an unsupported field`);
+  }
+  return record;
+}
+
+function requiredText(value: unknown, label: string): string {
+  if (typeof value !== "string" || value.trim().length === 0) {
+    return inputError(`${label} must be a non-empty string`);
+  }
+  return value.trim();
+}
+
+function optionalText(value: unknown, label: string): string | undefined {
+  if (value === undefined) {
+    return undefined;
+  }
+  return requiredText(value, label);
+}
+
+function requiredProviderId(value: unknown): ProviderId {
+  const providerId = requiredText(value, "providerId");
+  if (!PROVIDER_ID.test(providerId)) {
+    return inputError("providerId contains unsupported characters");
+  }
+  return providerId as ProviderId;
+}
+
+function discoverModelsRequest(value: unknown): ServiceDiscoverModelsRequest {
+  const record = exactRecord(value, "discover-models payload", ["providerId", "apiKey", "customBaseUrl"]);
+  const providerId = requiredProviderId(record.providerId);
+  const apiKey = optionalText(record.apiKey, "apiKey");
+  const customBaseUrl = optionalText(record.customBaseUrl, "customBaseUrl");
+  return {
+    providerId,
+    ...(apiKey === undefined ? {} : { apiKey }),
+    ...(customBaseUrl === undefined ? {} : { customBaseUrl }),
+  };
+}
+
+function testModelRequest(value: unknown): ServiceTestModelRequest {
+  const record = exactRecord(value, "test-model payload", [
+    "providerId",
+    "apiKey",
+    "modelId",
+    "reasoningEffort",
+    "customBaseUrl",
+  ]);
+  const providerId = requiredProviderId(record.providerId);
+  const apiKey = optionalText(record.apiKey, "apiKey");
+  const modelId = requiredText(record.modelId, "modelId");
+  const reasoningEffort = optionalText(record.reasoningEffort, "reasoningEffort");
+  const customBaseUrl = optionalText(record.customBaseUrl, "customBaseUrl");
+  return {
+    providerId,
+    modelId,
+    ...(apiKey === undefined ? {} : { apiKey }),
+    ...(reasoningEffort === undefined ? {} : { reasoningEffort: reasoningEffort as ProviderEffort }),
+    ...(customBaseUrl === undefined ? {} : { customBaseUrl }),
+  };
+}
+
+function publicProviders(snapshot: DesktopIpcModelSnapshot): readonly DesktopOnboardingProvider[] {
+  return snapshot.providers.map((provider) => ({
+    id: provider.id,
+    displayName: provider.displayName,
+    keyPlaceholder: provider.keyPlaceholder,
+    efforts: [...provider.efforts],
+    fallbackModelIds: [...provider.fallbackModelIds],
+    allowManualModel: provider.allowManualModel,
+    allowCustomBaseUrl: provider.allowCustomBaseUrl,
+    credentialStatus: provider.credentialStatus,
+    ...(provider.credentialPersistence === undefined
+      ? {}
+      : { credentialPersistence: provider.credentialPersistence }),
+  }));
+}
+
+function publicProbe(probe: DesktopIpcModelSnapshot["latestProbe"]): DesktopModelProbe | undefined {
+  if (probe === undefined) {
+    return undefined;
+  }
+  return {
+    status: probe.status,
+    ...(probe.code === undefined ? {} : { code: probe.code }),
+    ...(probe.message === undefined ? {} : { message: probe.message }),
+    ...(probe.retryable === undefined ? {} : { retryable: probe.retryable }),
+    ...(probe.checkedAt === undefined ? {} : { checkedAt: probe.checkedAt }),
+  };
+}
+
+function onboardingState(
+  modelSnapshot: DesktopIpcModelSnapshot,
+  project: DesktopProjectSnapshot | undefined,
+): DesktopOnboardingState {
+  const providers = publicProviders(modelSnapshot);
+  const latestProbe = publicProbe(modelSnapshot.latestProbe);
+  const profile = modelSnapshot.activeModelProfile;
+  const provider = profile === undefined
+    ? undefined
+    : providers.find((candidate) => candidate.id === profile.providerId);
+  // `latestProbe` describes the most recent attempted model, which can differ
+  // from the separately persisted ready profile. Credential availability is
+  // the durable fact that the saved profile remains runnable.
+  const capability: DesktopModelSummary["capability"] = profile !== undefined
+    && provider?.credentialStatus === "available"
+    ? "ready"
+    : "unverified";
+  const activeModel = profile === undefined
+    ? undefined
+    : {
+      providerId: profile.providerId,
+      modelId: profile.modelId,
+      ...(profile.reasoningEffort === undefined ? {} : { reasoningEffort: profile.reasoningEffort }),
+      // Only the explicitly configured custom endpoint can return to the renderer.
+      ...(provider?.allowCustomBaseUrl === true && profile.customBaseUrl !== undefined
+        ? { customBaseUrl: profile.customBaseUrl }
+        : {}),
+      capability,
+    };
+  const model = activeModel?.capability === "ready";
+  return {
+    ...(project === undefined ? {} : { project }),
+    providers,
+    ...(activeModel === undefined ? {} : { activeModel }),
+    ...(latestProbe === undefined ? {} : { latestProbe }),
+    readiness: {
+      source: project !== undefined,
+      model,
+      trial: project !== undefined && model,
+    },
+  };
+}
+
 export function registerDesktopIpc(dependencies: DesktopIpcDependencies): void {
   let activeSnapshot: DesktopProjectSnapshot | undefined;
 
@@ -117,6 +328,80 @@ export function registerDesktopIpc(dependencies: DesktopIpcDependencies): void {
     }
     return result;
   };
+
+  const currentProject = (): DesktopResult<DesktopProjectSnapshot | undefined> => {
+    const current = dependencies.getCurrentRequest();
+    if (current === undefined) {
+      return ok(undefined);
+    }
+    const result = snapshot(current);
+    return result.ok ? ok(result.value) : fail(result.error);
+  };
+
+  const currentOnboarding = (): DesktopResult<DesktopOnboardingState> => {
+    const project = currentProject();
+    if (!project.ok) {
+      return fail(project.error);
+    }
+    return ok(onboardingState(dependencies.modelService.snapshot(), project.value));
+  };
+
+  handleTrusted("folioloom:choose-source", async (_event, ...args) => resultFrom(async () => {
+    noArguments(args, "choose-source");
+    const sourcePath = await chooseSingleFile(dependencies.dialog, manuscriptFilter);
+    if (sourcePath === undefined) {
+      return canceledSelection();
+    }
+    if (!isManuscriptPath(sourcePath)) {
+      return invalidSelection("sourcePath must use a supported manuscript extension");
+    }
+    const imported = await dependencies.sourceService.importSource({ sourcePath });
+    const request: DesktopProjectRequest = { manifestPath: imported.manifestPath };
+    const result = snapshot(request);
+    if (result.ok) {
+      dependencies.setCurrentRequest(request);
+    }
+    return result;
+  }));
+
+  handleTrusted("folioloom:onboarding-state", async (_event, ...args) => resultFrom(() => {
+    noArguments(args, "onboarding-state");
+    return currentOnboarding();
+  }));
+
+  handleTrusted("folioloom:discover-models", async (_event, ...args) => resultFrom(async () => {
+    const request = discoverModelsRequest(oneArgument(args, "discover-models"));
+    const models = await dependencies.modelService.discoverModels(request);
+    const value: readonly DesktopModelOption[] = models.map((model) => ({
+      id: model.id,
+      displayName: model.displayName,
+    }));
+    return ok(value);
+  }));
+
+  handleTrusted("folioloom:test-model", async (_event, ...args) => resultFrom(async () => {
+    const request = testModelRequest(oneArgument(args, "test-model"));
+    const tested = await dependencies.modelService.testAndSave(request);
+    const project = currentProject();
+    if (!project.ok) {
+      return fail(project.error);
+    }
+    const report = publicProbe(tested.report);
+    if (report === undefined) {
+      return failure("DESKTOP_MODEL_TEST_INVALID", "model test returned no report");
+    }
+    const value: DesktopTestModelResult = {
+      report,
+      onboarding: onboardingState(tested.snapshot, project.value),
+    };
+    return ok(value);
+  }));
+
+  handleTrusted("folioloom:forget-credential", async (_event, ...args) => resultFrom(() => {
+    const providerId = requiredProviderId(oneArgument(args, "forget-credential"));
+    dependencies.modelService.forgetCredential(providerId);
+    return currentOnboarding();
+  }));
 
   handleTrusted("folioloom:choose-project", async () => resultFrom(async () => {
     const manifestPath = await chooseSingleFile(dependencies.dialog, manifestFilter);

@@ -14,6 +14,8 @@ import {
   registerDesktopIpc,
   type DesktopIpcDependencies,
   type DesktopIpcHandler,
+  type DesktopIpcModelSnapshot,
+  type DesktopIpcModelTestResult,
 } from "../src/desktop/main/ipc.js";
 
 const EMPTY_DOCTOR_REPORT: DesktopDoctorReport = {
@@ -70,28 +72,88 @@ function snapshotFor(
 interface IpcFixtureOptions {
   activeRunIds?: readonly string[];
   pickedStore?: "directory" | "text";
+  pickedSource?: "cancel" | "source" | "invalid";
+  existingReadyModel?: boolean;
+  testStatus?: "ready" | "limited" | "failed";
 }
 
 interface IpcFixture {
   directory: string;
+  manifestPath: string;
+  sourcePath: string;
   textPath: string;
   handlers: Map<string, DesktopIpcHandler>;
   trustedEvent: unknown;
   snapshotCalls: number;
+  sourceImports: readonly string[];
+  modelCalls: {
+    discoveries: readonly unknown[];
+    tests: readonly unknown[];
+    forgotten: readonly unknown[];
+  };
+  dialogFilters: ReadonlyArray<{ name: string; extensions: string[] }>;
+  currentRequest: DesktopProjectRequest | undefined;
 }
 
 function registerFixtureHandlers(options: IpcFixtureOptions = {}): IpcFixture {
   const directory = mkdtempSync(join(tmpdir(), "folioloom-desktop-ipc-"));
   const manifestPath = join(directory, "source_manifest.json");
+  const importedManifestPath = join(directory, "Imported", "source_manifest.json");
+  const sourcePath = join(directory, "chapter.epub");
+  const invalidSourcePath = join(directory, "chapter.exe");
   const textPath = join(directory, "not-a-store.txt");
   const activeRunIds = options.activeRunIds ?? [];
   const handlers = new Map<string, DesktopIpcHandler>();
+  const sourceImports: string[] = [];
+  const discoveries: unknown[] = [];
+  const tests: unknown[] = [];
+  const forgotten: unknown[] = [];
+  const dialogFilters: Array<{ name: string; extensions: string[] }> = [];
   const trustedEvent = {
     sender: { id: 7 },
     senderFrame: { url: "file:///folioloom/index.html", parent: null },
   };
   let snapshotCalls = 0;
   let currentRequest: DesktopProjectRequest | undefined = { manifestPath };
+  let activeModelProfile: {
+    providerId: string;
+    modelId: string;
+    reasoningEffort?: string;
+    customBaseUrl?: string;
+  } | undefined = options.existingReadyModel
+    ? { providerId: "deepseek", modelId: "saved-ready-model" }
+    : undefined;
+  let latestProbe: {
+    status: "ready" | "limited" | "failed";
+    code?: string;
+    message?: string;
+    retryable?: boolean;
+    checkedAt?: string;
+  } | undefined = options.existingReadyModel
+    ? {
+      status: "ready",
+      code: "READY",
+      message: "Saved model was verified.",
+      retryable: false,
+      checkedAt: "2026-07-22T00:00:00.000Z",
+    }
+    : undefined;
+
+  const modelSnapshot = (): DesktopIpcModelSnapshot => ({
+    providers: [{
+      id: "deepseek",
+      displayName: "DeepSeek",
+      keyPlaceholder: "DeepSeek API Key",
+      efforts: ["off", "high", "max"],
+      fallbackModelIds: ["deepseek-chat"],
+      allowManualModel: true,
+      allowCustomBaseUrl: false,
+      credentialStatus: activeModelProfile === undefined ? "missing" as const : "available" as const,
+      ...(activeModelProfile === undefined ? {} : { credentialPersistence: "encrypted" as const }),
+    }],
+    ...(activeModelProfile === undefined ? {} : { activeModelProfile }),
+    ...(latestProbe === undefined ? {} : { latestProbe }),
+  });
 
   const dependencies: DesktopIpcDependencies = {
     ipcMain: {
@@ -101,8 +163,18 @@ function registerFixtureHandlers(options: IpcFixtureOptions = {}): IpcFixture {
     },
     dialog: {
       async showOpenDialog(dialogOptions) {
+        dialogFilters.push(...dialogOptions.filters.map((filter) => ({
+          name: filter.name,
+          extensions: [...filter.extensions],
+        })));
         const extension = dialogOptions.filters[0]?.extensions[0];
-        const selected = extension !== "db"
+        const selected = extension === "txt"
+          ? options.pickedSource === "source"
+            ? sourcePath
+            : options.pickedSource === "invalid"
+              ? invalidSourcePath
+            : undefined
+          : extension !== "db"
           ? manifestPath
           : options.pickedStore === "directory"
             ? directory
@@ -126,6 +198,43 @@ function registerFixtureHandlers(options: IpcFixtureOptions = {}): IpcFixture {
         return ok(EMPTY_DOCTOR_REPORT);
       },
     },
+    sourceService: {
+      async importSource(request) {
+        sourceImports.push(request.sourcePath);
+        return { manifestPath: importedManifestPath };
+      },
+    },
+    modelService: {
+      snapshot: modelSnapshot,
+      async discoverModels(request) {
+        discoveries.push(request);
+        return [{ id: "deepseek-chat", displayName: "DeepSeek Chat" }];
+      },
+      async testAndSave(request): Promise<DesktopIpcModelTestResult> {
+        tests.push(request);
+        const status = options.testStatus ?? "ready";
+        if (status === "ready") {
+          activeModelProfile = {
+            providerId: request.providerId,
+            modelId: request.modelId,
+            ...(request.reasoningEffort === undefined ? {} : { reasoningEffort: request.reasoningEffort }),
+            ...(request.customBaseUrl === undefined ? {} : { customBaseUrl: request.customBaseUrl }),
+          };
+        }
+        latestProbe = {
+          status,
+          code: status === "ready" ? "READY" : "TOOL_CALL_UNSUPPORTED",
+          message: status === "ready" ? "Compatibility passed." : "Compatibility failed.",
+          retryable: false,
+          checkedAt: "2026-07-22T00:00:00.000Z",
+        };
+        return { report: latestProbe, snapshot: modelSnapshot() };
+      },
+      forgetCredential(providerId) {
+        forgotten.push(providerId);
+        activeModelProfile = undefined;
+      },
+    },
     isTrustedEvent(event) {
       return event === trustedEvent;
     },
@@ -139,11 +248,25 @@ function registerFixtureHandlers(options: IpcFixtureOptions = {}): IpcFixture {
   registerDesktopIpc(dependencies);
   return {
     directory,
+    manifestPath,
+    sourcePath,
     textPath,
     handlers,
     trustedEvent,
     get snapshotCalls() {
       return snapshotCalls;
+    },
+    get sourceImports() {
+      return sourceImports;
+    },
+    get modelCalls() {
+      return { discoveries, tests, forgotten };
+    },
+    get dialogFilters() {
+      return dialogFilters;
+    },
+    get currentRequest() {
+      return currentRequest;
     },
   };
 }
@@ -160,12 +283,172 @@ test("IPC only registers the desktop allowlist", () => {
   const fixture = registerFixtureHandlers();
   try {
     assert.deepEqual([...fixture.handlers.keys()].sort(), [
+      "folioloom:choose-source",
       "folioloom:choose-project",
       "folioloom:choose-store",
+      "folioloom:discover-models",
       "folioloom:doctor",
+      "folioloom:forget-credential",
+      "folioloom:onboarding-state",
       "folioloom:refresh-project",
       "folioloom:select-run",
-    ]);
+      "folioloom:test-model",
+    ].sort());
+  } finally {
+    rmSync(fixture.directory, { recursive: true, force: true });
+  }
+});
+
+test("choose-source accepts only manuscript formats and cancellation preserves the active project", async () => {
+  const fixture = registerFixtureHandlers({ pickedSource: "cancel" });
+  try {
+    const before = fixture.currentRequest;
+    const result = await handler(fixture, "folioloom:choose-source")(fixture.trustedEvent) as DesktopResult<DesktopProjectSnapshot>;
+    assert.equal(result.ok, false);
+    if (!result.ok) {
+      assert.equal(result.error.code, "DESKTOP_SELECTION_CANCELLED");
+    }
+    assert.deepEqual(fixture.dialogFilters, [{
+      name: "书稿",
+      extensions: ["txt", "md", "markdown", "epub", "docx"],
+    }]);
+    assert.equal(fixture.sourceImports.length, 0);
+    assert.deepEqual(fixture.currentRequest, before);
+  } finally {
+    rmSync(fixture.directory, { recursive: true, force: true });
+  }
+});
+
+test("choose-source imports a selected manuscript without exposing a path-taking renderer API", async () => {
+  const fixture = registerFixtureHandlers({ pickedSource: "source" });
+  try {
+    const result = await handler(fixture, "folioloom:choose-source")(fixture.trustedEvent) as DesktopResult<DesktopProjectSnapshot>;
+    assert.equal(result.ok, true);
+    assert.deepEqual(fixture.sourceImports, [fixture.sourcePath]);
+    assert.equal(fixture.currentRequest?.manifestPath.endsWith("Imported\\source_manifest.json"), true);
+  } finally {
+    rmSync(fixture.directory, { recursive: true, force: true });
+  }
+});
+
+test("choose-source refuses an unexpected dialog result before importing", async () => {
+  const fixture = registerFixtureHandlers({ pickedSource: "invalid" });
+  try {
+    const result = await handler(fixture, "folioloom:choose-source")(fixture.trustedEvent) as DesktopResult<DesktopProjectSnapshot>;
+    assert.equal(result.ok, false);
+    if (!result.ok) {
+      assert.equal(result.error.code, "DESKTOP_INPUT_INVALID");
+    }
+    assert.equal(fixture.sourceImports.length, 0);
+  } finally {
+    rmSync(fixture.directory, { recursive: true, force: true });
+  }
+});
+
+test("onboarding IPC projects source/model readiness and never returns the submitted API Key", async () => {
+  const fixture = registerFixtureHandlers();
+  const apiKey = "desktop-ipc-secret";
+  try {
+    const testResult = await handler(fixture, "folioloom:test-model")(fixture.trustedEvent, {
+      providerId: "deepseek",
+      modelId: "deepseek-chat",
+      reasoningEffort: "max",
+      apiKey,
+    }) as DesktopResult<unknown>;
+    assert.equal(testResult.ok, true);
+    assert.doesNotMatch(JSON.stringify(testResult), new RegExp(apiKey));
+    assert.equal(fixture.modelCalls.tests.length, 1);
+
+    const onboarding = await handler(fixture, "folioloom:onboarding-state")(fixture.trustedEvent) as DesktopResult<{
+      readiness: { source: boolean; model: boolean; trial: boolean };
+      activeModel?: { providerId: string; modelId: string; capability: string };
+      providers: readonly { id: string; [key: string]: unknown }[];
+    }>;
+    assert.equal(onboarding.ok, true);
+    if (!onboarding.ok) {
+      throw new Error("onboarding state should succeed");
+    }
+    assert.deepEqual(onboarding.value.readiness, { source: true, model: true, trial: true });
+    assert.deepEqual(onboarding.value.activeModel, {
+      providerId: "deepseek",
+      modelId: "deepseek-chat",
+      reasoningEffort: "max",
+      capability: "ready",
+    });
+    assert.equal(onboarding.value.providers[0]?.id, "deepseek");
+    assert.doesNotMatch(JSON.stringify(onboarding.value), /apiKey|desktop-ipc-secret|https:\/\//u);
+  } finally {
+    rmSync(fixture.directory, { recursive: true, force: true });
+  }
+});
+
+test("onboarding keeps a previously saved ready model usable after another model test fails", async () => {
+  const fixture = registerFixtureHandlers({ existingReadyModel: true, testStatus: "failed" });
+  try {
+    const result = await handler(fixture, "folioloom:test-model")(fixture.trustedEvent, {
+      providerId: "deepseek",
+      modelId: "unverified-model",
+      apiKey: "failed-model-secret",
+    }) as DesktopResult<{
+      report: { status: string };
+      onboarding: {
+        readiness: { source: boolean; model: boolean; trial: boolean };
+        activeModel?: { modelId: string; capability: string };
+        latestProbe?: { status: string };
+      };
+    }>;
+    assert.equal(result.ok, true);
+    if (!result.ok) {
+      throw new Error("model result should be projected");
+    }
+    assert.equal(result.value.report.status, "failed");
+    assert.equal(result.value.onboarding.latestProbe?.status, "failed");
+    assert.equal(result.value.onboarding.activeModel?.modelId, "saved-ready-model");
+    assert.equal(result.value.onboarding.activeModel?.capability, "ready");
+    assert.deepEqual(result.value.onboarding.readiness, { source: true, model: true, trial: true });
+  } finally {
+    rmSync(fixture.directory, { recursive: true, force: true });
+  }
+});
+
+test("model IPC validates exact payloads before reaching services", async () => {
+  const fixture = registerFixtureHandlers();
+  try {
+    const malformedTest = await handler(fixture, "folioloom:test-model")(fixture.trustedEvent, {
+      providerId: "deepseek",
+      modelId: "deepseek-chat",
+      apiKey: 42,
+    }) as DesktopResult<unknown>;
+    const malformedDiscovery = await handler(fixture, "folioloom:discover-models")(fixture.trustedEvent, {
+      providerId: "deepseek",
+      sourcePath: "C:\\outside.txt",
+    }) as DesktopResult<unknown>;
+    const malformedForget = await handler(fixture, "folioloom:forget-credential")(fixture.trustedEvent, { providerId: "deepseek" }) as DesktopResult<unknown>;
+
+    assert.equal(malformedTest.ok, false);
+    assert.equal(malformedDiscovery.ok, false);
+    assert.equal(malformedForget.ok, false);
+    assert.equal(fixture.modelCalls.tests.length, 0);
+    assert.equal(fixture.modelCalls.discoveries.length, 0);
+    assert.equal(fixture.modelCalls.forgotten.length, 0);
+  } finally {
+    rmSync(fixture.directory, { recursive: true, force: true });
+  }
+});
+
+test("discover-models and forget-credential use fixed operations only", async () => {
+  const fixture = registerFixtureHandlers();
+  try {
+    const discovered = await handler(fixture, "folioloom:discover-models")(fixture.trustedEvent, {
+      providerId: "deepseek",
+      apiKey: "discovery-only-secret",
+    }) as DesktopResult<unknown>;
+    const forgotten = await handler(fixture, "folioloom:forget-credential")(fixture.trustedEvent, "deepseek") as DesktopResult<unknown>;
+    assert.equal(discovered.ok, true);
+    assert.doesNotMatch(JSON.stringify(discovered), /discovery-only-secret/);
+    assert.equal(forgotten.ok, true);
+    assert.equal(fixture.modelCalls.discoveries.length, 1);
+    assert.deepEqual(fixture.modelCalls.forgotten, ["deepseek"]);
   } finally {
     rmSync(fixture.directory, { recursive: true, force: true });
   }
