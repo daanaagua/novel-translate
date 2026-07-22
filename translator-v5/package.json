@@ -11,6 +11,7 @@
     "folioloom": "tsx src/cli.ts",
     "pilot": "tsx src/cli.ts",
     "book": "tsx src/cli.ts book",
+    "benchmark:cjk": "tsx src/benchmark/cjk-benchmark.ts",
     "desktop:dev": "electron-vite dev",
     "desktop:build": "electron-vite build && node --test --import tsx test/verify-desktop-build.test.ts",
     "desktop:typecheck": "tsc --noEmit -p tsconfig.desktop.json",

@@ -50,3 +50,21 @@ npm.cmd test
 ```
 
 `desktop:build` 只构建本地 Electron 资源，并断言主进程实际使用的 preload 与 renderer 入口存在。它不会调用模型或创建翻译输出。
+
+## 私有日/韩基准
+
+`benchmark:cjk` 默认只生成离线计划，不会调用模型。它读取 `FOLIOLOOM_JA_SOURCE`、`FOLIOLOOM_KO_SOURCE`、`BENCH_CONFIG`、`OPENCODE_AUTH` 与 `BENCH_OUTPUT`（旧的 `FOLIOLOOM_BENCH_*` 名称仍可用），并只把哈希、Unicode scalar 范围、语言画像和计划写入输出目录。
+
+```powershell
+npm.cmd run benchmark:cjk
+```
+
+计划固定为：日、韩各一个 20k scalar 的 `quality/high` 与 `fast/off` 对照；门槛通过后的正式吞吐验证为全量日文和约 200k scalar 韩文，均使用 `fast/off`。报告不会保存原文、源路径、API Key 或模型原始响应。
+
+实际执行必须显式传入受控 adapter，因而不会由默认脚本暗中产生付费请求。维护者可设置 `BENCH_EXECUTOR_MODULE`（或 `FOLIOLOOM_BENCH_EXECUTOR_MODULE`）并明确运行：
+
+```powershell
+npm.cmd run benchmark:cjk -- --execute
+```
+
+该模块需要导出 `executeCjkBenchmarkRequest(request)`；它只应返回聚合指标，例如模型、effort、usage、请求数、重试数和错误分类。基准 harness 会再次过滤这些字段，拒绝把正文或原始响应写入报告。
