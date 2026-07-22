@@ -258,6 +258,19 @@ function losslessBatchResponse(context: Context) {
   }), { stopReason: "toolUse" });
 }
 
+function promptBatchWindows(context: Context): Array<{
+  windowId: string;
+  blocks: Array<{ blockId: string }>;
+}> {
+  const prompt = userText(context);
+  const match = /WINDOWS\n\n(\[[\s\S]*?\])\n\nSTABLE TERMS/u.exec(prompt);
+  assert.ok(match?.[1], prompt.slice(0, 500));
+  return JSON.parse(match[1]) as Array<{
+    windowId: string;
+    blocks: Array<{ blockId: string }>;
+  }>;
+}
+
 function lexicalAnchorResponse(
   context: Context,
   entityLink?: {
@@ -463,6 +476,175 @@ test("complete request admission rejects a tiny context before any provider call
     (error: unknown) => error instanceof BookRequestCapacityError,
   );
   assert.equal(fixture.faux.state.callCount, 0);
+});
+
+test("preflight splits one oversized logical window only at immutable block boundaries", async () => {
+  const fixture = losslessFixture(`${"word ".repeat(3_000)}.`);
+  const observedBlockGroups: string[][] = [];
+  const observedRequestIds: string[] = [];
+  fixture.faux.setResponses(Array.from({ length: 2 }, () => (context: Context) => {
+    const prompt = userText(context);
+    observedRequestIds.push(/PHYSICAL REQUEST ([^\n]+)/u.exec(prompt)?.[1] ?? "");
+    observedBlockGroups.push(promptBatchWindows(context).flatMap((window) =>
+      window.blocks.map((block) => block.blockId)));
+    return losslessBatchResponse(context);
+  }));
+  const tokenEstimator = {
+    estimateText(text: string) {
+      return {
+        tokens: text.startsWith("WINDOWS\n\n")
+          ? (text.match(/"blockId"/gu)?.length ?? 0) * 900
+          : 1,
+        uncertainty: 0,
+      };
+    },
+    estimateJson() {
+      return { tokens: 0, uncertainty: 0 };
+    },
+    observeUsage() {},
+  };
+  const model = {
+    ...fixture.faux.getModel(),
+    contextWindow: 2_500,
+    maxTokens: 128,
+  };
+
+  const result = await runBook({
+    ...fixture.options,
+    model,
+    tokenEstimator,
+    maxWindows: 1,
+    maxRequestTokens: 5_000,
+    maxInFlightTokens: 2_500,
+    windowOptions: {
+      maxBlocks: 4,
+      targetSourceTokens: 5_000,
+      maxSourceTokens: 5_000,
+    },
+  } as never);
+
+  assert.equal(result.status.totalWindows, 1);
+  assert.equal(result.status.completedWindows, 1);
+  assert.equal(fixture.faux.state.callCount, 2);
+  assert.deepEqual(observedBlockGroups.map((blocks) => blocks.length), [1, 2]);
+  assert.equal(new Set(observedRequestIds).size, 2);
+  const database = new DatabaseSync(fixture.options.storePath);
+  try {
+    const events = (database.prepare(`
+      SELECT kind, COUNT(*) AS count FROM events
+      WHERE run_id='run-lossless' AND kind IN ('window_claimed', 'window_staged', 'window_promoted')
+      GROUP BY kind
+    `).all() as Array<{ kind: string; count: number }>).map((row) => ({ ...row }));
+    assert.deepEqual(events, [
+      { kind: "window_claimed", count: 1 },
+      { kind: "window_promoted", count: 1 },
+      { kind: "window_staged", count: 1 },
+    ]);
+  } finally {
+    database.close();
+  }
+  const store = new LosslessBookStore(fixture.options.storePath);
+  try {
+    const state = store.auditState("run-lossless");
+    const expected = state.memberships.map((membership) => membership.blockId);
+    assert.deepEqual(observedBlockGroups.flat(), expected);
+    assert.deepEqual(state.translations.map((translation) => translation.blockId), expected);
+  } finally {
+    store.close();
+  }
+});
+
+test("runtime context overflow splits a physical batch before escalating its thinking", async () => {
+  const fixture = losslessFixture("EDGEWOOD\n\nBOOK ONE");
+  const primary = fauxProvider();
+  const escalation = fauxProvider();
+  const observedBlockGroups: string[][] = [];
+  const observedRequestIds: string[] = [];
+  primary.setResponses([
+    (context: Context) => {
+      const prompt = userText(context);
+      observedRequestIds.push(/PHYSICAL REQUEST ([^\n]+)/u.exec(prompt)?.[1] ?? "");
+      observedBlockGroups.push(promptBatchWindows(context).flatMap((window) =>
+        window.blocks.map((block) => block.blockId)));
+      return fauxAssistantMessage([], {
+        stopReason: "error",
+        errorMessage: "input exceeds the context window",
+      });
+    },
+    (context: Context) => {
+      const prompt = userText(context);
+      observedRequestIds.push(/PHYSICAL REQUEST ([^\n]+)/u.exec(prompt)?.[1] ?? "");
+      observedBlockGroups.push(promptBatchWindows(context).flatMap((window) =>
+        window.blocks.map((block) => block.blockId)));
+      return losslessBatchResponse(context);
+    },
+    (context: Context) => {
+      const prompt = userText(context);
+      observedRequestIds.push(/PHYSICAL REQUEST ([^\n]+)/u.exec(prompt)?.[1] ?? "");
+      observedBlockGroups.push(promptBatchWindows(context).flatMap((window) =>
+        window.blocks.map((block) => block.blockId)));
+      return losslessBatchResponse(context);
+    },
+  ]);
+  const primaryModel = primary.getModel();
+  const primaryStream = primary.provider.streamSimple.bind(primary.provider);
+
+  const result = await runBook({
+    ...fixture.options,
+    model: primaryModel,
+    streamFn: primaryStream,
+    maxAttempts: 1,
+    runtimeSet: {
+      mode: "fast",
+      primary: {
+        model: primaryModel,
+        streamFn: primaryStream,
+        effort: "off",
+        thinkingLevel: "off",
+      },
+      escalation: {
+        model: escalation.getModel(),
+        streamFn: escalation.provider.streamSimple.bind(escalation.provider),
+        effort: "high",
+        thinkingLevel: "high",
+      },
+    },
+  } as never);
+
+  assert.equal(result.status.completedWindows, 2);
+  assert.equal(primary.state.callCount, 3);
+  assert.equal(escalation.state.callCount, 0);
+  assert.deepEqual(observedBlockGroups.map((blocks) => blocks.length), [2, 1, 1]);
+  assert.equal(new Set(observedRequestIds).size, 3);
+  const database = new DatabaseSync(fixture.options.storePath);
+  try {
+    const events = (database.prepare(`
+      SELECT kind, COUNT(*) AS count FROM events
+      WHERE run_id='run-lossless' AND kind IN ('window_claimed', 'window_staged', 'window_promoted')
+      GROUP BY kind
+    `).all() as Array<{ kind: string; count: number }>).map((row) => ({ ...row }));
+    assert.deepEqual(events, [
+      { kind: "window_claimed", count: 2 },
+      { kind: "window_promoted", count: 2 },
+      { kind: "window_staged", count: 2 },
+    ]);
+  } finally {
+    database.close();
+  }
+});
+
+test("a runtime context overflow for one indivisible block has a capacity error", async () => {
+  const fixture = losslessFixture("the only quiet line.");
+  fixture.faux.setResponses([fauxAssistantMessage([], {
+    stopReason: "error",
+    errorMessage: "input exceeds the context window",
+  })]);
+
+  await assert.rejects(
+    runBook(fixture.options as never),
+    (error: unknown) => error instanceof BookRequestCapacityError,
+  );
+  assert.equal(fixture.faux.state.callCount, 1);
 });
 
 test("lossless book aborts before selecting a new wave and reaches no provider call", async () => {
@@ -883,11 +1065,24 @@ test("lossless runner hydrates full knowledge history when resuming from a revis
   const resumedProvider = fauxProvider();
   resumedProvider.setResponses([(context) => {
     const prompt = userText(context);
-    const projectionMatch = /KNOWLEDGE SNAPSHOT REVISIONS\n\n(\[[\s\S]*?\])\n\nWINDOWS/u.exec(prompt);
+    const projectionMatch = /KNOWLEDGE SNAPSHOT PROJECTION\n\n(\{[\s\S]*\})\n\nWINDOWS/u.exec(prompt);
     assert.ok(projectionMatch?.[1]);
-    const projection = JSON.parse(projectionMatch[1]) as Array<{ revision: number; status: string }>;
-    assert.deepEqual(projection.map((revision) => [revision.revision, revision.status]), [
-      [2, "needs_revalidate"],
+    const projection = JSON.parse(projectionMatch[1]) as {
+      metadata: { total: number; projected: number; omitted: number };
+      revisions: Array<{ normalizedSubject: string; revision: number; status: string }>;
+    };
+    assert.deepEqual(projection.metadata, {
+      ...projection.metadata,
+      total: 1,
+      projected: 1,
+      omitted: 0,
+    });
+    assert.deepEqual(projection.revisions.map((revision) => [
+      revision.normalizedSubject,
+      revision.revision,
+      revision.status,
+    ]), [
+      ["alpha", 2, "needs_revalidate"],
     ]);
     return responseWithMemory("乙")(context);
   }]);

@@ -12,7 +12,11 @@ import {
   type LexicalAnchorOutcome,
 } from "../agents/lexical-anchorer.js";
 import { ModelProviderError, PiRuntime } from "../agents/pi-runtime.js";
-import { runTranslationBatch } from "../agents/translation-batch.js";
+import {
+  runTranslationBatch,
+  type TranslationBatchResult,
+  type TranslationBatchWindowResult,
+} from "../agents/translation-batch.js";
 import type { TranslationRequestInput } from "../agents/translation-request.js";
 import { entityLinkAsTerms, type EntityLink } from "../domain/entity-links.js";
 import type { StableTerm, V4Block } from "../domain/types.js";
@@ -30,6 +34,7 @@ import {
 } from "../knowledge/knowledge-store.js";
 import { createKnowledgeSnapshot } from "../knowledge/snapshot.js";
 import { SourceLedger } from "../source/source-ledger.js";
+import type { LosslessBlock } from "../source/types.js";
 import {
   WeightedTokenEstimator,
   type UsageObservation,
@@ -76,6 +81,7 @@ import {
 import type { WindowExecutionSummary } from "./types.js";
 import type {
   PhysicalRequestPlan,
+  RequestBatchWindow,
   TranslationRuntime,
   TranslationRuntimeSet,
 } from "./types.js";
@@ -301,10 +307,15 @@ export class BookRequestCapacityError extends Error {
   readonly code = "REQUEST_CONTEXT_EXCEEDED" as const;
   readonly retryable = false;
 
-  constructor(requestId: string, assessment: RequestBudgetAssessment) {
+  constructor(
+    requestId: string,
+    assessment: RequestBudgetAssessment,
+    detail?: string,
+  ) {
     super(
       `REQUEST_CONTEXT_EXCEEDED: ${requestId} reserves ${assessment.totalReserved} tokens `
-      + `for a ${assessment.contextWindowTokens}-token context`,
+      + `for a ${assessment.contextWindowTokens}-token context`
+      + (detail === undefined ? "" : ` (${detail})`),
     );
     this.name = "BookRequestCapacityError";
   }
@@ -1011,48 +1022,318 @@ function outputReserveTokens(request: PhysicalRequestPlan, runtime: TranslationR
   );
 }
 
-interface AdmittedRequest<TInput> {
+const CONTEXT_FRAGMENT_PROTOCOL_VERSION = "v5-context-fragment-1";
+const MAX_CONTEXT_SPLIT_DEPTH = 16;
+const MAX_CONTEXT_SPLIT_ATTEMPTS = 32;
+
+interface AdmittedRequestFragment<TInput> {
   request: PhysicalRequestPlan;
   input: TInput;
   assessment: RequestBudgetAssessment;
+  /** Every split raises this number, so recovery cannot re-enqueue the same shape forever. */
+  depth: number;
+}
+
+interface AdmittedRequest<TInput> {
+  /** Original physical grouping: it is the durable claim/stage/promote boundary. */
+  request: PhysicalRequestPlan;
+  /** Context-safe provider calls, executed serially while holding one scheduler permit. */
+  fragments: readonly AdmittedRequestFragment<TInput>[];
+  /** Reserve only the largest fragment, never the sum of serial fragment calls. */
+  assessment: RequestBudgetAssessment;
+}
+
+function contextFragmentRequestId(
+  parentRequestId: string,
+  windowId: string,
+  blockIds: readonly string[],
+): string {
+  const hash = createHash("sha256");
+  hash.update(CONTEXT_FRAGMENT_PROTOCOL_VERSION);
+  hash.update("\0");
+  hash.update(parentRequestId);
+  hash.update("\0");
+  hash.update(windowId);
+  for (const blockId of blockIds) {
+    hash.update("\0");
+    hash.update(blockId);
+  }
+  return `request-${hash.digest("hex").slice(0, 20)}`;
+}
+
+function blocksForFragment(
+  blockIds: readonly string[],
+  blockById: ReadonlyMap<string, LosslessBlock>,
+): LosslessBlock[] {
+  return blockIds.map((blockId) => {
+    const block = blockById.get(blockId);
+    if (block === undefined) {
+      throw new Error(`context fragment references unknown block ${blockId}`);
+    }
+    return block;
+  });
+}
+
+function fragmentWindowAtBlocks(
+  window: RequestBatchWindow,
+  blockIds: readonly string[],
+  blockById: ReadonlyMap<string, LosslessBlock>,
+): RequestBatchWindow {
+  const blocks = blocksForFragment(blockIds, blockById);
+  return {
+    ...window,
+    blockIds: [...blockIds],
+    globalIndexes: blocks.map((block) => block.globalIndex),
+    sourceTokens: blocks.reduce((total, block) => total + block.tokenCount, 0),
+    sourceChars: blocks.reduce(
+      (total, block) => total + block.canonicalEnd - block.canonicalStart,
+      0,
+    ),
+    oversized: false,
+  };
+}
+
+function splitSingleWindowRequestAtBlocks(
+  request: PhysicalRequestPlan,
+  blockById: ReadonlyMap<string, LosslessBlock>,
+): PhysicalRequestPlan[] {
+  const window = request.windows[0];
+  if (window === undefined || window.blockIds.length < 2) {
+    return [];
+  }
+  const blocks = blocksForFragment(window.blockIds, blockById);
+  const totalTokens = blocks.reduce((total, block) => total + block.tokenCount, 0);
+  let leftTokens = 0;
+  let bestCut = 1;
+  let bestDistance = Number.POSITIVE_INFINITY;
+  for (let index = 1; index < blocks.length; index += 1) {
+    leftTokens += (blocks[index - 1] as LosslessBlock).tokenCount;
+    const distance = Math.abs(totalTokens - leftTokens * 2);
+    if (distance < bestDistance) {
+      bestDistance = distance;
+      bestCut = index;
+    }
+  }
+  const partitions = [
+    window.blockIds.slice(0, bestCut),
+    window.blockIds.slice(bestCut),
+  ];
+  return partitions.map((blockIds) => {
+    const fragmentWindow = fragmentWindowAtBlocks(window, blockIds, blockById);
+    return {
+      requestId: contextFragmentRequestId(request.requestId, window.windowId, blockIds),
+      windows: [fragmentWindow],
+      sourceTokens: fragmentWindow.sourceTokens,
+    };
+  });
+}
+
+/**
+ * Always isolate logical windows before splitting their source.  This ordering
+ * preserves maximal narrative context whenever the provider capacity permits it.
+ */
+function splitPhysicalRequestAtBoundaries(
+  request: PhysicalRequestPlan,
+  blockById: ReadonlyMap<string, LosslessBlock>,
+): PhysicalRequestPlan[] {
+  if (request.windows.length > 1) {
+    return packPhysicalRequests(request.windows, {
+      tinyWindowTokens: 1,
+      maxRequestTokens: Math.max(1, request.sourceTokens),
+      maxWindowsPerRequest: 1,
+    });
+  }
+  return splitSingleWindowRequestAtBlocks(request, blockById);
+}
+
+function assessTranslationFragment<TInput extends TranslationRequestInput>(
+  request: PhysicalRequestPlan,
+  runtime: TranslationRuntime,
+  estimator: WeightedTokenEstimator,
+  buildInput: (request: PhysicalRequestPlan) => TInput,
+  depth = 0,
+): AdmittedRequestFragment<TInput> {
+  const input = buildInput(request);
+  const assessment = new RequestBudgeter(estimator, {
+    modelId: runtime.model.id,
+    contextWindowTokens: runtime.model.contextWindow,
+    outputTokens: outputReserveTokens(request, runtime),
+    reasoningReserveTokens: Math.min(
+      reasoningReserveTokens(runtime),
+      runtime.model.maxTokens,
+    ),
+    safetyMarginTokens: Math.max(512, Math.ceil(runtime.model.contextWindow * 0.02)),
+  }).assess(input);
+  return { request, input, assessment, depth };
+}
+
+function capacityAssessmentForProviderContext(
+  assessment: RequestBudgetAssessment,
+): RequestBudgetAssessment {
+  if (!assessment.fits) {
+    return assessment;
+  }
+  const totalReserved = assessment.contextWindowTokens < Number.MAX_SAFE_INTEGER
+    ? Math.max(assessment.totalReserved, assessment.contextWindowTokens + 1)
+    : assessment.totalReserved;
+  return {
+    ...assessment,
+    totalReserved,
+    fits: false,
+    decision: "split_window",
+  };
+}
+
+function admitTranslationFragments<TInput extends TranslationRequestInput>(
+  requests: readonly PhysicalRequestPlan[],
+  runtime: TranslationRuntime,
+  estimator: WeightedTokenEstimator,
+  blockById: ReadonlyMap<string, LosslessBlock>,
+  buildInput: (request: PhysicalRequestPlan) => TInput,
+  initialDepth = 0,
+): AdmittedRequestFragment<TInput>[] {
+  const admitted: AdmittedRequestFragment<TInput>[] = [];
+  const queue = requests.map((request) => ({ request, depth: initialDepth }));
+  while (queue.length > 0) {
+    const queued = queue.shift() as { request: PhysicalRequestPlan; depth: number };
+    const fragment = assessTranslationFragment(
+      queued.request,
+      runtime,
+      estimator,
+      buildInput,
+      queued.depth,
+    );
+    if (fragment.assessment.fits) {
+      admitted.push(fragment);
+      continue;
+    }
+    const children = splitPhysicalRequestAtBoundaries(fragment.request, blockById);
+    if (children.length === 0 || fragment.depth >= MAX_CONTEXT_SPLIT_DEPTH) {
+      throw new BookRequestCapacityError(
+        fragment.request.requestId,
+        fragment.assessment,
+        children.length === 0
+          ? "one logical source block cannot be subdivided further"
+          : `automatic context subdivision reached ${MAX_CONTEXT_SPLIT_DEPTH} levels`,
+      );
+    }
+    queue.unshift(...children.map((request) => ({ request, depth: fragment.depth + 1 })));
+  }
+  return admitted;
 }
 
 function admitTranslationRequests<TInput extends TranslationRequestInput>(
   requests: readonly PhysicalRequestPlan[],
   runtime: TranslationRuntime,
   estimator: WeightedTokenEstimator,
+  blockById: ReadonlyMap<string, LosslessBlock>,
   buildInput: (request: PhysicalRequestPlan) => TInput,
 ): AdmittedRequest<TInput>[] {
-  const admitted: AdmittedRequest<TInput>[] = [];
-  const queue = [...requests];
-  while (queue.length > 0) {
-    const request = queue.shift() as PhysicalRequestPlan;
-    const input = buildInput(request);
-    const assessment = new RequestBudgeter(estimator, {
-      modelId: runtime.model.id,
-      contextWindowTokens: runtime.model.contextWindow,
-      outputTokens: outputReserveTokens(request, runtime),
-      reasoningReserveTokens: Math.min(
-        reasoningReserveTokens(runtime),
-        runtime.model.maxTokens,
-      ),
-      safetyMarginTokens: Math.max(512, Math.ceil(runtime.model.contextWindow * 0.02)),
-    }).assess(input);
-    if (assessment.fits) {
-      admitted.push({ request, input, assessment });
-      continue;
+  return requests.map((request) => {
+    const fragments = admitTranslationFragments(
+      [request],
+      runtime,
+      estimator,
+      blockById,
+      buildInput,
+    );
+    const largest = fragments.reduce((current, fragment) =>
+      fragment.assessment.totalReserved > current.assessment.totalReserved
+        ? fragment
+        : current,
+    );
+    return { request, fragments, assessment: largest.assessment };
+  });
+}
+
+interface FragmentTranslationExecution {
+  fragment: AdmittedRequestFragment<TranslationRequestInput>;
+  result: TranslationBatchResult;
+}
+
+interface MergedTranslationResult {
+  windows: TranslationBatchWindowResult[];
+  responseErrors: string[];
+}
+
+function mergeFragmentTranslationResults(
+  request: PhysicalRequestPlan,
+  executions: readonly FragmentTranslationExecution[],
+): MergedTranslationResult {
+  const partsByWindow = new Map<string, TranslationBatchWindowResult[]>();
+  for (const execution of executions) {
+    for (const result of execution.result.windows) {
+      const parts = partsByWindow.get(result.windowId) ?? [];
+      parts.push(result);
+      partsByWindow.set(result.windowId, parts);
     }
-    if (assessment.decision === "split_request" && request.windows.length > 1) {
-      queue.unshift(...packPhysicalRequests(request.windows, {
-        tinyWindowTokens: 1,
-        maxRequestTokens: Math.max(1, request.sourceTokens),
-        maxWindowsPerRequest: 1,
-      }));
-      continue;
-    }
-    throw new BookRequestCapacityError(request.requestId, assessment);
   }
-  return admitted;
+  const windows = request.windows.map((logicalWindow): TranslationBatchWindowResult => {
+    const parts = partsByWindow.get(logicalWindow.windowId) ?? [];
+    const failedPart = parts.find((part) => part.status === "failed");
+    if (failedPart !== undefined) {
+      return {
+        windowId: logicalWindow.windowId,
+        ordinal: logicalWindow.ordinal,
+        status: "failed",
+        translations: [],
+        notes: [],
+        memoryCandidates: [],
+        error: failedPart.error ?? "fragment translation failed",
+      };
+    }
+    const translationsByBlock = new Map<string, { blockId: string; text: string }>();
+    for (const part of parts) {
+      for (const translation of part.translations) {
+        if (translationsByBlock.has(translation.blockId)) {
+          return {
+            windowId: logicalWindow.windowId,
+            ordinal: logicalWindow.ordinal,
+            status: "failed",
+            translations: [],
+            notes: [],
+            memoryCandidates: [],
+            error: `duplicate block translation while merging context fragments: ${translation.blockId}`,
+          };
+        }
+        translationsByBlock.set(translation.blockId, translation);
+      }
+    }
+    const missing = logicalWindow.blockIds.filter((blockId) => !translationsByBlock.has(blockId));
+    if (missing.length > 0) {
+      return {
+        windowId: logicalWindow.windowId,
+        ordinal: logicalWindow.ordinal,
+        status: "failed",
+        translations: [],
+        notes: [],
+        memoryCandidates: [],
+        error: `missing block translations while merging context fragments: ${missing.join(", ")}`,
+      };
+    }
+    let styleObservation: TranslationBatchWindowResult["styleObservation"];
+    for (const part of parts) {
+      if (part.styleObservation !== undefined) {
+        styleObservation = part.styleObservation;
+      }
+    }
+    return {
+      windowId: logicalWindow.windowId,
+      ordinal: logicalWindow.ordinal,
+      status: parts.some((part) => part.status === "completed_with_warnings")
+        ? "completed_with_warnings"
+        : "completed",
+      translations: logicalWindow.blockIds.map((blockId) =>
+        translationsByBlock.get(blockId) as { blockId: string; text: string }),
+      notes: parts.flatMap((part) => part.notes),
+      memoryCandidates: parts.flatMap((part) => part.memoryCandidates),
+      ...(styleObservation === undefined ? {} : { styleObservation }),
+    };
+  });
+  return {
+    windows,
+    responseErrors: executions.flatMap((execution) => execution.result.responseErrors),
+  };
 }
 
 interface ScheduledResult<T> {
@@ -1429,28 +1710,30 @@ async function runLosslessBook(
         const executionRuntime = retryRound === 0
           ? runtimeSet.primary
           : runtimeSet.escalation;
+        const buildTranslationInput = (request: PhysicalRequestPlan): TranslationRequestInput => ({
+          request,
+          blocks: context.losslessBlocks,
+          stableTerms: termsForWindows(
+            activeTerms,
+            request.windows,
+            context,
+            options.glossary,
+          ),
+          snapshot,
+          styleState: options.styleState,
+          sourceLanguageProfile: context.languageProfile,
+          entityLinkWarnings,
+          effectiveStyleByWindow: Object.fromEntries(request.windows.map((window) => [
+            window.windowId,
+            effectiveStyleByWindow[window.windowId] as EffectiveStyleProjection,
+          ])),
+        });
         const requestInputs = admitTranslationRequests(
           requests,
           executionRuntime,
           estimator,
-          (request): TranslationRequestInput => ({
-            request,
-            blocks: context.losslessBlocks,
-            stableTerms: termsForWindows(
-              activeTerms,
-              request.windows,
-              context,
-              options.glossary,
-            ),
-            snapshot,
-            styleState: options.styleState,
-            sourceLanguageProfile: context.languageProfile,
-            entityLinkWarnings,
-            effectiveStyleByWindow: Object.fromEntries(request.windows.map((window) => [
-              window.windowId,
-              effectiveStyleByWindow[window.windowId] as EffectiveStyleProjection,
-            ])),
-          }),
+          blockById,
+          buildTranslationInput,
         );
         if (initialRequestCount === 0) {
           initialRequestCount = requestInputs.length;
@@ -1467,51 +1750,113 @@ async function runLosslessBook(
         throwIfAborted(options.signal);
         for (const { request } of requestInputs) {
           for (const window of request.windows) {
-            claimed.set(window.windowId, store.claimWindow(runId, window.windowId));
+            if (!claimed.has(window.windowId)) {
+              claimed.set(window.windowId, store.claimWindow(runId, window.windowId));
+            }
           }
         }
 
         type CompletedRequest = {
-          request: (typeof requests)[number];
-          budget: BudgetLedger;
-          result?: Awaited<ReturnType<typeof runTranslationBatch>>;
+          request: PhysicalRequestPlan;
+          budget: Readonly<Record<string, number>>;
+          result?: MergedTranslationResult;
           error?: unknown;
         };
         const completionOrder = await runWithAdaptiveScheduler(
           requestInputs,
           scheduler,
-          async ({ request, input, assessment }): Promise<ScheduledResult<CompletedRequest>> => {
+          async ({ request, fragments }): Promise<ScheduledResult<CompletedRequest>> => {
+            // Fragments are one logical provider operation. Reusing the ledger
+            // preserves the original hard ceilings instead of multiplying every
+            // budget limit by the number of context-recovery fragments.
             const budget = new BudgetLedger();
-            try {
-              throwIfAborted(options.signal);
-              const result = await runTranslationBatch({
-                ...input,
-                model: executionRuntime.model,
-                streamFn: executionRuntime.streamFn,
-                thinkingLevel: executionRuntime.thinkingLevel,
-                repairRuntime: {
-                  model: runtimeSet.escalation.model,
-                  streamFn: runtimeSet.escalation.streamFn,
-                  thinkingLevel: runtimeSet.escalation.thinkingLevel,
-                },
-                budget,
-                signal: options.signal,
-                deadlineMs: options.hardDeadlineMs,
-              });
-              if (result.run.modelCalls === 1
-                && assessment.inputTokens > 0
-                && result.run.usage.input > 0) {
-                const observation: UsageObservation = {
-                  modelId: executionRuntime.model.id,
-                  profile: context.languageProfile,
-                  estimatedTokens: assessment.inputTokens,
-                  actualInputTokens: result.run.usage.input,
-                };
-                estimator.observeUsage(observation);
+            let observedContextOverflow = false;
+            let contextSplitAttempts = 0;
+            const executeFragments = async (
+              pendingFragments: readonly AdmittedRequestFragment<TranslationRequestInput>[],
+              retryingAfterContext = false,
+            ): Promise<FragmentTranslationExecution[]> => {
+              const completed: FragmentTranslationExecution[] = [];
+              for (const fragment of pendingFragments) {
+                try {
+                  throwIfAborted(options.signal);
+                  const result = await runTranslationBatch({
+                    ...fragment.input,
+                    model: executionRuntime.model,
+                    streamFn: executionRuntime.streamFn,
+                    thinkingLevel: executionRuntime.thinkingLevel,
+                    repairRuntime: retryingAfterContext
+                      ? {
+                        model: executionRuntime.model,
+                        streamFn: executionRuntime.streamFn,
+                        thinkingLevel: executionRuntime.thinkingLevel,
+                      }
+                      : {
+                        model: runtimeSet.escalation.model,
+                        streamFn: runtimeSet.escalation.streamFn,
+                        thinkingLevel: runtimeSet.escalation.thinkingLevel,
+                      },
+                    budget,
+                    signal: options.signal,
+                    deadlineMs: options.hardDeadlineMs,
+                  });
+                  if (result.run.modelCalls === 1
+                    && fragment.assessment.inputTokens > 0
+                    && result.run.usage.input > 0) {
+                    const observation: UsageObservation = {
+                      modelId: executionRuntime.model.id,
+                      profile: context.languageProfile,
+                      estimatedTokens: fragment.assessment.inputTokens,
+                      actualInputTokens: result.run.usage.input,
+                    };
+                    estimator.observeUsage(observation);
+                  }
+                  completed.push({ fragment, result });
+                } catch (error) {
+                  if (!(error instanceof ModelProviderError) || error.kind !== "context") {
+                    throw error;
+                  }
+                  observedContextOverflow = true;
+                  contextSplitAttempts += 1;
+                  const children = splitPhysicalRequestAtBoundaries(
+                    fragment.request,
+                    blockById,
+                  );
+                  if (children.length === 0
+                    || fragment.depth >= MAX_CONTEXT_SPLIT_DEPTH
+                    || contextSplitAttempts > MAX_CONTEXT_SPLIT_ATTEMPTS) {
+                    throw new BookRequestCapacityError(
+                      fragment.request.requestId,
+                      capacityAssessmentForProviderContext(fragment.assessment),
+                      children.length === 0
+                        ? "provider rejected one indivisible source block for context capacity"
+                        : fragment.depth >= MAX_CONTEXT_SPLIT_DEPTH
+                          ? `provider context recovery reached ${MAX_CONTEXT_SPLIT_DEPTH} levels`
+                          : `provider context recovery exceeded ${MAX_CONTEXT_SPLIT_ATTEMPTS} retries`,
+                    );
+                  }
+                  const admittedChildren = admitTranslationFragments(
+                    children,
+                    executionRuntime,
+                    estimator,
+                    blockById,
+                    buildTranslationInput,
+                    fragment.depth + 1,
+                  );
+                  completed.push(...await executeFragments(admittedChildren, true));
+                }
               }
+              return completed;
+            };
+            try {
+              const executions = await executeFragments(fragments);
               return {
-                value: { request, budget, result },
-                status: "success",
+                value: {
+                  request,
+                  budget: budget.snapshot(),
+                  result: mergeFragmentTranslationResults(request, executions),
+                },
+                status: observedContextOverflow ? "context" : "success",
               };
             } catch (error) {
               const status: SchedulerObservationStatus = error instanceof ModelProviderError
@@ -1522,7 +1867,7 @@ async function runLosslessBook(
                 ? error.kind
                 : "failed";
               return {
-                value: { request, budget, error },
+                value: { request, budget: budget.snapshot(), error },
                 status,
               };
             }
@@ -1552,28 +1897,30 @@ async function runLosslessBook(
           }
         }
         const nextRetries: PersistedLosslessWindow[] = [];
+        let capacityFailure: BookRequestCapacityError | undefined;
         for (const completed of completionOrder) {
           if (completed.error !== undefined) {
             const completedError = completed.error;
             const message = completedError instanceof Error
               ? completedError.message
               : String(completedError);
+            const capacityError = completedError instanceof BookRequestCapacityError;
             for (const requestWindow of completed.request.windows) {
               const window = claimed.get(requestWindow.windowId) as PersistedLosslessWindow;
-              const external = completedError instanceof ModelProviderError;
+              const external = !capacityError && completedError instanceof ModelProviderError;
               if (external && firstProviderFailure === undefined) {
                 firstProviderFailure = completedError;
               }
               const boundedProviderRetry = external
                 && completedError.retryable
                 && window.attemptCount < maxAttempts;
-              const retry = external || window.attemptCount < maxAttempts;
+              const retry = !capacityError && (external || window.attemptCount < maxAttempts);
               store.failWindow(runId, window.windowId, {
                 error: message,
                 retry,
                 budget: persistedBudgetFor(
                   window,
-                  completed.budget.snapshot(),
+                  completed.budget,
                   completed.request.windows[0]?.windowId === window.windowId,
                 ),
                 warnings: external
@@ -1584,6 +1931,10 @@ async function runLosslessBook(
                 nextRetries.push(store.pendingWindows(runId)
                   .find((item) => item.windowId === window.windowId) as PersistedLosslessWindow);
               }
+            }
+            if (capacityError) {
+              capacityFailure ??= completedError;
+              continue;
             }
             if (completedError instanceof ModelProviderError
               && (!completedError.retryable
@@ -1600,7 +1951,7 @@ async function runLosslessBook(
             continue;
           }
 
-          const result = completed.result as Awaited<ReturnType<typeof runTranslationBatch>>;
+          const result = completed.result as MergedTranslationResult;
           for (const windowResult of result.windows) {
             const window = claimed.get(windowResult.windowId) as PersistedLosslessWindow;
             if (windowResult.status === "failed") {
@@ -1611,7 +1962,7 @@ async function runLosslessBook(
                 retry,
                 budget: persistedBudgetFor(
                   window,
-                  completed.budget.snapshot(),
+                  completed.budget,
                   completed.request.windows[0]?.windowId === window.windowId,
                 ),
                 warnings: [error, ...result.responseErrors],
@@ -1661,7 +2012,7 @@ async function runLosslessBook(
               styleTail: canonicalJson(styleObservation),
               budget: persistedBudgetFor(
                 window,
-                completed.budget.snapshot(),
+                completed.budget,
                 completed.request.windows[0]?.windowId === window.windowId,
               ),
               warnings,
@@ -1676,6 +2027,9 @@ async function runLosslessBook(
             throwIfAborted(options.signal);
             coordinator.promoteReady();
           }
+        }
+        if (capacityFailure !== undefined) {
+          throw capacityFailure;
         }
         retryWindows = nextRetries;
         retryRound += 1;
