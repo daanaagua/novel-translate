@@ -1869,6 +1869,45 @@ async function runLosslessBook(
                   }
                   const recoverableWindowIds = recoverableStructuralWindowIds(result);
                   if (recoverableWindowIds.size > 0
+                    && fragment.input.responseProtocol === "typed_tool"
+                    && protocolSplitAttempts < MAX_PROTOCOL_SPLIT_ATTEMPTS) {
+                    const failedRequest = requestWithWindows(
+                      fragment.request,
+                      recoverableWindowIds,
+                    );
+                    if (failedRequest.windows.length > 0) {
+                      protocolSplitAttempts += 1;
+                      const validWindows = result.windows.filter((window) =>
+                        !recoverableWindowIds.has(window.windowId));
+                      if (validWindows.length > 0) {
+                        completed.push({
+                          fragment,
+                          result: { ...result, windows: validWindows },
+                        });
+                      }
+                      const buildFramedTranslationInput = (
+                        request: PhysicalRequestPlan,
+                      ): TranslationRequestInput => ({
+                        ...buildTranslationInput(request),
+                        responseProtocol: "framed_text",
+                      });
+                      const admittedFallback = admitTranslationFragments(
+                        [failedRequest],
+                        runtimeSet.escalation,
+                        estimator,
+                        blockById,
+                        buildFramedTranslationInput,
+                        fragment.depth,
+                      );
+                      completed.push(...await executeFragments(
+                        admittedFallback,
+                        runtimeSet.escalation,
+                        true,
+                      ));
+                      continue;
+                    }
+                  }
+                  if (recoverableWindowIds.size > 0
                     && fragment.request.windows.length === 1
                     && fragment.depth < MAX_CONTEXT_SPLIT_DEPTH
                     && protocolSplitAttempts < MAX_PROTOCOL_SPLIT_ATTEMPTS) {

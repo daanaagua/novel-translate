@@ -893,26 +893,29 @@ test("lossless runner injects only glossary terms relevant to each physical requ
   assert.doesNotMatch(prompts[1] ?? "", /"sourceForm":"Typhon"/u);
 });
 
-test("one malformed window in a batch cannot erase its valid earlier sibling", async () => {
+test("one malformed typed window preserves its valid sibling while framed fallback repairs only the failure", async () => {
   const fixture = losslessFixture("EDGEWOOD\n\nBOOK ONE");
   const malformed = structuredClone(fixture.submission);
   malformed.windows[1]!.translations[0]!.text = "";
-  fixture.faux.setResponses([fauxAssistantMessage(fauxToolCall(
-    "finalize_translation_batch",
-    malformed,
-  ), { stopReason: "toolUse" })]);
+  fixture.faux.setResponses([
+    fauxAssistantMessage(fauxToolCall(
+      "finalize_translation_batch",
+      malformed,
+    ), { stopReason: "toolUse" }),
+    losslessBatchResponse,
+  ]);
 
   const result = await runBook({ ...fixture.options, maxAttempts: 1 } as never);
 
-  assert.equal(fixture.faux.state.callCount, 1);
-  assert.equal(result.status.completedWindows, 1);
-  assert.equal(result.status.humanRequiredWindows, 1);
+  assert.equal(fixture.faux.state.callCount, 2);
+  assert.equal(result.status.completedWindows, 2);
+  assert.equal(result.status.humanRequiredWindows, 0);
   assert.deepEqual(result.windows.map((window) => window.status), [
     "completed",
-    "human_required",
+    "completed",
   ]);
   const store = new LosslessBookStore(fixture.options.storePath);
-  assert.deepEqual(store.styleObservations("run-lossless").map((item) => item.ordinal), [0]);
+  assert.deepEqual(store.styleObservations("run-lossless").map((item) => item.ordinal), [0, 1]);
   store.close();
 });
 
@@ -967,6 +970,39 @@ test("fast mode retries an invalid physical request with only the escalation run
   assert.equal(primary.state.callCount, 1);
   assert.equal(escalation.state.callCount, 1);
   assert.equal(result.status.completedWindows, 2);
+});
+
+test("quality mode falls back from a malformed typed payload to framed text before human review", async () => {
+  const fixture = losslessFixture("One complete source paragraph without named entities.");
+  const primary = fauxProvider();
+  primary.setResponses([
+    fauxAssistantMessage("I failed to call the finalizer."),
+    losslessBatchResponse,
+  ]);
+  const primaryModel = primary.getModel();
+  const primaryStream = primary.provider.streamSimple.bind(primary.provider);
+  const runtime = {
+    model: primaryModel,
+    streamFn: primaryStream,
+    effort: "high" as const,
+    thinkingLevel: "high" as const,
+  };
+
+  const result = await runBook({
+    ...fixture.options,
+    model: primaryModel,
+    streamFn: primaryStream,
+    maxAttempts: 1,
+    runtimeSet: {
+      mode: "quality",
+      primary: runtime,
+      escalation: runtime,
+    },
+  } as never);
+
+  assert.equal(primary.state.callCount, 2);
+  assert.equal(result.status.humanRequiredWindows, 0);
+  assert.equal(result.status.completedWindows, result.status.totalWindows);
 });
 
 test("fast mode resolves lexical anchors on the primary runtime and leaves high effort for escalation", async () => {
