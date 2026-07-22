@@ -246,6 +246,65 @@ describe("FolioLoom desktop onboarding", () => {
     expect(await screen.findByRole("button", { name: "DeepSeek" })).toBeTruthy();
   });
 
+  it("shows an encoding choice above an existing project while replacing its manuscript", async () => {
+    const user = userEvent.setup();
+    const pending: DesktopChooseSourceResult = {
+      status: "encoding_required",
+      pendingImportId: "9b34f991-35a9-47ba-8fda-92fa847d9459",
+      fileName: "replacement-korean.txt",
+      encodings: ["euc-kr", "windows-949"],
+    };
+    render(<App api={createApi({
+      getOnboardingState: vi.fn().mockResolvedValue(ok(sourceOnlyOnboarding)),
+      chooseSource: vi.fn().mockResolvedValue(ok(pending)),
+    })} />);
+
+    await user.click(await screen.findByRole("button", { name: "更换书稿" }));
+
+    expect(await screen.findByRole("heading", { name: "请选择文字编码" })).toBeTruthy();
+    expect(screen.getByText("replacement-korean.txt")).toBeTruthy();
+  });
+
+  it("clears stale trial state and locks trial when a new-source refresh fails", async () => {
+    const user = userEvent.setup();
+    const replacement = { ...project, title: "Replacement Book", sourceVersion: "source-replacement" };
+    const getOnboardingState = vi.fn()
+      .mockResolvedValueOnce(ok(readyOnboarding))
+      .mockResolvedValueOnce(failure("DESKTOP_REFRESH_FAILED", "书稿状态刷新失败"));
+    const startTrial = vi.fn().mockResolvedValue(ok({
+      runId: "old-run",
+      sourceText: "OLD SOURCE",
+      translationText: "OLD TRANSLATION",
+    }));
+    render(<App api={createApi({
+      getOnboardingState,
+      startTrial,
+      chooseSource: vi.fn().mockResolvedValue(ok({
+        status: "ready",
+        project: replacement,
+      } satisfies DesktopChooseSourceResult)),
+    })} />);
+
+    await user.click(await screen.findByRole("button", { name: "开始试译" }));
+    expect(await screen.findByText("OLD TRANSLATION")).toBeTruthy();
+    await user.click(screen.getByRole("button", { name: "更换书稿" }));
+
+    expect(await screen.findByRole("heading", { name: "Replacement Book" })).toBeTruthy();
+    expect(screen.queryByText("OLD TRANSLATION")).toBeNull();
+    expect((screen.getByRole("button", { name: "开始试译" }) as HTMLButtonElement).disabled).toBe(true);
+    expect(screen.getByText("书稿状态刷新失败")).toBeTruthy();
+  });
+
+  it("treats closing the manuscript picker as a no-op", async () => {
+    const user = userEvent.setup();
+    render(<App api={createApi()} />);
+
+    await user.click(await screen.findByRole("button", { name: "选择书稿" }));
+
+    await waitFor(() => expect(screen.queryByText("已取消选择")).toBeNull());
+    expect(screen.getByRole("heading", { name: "开始翻译一本书" })).toBeTruthy();
+  });
+
   it("renders six direct providers and keeps the custom interface under more services", async () => {
     const user = userEvent.setup();
     render(<App api={createApi({ getOnboardingState: vi.fn().mockResolvedValue(ok(sourceOnlyOnboarding)) })} />);
@@ -294,6 +353,20 @@ describe("FolioLoom desktop onboarding", () => {
     expect(kimi.getAttribute("aria-pressed")).toBe("true");
     expect((screen.getByLabelText("模型") as HTMLSelectElement).value).toBe("moonshot-v1-8k");
     expect(screen.getByRole("button", { name: "high" }).getAttribute("aria-pressed")).toBe("true");
+  });
+
+  it("locks trial when the visible model draft no longer matches the tested model", async () => {
+    const user = userEvent.setup();
+    render(<App api={createApi({
+      getOnboardingState: vi.fn().mockResolvedValue(ok(readyOnboarding)),
+    })} />);
+
+    const trial = await screen.findByRole("button", { name: "开始试译" }) as HTMLButtonElement;
+    await waitFor(() => expect(trial.disabled).toBe(false));
+    await user.click(screen.getByRole("button", { name: "Kimi" }));
+
+    await waitFor(() => expect(trial.disabled).toBe(true));
+    expect(screen.getByText(/重新测试连接后才能试译/u)).toBeTruthy();
   });
 
   it("clears the API Key and shows confirmation only after a ready connection", async () => {

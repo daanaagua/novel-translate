@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState, type JSX } from "react";
+import { useEffect, useLayoutEffect, useMemo, useRef, useState, type JSX } from "react";
 
 import type {
   DesktopDiscoverModelsRequest,
@@ -24,6 +24,7 @@ interface ProviderSetupProps {
   onDiscoverModels(request: DesktopDiscoverModelsRequest): Promise<DesktopResult<readonly DesktopModelOption[]>>;
   onTestModel(request: DesktopTestModelRequest): Promise<DesktopResult<DesktopTestModelResult>>;
   onForgetCredential(providerId: string): Promise<DesktopResult<DesktopOnboardingState>>;
+  onDraftValidityChange?(matchesActive: boolean): void;
 }
 
 function firstModel(provider: DesktopOnboardingProvider | undefined): string {
@@ -65,6 +66,7 @@ export function ProviderSetup({
   onDiscoverModels,
   onTestModel,
   onForgetCredential,
+  onDraftValidityChange,
 }: ProviderSetupProps): JSX.Element {
   const directProviders = useMemo(
     () => providers.filter((provider) => !provider.allowCustomBaseUrl),
@@ -87,10 +89,32 @@ export function ProviderSetup({
   const [discoveredModels, setDiscoveredModels] = useState<readonly DesktopModelOption[]>([]);
   const [testingConnection, setTestingConnection] = useState(false);
   const [connectionFeedback, setConnectionFeedback] = useState<ConnectionFeedback>();
+  const synchronizedActiveModel = useRef<string>();
 
   const selectedProvider = providers.find((provider) => provider.id === providerId) ?? directProviders[0] ?? additionalProviders[0];
 
-  useEffect(() => {
+  useLayoutEffect(() => {
+    if (activeModel === undefined
+      || !providers.some((provider) => provider.id === activeModel.providerId)) {
+      return;
+    }
+    const signature = [
+      activeModel.providerId,
+      activeModel.modelId,
+      activeModel.reasoningEffort ?? "",
+      activeModel.customBaseUrl ?? "",
+      activeModel.capability,
+    ].join("\0");
+    if (synchronizedActiveModel.current === signature) return;
+    synchronizedActiveModel.current = signature;
+    setProviderId(activeModel.providerId);
+    setModelId(activeModel.modelId);
+    setReasoningEffort(activeModel.reasoningEffort ?? "");
+    setCustomBaseUrl(activeModel.customBaseUrl ?? "");
+    setDiscoveredModels([]);
+  }, [activeModel, providers]);
+
+  useLayoutEffect(() => {
     if (selectedProvider === undefined) return;
     const savedModel = activeModel?.providerId === selectedProvider.id ? activeModel : undefined;
     setModelId(savedModel?.modelId ?? firstModel(selectedProvider));
@@ -107,6 +131,16 @@ export function ProviderSetup({
     ? [{ id: modelId, displayName: modelId }, ...listedModelOptions]
     : listedModelOptions;
   const formLocked = busy || testingConnection;
+  const draftMatchesActive = apiKey === ""
+    && activeModel?.capability === "ready"
+    && selectedProvider?.id === activeModel.providerId
+    && modelId === activeModel.modelId
+    && reasoningEffort === (activeModel.reasoningEffort ?? "")
+    && customBaseUrl.trim() === (activeModel.customBaseUrl ?? "").trim();
+
+  useEffect(() => {
+    onDraftValidityChange?.(draftMatchesActive);
+  }, [draftMatchesActive, onDraftValidityChange]);
 
   function chooseProvider(nextProvider: DesktopOnboardingProvider): void {
     if (formLocked) return;

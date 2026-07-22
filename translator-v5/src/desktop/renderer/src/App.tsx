@@ -122,6 +122,10 @@ export function App({ api }: AppProps): JSX.Element {
       return;
     }
     setPendingEncoding(undefined);
+    // A source identity change invalidates every projected trial artifact even
+    // when refreshing the richer onboarding snapshot subsequently fails.
+    setTrialProgress(undefined);
+    setTrialResult(undefined);
     const stateResult = await desktopApi.getOnboardingState();
     if (!stateResult.ok) {
       setOnboarding((current) => ({
@@ -133,8 +137,6 @@ export function App({ api }: AppProps): JSX.Element {
       return;
     }
     acceptOnboarding(stateResult);
-    setTrialProgress(undefined);
-    setTrialResult(undefined);
   }
 
   async function chooseSource(): Promise<void> {
@@ -144,6 +146,10 @@ export function App({ api }: AppProps): JSX.Element {
     try {
       const sourceResult = await desktopApi.chooseSource();
       if (!sourceResult.ok) {
+        if (sourceResult.error.code === "DESKTOP_SELECTION_CANCELLED") {
+          setOperationError(undefined);
+          return;
+        }
         setOperationError(sourceResult.error);
         return;
       }

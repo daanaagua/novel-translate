@@ -1,4 +1,4 @@
-import type { JSX } from "react";
+import { useState, type JSX } from "react";
 
 import type {
   DesktopDiscoverModelsRequest,
@@ -61,9 +61,14 @@ export function Onboarding({
   onStartTrial,
   onCancelTrial,
 }: OnboardingProps): JSX.Element {
+  const [modelDraftMatchesActive, setModelDraftMatchesActive] = useState(false);
   const sourceReady = onboarding.project !== undefined;
   const modelReady = onboarding.activeModel?.capability === "ready";
-  const trialEnabled = sourceReady && modelReady && busyAction === undefined;
+  const trialEnabled = sourceReady
+    && modelReady
+    && modelDraftMatchesActive
+    && onboarding.readiness.trial
+    && busyAction === undefined;
   const trialRunning = busyAction === "start-trial" || busyAction === "cancel-trial";
   const errorPanel = operationError === undefined ? null : (
     <section className="operation-error" role="status">
@@ -72,6 +77,29 @@ export function Onboarding({
       <TechnicalDetails details={operationError.technicalDetails} />
     </section>
   );
+
+  if (pendingEncoding !== undefined) {
+    return (
+      <main className="onboarding-scroll">
+        <div className="content-column welcome-page">
+          <div className="welcome-grid">
+            <section className="welcome-copy">
+              <p className="eyebrow">FolioLoom / Encoding</p>
+              <h1>确认书稿编码</h1>
+              <p className="onboarding-lead">选对文字编码后再打开书稿，避免把乱码带进翻译。</p>
+            </section>
+            <EncodingChooser
+              pending={pendingEncoding}
+              busy={busyAction !== undefined}
+              onConfirm={onConfirmSourceEncoding}
+              onChooseAnother={onChooseSource}
+            />
+          </div>
+          {errorPanel}
+        </div>
+      </main>
+    );
+  }
 
   if (!sourceReady) {
     return (
@@ -91,23 +119,14 @@ export function Onboarding({
                 {busyAction === "choose-source" ? "正在选择…" : "选择书稿"}
               </button>
             </section>
-            {pendingEncoding === undefined ? (
-              <aside className="welcome-card">
-                <p className="eyebrow">支持格式</p>
-                <h2>直接选择原稿</h2>
-                <p>程序会复制原文件用于翻译，不会改动你选择的书稿。</p>
-                <div className="format-list" aria-label="支持的书稿格式">
-                  <span>TXT</span><span>EPUB</span><span>DOCX</span><span>Markdown</span>
-                </div>
-              </aside>
-            ) : (
-              <EncodingChooser
-                pending={pendingEncoding}
-                busy={busyAction !== undefined}
-                onConfirm={onConfirmSourceEncoding}
-                onChooseAnother={onChooseSource}
-              />
-            )}
+            <aside className="welcome-card">
+              <p className="eyebrow">支持格式</p>
+              <h2>直接选择原稿</h2>
+              <p>程序会复制原文件用于翻译，不会改动你选择的书稿。</p>
+              <div className="format-list" aria-label="支持的书稿格式">
+                <span>TXT</span><span>EPUB</span><span>DOCX</span><span>Markdown</span>
+              </div>
+            </aside>
           </div>
           {errorPanel}
         </div>
@@ -154,6 +173,7 @@ export function Onboarding({
               onDiscoverModels={onDiscoverModels}
               onTestModel={onTestModel}
               onForgetCredential={onForgetCredential}
+              onDraftValidityChange={setModelDraftMatchesActive}
             />
           </section>
         </div>
@@ -164,6 +184,9 @@ export function Onboarding({
             <p className="eyebrow">试译</p>
             <h2 id="trial-step-title">先试译一小段</h2>
             <p className="section-copy">连接检查通过后，用一个片段确认模型能完整走通翻译流程。</p>
+            {modelReady && !modelDraftMatchesActive ? (
+              <p className="inline-note">当前设置尚未测试，重新测试连接后才能试译。</p>
+            ) : null}
             {trialProgress === undefined ? null : (
               <p className={`trial-status is-${trialProgress.stage}`} role="status">
                 {TRIAL_STAGE_LABELS[trialProgress.stage]}
