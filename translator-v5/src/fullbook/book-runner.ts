@@ -91,6 +91,9 @@ export const LOSSLESS_BOOK_PROTOCOL_VERSION = "v5-book-3";
 const DEFAULT_PROTOCOL_VERSION = LOSSLESS_BOOK_PROTOCOL_VERSION;
 const DEFAULT_MAX_ATTEMPTS = 2;
 const DEFAULT_MAX_CONCURRENCY = 2;
+const FAST_TARGET_SOURCE_TOKENS = 3_200;
+const FAST_MAX_SOURCE_TOKENS = 4_800;
+const FAST_MAX_BLOCKS = 4;
 
 export class BookStorageIncidentError extends Error {
   readonly code = "STORAGE_LOCKED" as const;
@@ -960,6 +963,21 @@ function normalizeRuntimeSet(options: LosslessBookRunOptions): TranslationRuntim
   return runtimeSet;
 }
 
+export function windowOptionsForRunMode(
+  mode: TranslationRuntimeSet["mode"],
+  requested: WindowPlanOptions = {},
+): WindowPlanOptions {
+  if (mode === "quality") return { ...requested };
+  const maxSourceTokens = requested.maxSourceTokens ?? FAST_MAX_SOURCE_TOKENS;
+  return {
+    ...requested,
+    targetSourceTokens: requested.targetSourceTokens
+      ?? Math.min(FAST_TARGET_SOURCE_TOKENS, maxSourceTokens),
+    maxSourceTokens,
+    maxBlocks: requested.maxBlocks ?? FAST_MAX_BLOCKS,
+  };
+}
+
 function reasoningReserveTokens(runtime: TranslationRuntime): number {
   switch (runtime.effort ?? runtime.thinkingLevel) {
     case undefined:
@@ -1208,7 +1226,7 @@ async function runLosslessBook(
       metadata: existingRun?.metadata ?? requestedMetadata,
     });
     const planned = planBookWindows(context.losslessBlocks, {
-      ...options.windowOptions,
+      ...windowOptionsForRunMode(runtimeSet.mode, options.windowOptions),
       protocolVersion,
     });
     store.initializeWindowPlan(runId, planned);

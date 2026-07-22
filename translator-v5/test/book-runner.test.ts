@@ -16,6 +16,7 @@ import {
 import {
   BookRequestCapacityError,
   runBook,
+  windowOptionsForRunMode,
 } from "../src/fullbook/book-runner.js";
 import { BookContext } from "../src/fullbook/book-context.js";
 import { loadGlossary } from "../src/glossary/glossary-profile.js";
@@ -100,6 +101,20 @@ function losslessFixture(source: string) {
     },
   };
 }
+
+test("fast mode uses larger bounded windows unless the caller supplies tighter limits", () => {
+  assert.deepEqual(windowOptionsForRunMode("fast"), {
+    targetSourceTokens: 3_200,
+    maxSourceTokens: 4_800,
+    maxBlocks: 4,
+  });
+  assert.deepEqual(windowOptionsForRunMode("fast", { maxSourceTokens: 900 }), {
+    targetSourceTokens: 900,
+    maxSourceTokens: 900,
+    maxBlocks: 4,
+  });
+  assert.deepEqual(windowOptionsForRunMode("quality", {}), {});
+});
 
 function createFixture(path: string, blockCount: number): void {
   const database = new DatabaseSync(path);
