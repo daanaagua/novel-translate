@@ -912,6 +912,11 @@ git status --short
 
 预期：工作树除本任务明确生成的验证产物外没有未提交代码；`release/` 与 `out/` 保持被 `.gitignore` 忽略。
 
+### 最终审查修复（2026-07-22）
+
+- [x] 以失败测试锁定 `package.json` 缺少 Electron 主入口的问题，并声明 `"main": "out/main/index.js"`。
+- [x] 使用 `electron-builder --win --x64 --dir` 验证未压缩应用可构建，再启动 `FolioLoom.exe` 确认窗口标题为“FolioLoom · 翻译中”；未生成 portable EXE/ZIP 发布物。
+
 ## 计划自检
 
 - **规格覆盖：** 任务 1 实现真实只读 SQLite；任务 2 读取 manifest、真实 run 与无模型 doctor；任务 3 限制 Electron 安全边界和文件选择；任务 4 实现“翻译中”的文稿工作台、真实数据及诚实空态；任务 5 配置 Windows x64 portable 元数据、开发命令、自动验证和人工验收。

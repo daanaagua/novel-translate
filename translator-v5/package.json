@@ -4,6 +4,7 @@
   "private": true,
   "description": "A continuity-aware translation engine for long-form fiction.",
   "type": "module",
+  "main": "out/main/index.js",
   "scripts": {
     "test": "node --test --import tsx test/**/*.test.ts",
     "typecheck": "tsc --noEmit",

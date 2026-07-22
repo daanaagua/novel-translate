@@ -13,9 +13,11 @@ function readText(path: string): string {
 
 test("desktop package scripts and portable metadata stay explicit", () => {
   const packageJson = JSON.parse(readText(join(projectRoot, "package.json"))) as {
+    main?: string;
     scripts: Record<string, string>;
   };
   const scripts = packageJson.scripts;
+  assert.equal(packageJson.main, "out/main/index.js");
   assert.equal(scripts["desktop:dev"], "electron-vite dev");
   assert.match(scripts["desktop:build"] ?? "", /electron-vite build/);
   assert.match(scripts["desktop:build"] ?? "", /verify-desktop-build\.test\.ts/);
