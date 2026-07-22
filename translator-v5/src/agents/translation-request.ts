@@ -1,6 +1,7 @@
 import type { StableTerm } from "../domain/types.js";
 import type { PhysicalRequestPlan } from "../fullbook/types.js";
 import { canonicalJson } from "../knowledge/knowledge-store.js";
+import { projectKnowledgeForTranslation } from "../knowledge/translation-knowledge-projection.js";
 import { getSourceLanguageProfile } from "../language/profiles.js";
 import type { SourceLanguageProfile } from "../language/types.js";
 import type { LosslessBlock } from "../source/types.js";
@@ -205,7 +206,11 @@ export function prepareTranslationRequest(
     sourceLanguage: { id: profile.id, displayName: profile.displayName },
     targetLanguage: "zh",
   };
-  const memoryPayload = input.snapshot.revisions;
+  const memoryPayload = projectKnowledgeForTranslation(
+    input.snapshot.revisions,
+    windows.flatMap((window) => window.blocks.map((block) => block.sourceText)),
+    profile,
+  );
   const termsPayload = {
     stableTerms: input.stableTerms,
     entityLinkWarnings: input.entityLinkWarnings ?? [],
@@ -228,7 +233,7 @@ export function prepareTranslationRequest(
     },
     {
       kind: "memory",
-      text: ["KNOWLEDGE SNAPSHOT REVISIONS", canonicalJson(input.snapshot.revisions)]
+      text: ["KNOWLEDGE SNAPSHOT PROJECTION", canonicalJson(memoryPayload)]
         .join("\n\n"),
       jsonPayload: memoryPayload,
     },

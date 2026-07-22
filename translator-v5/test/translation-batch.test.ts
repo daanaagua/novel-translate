@@ -16,7 +16,6 @@ import {
 import { prepareTranslationRequest } from "../src/agents/translation-request.js";
 import type { PhysicalRequestPlan } from "../src/fullbook/types.js";
 import { BudgetLedger } from "../src/kernel/budget.js";
-import { canonicalJson } from "../src/knowledge/knowledge-store.js";
 import { getSourceLanguageProfile } from "../src/language/profiles.js";
 import type { LosslessBlock } from "../src/source/types.js";
 import { createBookStyleConstitution, composeEffectiveStyle } from "../src/style/effective-style.js";
@@ -143,7 +142,7 @@ test("batch isolates one malformed logical window without discarding its valid s
   assert.match(result.windows[1]?.error ?? "", /empty/i);
 });
 
-test("batch prompt includes the current knowledge snapshot revisions behind one sentinel", async () => {
+test("batch prompt includes only the bounded current knowledge projection behind one sentinel", async () => {
   const faux = fauxProvider();
   faux.setResponses([fauxAssistantMessage(fauxToolCall(
     "finalize_translation_batch",
@@ -154,12 +153,21 @@ test("batch prompt includes the current knowledge snapshot revisions behind one 
     })) },
   ), { stopReason: "toolUse" })]);
   const revisions = [{
-    id: "knowledge-revision-1",
+    revisionId: "knowledge-revision-1",
     kind: "character",
-    normalizedSubject: "alice",
+    normalizedSubject: "alpha",
     revision: 1,
     status: "active",
-    payload: { canonicalName: "爱丽丝" },
+    payload: {
+      fact: "Alpha remains the same character in this scene.",
+      subjectForms: ["Alpha"],
+    },
+    alternatives: [{
+      fact: "Alpha remains the same character in this scene.",
+      subjectForms: ["Alpha"],
+    }],
+    candidateIds: ["candidate-alpha"],
+    sourceWindowIds: ["window-prior"],
   }];
 
   const result = await runTranslationBatch({
@@ -175,8 +183,9 @@ test("batch prompt includes the current knowledge snapshot revisions behind one 
   const prompt = (result.run.messages[0] as {
     content?: Array<{ type: string; text?: string }>;
   }).content?.[0]?.text ?? "";
-  assert.equal(prompt.match(/KNOWLEDGE SNAPSHOT REVISIONS/g)?.length, 1);
-  assert.ok(prompt.includes(canonicalJson(revisions)));
+  assert.equal(prompt.match(/KNOWLEDGE SNAPSHOT PROJECTION/g)?.length, 1);
+  assert.match(prompt, /Alpha remains the same character/u);
+  assert.doesNotMatch(prompt, /candidate-alpha|window-prior/u);
 });
 
 test("batch rejects unknown and duplicate outer window identities without erasing a valid window", async () => {
