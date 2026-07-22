@@ -112,6 +112,7 @@ const DEFINITIONS: readonly ProfileDefinition[] = [
     chapterPatterns: [
       /^\u7b2c[^\r\n]{1,20}\u7ae0$/u,
       /^\u7b2c[^\r\n]{1,20}\u8a71$/u,
+      /^(?:[\u4e00\u4e8c\u4e09\u56db\u4e94\u516d\u4e03\u516b\u4e5d\u5341\u767e\u5343\u3007\u96f6]+|\d{1,4})$/u,
       /^(?:\u5e8f\u7ae0|\u7d42\u7ae0|\u30d7\u30ed\u30ed\u30fc\u30b0|\u30a8\u30d4\u30ed\u30fc\u30b0)$/u,
     ],
     stopWords: [
