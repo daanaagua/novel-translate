@@ -1530,6 +1530,7 @@ async function runLosslessBook(
     const blockById = new Map(context.losslessBlocks.map((block) => [block.id, block]));
     const styleConstitution = losslessStyleConstitution(options.styleState);
     const voiceProfiles = losslessVoiceProfiles(options.styleState);
+    let fastWaveHorizonMultiplier = runtimeSet.mode === "fast" ? 2 : 1;
 
     while (processedWindows < maxWindows) {
       throwIfAborted(options.signal);
@@ -1541,6 +1542,7 @@ async function runLosslessBook(
       }
       const remaining = maxWindows - processedWindows;
       const selected: PersistedLosslessWindow[] = [];
+      const physicalRequestHorizon = maxConcurrency * fastWaveHorizonMultiplier;
       for (const window of allWindows.slice(barrier.ordinal)) {
         if (window.status !== "pending"
           || selected.length >= remaining) {
@@ -1551,7 +1553,7 @@ async function runLosslessBook(
           tentative.map((item) => ({ ...item, status: "pending" as const })),
           { tinyWindowTokens, maxRequestTokens, maxWindowsPerRequest },
         ).length;
-        if (physicalCount > maxConcurrency) {
+        if (physicalCount > physicalRequestHorizon) {
           break;
         }
         selected.push(window);
@@ -2045,6 +2047,14 @@ async function runLosslessBook(
         windowIds: selected.map((window) => window.windowId),
       });
       processedWindows += selected.length;
+      if (runtimeSet.mode === "fast") {
+        const hasUnresolvedKnowledge = store.latestKnowledgeSnapshot(runId).revisions
+          .some((revision) => revision.status === "needs_revalidate");
+        const waveWasUnstable = retryRound > 1
+          || entityLinkWarnings.length > 0
+          || hasUnresolvedKnowledge;
+        fastWaveHorizonMultiplier = waveWasUnstable ? 1 : 2;
+      }
       if (providerFailure !== undefined) {
         throw providerFailure;
       }

@@ -158,6 +158,70 @@ test("fast mode keeps its default physical request limit aligned with a legal 4,
   assert.equal(result.status.completedWindows + result.status.warningWindows, result.status.totalWindows);
 });
 
+test("clean fast waves prepare two scheduler horizons without exceeding runtime concurrency", async () => {
+  const fixture = losslessFixture([
+    "BOOK ONE", "CHAPTER ONE", "BOOK TWO", "CHAPTER TWO",
+    "BOOK THREE", "CHAPTER THREE", "BOOK FOUR", "CHAPTER FOUR",
+  ].join("\n\n"));
+  assert.ok(fixture.submission.windows.length >= 4);
+  fixture.faux.setResponses(Array.from(
+    { length: fixture.submission.windows.length },
+    () => losslessBatchResponse,
+  ));
+  const model = fixture.faux.getModel();
+  const streamFn = fixture.faux.provider.streamSimple.bind(fixture.faux.provider);
+
+  const result = await runBook({
+    ...fixture.options,
+    model,
+    streamFn,
+    tinyWindowTokens: 1,
+    maxWindowsPerRequest: 1,
+    maxConcurrency: 2,
+    runtimeSet: {
+      mode: "fast",
+      primary: { model, streamFn, effort: "off", thinkingLevel: "off" },
+      escalation: { model, streamFn, effort: "high", thinkingLevel: "high" },
+    },
+  } as never);
+
+  assert.equal(result.waves[0]?.windowIds.length, 4);
+  assert.ok(result.waves.every((wave) => wave.windowIds.length <= 4));
+  assert.equal(result.status.completedWindows, result.status.totalWindows);
+});
+
+test("fast waves fall back to one scheduler horizon after a retry", async () => {
+  const fixture = losslessFixture([
+    "BOOK ONE", "CHAPTER ONE", "BOOK TWO", "CHAPTER TWO",
+    "BOOK THREE", "CHAPTER THREE", "BOOK FOUR", "CHAPTER FOUR",
+  ].join("\n\n"));
+  const model = fixture.faux.getModel();
+  const streamFn = fixture.faux.provider.streamSimple.bind(fixture.faux.provider);
+  fixture.faux.setResponses([
+    fauxAssistantMessage(fauxToolCall("finalize_translation_batch", { windows: [] }), {
+      stopReason: "toolUse",
+    }),
+    ...Array.from({ length: fixture.submission.windows.length + 2 }, () => losslessBatchResponse),
+  ]);
+
+  const result = await runBook({
+    ...fixture.options,
+    model,
+    streamFn,
+    tinyWindowTokens: 1,
+    maxWindowsPerRequest: 1,
+    maxConcurrency: 2,
+    runtimeSet: {
+      mode: "fast",
+      primary: { model, streamFn, effort: "off", thinkingLevel: "off" },
+      escalation: { model, streamFn, effort: "high", thinkingLevel: "high" },
+    },
+  } as never);
+
+  assert.deepEqual(result.waves.map((wave) => wave.windowIds.length), [4, 2, 2]);
+  assert.equal(result.status.completedWindows, result.status.totalWindows);
+});
+
 function createFixture(path: string, blockCount: number): void {
   const database = new DatabaseSync(path);
   database.exec(`

@@ -13,6 +13,7 @@ import {
 } from "../language/target.js";
 import type { SourceLanguageProfile } from "../language/types.js";
 import { normalizeChineseQuoteTexts } from "../style/chinese-quote-normalization.js";
+import { simplifyChineseTranslation } from "../style/chinese-script-normalization.js";
 import type {
   CandidateCollector,
   ResolutionCandidate,
@@ -113,6 +114,7 @@ export function trimExactBoundaryOverlaps(
 export function normalizeCandidateTypography(
   candidate: TranslationCandidate,
   _styleState: StyleState,
+  preservedTargetForms: readonly string[] = [],
 ): TranslationCandidate {
   const normalized = normalizeChineseQuoteTexts(candidate.translations.map((item) => item.text));
   return {
@@ -120,7 +122,10 @@ export function normalizeCandidateTypography(
     notes: [...candidate.notes],
     translations: candidate.translations.map((translation, index) => ({
       ...translation,
-      text: normalized.texts[index] ?? translation.text,
+      text: simplifyChineseTranslation(
+        normalized.texts[index] ?? translation.text,
+        preservedTargetForms,
+      ),
     })),
   };
 }
@@ -240,8 +245,9 @@ export class Translator {
       .filter((term) => term.locked && term.conceptId.startsWith("run-anchor-"))
       .map((term) => ({ sourceForm: term.sourceForm, target: term.target }));
     let candidate = input.collector.translations().slice(before).at(-1);
+    const preservedTargetForms = terms.filter((term) => term.locked).map((term) => term.target);
     if (candidate !== undefined) {
-      candidate = normalizeCandidateTypography(candidate, input.styleState);
+      candidate = normalizeCandidateTypography(candidate, input.styleState, preservedTargetForms);
     }
     let validation = this.#validator.validate(
       input.island.blocks,
@@ -269,7 +275,11 @@ export class Translator {
       repairAttempts += 1;
       repairRuns.push(repair.run);
       if (repair.candidate !== undefined) {
-        candidate = normalizeCandidateTypography(repair.candidate, input.styleState);
+        candidate = normalizeCandidateTypography(
+          repair.candidate,
+          input.styleState,
+          preservedTargetForms,
+        );
         validation = this.#validator.validate(
           input.island.blocks,
           candidate,

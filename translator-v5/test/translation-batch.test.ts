@@ -204,6 +204,40 @@ test("batch normalizes every forbidden double-quote glyph before initial validat
   assert.equal(/["‛‟〝〞„]/u.test(result.windows[0]?.translations[0]?.text ?? ""), false);
 });
 
+test("batch normalizes traditional prose before validation and preserves locked targets", async () => {
+  const sourceBlocks = [block("block-0", 0, "Dragon completed the training.")];
+  const sourceRequest = singleWindowRequest(sourceBlocks);
+  const faux = fauxProvider();
+  faux.setResponses([fauxAssistantMessage(fauxToolCall(
+    "finalize_translation_batch",
+    { windows: [{
+      windowId: sourceRequest.windows[0]?.windowId,
+      translations: [{ blockId: "block-0", text: "龍完成了黑殺隊的訓練。" }],
+      notes: [],
+    }] },
+  ), { stopReason: "toolUse" })]);
+
+  const result = await runTranslationBatch({
+    request: sourceRequest,
+    blocks: sourceBlocks,
+    stableTerms: [{
+      conceptId: "dragon",
+      lexemeId: "dragon-lexeme",
+      sourceForm: "Dragon",
+      canonicalSource: "Dragon",
+      target: "龍",
+      locked: true,
+    }],
+    snapshot: { id: "snapshot-0", revisions: [] },
+    model: faux.getModel(),
+    streamFn: faux.provider.streamSimple.bind(faux.provider),
+    budget: new BudgetLedger(),
+  });
+
+  assert.equal(result.windows[0]?.status, "completed");
+  assert.equal(result.windows[0]?.translations[0]?.text, "龍完成了黑杀队的训练。");
+});
+
 test("batch mechanically corrects one unknown canonical block-id character typo", async () => {
   const expected = block("block-1f85f23a483f9edef746", 0, "Alpha.");
   const mistyped = "block-1f85a23a483f9edef746";

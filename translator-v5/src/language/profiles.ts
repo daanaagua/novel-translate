@@ -140,9 +140,10 @@ const DEFINITIONS: readonly ProfileDefinition[] = [
     stopWords: [
       "\uadf8\ub7ec\ub098", "\uadf8\ub9ac\uace0", "\uadf8\ub7f0", "\uc774\ub7f0", "\uac83\uc740", "\uac83\uc774", "\uc5c6\uc5c8\ub2e4",
       "\uc788\uc5c8\ub2e4", "\ud588\ub2e4", "\ub418\uc5c8\ub2e4", "\ud558\uc5c8\ub2e4", "\ud558\ub294", "\uc774\ub2e4",
+      "이것", "그것", "저것", "이유", "벌써", "결국", "예전", "일종", "정식", "의견",
     ],
     script: "hangul",
-    aliasCuePatterns: [/(?:\ubcc4\uba85|\ubd88\ub9ac|\ub77c\uace0\s*\ud55c\ub2e4)/u],
+    aliasCuePatterns: [/(?:\ubcc4\uba85|(?:\ub77c\uace0|\uc73c\ub85c|\ub85c)\s*\ubd88\ub9ac|\ub77c\uace0\s*\ud55c\ub2e4)/u],
     namingCuePatterns: [/(?:\uc528|\ub2d8|\uc7a5\uad70|\ub300\uac10)/u],
   },
   {
@@ -391,6 +392,10 @@ function cjkCandidateToken(token: SourceToken, definition: ProfileDefinition): b
   return /\p{Script=Hangul}/u.test(token.value);
 }
 
+function hasDirectHanGloss(text: string, token: SourceToken): boolean {
+  return /^\s*[（(]\s*\p{Script=Han}/u.test(text.slice(token.end, token.end + 24));
+}
+
 function isCandidateToken(token: SourceToken, definition: ProfileDefinition): boolean {
   if (!token.isWordLike || token.normalized.length < 2) {
     return false;
@@ -410,6 +415,65 @@ function isCandidateToken(token: SourceToken, definition: ProfileDefinition): bo
   return false;
 }
 
+interface CandidateTokenForm {
+  sourceForm: string;
+  normalizedSource: string;
+  morphologyMarker: string;
+}
+
+const KOREAN_CASE_MARKERS = [
+  "으로부터", "에게서", "한테서", "이라는", "이라고", "에서", "에게", "한테",
+  "으로", "까지", "부터", "처럼", "보다", "이나", "라며", "라고",
+  "은", "는", "이", "가", "을", "를", "의", "에", "와", "과", "로", "도", "만", "든",
+] as const;
+
+function hangulSyllableCount(value: string): number {
+  return [...value].filter((scalar) => /\p{Script=Hangul}/u.test(scalar)).length;
+}
+
+/**
+ * Intl.Segmenter deliberately returns Korean eojeol rather than morphemes.
+ * Normalize productive case/topic markers so repeated names and terms share
+ * one statistical key. A one-syllable remainder is rejected: at that point a
+ * particle and a verbal/adnominal ending cannot be distinguished safely.
+ */
+function koreanCandidateForm(value: string): Omit<CandidateTokenForm, "normalizedSource"> | null {
+  if (/다$/u.test(value) || /^(?:되어|돼|하여|해|있어|없어)$/u.test(value)) {
+    return null;
+  }
+  for (const marker of KOREAN_CASE_MARKERS) {
+    if (!value.endsWith(marker)) {
+      continue;
+    }
+    const base = value.slice(0, -marker.length);
+    if (hangulSyllableCount(base) < 2) {
+      return null;
+    }
+    return { sourceForm: base, morphologyMarker: marker };
+  }
+  return { sourceForm: value, morphologyMarker: "" };
+}
+
+function candidateTokenForm(
+  token: SourceToken,
+  definition: ProfileDefinition,
+): CandidateTokenForm | null {
+  if (!isCandidateToken(token, definition)) {
+    return null;
+  }
+  const transformed = definition.id === "ko"
+    ? koreanCandidateForm(token.value)
+    : { sourceForm: token.value.replace(/[’']s$/u, ""), morphologyMarker: "" };
+  if (transformed === null) {
+    return null;
+  }
+  const normalizedSource = normalizeForm(transformed.sourceForm, definition);
+  if (normalizedSource.length < 2 || definition.stopWords.includes(normalizedSource)) {
+    return null;
+  }
+  return { ...transformed, normalizedSource };
+}
+
 function collectCandidates(
   input: AnchorCandidateInput,
   definition: ProfileDefinition,
@@ -419,20 +483,35 @@ function collectCandidates(
     throw new TypeError("candidate limit must be a non-negative safe integer");
   }
   const limit = Math.min(requestedLimit, DEFAULT_CANDIDATE_LIMIT);
-  const established = new Set((input.establishedSourceForms ?? [])
-    .map((form) => normalizeForm(form, definition)));
-  const current = new Map<string, { sourceForm: string; count: number }>();
+  const established = new Set((input.establishedSourceForms ?? []).map((form) => {
+    const token: SourceToken = {
+      value: form,
+      normalized: normalizeForm(form, definition),
+      start: 0,
+      end: form.length,
+      isWordLike: true,
+    };
+    return candidateTokenForm(token, definition)?.normalizedSource ?? token.normalized;
+  }));
+  const current = new Map<string, {
+    sourceForm: string;
+    count: number;
+    morphologyMarkers: Set<string>;
+  }>();
   for (const text of input.targetTexts) {
     for (const token of segmentText(text, definition)) {
-      if (!isCandidateToken(token, definition) || established.has(token.normalized)) {
+      const candidate = candidateTokenForm(token, definition);
+      if (candidate === null || established.has(candidate.normalizedSource)) {
         continue;
       }
-      const record = current.get(token.normalized) ?? {
-        sourceForm: token.value.replace(/[’']s$/u, ""),
+      const record = current.get(candidate.normalizedSource) ?? {
+        sourceForm: candidate.sourceForm,
         count: 0,
+        morphologyMarkers: new Set<string>(),
       };
       record.count += 1;
-      current.set(token.normalized, record);
+      record.morphologyMarkers.add(candidate.morphologyMarker);
+      current.set(candidate.normalizedSource, record);
     }
   }
 
@@ -441,22 +520,33 @@ function collectCandidates(
     candidateCaseCount: number;
     contexts: Set<string>;
     documentIndexes: Set<number>;
+    morphologyMarkers: Set<string>;
+    directTermCueCount: number;
   }>();
   for (const [documentIndex, text] of input.corpusTexts.entries()) {
     for (const token of segmentText(text, definition)) {
-      if (!current.has(token.normalized)) {
+      const candidate = candidateTokenForm(token, definition);
+      const normalizedSource = candidate?.normalizedSource
+        ?? (definition.id === "ko" ? "" : token.normalized);
+      if (!current.has(normalizedSource)) {
         continue;
       }
-      const record = corpus.get(token.normalized) ?? {
+      const record = corpus.get(normalizedSource) ?? {
         count: 0,
         candidateCaseCount: 0,
         contexts: new Set<string>(),
         documentIndexes: new Set<number>(),
+        morphologyMarkers: new Set<string>(),
+        directTermCueCount: 0,
       };
       record.count += 1;
       record.documentIndexes.add(documentIndex);
-      if (isCandidateToken(token, definition)) {
+      if (candidate !== null) {
         record.candidateCaseCount += 1;
+        record.morphologyMarkers.add(candidate.morphologyMarker);
+      }
+      if (hasDirectHanGloss(text, token)) {
+        record.directTermCueCount += 1;
       }
       if (record.contexts.size < 3) {
         const context = compactContext(text, token.start);
@@ -464,7 +554,7 @@ function collectCandidates(
           record.contexts.add(context);
         }
       }
-      corpus.set(token.normalized, record);
+      corpus.set(normalizedSource, record);
     }
   }
 
@@ -474,6 +564,8 @@ function collectCandidates(
       candidateCaseCount: wave.count,
       contexts: new Set<string>(),
       documentIndexes: new Set<number>(),
+      morphologyMarkers: wave.morphologyMarkers,
+      directTermCueCount: 0,
     };
     const contexts = [...evidence.contexts];
     const hasAliasCue = contexts.some((context) =>
@@ -489,8 +581,20 @@ function collectCandidates(
       return [];
     }
     const isCjk = definition.script === "kana" || definition.script === "hangul";
-    if (isCjk && evidence.count < 2 && wave.count < 2 && !hasAliasCue && !hasNamingCue) {
+    const hasDirectTermCue = evidence.directTermCueCount > 0;
+    if (isCjk && evidence.count < 2 && wave.count < 2
+      && !hasAliasCue && !hasNamingCue && !hasDirectTermCue) {
       return [];
+    }
+    if (definition.id === "ko") {
+      if (evidence.count < 2 && wave.count < 2 && !hasNamingCue && !hasDirectTermCue) {
+        return [];
+      }
+      if (evidence.morphologyMarkers.size === 1
+        && !hasNamingCue
+        && !hasDirectTermCue) {
+        return [];
+      }
     }
     const positionalSpread = Math.min(evidence.documentIndexes.size, 3) * 5
       + Math.min(contexts.length, 3) * 3;

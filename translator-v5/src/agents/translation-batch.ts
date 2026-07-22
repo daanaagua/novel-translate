@@ -5,6 +5,7 @@ import type { V4Block } from "../domain/types.js";
 import type { BudgetLedger } from "../kernel/budget.js";
 import type { LosslessBlock } from "../source/types.js";
 import { normalizeChineseQuoteTexts } from "../style/chinese-quote-normalization.js";
+import { simplifyChineseTranslation } from "../style/chinese-script-normalization.js";
 import type { StyleObservationSubmission } from "../style/types.js";
 import type {
   TranslationCandidate,
@@ -232,7 +233,13 @@ function validateSubmission(
         : { styleObservation: structuredClone(candidate.styleObservation) }),
     };
   });
-  return { windows: normalizeWindowTypography(windows), responseErrors };
+  return {
+    windows: normalizeWindowTypography(
+      windows,
+      input.stableTerms.filter((term) => term.locked).map((term) => term.target),
+    ),
+    responseErrors,
+  };
 }
 
 function losslessAsV4(block: LosslessBlock): V4Block {
@@ -260,6 +267,7 @@ function candidateFor(window: TranslationBatchWindowResult): TranslationCandidat
 
 function normalizeWindowTypography(
   windows: readonly TranslationBatchWindowResult[],
+  preservedTargetForms: readonly string[],
 ): TranslationBatchWindowResult[] {
   let state = { openDoubleQuoteDepth: 0 };
   return windows.map((window) => {
@@ -272,7 +280,10 @@ function normalizeWindowTypography(
       ...window,
       translations: window.translations.map((translation, index) => ({
         ...translation,
-        text: normalized.texts[index] ?? translation.text,
+        text: simplifyChineseTranslation(
+          normalized.texts[index] ?? translation.text,
+          preservedTargetForms,
+        ),
       })),
     };
   });
@@ -385,7 +396,10 @@ async function validateAndRepair(
     delete repairedWindow.styleObservation;
     return repairedWindow;
   });
-  const windows = normalizeWindowTypography(patchedWindows);
+  const windows = normalizeWindowTypography(
+    patchedWindows,
+    input.stableTerms.filter((term) => term.locked).map((term) => term.target),
+  );
   const validatedWindows = windows.map((window): TranslationBatchWindowResult => {
     const item = invalidById.get(window.windowId);
     if (item === undefined || window.status === "failed") {

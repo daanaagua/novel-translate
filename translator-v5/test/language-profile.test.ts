@@ -122,7 +122,7 @@ test("CJK candidate projection remains capped at twenty-four even when callers r
   const korean = getSourceLanguageProfile("ko");
   const names = Array.from({ length: 30 }, (_, index) => (
     `${String.fromCodePoint(0xac00 + index)}\uc628`
-  )).flatMap((name) => [name, name]).join(" ");
+  )).flatMap((name) => [`${name}은`, `${name}을`]).join(" ");
   const candidates = korean.collectAnchorCandidates({
     targetTexts: [names],
     corpusTexts: [names],
@@ -130,6 +130,40 @@ test("CJK candidate projection remains capped at twenty-four even when callers r
   });
 
   assert.equal(candidates.length, 24);
+});
+
+test("Korean anchor candidates merge case particles and exclude predicate forms", () => {
+  const korean = getSourceLanguageProfile("ko");
+  const text = [
+    "묵향은 마교의 본산에 들어갔다.",
+    "묵향의 검은 묵향을 지켰고 마교를 뒤흔들었다.",
+    "있다 되어 때문이다 버렸다 불리는 보는 많은 모든 없이.",
+  ].join(" ");
+  const candidates = korean.collectAnchorCandidates({
+    targetTexts: [text],
+    corpusTexts: [text],
+  });
+  const forms = candidates.map((candidate) => candidate.sourceForm);
+
+  assert.ok(forms.includes("묵향"));
+  assert.ok(forms.includes("마교"));
+  assert.equal(forms.some((form) => ["묵향은", "묵향의", "묵향을", "마교의", "마교를"].includes(form)), false);
+  assert.equal(forms.some((form) => [
+    "있다", "되어", "때문이다", "버렸다", "불리는", "불리", "보는", "많은", "모든", "없이",
+  ].includes(form)), false);
+  assert.equal(candidates.find((candidate) => candidate.sourceForm === "묵향")?.currentWaveOccurrences, 3);
+});
+
+test("Korean candidate termhood keeps direct Han glosses but drops repeated bare predicates", () => {
+  const korean = getSourceLanguageProfile("ko");
+  const text = "극마(極魔)는 경지다. 극마(極魔)를 논했다. 보이지 않는 벽은 아직 보이지 않았다.";
+  const forms = korean.collectAnchorCandidates({
+    targetTexts: [text],
+    corpusTexts: [text],
+  }).map((candidate) => candidate.sourceForm);
+
+  assert.ok(forms.includes("극마"));
+  assert.equal(forms.includes("보이지"), false);
 });
 
 test("language profiles classify their own structure headings", () => {

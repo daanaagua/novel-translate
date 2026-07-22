@@ -334,6 +334,16 @@ test("typography is normalized and untranslated prose words are rejected", () =>
   );
 });
 
+test("typography normalization simplifies prose without rewriting locked targets", () => {
+  const normalized = normalizeCandidateTypography({
+    translations: [{ blockId: "block-0", text: "龍與黑殺隊完成了訓練。" }],
+    notes: [],
+    repaired: false,
+  }, { dialogueQuotes: "Chinese curly double quotes" }, ["龍"]);
+
+  assert.equal(normalized.translations[0]?.text, "龍与黑杀队完成了训练。");
+});
+
 test("validator preserves exact isolated source identifiers without allowing copied prose", () => {
   const block = chapterBlock(0, "eGod\n\nThe sailors looked up.");
   const preserved = new TranslationValidator().validate([block], {

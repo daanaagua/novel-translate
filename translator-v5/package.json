@@ -22,6 +22,7 @@
     "@earendil-works/pi-agent-core": "0.80.10",
     "@earendil-works/pi-ai": "0.80.10",
     "fast-xml-parser": "^5.10.1",
+    "opencc-js": "1.4.1",
     "react": "19.2.8",
     "react-dom": "19.2.8",
     "yaml": "2.9.0",
