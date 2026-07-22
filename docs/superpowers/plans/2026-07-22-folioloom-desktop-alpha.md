@@ -443,15 +443,17 @@ git commit -m "feat: add read-only desktop project service"
 - 创建：`translator-v5/src/desktop/preload/folioloom-api.d.ts`
 - 创建：`translator-v5/test/desktop-ipc.test.ts`
 
-- [ ] **步骤 1：安装桌面运行时与测试基础设施**
+- [x] **步骤 1：安装桌面运行时与测试基础设施**
 
 在 `translator-v5` 内安装 Electron、React、Vite 和测试工具；这一步不安装 Builder，也不生成桌面产物：
 
 ```powershell
 Set-Location translator-v5
-npm.cmd install --save-dev electron@43.2.0 electron-vite@5.0.0 vite@8.1.5 @vitejs/plugin-react@6.0.4 vitest@4.1.10 jsdom@29.1.1 @testing-library/react@16.3.2 @testing-library/user-event@14.6.1 @types/react@19.2.17 @types/react-dom@19.2.3
+npm.cmd install --save-dev electron@43.2.0 electron-vite@5.0.0 vite@7.3.6 @vitejs/plugin-react@5.2.0 vitest@4.1.10 jsdom@29.1.1 @testing-library/react@16.3.2 @testing-library/user-event@14.6.1 @types/react@19.2.17 @types/react-dom@19.2.3
 npm.cmd install react@19.2.8 react-dom@19.2.8
 ```
+
+兼容性修正：`electron-vite@5.0.0` 的 peer dependency 只接受 Vite 5–7，而 `@vitejs/plugin-react@6.0.4` 只接受 Vite 8。因此锁定可共同满足 peer 的 `vite@7.3.6` 与 `@vitejs/plugin-react@5.2.0`，不用 `--legacy-peer-deps` 绕过解析。
 
 向 `package.json` 添加：
 
@@ -479,7 +481,7 @@ export default defineConfig({
 });
 ```
 
-- [ ] **步骤 2：写独立于 Electron 运行时的 IPC 工厂测试**
+- [x] **步骤 2：写独立于 Electron 运行时的 IPC 工厂测试**
 
 把实际 Electron `ipcMain.handle()` 注册包在可注入的 `registerDesktopIpc(deps)` 中。测试用假对话框、假会话和 `Map<string, Handler>` 代替 Electron，对输入表面做如下断言：
 
@@ -513,7 +515,7 @@ test("choose-store rejects a directory and a non-db selection", async () => {
 });
 ```
 
-- [ ] **步骤 3：运行 IPC 测试，确认入口不存在**
+- [x] **步骤 3：运行 IPC 测试，确认入口不存在**
 
 运行：
 
@@ -524,7 +526,7 @@ npm.cmd test -- --test-name-pattern="IPC only registers|select-run accepts|choos
 
 预期：FAIL，无法解析 `../src/desktop/main/ipc.js`。
 
-- [ ] **步骤 4：实现主进程会话与严格 API**
+- [x] **步骤 4：实现主进程会话与严格 API**
 
 `electron.vite.config.ts` 明确给出三个入口，避免 electron-vite 从传统 `src/main`、`src/preload` 路径猜测文件：
 
@@ -604,7 +606,7 @@ declare global {
 export {};
 ```
 
-- [ ] **步骤 5：运行 IPC 与领域层测试**
+- [x] **步骤 5：运行 IPC 与领域层测试**
 
 运行：
 
@@ -612,11 +614,12 @@ export {};
 Set-Location translator-v5
 npm.cmd test -- --test-name-pattern="IPC only registers|select-run accepts|choose-store rejects|snapshot opens|read-only store"
 npm.cmd run typecheck
+npm.cmd run desktop:typecheck
 ```
 
 预期：PASS；测试中不存在可调用的任意 channel，也没有 renderer 端文件系统入口。
 
-- [ ] **步骤 6：提交 Electron 安全边界与基础工具链**
+- [x] **步骤 6：提交 Electron 安全边界与基础工具链**
 
 ```powershell
 git add translator-v5/package.json translator-v5/package-lock.json translator-v5/electron.vite.config.ts translator-v5/tsconfig.desktop.json translator-v5/vitest.desktop.config.ts translator-v5/src/desktop/main translator-v5/src/desktop/preload translator-v5/test/desktop-ipc.test.ts
