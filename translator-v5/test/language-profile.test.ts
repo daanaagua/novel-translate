@@ -118,6 +118,17 @@ test("Kana and Hangul prose residue is detected without treating Han alone as Ja
   assert.deepEqual(japanese.detectSourceResidue("\u7eaf\u4e2d\u6587\u6c49\u5b57"), []);
 });
 
+test("Japanese residue detects kana split by kanji while honoring an explicit preserved form", () => {
+  const japanese = getSourceLanguageProfile("ja");
+  const translation = "他绕到背后，猛地使出一记拜み讨ち。";
+
+  assert.ok(japanese.detectSourceResidue(translation)
+    .some((finding) => finding.form.includes("み") && finding.form.includes("ち")));
+  assert.deepEqual(japanese.detectSourceResidue(translation, {
+    preservedSourceForms: ["拜み讨ち"],
+  }), []);
+});
+
 test("CJK candidate projection remains capped at twenty-four even when callers request more", () => {
   const korean = getSourceLanguageProfile("ko");
   const names = Array.from({ length: 30 }, (_, index) => (

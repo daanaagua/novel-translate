@@ -794,3 +794,46 @@ test("framed text batch parses raw assistant prose without a tool call", async (
   assert.equal(result.windows[1]?.translations[0]?.text, "贝塔。");
   assert.equal(budget.snapshot().translationToolCalls, 1);
 });
+
+test("Japanese mixed kanji-kana residue triggers one targeted repair", async () => {
+  const sourceBlocks = [block("block-0", 0, "背後から拝み討ちを放った。")];
+  const sourceRequest = singleWindowRequest(sourceBlocks);
+  const prepared = prepareTranslationRequest({
+    request: sourceRequest,
+    blocks: sourceBlocks,
+    stableTerms: [],
+    snapshot: { id: "snapshot-ja", revisions: [] },
+    sourceLanguageProfile: getSourceLanguageProfile("ja"),
+    responseProtocol: "framed_text",
+  });
+  const frame = prepared.framedProtocol?.frames[0];
+  assert.ok(frame);
+  const faux = fauxProvider();
+  faux.setResponses([
+    fauxAssistantMessage([
+      frame.beginLine,
+      "他从背后使出一记拜み讨ち。",
+      frame.endLine,
+    ].join("\n")),
+    fauxAssistantMessage(fauxToolCall("submit_repaired_translation", {
+      translations: [{ blockId: "block-0", text: "他从背后使出一记拜式斩击。" }],
+      notes: [],
+    }), { stopReason: "toolUse" }),
+  ]);
+
+  const result = await runTranslationBatch({
+    request: sourceRequest,
+    blocks: sourceBlocks,
+    stableTerms: [],
+    snapshot: { id: "snapshot-ja", revisions: [] },
+    sourceLanguageProfile: getSourceLanguageProfile("ja"),
+    responseProtocol: "framed_text",
+    model: faux.getModel(),
+    streamFn: faux.provider.streamSimple.bind(faux.provider),
+    budget: new BudgetLedger(),
+  });
+
+  assert.equal(faux.state.callCount, 2);
+  assert.equal(result.windows[0]?.status, "completed");
+  assert.equal(result.windows[0]?.translations[0]?.text, "他从背后使出一记拜式斩击。");
+});

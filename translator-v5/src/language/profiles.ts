@@ -675,11 +675,24 @@ function scriptedResidue(
     : definition.script === "hangul"
       ? /[\p{Script=Hangul}]{2,}/gu
       : /[\p{Script=Hiragana}\p{Script=Katakana}\u30fc]{2,}/gu;
-  return [...text.matchAll(pattern)].flatMap((match): ResidueFinding[] => {
+  const matches = [...text.matchAll(pattern)];
+  if (definition.script === "kana") {
+    matches.push(...text.matchAll(
+      /[\p{Script=Hiragana}\p{Script=Katakana}\u30fc][\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\u30fc]{0,8}[\p{Script=Hiragana}\p{Script=Katakana}\u30fc]/gu,
+    ));
+  }
+  const seen = new Set<string>();
+  return matches.sort((left, right) => left.index - right.index
+    || left[0].length - right[0].length).flatMap((match): ResidueFinding[] => {
     const form = match[0];
-    if (preserved.has(normalizeForm(form, definition))) {
+    const normalized = normalizeForm(form, definition);
+    const key = `${match.index}:${match.index + form.length}`;
+    if (seen.has(key)
+      || preserved.has(normalized)
+      || [...preserved].some((preservedForm) => preservedForm.includes(normalized))) {
       return [];
     }
+    seen.add(key);
     return [{
       code: "source_prose_residue",
       form,
