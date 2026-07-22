@@ -15,6 +15,7 @@ test("desktop package scripts and portable metadata stay explicit", () => {
   const packageJson = JSON.parse(readText(join(projectRoot, "package.json"))) as {
     main?: string;
     scripts: Record<string, string>;
+    dependencies?: Record<string, string>;
   };
   const scripts = packageJson.scripts;
   assert.equal(packageJson.main, "out/main/index.js");
@@ -28,12 +29,21 @@ test("desktop package scripts and portable metadata stay explicit", () => {
     scripts["desktop:dist"],
     "npm run desktop:build && electron-builder --win portable --x64",
   );
+  for (const dependency of [
+    "@earendil-works/pi-agent-core",
+    "@earendil-works/pi-ai",
+    "fast-xml-parser",
+    "yauzl",
+  ]) {
+    assert.equal(typeof packageJson.dependencies?.[dependency], "string", `missing runtime dependency ${dependency}`);
+  }
 
   const builder = readText(join(projectRoot, "electron-builder.yml"));
   assert.match(builder, /^appId: io\.folioloom\.desktop$/m);
   assert.match(builder, /^productName: FolioLoom$/m);
   assert.match(builder, /directories:\r?\n\s+output: release/);
   assert.match(builder, /files:\r?\n\s+- out\/\*\*\/\*\r?\n\s+- package\.json/);
+  assert.doesNotMatch(builder, /^\s+-\s+(?:src|test|fixtures|projects|config)\//m);
   assert.match(builder, /extraResources:\r?\n\s+- from: desktop\/resources\r?\n\s+to: folioloom/);
   assert.match(builder, /target:\r?\n\s+- target: portable\r?\n\s+arch:\r?\n\s+- x64/);
   assert.match(builder, /^artifactName: FolioLoom-portable-win-x64\.\$\{ext\}$/m);
@@ -48,7 +58,7 @@ test("desktop package scripts and portable metadata stay explicit", () => {
     schema: "folioloom-desktop-resource-1",
     apiKeyPolicy: "never-packaged",
     projectDataPolicy: "user-selected",
-    translationWritePolicy: "disabled-in-alpha",
+    translationWritePolicy: "single-window-trial",
   });
 
   const gitignore = readText(join(repositoryRoot, ".gitignore"));

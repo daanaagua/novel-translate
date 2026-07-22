@@ -58,7 +58,7 @@
 - 修改：`translator-v5/package.json`
 - 修改：`translator-v5/package-lock.json`
 
-- [ ] **步骤 1：安装显式依赖**
+- [x] **步骤 1：安装显式依赖**
 
 运行：
 
@@ -70,7 +70,7 @@ npm.cmd install --save-dev @types/yauzl@2
 
 预期：`package.json` 只新增上述运行时与类型依赖，lockfile 正常更新。
 
-- [ ] **步骤 2：先写 TXT/Markdown、编码和账本覆盖失败测试**
+- [x] **步骤 2：先写 TXT/Markdown、编码和账本覆盖失败测试**
 
 测试必须断言：UTF-8、五种 BOM、CRLF 规范化、无 BOM 非 UTF-8 返回 `ENCODING_AMBIGUOUS`；`canonical_segments` 以 Unicode scalar 坐标连续覆盖全文；读取中源文件变化不留下项目目录。
 
@@ -88,7 +88,7 @@ test("imports UTF-8 text into a certified scalar source ledger", async () => {
 });
 ```
 
-- [ ] **步骤 3：运行测试并确认导入 API 尚不存在**
+- [x] **步骤 3：运行测试并确认导入 API 尚不存在**
 
 运行：
 
@@ -98,7 +98,7 @@ npm.cmd test -- --test-name-pattern="imports UTF-8|encoding ambiguous|source cha
 
 预期：FAIL，缺少 `source-importer.ts` 或导出函数。
 
-- [ ] **步骤 4：实现纯文本导入、语言检测和原子目录发布**
+- [x] **步骤 4：实现纯文本导入、语言检测和原子目录发布**
 
 公开边界固定为：
 
@@ -122,19 +122,19 @@ export async function importSource(request: SourceImportRequest): Promise<Source
 
 写入 `source/original.<ext>`、`source.txt` 和 `source_manifest.json` 时先使用同父目录临时目录；全部写入并经 `SourceLedger.open()` 自验后再 rename 发布。失败时删除临时目录，不覆盖已有项目。
 
-- [ ] **步骤 5：先写 DOCX/EPUB 顺序、空段落与 ZIP 限制测试**
+- [x] **步骤 5：先写 DOCX/EPUB 顺序、空段落与 ZIP 限制测试**
 
 用测试内生成的小型 ZIP fixture 覆盖：DOCX 文档段落顺序及空段落；EPUB container → OPF → spine 顺序；路径穿越、单项超过 64 MiB、总展开大小超过 512 MiB、缺失 container/OPF/document.xml 均返回稳定错误。
 
-- [ ] **步骤 6：实现 lazy ZIP 与 XML 提取**
+- [x] **步骤 6：实现 lazy ZIP 与 XML 提取**
 
 使用 `yauzl.open(..., { lazyEntries: true })` 先检查 central directory 元数据，只读取需要的成员。XML 使用 `fast-xml-parser`，关闭实体展开，拒绝 `..`、绝对路径和反斜线路径逃逸。DOCX 与 EPUB 分别生成 `docx_paragraph` 和 `epub_spine_member` provenance。
 
-- [ ] **步骤 7：实现项目去重与用户目录服务**
+- [x] **步骤 7：实现项目去重与用户目录服务**
 
 `DesktopSourceService` 构造函数注入 `projectsRoot`。它以 `sanitizeTitle(basename)` 与源 SHA 前 12 位生成目录；已存在目录先用 `SourceLedger.open()` 校验 raw hash，相同则复用，不同则创建带 hash 的新目录。
 
-- [ ] **步骤 8：运行导入测试、类型检查和现有 ledger 回归**
+- [x] **步骤 8：运行导入测试、类型检查和现有 ledger 回归**
 
 ```powershell
 npm.cmd test -- --test-name-pattern="source importer|desktop source service|source ledger"
@@ -143,7 +143,7 @@ npm.cmd run typecheck
 
 预期：PASS。
 
-- [ ] **步骤 9：提交**
+- [x] **步骤 9：提交**
 
 ```powershell
 git add translator-v5/package.json translator-v5/package-lock.json translator-v5/src/source translator-v5/src/desktop/desktop-source-service.ts translator-v5/test/source-importer.test.ts translator-v5/test/desktop-source-service.test.ts
@@ -164,7 +164,7 @@ git commit -m "feat: import manuscript files in desktop"
 - 创建：`translator-v5/test/provider-runtime.test.ts`
 - 修改：`translator-v5/src/agents/pi-runtime.ts`
 
-- [ ] **步骤 1：先写注册表、URL 和 effort 映射失败测试**
+- [x] **步骤 1：先写注册表、URL 和 effort 映射失败测试**
 
 断言首批 provider ID 精确为 `deepseek`、`kimi-cn`、`bailian`、`volcengine`、`openai`、`siliconflow`、`openai-compatible`；预置 Base URL 不接受 UI 覆盖；自定义接口只接受 HTTPS 或 loopback HTTP；`max` 经内部 `xhigh` 后仍发送为 `max`。
 
@@ -177,7 +177,7 @@ assert.equal(toInternalThinking("max"), "xhigh");
 assert.equal(toProviderEffort("xhigh", profile), "max");
 ```
 
-- [ ] **步骤 2：运行定向测试确认失败**
+- [x] **步骤 2：运行定向测试确认失败**
 
 ```powershell
 npm.cmd test -- --test-name-pattern="provider registry|custom provider URL|raw max effort"
@@ -185,7 +185,7 @@ npm.cmd test -- --test-name-pattern="provider registry|custom provider URL|raw m
 
 预期：FAIL，providers 模块不存在。
 
-- [ ] **步骤 3：定义稳定领域类型**
+- [x] **步骤 3：定义稳定领域类型**
 
 ```ts
 export type ProviderId =
@@ -207,15 +207,15 @@ export interface ProviderRuntime {
 
 `ModelProfile` 不含 API Key；effort 为接口原始值，不使用翻译枚举。
 
-- [ ] **步骤 4：实现预设、模型发现与保守回退**
+- [x] **步骤 4：实现预设、模型发现与保守回退**
 
 标准 `/models` 响应只接收 `{ data: [{ id: string }] }`；去重、排序并限制为 500 项。网络失败返回内置推荐列表加 `source: "fallback"`，不把回退描述为在线结果。百炼、火山和自定义接口始终允许手填模型 ID。
 
-- [ ] **步骤 5：实现 runtime 并保留 CLI 兼容包装器**
+- [x] **步骤 5：实现 runtime 并保留 CLI 兼容包装器**
 
 `createProviderRuntime(profile, credential)` 根据 api family 选择 pi-ai 的 OpenAI Chat 或 Responses 实现，并填入模型级 compat。`createDeepSeekModel()` 与 `createDeepSeekStreamFn()` 继续导出，但只把现有 `PilotModelConfig` 转成 `ModelProfile` 后委托新 runtime，保证 CLI 测试不变。
 
-- [ ] **步骤 6：运行 provider、pi-runtime 和 config 回归**
+- [x] **步骤 6：运行 provider、pi-runtime 和 config 回归**
 
 ```powershell
 npm.cmd test -- --test-name-pattern="provider registry|provider runtime|PiRuntime|config"
@@ -224,7 +224,7 @@ npm.cmd run typecheck
 
 预期：PASS，并确认 `reasoningEffort: "max"` 不再静默变成 `high`。
 
-- [ ] **步骤 7：提交**
+- [x] **步骤 7：提交**
 
 ```powershell
 git add translator-v5/src/providers translator-v5/src/agents/pi-runtime.ts translator-v5/test/provider-registry.test.ts translator-v5/test/provider-runtime.test.ts
@@ -241,7 +241,7 @@ git commit -m "feat: add extensible model provider registry"
 - 创建：`translator-v5/test/provider-capability-probe.test.ts`
 - 修改：`translator-v5/src/providers/types.ts`
 
-- [ ] **步骤 1：写本地假服务的失败测试**
+- [x] **步骤 1：写本地假服务的失败测试**
 
 测试服务器分别模拟：完整流式工具调用、只返回文本、碎片化 tool arguments、第二轮拒绝 reasoning 内容、401、404 model、429、503、超时和非法 JSON。自动测试不得请求真实厂商。
 
@@ -253,7 +253,7 @@ assert.deepEqual(report.checks.map((check) => check.id), [
 ]);
 ```
 
-- [ ] **步骤 2：运行定向测试确认失败**
+- [x] **步骤 2：运行定向测试确认失败**
 
 ```powershell
 npm.cmd test -- --test-name-pattern="capability probe"
@@ -261,7 +261,7 @@ npm.cmd test -- --test-name-pattern="capability probe"
 
 预期：FAIL，probe API 不存在。
 
-- [ ] **步骤 3：实现 30 秒、低输出上限的探针状态机**
+- [x] **步骤 3：实现 30 秒、低输出上限的探针状态机**
 
 探针使用无副作用工具：
 
@@ -280,11 +280,11 @@ const tool = {
 
 第一轮强制调用工具，主进程回传固定 token，第二轮要求只输出 `FOLIOLOOM_READY`。任何一步不能结构化完成均为 `limited`，鉴权/网络/参数错误为 `failed`。
 
-- [ ] **步骤 4：建立脱敏错误分类**
+- [x] **步骤 4：建立脱敏错误分类**
 
 将常见响应映射为 `AUTH_INVALID`、`MODEL_NOT_FOUND`、`QUOTA_EXHAUSTED`、`RATE_LIMITED`、`PROVIDER_BUSY`、`TOOL_CALL_UNSUPPORTED`、`REASONING_CONTINUITY_UNSUPPORTED`、`REQUEST_TIMEOUT`。技术详情移除 Authorization、API Key、URL query 和响应中的疑似密钥串。
 
-- [ ] **步骤 5：运行探针和 provider 全套测试**
+- [x] **步骤 5：运行探针和 provider 全套测试**
 
 ```powershell
 npm.cmd test -- --test-name-pattern="capability probe|provider runtime|provider registry"
@@ -293,7 +293,7 @@ npm.cmd run typecheck
 
 预期：PASS。
 
-- [ ] **步骤 6：提交**
+- [x] **步骤 6：提交**
 
 ```powershell
 git add translator-v5/src/providers translator-v5/test/provider-capability-probe.test.ts
@@ -313,7 +313,7 @@ git commit -m "feat: verify provider tool compatibility"
 - 修改：`translator-v5/src/desktop/desktop-preferences.ts`
 - 修改：`translator-v5/test/desktop-preferences.test.ts`
 
-- [ ] **步骤 1：写 safeStorage、会话回退和不泄密测试**
+- [x] **步骤 1：写 safeStorage、会话回退和不泄密测试**
 
 测试注入假 `safeStorage`，验证落盘只有 base64 密文；`isEncryptionAvailable() === false` 时不创建 credential 文件；读取设置、错误序列化、`JSON.stringify(service.snapshot())` 均不包含明文 key。
 
@@ -325,7 +325,7 @@ interface DesktopSecretBox {
 }
 ```
 
-- [ ] **步骤 2：运行定向测试确认失败**
+- [x] **步骤 2：运行定向测试确认失败**
 
 ```powershell
 npm.cmd test -- --test-name-pattern="credential store|model service|desktop preferences v2"
@@ -333,19 +333,19 @@ npm.cmd test -- --test-name-pattern="credential store|model service|desktop pref
 
 预期：FAIL。
 
-- [ ] **步骤 3：实现原子密文存储与会话模式**
+- [x] **步骤 3：实现原子密文存储与会话模式**
 
 credential 文件 schema 固定为 `folioloom-desktop-credentials-1`，按 provider ID 保存密文。文件写入沿用临时文件 + rename；解密失败时返回“需要重新输入”，不删除其他厂商密钥。`forget(providerId)` 同时清理磁盘与内存。
 
-- [ ] **步骤 4：升级非秘密偏好 schema**
+- [x] **步骤 4：升级非秘密偏好 schema**
 
 `DesktopPreferences` 升级到 schema 2，保存：`recent`、`activeModelProfile`、最近一次脱敏 probe 摘要。读取 schema 1 时迁移 recent project，绝不尝试迁移密钥。
 
-- [ ] **步骤 5：实现 DesktopModelService**
+- [x] **步骤 5：实现 DesktopModelService**
 
 该服务组合 registry、credential store 和 probe，公开 `listProviders()`、`discoverModels(request)`、`testAndSave(request)`、`forgetCredential(providerId)` 和 `snapshot()`。只有 probe 为 `ready` 才保存 active profile；API Key 参数在调用结束后的任何 DTO 中均不存在。
 
-- [ ] **步骤 6：运行桌面设置测试与类型检查**
+- [x] **步骤 6：运行桌面设置测试与类型检查**
 
 ```powershell
 npm.cmd test -- --test-name-pattern="credential store|model service|desktop preferences"
@@ -355,7 +355,7 @@ npm.cmd run typecheck
 
 预期：PASS。
 
-- [ ] **步骤 7：提交**
+- [x] **步骤 7：提交**
 
 ```powershell
 git add translator-v5/src/desktop/desktop-credential-store.ts translator-v5/src/desktop/desktop-model-service.ts translator-v5/src/desktop/desktop-preferences.ts translator-v5/test/desktop-credential-store.test.ts translator-v5/test/desktop-model-service.test.ts translator-v5/test/desktop-preferences.test.ts
@@ -377,11 +377,11 @@ git commit -m "feat: store desktop model credentials securely"
 - 修改：`translator-v5/test/desktop-ipc.test.ts`
 - 修改：`translator-v5/test/desktop-main-security.test.ts`
 
-- [ ] **步骤 1：先写 IPC 白名单和输入拒绝测试**
+- [x] **步骤 1：先写 IPC 白名单和输入拒绝测试**
 
 新增固定 channel：`choose-source`、`onboarding-state`、`discover-models`、`test-model`、`forget-credential`。断言没有 `invoke(channel, payload)`、任意 URL fetch、读取 credential 或任意文件路径 API。`choose-source` picker 只接受 TXT/MD/EPUB/DOCX。
 
-- [ ] **步骤 2：运行桌面 IPC 测试确认失败**
+- [x] **步骤 2：运行桌面 IPC 测试确认失败**
 
 ```powershell
 npm.cmd test -- --test-name-pattern="desktop IPC|trusted renderer|model credential"
@@ -389,7 +389,7 @@ npm.cmd test -- --test-name-pattern="desktop IPC|trusted renderer|model credenti
 
 预期：FAIL，channel 与契约尚不存在。
 
-- [ ] **步骤 3：扩充纯 JSON DTO**
+- [x] **步骤 3：扩充纯 JSON DTO**
 
 ```ts
 export interface DesktopOnboardingState {
@@ -410,15 +410,15 @@ export interface DesktopTestModelRequest {
 
 任何响应类型不得出现 `apiKey`、encrypted secret、Node Buffer、Error、Model 或 StreamFn。
 
-- [ ] **步骤 4：实现依赖注入式 IPC 和 main 装配**
+- [x] **步骤 4：实现依赖注入式 IPC 和 main 装配**
 
 `main/index.ts` 在 `app.whenReady()` 后以 `safeStorage`、`app.getPath("userData")`、`app.getPath("documents")` 创建服务。IPC 继续验证顶层 frame 和精确 renderer URL。取消文件选择返回可忽略的 `DESKTOP_SELECTION_CANCELLED`，不覆盖当前状态。
 
-- [ ] **步骤 5：实现 preload 窄接口**
+- [x] **步骤 5：实现 preload 窄接口**
 
 只暴露命名方法；API Key 仅可作为 `testModel()` 请求字段进入主进程，主进程响应不回显。渲染器无 provider URL 表，防止篡改预置地址。
 
-- [ ] **步骤 6：运行 IPC、安全、偏好和 build 测试**
+- [x] **步骤 6：运行 IPC、安全、偏好和 build 测试**
 
 ```powershell
 npm.cmd test -- --test-name-pattern="desktop IPC|desktop window|desktop preferences|credential"
@@ -428,7 +428,7 @@ npm.cmd run desktop:build
 
 预期：PASS。
 
-- [ ] **步骤 7：提交**
+- [x] **步骤 7：提交**
 
 ```powershell
 git add translator-v5/src/desktop/contracts.ts translator-v5/src/desktop/desktop-errors.ts translator-v5/src/desktop/main translator-v5/src/desktop/preload translator-v5/test/desktop-ipc.test.ts translator-v5/test/desktop-main-security.test.ts
@@ -453,11 +453,11 @@ git commit -m "feat: expose secure desktop onboarding IPC"
 - 修改：`translator-v5/src/desktop/renderer/src/components/WorkspacePlaceholder.tsx`
 - 修改：`translator-v5/src/desktop/renderer/src/styles.css`
 
-- [ ] **步骤 1：先写用户流程与禁用文案测试**
+- [x] **步骤 1：先写用户流程与禁用文案测试**
 
 覆盖：空状态显示“开始翻译一本书”和“选择书稿”；厂商按钮包括六个直接入口和“更多服务”；选 DeepSeek 时 effort 显示原始 `high`、`max`；API Key 测试成功后输入框清空；模型未 ready 时试译禁用；默认 DOM 不出现 `V5`、`source_manifest.json`、`book.db`、`canonical`、`SQLite`、`状态库`。
 
-- [ ] **步骤 2：运行 renderer 测试确认失败**
+- [x] **步骤 2：运行 renderer 测试确认失败**
 
 ```powershell
 npx.cmd vitest run --config vitest.desktop.config.ts src/desktop/renderer/src/App.test.tsx
@@ -465,7 +465,7 @@ npx.cmd vitest run --config vitest.desktop.config.ts src/desktop/renderer/src/Ap
 
 预期：FAIL，仍显示旧 Alpha 空状态。
 
-- [ ] **步骤 3：实现三步状态机**
+- [x] **步骤 3：实现三步状态机**
 
 `App` 状态只保留 DTO、表单草稿和 busy action。流程状态从服务快照派生，不以“用户点击过”作为完成依据：
 
@@ -477,15 +477,15 @@ const trialEnabled = sourceReady && modelReady && busyAction === undefined;
 
 API Key 只存在 `ProviderSetup` 的受控 state；`testModel` promise settled 后立即 `setApiKey("")`。
 
-- [ ] **步骤 4：按已确认原型实现视觉层级**
+- [x] **步骤 4：按已确认原型实现视觉层级**
 
 保留现有暗色标题栏和侧栏；内容区使用 1/2/3 三段。思考强度用模型元数据返回的原始字符串；不翻译、不补齐不存在的等级。自定义接口置于“更多服务”，展开后才显示 Base URL。
 
-- [ ] **步骤 5：清理所有默认可见工程文案**
+- [x] **步骤 5：清理所有默认可见工程文案**
 
 统一替换为“书稿、翻译记录、翻译任务、片段、检查”。错误码和内部路径只放进 `<details><summary>技术详情</summary>`；技术详情组件在渲染前再次调用纯函数脱敏。
 
-- [ ] **步骤 6：运行 renderer、布局和可访问性回归**
+- [x] **步骤 6：运行 renderer、布局和可访问性回归**
 
 ```powershell
 npm.cmd run desktop:test
@@ -494,7 +494,7 @@ npm.cmd run desktop:typecheck
 
 预期：PASS；1440×920、1100×720 下 `.workbench-main` 无页面级纵向滚动条，内容区自身按需滚动；厂商按钮、字段和错误提示均有可访问名称。
 
-- [ ] **步骤 7：提交**
+- [x] **步骤 7：提交**
 
 ```powershell
 git add translator-v5/src/desktop/renderer
@@ -518,11 +518,11 @@ git commit -m "feat: add reader-friendly desktop onboarding"
 - 修改：`translator-v5/src/desktop/renderer/src/components/Onboarding.tsx`
 - 修改：相关测试。
 
-- [ ] **步骤 1：写试译边界和恢复失败测试**
+- [x] **步骤 1：写试译边界和恢复失败测试**
 
 用 fake StreamFn 验证：只处理一个 window、`maxConcurrency: 1`、同一项目不能并发两个试译、模型未 ready 拒绝、成功返回源文/译文和 run ID、失败仍释放 lease、第二次启动能从 SQLite 读取上次结果。
 
-- [ ] **步骤 2：运行定向测试确认失败**
+- [x] **步骤 2：运行定向测试确认失败**
 
 ```powershell
 npm.cmd test -- --test-name-pattern="desktop trial"
@@ -530,23 +530,23 @@ npm.cmd test -- --test-name-pattern="desktop trial"
 
 预期：FAIL，trial service 不存在。
 
-- [ ] **步骤 3：为 lossless runner 添加可选 AbortSignal**
+- [x] **步骤 3：为 lossless runner 添加可选 AbortSignal**
 
 在 `LosslessBookRunOptions` 增加 `signal?: AbortSignal`，每轮选窗前、provider 调用前和提交下一原子窗口前 `throwIfAborted()`；信号向 PiSessionSpec 传递。已进入 commit coordinator 的原子提交不得被中途打断。
 
-- [ ] **步骤 4：实现单任务控制器**
+- [x] **步骤 4：实现单任务控制器**
 
 `DesktopTrialService.start()` 固定 `maxWindows: 1`、`maxConcurrency: 1`，store 使用项目内 `artifacts/folioloom/book.db`。运行前重新验证 source version 与 active profile；运行后从 `LosslessBookStore.auditState(runId).translations` 投影第一个译文。窗口关闭时 `cancel()` 发 signal，并等待 promise settled 后允许 app quit。
 
-- [ ] **步骤 5：增加固定进度事件**
+- [x] **步骤 5：增加固定进度事件**
 
 主进程只发送 `preparing`、`translating`、`checking`、`completed`、`failed`；事件不包含 prompt、API Key 或完整 provider 响应。preload 返回 unsubscribe 函数，且只接受来自固定 channel 的 DTO。
 
-- [ ] **步骤 6：在 UI 显示试译结果**
+- [x] **步骤 6：在 UI 显示试译结果**
 
 三步页第三段在运行时显示阶段文字；成功后并排显示原文与译文，并提供“进入翻译进度”入口。失败显示普通用户原因和折叠技术详情，不自动启动整本翻译。
 
-- [ ] **步骤 7：运行 trial、runner、desktop 全套回归**
+- [x] **步骤 7：运行 trial、runner、desktop 全套回归**
 
 ```powershell
 npm.cmd test -- --test-name-pattern="desktop trial|lossless book|abort"
@@ -557,7 +557,7 @@ npm.cmd run desktop:typecheck
 
 预期：PASS。
 
-- [ ] **步骤 8：提交**
+- [x] **步骤 8：提交**
 
 ```powershell
 git add translator-v5/src/desktop translator-v5/src/fullbook/book-runner.ts translator-v5/test/desktop-trial-service.test.ts translator-v5/test/book-runner.test.ts
@@ -576,15 +576,15 @@ git commit -m "feat: run one-window desktop trials"
 - 修改：`translator-v5/test/desktop-build-config.test.ts`
 - 修改：`docs/superpowers/plans/2026-07-22-desktop-onboarding-provider-registry.md`（勾选完成状态）
 
-- [ ] **步骤 1：更新桌面边界与用户说明**
+- [x] **步骤 1：更新桌面边界与用户说明**
 
 文档只让普通用户执行：启动应用 → 选择书稿 → 选择厂商 → 填入 API Key/模型/effort → 测试连接 → 试译。说明密钥用系统加密保存，`safeStorage` 不可用时为会话模式。开发者章节另行解释内部项目和 CLI，不混进用户步骤。
 
-- [ ] **步骤 2：更新资源策略和构建测试**
+- [x] **步骤 2：更新资源策略和构建测试**
 
 `app-info.json` 将 `translationWritePolicy` 从 Alpha 禁用状态改为 `single-window-trial`，保留 `apiKeyPolicy: "never-packaged"`。构建测试断言 `yauzl`、XML parser 和 provider runtime 被打入产物，而测试 fixture、密钥文件和本机项目不进入包。
 
-- [ ] **步骤 3：运行完整自动验证**
+- [x] **步骤 3：运行完整自动验证**
 
 ```powershell
 Set-Location translator-v5
@@ -598,7 +598,7 @@ npx.cmd electron-builder --win --x64 --dir
 
 预期：全部 PASS，`release/win-unpacked/FolioLoom.exe` 存在。
 
-- [ ] **步骤 4：执行本地 smoke test**
+- [x] **步骤 4：执行本地 smoke test**
 
 使用不含私人密钥的本地假 provider：
 
@@ -610,7 +610,7 @@ npx.cmd electron-builder --win --x64 --dir
 6. 关闭并重启应用，确认项目和非秘密模型配置恢复；测试密钥按 safeStorage 策略恢复。
 7. 退出所有 FolioLoom 进程和本地假服务。
 
-- [ ] **步骤 5：检查仓库与密钥污染**
+- [x] **步骤 5：检查仓库与密钥污染**
 
 ```powershell
 git status --short
@@ -619,7 +619,7 @@ git grep -n -I -E "sk-[A-Za-z0-9_-]{12,}|Authorization: Bearer [A-Za-z0-9_-]{8,}
 
 预期：无真实密钥；只有本计划产生的预期修改。
 
-- [ ] **步骤 6：提交文档与验收元数据**
+- [x] **步骤 6：提交文档与验收元数据**
 
 ```powershell
 git add README.md translator-v5/README.md translator-v5/desktop/resources/app-info.json translator-v5/test/desktop-build-config.test.ts docs/superpowers/plans/2026-07-22-desktop-onboarding-provider-registry.md
