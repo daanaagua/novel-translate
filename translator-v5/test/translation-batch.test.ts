@@ -72,6 +72,11 @@ test("batch protocol states that user style requirements cannot override integri
   );
 });
 
+test("batch protocol names Korean sources rather than treating them as undetermined", () => {
+  const prompt = translationBatchSystemPrompt(getSourceLanguageProfile("ko"));
+  assert.match(prompt, /The source language is Korean \(ko\)/u);
+});
+
 test("batch isolates one malformed logical window without discarding its valid sibling", async () => {
   const faux = fauxProvider();
   faux.setResponses([fauxAssistantMessage(fauxToolCall(

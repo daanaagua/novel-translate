@@ -1,14 +1,17 @@
 import type {
   AnchorCandidateInput,
+  BoundaryCandidate,
   ProfileAnchorCandidate,
   ResidueDetectionOptions,
   ResidueFinding,
+  ScriptStats,
   SourceLanguageProfile,
+  SourceScript,
   SourceToken,
   StructureHeading,
 } from "./types.js";
 
-const PROFILE_VERSION = "source-language-profile-1";
+const PROFILE_VERSION = "source-language-profile-2";
 const DEFAULT_CANDIDATE_LIMIT = 24;
 
 interface ProfileDefinition {
@@ -18,9 +21,10 @@ interface ProfileDefinition {
   volumePatterns: readonly RegExp[];
   chapterPatterns: readonly RegExp[];
   stopWords: readonly string[];
-  script: "latin" | "cyrillic" | "kana" | "unknown";
+  script: SourceScript;
   leadingContractions?: readonly string[];
   aliasCuePatterns?: readonly RegExp[];
+  namingCuePatterns?: readonly RegExp[];
 }
 
 const DEFINITIONS: readonly ProfileDefinition[] = [
@@ -101,11 +105,43 @@ const DEFINITIONS: readonly ProfileDefinition[] = [
     id: "ja",
     displayName: "Japanese",
     locale: "ja",
-    volumePatterns: [/^第[^\r\n]{1,20}巻$/u],
-    chapterPatterns: [/^第[^\r\n]{1,20}章$/u],
-    stopWords: [],
+    volumePatterns: [
+      /^\u7b2c[^\r\n]{1,20}\u5dfb$/u,
+      /^[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\p{N}\u30fc]{2,24}\u306e\u5dfb$/u,
+    ],
+    chapterPatterns: [
+      /^\u7b2c[^\r\n]{1,20}\u7ae0$/u,
+      /^\u7b2c[^\r\n]{1,20}\u8a71$/u,
+      /^(?:\u5e8f\u7ae0|\u7d42\u7ae0|\u30d7\u30ed\u30ed\u30fc\u30b0|\u30a8\u30d4\u30ed\u30fc\u30b0)$/u,
+    ],
+    stopWords: [
+      "\u3053\u308c", "\u305d\u308c", "\u3042\u308c", "\u3053\u3068", "\u3082\u306e", "\u305f\u3081", "\u3055\u3089\u306b",
+      "\u3059\u308b", "\u3057\u305f", "\u3057\u3066", "\u3042\u308b", "\u3042\u3063\u305f", "\u3067\u3059", "\u307e\u3059",
+    ],
     script: "kana",
-    aliasCuePatterns: [/(?:別名|として知ら)/u],
+    aliasCuePatterns: [/(?:\u5225\u540d|\u3068\u3057\u3066\u77e5\u3089)/u],
+    namingCuePatterns: [/(?:\u6c0f|\u69d8|\u6bbf|\u3055\u3093)\b/u],
+  },
+  {
+    id: "ko",
+    displayName: "Korean",
+    locale: "ko",
+    volumePatterns: [
+      /^\uc81c\s*(?:\d+|[\p{Script=Hangul}\p{Script=Han}\p{N}]+)\s*\uad8c$/u,
+    ],
+    chapterPatterns: [
+      /^\uc81c\s*(?:\d+|[\p{Script=Hangul}\p{Script=Han}\p{N}]+)\s*\uc7a5$/u,
+      /^\d+\s*\uc7a5$/u,
+      /^(?:\uc11c\uc7a5|\uc885\uc7a5|\ud504\ub864\ub85c\uadf8|\uc5d0\ud544\ub85c\uadf8)$/u,
+      /^(?:\[|\u3010)\s*[\p{L}\p{N}\s-]{1,32}\s*(?:\]|\u3011)$/u,
+    ],
+    stopWords: [
+      "\uadf8\ub7ec\ub098", "\uadf8\ub9ac\uace0", "\uadf8\ub7f0", "\uc774\ub7f0", "\uac83\uc740", "\uac83\uc774", "\uc5c6\uc5c8\ub2e4",
+      "\uc788\uc5c8\ub2e4", "\ud588\ub2e4", "\ub418\uc5c8\ub2e4", "\ud558\uc5c8\ub2e4", "\ud558\ub294", "\uc774\ub2e4",
+    ],
+    script: "hangul",
+    aliasCuePatterns: [/(?:\ubcc4\uba85|\ubd88\ub9ac|\ub77c\uace0\s*\ud55c\ub2e4)/u],
+    namingCuePatterns: [/(?:\uc528|\ub2d8|\uc7a5\uad70|\ub300\uac10)/u],
   },
   {
     id: "und",
@@ -151,6 +187,133 @@ function segmentText(text: string, definition: ProfileDefinition): SourceToken[]
   }));
 }
 
+function scriptsFor(definition: ProfileDefinition): readonly SourceScript[] {
+  switch (definition.script) {
+    case "kana":
+      return ["han", "kana"];
+    case "hangul":
+      return ["han", "hangul"];
+    case "latin":
+      return ["latin"];
+    case "cyrillic":
+      return ["cyrillic"];
+    case "han":
+      return ["han"];
+    default:
+      return ["unknown"];
+  }
+}
+
+function scriptStats(text: string): ScriptStats {
+  const stats: ScriptStats = {
+    scalars: 0,
+    latin: 0,
+    han: 0,
+    kana: 0,
+    hangul: 0,
+    other: 0,
+  };
+  for (const scalar of text) {
+    stats.scalars += 1;
+    if (/\p{Script=Latin}/u.test(scalar)) {
+      stats.latin += 1;
+    } else if (/\p{Script=Han}/u.test(scalar)) {
+      stats.han += 1;
+    } else if (/[\p{Script=Hiragana}\p{Script=Katakana}\u30fc]/u.test(scalar)) {
+      stats.kana += 1;
+    } else if (/\p{Script=Hangul}/u.test(scalar)) {
+      stats.hangul += 1;
+    } else {
+      stats.other += 1;
+    }
+  }
+  return stats;
+}
+
+function scalarOffsetAt(text: string, utf16Offset: number): number {
+  return [...text.slice(0, utf16Offset)].length;
+}
+
+function structureHeading(
+  line: string,
+  definition: ProfileDefinition,
+): StructureHeading | null {
+  const title = line.trim();
+  if (definition.volumePatterns.some((pattern) => pattern.test(title))) {
+    return { kind: "volume_heading", title, boundaryWeight: 100 };
+  }
+  if (definition.chapterPatterns.some((pattern) => pattern.test(title))) {
+    return { kind: "chapter_heading", title, boundaryWeight: 80 };
+  }
+  return null;
+}
+
+const CLOSING_PUNCTUATION = new Set([
+  "\"", "'", "\u201d", "\u2019", "\u300d", "\u300f", "\uff09", "\u3011", "\u3015",
+]);
+
+function cjkBoundaryCandidates(
+  text: string,
+  definition: ProfileDefinition,
+): BoundaryCandidate[] {
+  const candidates: BoundaryCandidate[] = [];
+  for (const match of text.matchAll(/(?:\r\n|\r|\n)[ \t]*(?:(?:\r\n|\r|\n)[ \t]*)+/gu)) {
+    if (match.index !== undefined) {
+      candidates.push({
+        scalarOffset: scalarOffsetAt(text, match.index + match[0].length),
+        weight: 70,
+        kind: "paragraph",
+      });
+    }
+  }
+
+  const scalars = [...text];
+  for (let index = 0; index < scalars.length; index += 1) {
+    const scalar = scalars[index] as string;
+    const cjkTerminal = scalar === "\u3002" || scalar === "\uff01" || scalar === "\uff1f";
+    if (!cjkTerminal && scalar !== "." && scalar !== "!" && scalar !== "?") {
+      continue;
+    }
+    let end = index + 1;
+    while (end < scalars.length && CLOSING_PUNCTUATION.has(scalars[end] as string)) {
+      end += 1;
+    }
+    const next = scalars[end];
+    if (!cjkTerminal && next !== undefined && !/\s/u.test(next)) {
+      continue;
+    }
+    candidates.push({ scalarOffset: end, weight: 50, kind: "sentence" });
+    index = end - 1;
+  }
+
+  for (const match of text.matchAll(/^.*$/gmu)) {
+    if (match.index === undefined || match[0].length === 0) {
+      continue;
+    }
+    const heading = structureHeading(match[0], definition);
+    if (heading !== null) {
+      candidates.push({
+        scalarOffset: scalarOffsetAt(text, match.index),
+        weight: heading.boundaryWeight,
+        kind: "heading",
+      });
+    }
+  }
+
+  const strongestByOffset = new Map<number, BoundaryCandidate>();
+  for (const candidate of candidates) {
+    const previous = strongestByOffset.get(candidate.scalarOffset);
+    if (previous === undefined || candidate.weight > previous.weight) {
+      strongestByOffset.set(candidate.scalarOffset, candidate);
+    }
+  }
+  return [...strongestByOffset.values()].sort((left, right) => (
+    left.scalarOffset - right.scalarOffset
+    || right.weight - left.weight
+    || left.kind.localeCompare(right.kind)
+  ));
+}
+
 function compactContext(text: string, offset: number): string {
   const before = text.slice(0, offset);
   const left = Math.max(
@@ -172,6 +335,16 @@ function compactContext(text: string, offset: number): string {
   return text.slice(left + 1, right).replace(/\s+/gu, " ").trim().slice(0, 360);
 }
 
+function cjkCandidateToken(token: SourceToken, definition: ProfileDefinition): boolean {
+  if (!/^[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Hangul}\u30fc]+$/u.test(token.value)) {
+    return false;
+  }
+  if (definition.script === "kana") {
+    return /[\p{Script=Han}\p{Script=Katakana}]/u.test(token.value);
+  }
+  return /\p{Script=Hangul}/u.test(token.value);
+}
+
 function isCandidateToken(token: SourceToken, definition: ProfileDefinition): boolean {
   if (!token.isWordLike || token.normalized.length < 2) {
     return false;
@@ -185,6 +358,9 @@ function isCandidateToken(token: SourceToken, definition: ProfileDefinition): bo
   if (definition.script === "cyrillic") {
     return /^\p{Lu}[\p{Script=Cyrillic}\p{M}-]{1,}$/u.test(token.value);
   }
+  if (definition.script === "kana" || definition.script === "hangul") {
+    return cjkCandidateToken(token, definition);
+  }
   return false;
 }
 
@@ -192,10 +368,11 @@ function collectCandidates(
   input: AnchorCandidateInput,
   definition: ProfileDefinition,
 ): ProfileAnchorCandidate[] {
-  const limit = input.limit ?? DEFAULT_CANDIDATE_LIMIT;
-  if (!Number.isSafeInteger(limit) || limit < 0) {
+  const requestedLimit = input.limit ?? DEFAULT_CANDIDATE_LIMIT;
+  if (!Number.isSafeInteger(requestedLimit) || requestedLimit < 0) {
     throw new TypeError("candidate limit must be a non-negative safe integer");
   }
+  const limit = Math.min(requestedLimit, DEFAULT_CANDIDATE_LIMIT);
   const established = new Set((input.establishedSourceForms ?? [])
     .map((form) => normalizeForm(form, definition)));
   const current = new Map<string, { sourceForm: string; count: number }>();
@@ -217,8 +394,9 @@ function collectCandidates(
     count: number;
     candidateCaseCount: number;
     contexts: Set<string>;
+    documentIndexes: Set<number>;
   }>();
-  for (const text of input.corpusTexts) {
+  for (const [documentIndex, text] of input.corpusTexts.entries()) {
     for (const token of segmentText(text, definition)) {
       if (!current.has(token.normalized)) {
         continue;
@@ -227,8 +405,10 @@ function collectCandidates(
         count: 0,
         candidateCaseCount: 0,
         contexts: new Set<string>(),
+        documentIndexes: new Set<number>(),
       };
       record.count += 1;
+      record.documentIndexes.add(documentIndex);
       if (isCandidateToken(token, definition)) {
         record.candidateCaseCount += 1;
       }
@@ -247,24 +427,35 @@ function collectCandidates(
       count: wave.count,
       candidateCaseCount: wave.count,
       contexts: new Set<string>(),
+      documentIndexes: new Set<number>(),
     };
     const contexts = [...evidence.contexts];
     const hasAliasCue = contexts.some((context) =>
       definition.aliasCuePatterns?.some((pattern) => pattern.test(context)) ?? false);
+    const hasNamingCue = contexts.some((context) =>
+      definition.namingCuePatterns?.some((pattern) => pattern.test(context)) ?? false);
     const caseConsistency = evidence.count === 0
       ? 1
       : evidence.candidateCaseCount / evidence.count;
     const caseAmbiguous = evidence.candidateCaseCount < evidence.count
       && caseConsistency <= 0.5;
-    if (caseAmbiguous && !hasAliasCue) {
+    if (caseAmbiguous && !hasAliasCue && !hasNamingCue) {
       return [];
     }
+    const isCjk = definition.script === "kana" || definition.script === "hangul";
+    if (isCjk && evidence.count < 2 && wave.count < 2 && !hasAliasCue && !hasNamingCue) {
+      return [];
+    }
+    const positionalSpread = Math.min(evidence.documentIndexes.size, 3) * 5
+      + Math.min(contexts.length, 3) * 3;
     const score = 20
       + Math.log1p(evidence.count) * 8
       + Math.min(wave.count, 4) * 3
+      + positionalSpread
       + caseConsistency * 30
       - (1 - caseConsistency) * 35
-      + (hasAliasCue ? 80 : 0);
+      + (hasAliasCue ? 80 : 0)
+      + (hasNamingCue ? 20 : 0);
     return [{
       sourceForm: wave.sourceForm,
       normalizedSource,
@@ -331,7 +522,9 @@ function scriptedResidue(
     .map((form) => normalizeForm(form, definition)));
   const pattern = definition.script === "cyrillic"
     ? /[\p{Script=Cyrillic}\p{M}]{2,}/gu
-    : /[\p{Script=Hiragana}\p{Script=Katakana}ー]{2,}/gu;
+    : definition.script === "hangul"
+      ? /[\p{Script=Hangul}]{2,}/gu
+      : /[\p{Script=Hiragana}\p{Script=Katakana}\u30fc]{2,}/gu;
   return [...text.matchAll(pattern)].flatMap((match): ResidueFinding[] => {
     const form = match[0];
     if (preserved.has(normalizeForm(form, definition))) {
@@ -342,7 +535,11 @@ function scriptedResidue(
       form,
       start: match.index,
       end: match.index + form.length,
-      script: definition.script === "cyrillic" ? "cyrillic" : "kana",
+      script: definition.script === "cyrillic"
+        ? "cyrillic"
+        : definition.script === "hangul"
+          ? "hangul"
+          : "kana",
     }];
   });
 }
@@ -353,15 +550,15 @@ function buildProfile(definition: ProfileDefinition): SourceLanguageProfile {
     version: PROFILE_VERSION,
     displayName: definition.displayName,
     locale: definition.locale,
+    scripts: scriptsFor(definition),
     detectStructureHeading(line: string): StructureHeading | null {
-      const title = line.trim();
-      if (definition.volumePatterns.some((pattern) => pattern.test(title))) {
-        return { kind: "volume_heading", title, boundaryWeight: 100 };
-      }
-      if (definition.chapterPatterns.some((pattern) => pattern.test(title))) {
-        return { kind: "chapter_heading", title, boundaryWeight: 80 };
-      }
-      return null;
+      return structureHeading(line, definition);
+    },
+    collectBoundaryCandidates(text: string): BoundaryCandidate[] {
+      return cjkBoundaryCandidates(text, definition);
+    },
+    collectScriptStats(text: string): ScriptStats {
+      return scriptStats(text);
     },
     segment(text: string): SourceToken[] {
       return segmentText(text, definition);
@@ -379,7 +576,9 @@ function buildProfile(definition: ProfileDefinition): SourceLanguageProfile {
       if (definition.script === "latin") {
         return latinResidue(translation, definition, options);
       }
-      if (definition.script === "cyrillic" || definition.script === "kana") {
+      if (definition.script === "cyrillic"
+        || definition.script === "kana"
+        || definition.script === "hangul") {
         return scriptedResidue(translation, definition, options);
       }
       return [];

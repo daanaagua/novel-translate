@@ -77,6 +77,20 @@ test("window anchor candidates delegate first occurrences to the source language
   assert.deepEqual(candidates.map((item) => item.sourceForm), ["Loukianos", "Lucian"]);
 });
 
+test("window anchor candidates use the Korean profile instead of falling back to undetermined text", () => {
+  const source = "\ub77c\uc628 \uc7a5\uad70\uc740 \uc131\uc73c\ub85c \ud5a5\ud588\ub2e4. \ub77c\uc628 \uc7a5\uad70\uc740 \uc131\uc8fc\ub97c \ub9cc\ub0ac\ub2e4.";
+  const candidates = collectWindowAnchorCandidates(
+    [block(source, 0)],
+    [block(source, 0)],
+    [],
+    [],
+    getSourceLanguageProfile("ko"),
+  );
+
+  assert.ok(candidates.some((candidate) => candidate.sourceForm === "\ub77c\uc628"));
+  assert.ok(candidates.length <= 24);
+});
+
 test("Pi lexical anchor decisions become run-local stable terms", async () => {
   const candidates = collectRepeatedAnchorCandidates([
     block("The Conciliator spoke. Typhon opposed the Conciliator."),

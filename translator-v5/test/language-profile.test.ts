@@ -5,15 +5,92 @@ import {
   getSourceLanguageProfile,
   supportedSourceLanguageIds,
 } from "../src/language/profiles.js";
+import { detectLanguage } from "../src/source/language-detector.js";
+import { annotateStructure } from "../src/source/structure-annotator.js";
 
 test("language profile registry resolves supported ids deterministically", () => {
   assert.deepEqual(supportedSourceLanguageIds(), [
-    "de", "en", "es", "fr", "ja", "ru", "und",
+    "de", "en", "es", "fr", "ja", "ko", "ru", "und",
   ]);
   assert.equal(getSourceLanguageProfile("en-US").id, "en");
   assert.equal(getSourceLanguageProfile("fr").id, "fr");
+  assert.equal(getSourceLanguageProfile("ko-KR").id, "ko");
   assert.equal(getSourceLanguageProfile("unknown").id, "und");
   assert.equal(getSourceLanguageProfile("EN"), getSourceLanguageProfile("en"));
+});
+
+test("Korean is detected independently of undetermined text", () => {
+  const source = "\ud55c\uad6d\uc5b4 \ubb38\uc7a5\uc785\ub2c8\ub2e4. \uc774\uac83\uc740 \uc790\uc5f0\uc2a4\ub7ec\uc6b4 \ud14c\uc2a4\ud2b8\uc785\ub2c8\ub2e4. ".repeat(8);
+  const detected = detectLanguage(source);
+
+  assert.equal(detected?.id, "ko");
+  assert.ok((detected?.confidence ?? 0) >= 0.8);
+});
+
+test("Japanese and Korean profiles expose headings, sentence boundaries, and bounded candidates", () => {
+  const japanese = getSourceLanguageProfile("ja");
+  const korean = getSourceLanguageProfile("ko");
+  const japaneseVolume = "\u7532\u6e90\u4e00\u5200\u6d41\u306e\u5dfb";
+  const japaneseChapter = "\u7b2c\u5341\u4e8c\u7ae0";
+  const koreanChapter = "\uc81c2\uc7a5";
+  const koreanVolume = "\uc81c1\uad8c";
+
+  assert.equal(japanese.detectStructureHeading(japaneseVolume)?.kind, "volume_heading");
+  assert.equal(japanese.detectStructureHeading(japaneseChapter)?.kind, "chapter_heading");
+  assert.equal(korean.detectStructureHeading(koreanChapter)?.kind, "chapter_heading");
+  assert.equal(korean.detectStructureHeading(koreanVolume)?.kind, "volume_heading");
+  assert.deepEqual(
+    annotateStructure(`${japaneseChapter}\n${japaneseVolume}`, "source-ja", japanese)
+      .map((annotation) => annotation.kind),
+    ["chapter_heading", "volume_heading"],
+  );
+
+  const japaneseText = "\u5f7c\u306f\u7b11\u3063\u305f\u3002\u305d\u3057\u3066\u53bb\u3063\u305f\u3002";
+  const japaneseFirstEnd = [...japaneseText.slice(0, japaneseText.indexOf("\u3002") + 1)].length;
+  const koreanText = "\uccab \ubb38\uc7a5\uc774\ub2e4. \ub2e4\uc74c \ubb38\uc7a5\uc774\ub2e4.";
+  const koreanFirstEnd = [...koreanText.slice(0, koreanText.indexOf(".") + 1)].length;
+  assert.ok(japanese.collectBoundaryCandidates(japaneseText)
+    .some((candidate) => candidate.kind === "sentence" && candidate.scalarOffset === japaneseFirstEnd));
+  assert.ok(korean.collectBoundaryCandidates(koreanText)
+    .some((candidate) => candidate.kind === "sentence" && candidate.scalarOffset === koreanFirstEnd));
+
+  const japaneseCandidates = japanese.collectAnchorCandidates({
+    targetTexts: ["\u30a2\u30ab\u30cd\u306f\u971c\u5cf6\u57ce\u3078\u5411\u304b\u3063\u305f\u3002\u30a2\u30ab\u30cd\u306f\u57ce\u4e3b\u3068\u8a71\u3057\u305f\u3002"],
+    corpusTexts: ["\u30a2\u30ab\u30cd\u306f\u971c\u5cf6\u57ce\u3078\u5411\u304b\u3063\u305f\u3002\u30a2\u30ab\u30cd\u306f\u57ce\u4e3b\u3068\u8a71\u3057\u305f\u3002"],
+  });
+  const koreanCandidates = korean.collectAnchorCandidates({
+    targetTexts: ["\ub77c\uc628 \uc7a5\uad70\uc740 \uc131\uc73c\ub85c \ud5a5\ud588\ub2e4. \ub77c\uc628 \uc7a5\uad70\uc740 \uc131\uc8fc\ub97c \ub9cc\ub0ac\ub2e4."],
+    corpusTexts: ["\ub77c\uc628 \uc7a5\uad70\uc740 \uc131\uc73c\ub85c \ud5a5\ud588\ub2e4. \ub77c\uc628 \uc7a5\uad70\uc740 \uc131\uc8fc\ub97c \ub9cc\ub0ac\ub2e4."],
+  });
+  assert.ok(japaneseCandidates.some((candidate) => candidate.sourceForm === "\u30a2\u30ab\u30cd"));
+  assert.ok(koreanCandidates.some((candidate) => candidate.sourceForm === "\ub77c\uc628"));
+  assert.ok(japaneseCandidates.length <= 24);
+  assert.ok(koreanCandidates.length <= 24);
+});
+
+test("Kana and Hangul prose residue is detected without treating Han alone as Japanese", () => {
+  const japanese = getSourceLanguageProfile("ja");
+  const korean = getSourceLanguageProfile("ko");
+
+  assert.ok(japanese.detectSourceResidue("\u4e2d\u6587 \u30ab\u30ca\u30c8\u30b9\u30c8 \u304c\u6b8b\u3063\u305f")
+    .some((finding) => finding.script === "kana"));
+  assert.ok(korean.detectSourceResidue("\u4e2d\u6587 \ub77c\uc628\uc774 \ud55c\uad6d\uc5b4\ub85c \ub0a8\uc558\ub2e4")
+    .some((finding) => finding.script === "hangul"));
+  assert.deepEqual(japanese.detectSourceResidue("\u7eaf\u4e2d\u6587\u6c49\u5b57"), []);
+});
+
+test("CJK candidate projection remains capped at twenty-four even when callers request more", () => {
+  const korean = getSourceLanguageProfile("ko");
+  const names = Array.from({ length: 30 }, (_, index) => (
+    `${String.fromCodePoint(0xac00 + index)}\uc628`
+  )).flatMap((name) => [name, name]).join(" ");
+  const candidates = korean.collectAnchorCandidates({
+    targetTexts: [names],
+    corpusTexts: [names],
+    limit: 100,
+  });
+
+  assert.equal(candidates.length, 24);
 });
 
 test("language profiles classify their own structure headings", () => {

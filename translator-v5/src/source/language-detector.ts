@@ -25,6 +25,10 @@ function detectScriptLanguage(sample: string): DetectedLanguage | undefined {
   if (letters < 12) {
     return undefined;
   }
+  const hangul = countMatches(sample, /\p{Script=Hangul}/gu);
+  if (hangul >= 8 && hangul / letters >= 0.2) {
+    return { id: "ko", confidence: confidence(hangul, letters) };
+  }
   const kana = countMatches(sample, /[\p{Script=Hiragana}\p{Script=Katakana}]/gu);
   if (kana >= 8 && kana / letters >= 0.2) {
     return { id: "ja", confidence: confidence(kana, letters) };

@@ -217,6 +217,21 @@ test("source language profile participates in new source identity", () => {
   }
 });
 
+test("Korean source language manifests reopen with their normalized profile", () => {
+  const fixture = ledgerFixture("\ub77c\uc628\uc740 \uc131\uc73c\ub85c \ud5a5\ud588\ub2e4.", { sourceLanguage: "ko-KR" });
+  try {
+    const first = SourceLedger.open(fixture.manifestPath);
+    const reopened = SourceLedger.open(fixture.manifestPath);
+
+    assert.equal(first.sourceLanguage, "ko");
+    assert.equal(first.languageProfile.id, "ko");
+    assert.equal(first.sourceLanguageCompatibilityMode, false);
+    assert.equal(reopened.sourceVersion, first.sourceVersion);
+  } finally {
+    rmSync(fixture.directory, { recursive: true, force: true });
+  }
+});
+
 test("legacy manifest keeps its old identity while loading English compatibility", () => {
   const fixture = ledgerFixture("Legacy source.");
   try {

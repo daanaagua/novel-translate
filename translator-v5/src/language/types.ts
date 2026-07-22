@@ -1,5 +1,22 @@
 import type { StructureKind } from "../source/types.js";
 
+export type SourceScript = "latin" | "cyrillic" | "kana" | "hangul" | "han" | "unknown";
+
+export interface BoundaryCandidate {
+  scalarOffset: number;
+  weight: number;
+  kind: "paragraph" | "sentence" | "heading";
+}
+
+export interface ScriptStats {
+  scalars: number;
+  latin: number;
+  han: number;
+  kana: number;
+  hangul: number;
+  other: number;
+}
+
 export interface StructureHeading {
   kind: Extract<StructureKind, "volume_heading" | "chapter_heading">;
   title: string;
@@ -39,7 +56,7 @@ export interface ResidueFinding {
   form: string;
   start: number;
   end: number;
-  script: "latin" | "cyrillic" | "kana" | "unknown";
+  script: "latin" | "cyrillic" | "kana" | "hangul" | "unknown";
 }
 
 export interface SourceLanguageProfile {
@@ -47,7 +64,10 @@ export interface SourceLanguageProfile {
   readonly version: string;
   readonly displayName: string;
   readonly locale: string;
+  readonly scripts: readonly SourceScript[];
   detectStructureHeading(line: string): StructureHeading | null;
+  collectBoundaryCandidates(text: string): BoundaryCandidate[];
+  collectScriptStats(text: string): ScriptStats;
   segment(text: string): SourceToken[];
   normalizeSourceForm(text: string): string;
   collectAnchorCandidates(input: AnchorCandidateInput): ProfileAnchorCandidate[];
