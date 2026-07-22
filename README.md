@@ -118,6 +118,67 @@ npm.cmd run folioloom -- book run `
 
 每次运行都会把**生效后的**文风配置哈希写入 SQLite metadata。恢复已有运行时，必须继续传入能产生相同生效配置的 `--style-profile` 和/或 `--prompt`；配置发生变化时，FolioLoom 会拒绝恢复，防止一本书的后半段悄悄换一种文风。若需要尝试新文风，请使用新的状态库（`--store`）开启新运行。
 
+## 导入术语表
+
+术语表是给已经明确的译名、别名和称谓规则准备的“用户种子”，不是另一份需要模型全文阅读的提示词。FolioLoom 会在本地按源语言词元规则定位这些形式；这一步不调用模型，也不消耗 API token。翻译时，只有当前请求原文中实际出现的导入术语会进入模型上下文，既有叙事记忆和模型已确认的锚点仍按原有方式维持全局连续性。
+
+最简单的 JSON 可以直接写成“原文形式 → 默认译法”：
+
+```json
+{
+  "Severian": "塞万里安",
+  "Typhon": "提丰"
+}
+```
+
+需要处理别形或中文语境差异时，使用结构化格式；可复制 [`config/glossary.example.json`](config/glossary.example.json)：
+
+```json
+{
+  "schema": "folioloom-glossary-1",
+  "terms": [
+    {
+      "source": "Severian",
+      "target": "塞万里安",
+      "policy": "locked",
+      "forms": ["Severian's"]
+    },
+    {
+      "source": "Archon",
+      "target": "执政官",
+      "policy": "contextual",
+      "note": "作为官职时译为“执政官”；直接呼告时可按中文语境译为“阁下”。"
+    }
+  ]
+}
+```
+
+三种 `policy` 的区别：
+
+- `locked`：在命中该原文形式的块中，校验器要求使用指定译法；适合已经确定的专名。
+- `preferred`：默认策略，作为首选译法提供给模型，但不把所有语境冻结为一个字面形式。
+- `contextual`：提供译名与说明，不启用字面硬锁；适合官职、敬语和中文必须随句法变化的称谓。
+
+先运行无模型的检查，查看每个词命中了哪些 `globalIndex`，以及有哪些形式在原文中尚未命中：
+
+```powershell
+npm.cmd run folioloom -- book doctor `
+  --manifest ..\projects\my_book\source_manifest.json `
+  --glossary ..\config\glossary.json
+```
+
+确认报告后，把同一份表传给正式运行：
+
+```powershell
+npm.cmd run folioloom -- book run `
+  --manifest ..\projects\my_book\source_manifest.json `
+  --store ..\projects\my_book\artifacts\folioloom\book.db `
+  --config ..\config\config.yaml `
+  --glossary ..\config\glossary.json
+```
+
+术语表会被规范化后计算语义哈希并写入 run metadata。恢复同一 run 时必须继续提供语义相同的 `--glossary`；只调整 JSON 空白、对象键顺序、术语数组顺序或文件路径不影响恢复，修改原文形式、译法、策略、别形或注释则会被拒绝。若要换一份术语表，请使用新的 `--store` 开始新 run。
+
 ## V1.0 命令
 
 所有命令在 `translator-v5/` 中执行。
