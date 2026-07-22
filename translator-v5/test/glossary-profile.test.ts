@@ -165,4 +165,23 @@ test("hashes semantic glossary content deterministically and rejects ambiguous i
     }],
     glossaryPath: writeGlossary({ Typhon: "提丰" }),
   }), /glossary conflicts with existing stable term/i);
+  assert.throws(() => loadGlossary({
+    ...common,
+    existingStableTerms: [{
+      conceptId: "legacy-typhon-conflict",
+      lexemeId: "legacy-typhon-conflict-form",
+      sourceForm: "Typhon",
+      canonicalSource: "Typhon",
+      target: "泰丰",
+      locked: true,
+    }, {
+      conceptId: "legacy-typhon-match",
+      lexemeId: "legacy-typhon-match-form",
+      sourceForm: "Typhon",
+      canonicalSource: "Typhon",
+      target: "提丰",
+      locked: true,
+    }],
+    glossaryPath: writeGlossary({ Typhon: "提丰" }),
+  }), /glossary conflicts with existing stable term/i);
 });

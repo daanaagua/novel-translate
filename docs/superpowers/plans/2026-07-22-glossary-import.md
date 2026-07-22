@@ -126,7 +126,7 @@ const establishedTerms = uniqueTerms([
 
 await runTranslationBatch({
   // existing input
-  stableTerms: termsForWindows(activeTerms, request.windows, blockById, context, options.glossary),
+  stableTerms: termsForWindows(activeTerms, request.windows, context, options.glossary),
 });
 ```
 

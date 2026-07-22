@@ -335,15 +335,20 @@ function assertNoExistingConflict(
   existing: readonly StableTerm[],
   profile: SourceLanguageProfile,
 ): void {
-  const existingByForm = new Map<string, StableTerm>();
+  const existingByForm = new Map<string, Set<string>>();
   for (const term of existing) {
-    existingByForm.set(profile.normalizeSourceForm(term.sourceForm), term);
+    const normalized = profile.normalizeSourceForm(term.sourceForm);
+    const targets = existingByForm.get(normalized) ?? new Set<string>();
+    targets.add(term.target);
+    existingByForm.set(normalized, targets);
   }
   for (const term of terms) {
-    const previous = existingByForm.get(profile.normalizeSourceForm(term.sourceForm));
-    if (previous !== undefined && previous.target !== term.target) {
+    const previousTargets = existingByForm.get(profile.normalizeSourceForm(term.sourceForm));
+    const conflictingTarget = [...(previousTargets ?? [])]
+      .find((target) => target !== term.target);
+    if (conflictingTarget !== undefined) {
       throw new Error(
-        `glossary conflicts with existing stable term for ${term.sourceForm}: ${previous.target} != ${term.target}`,
+        `glossary conflicts with existing stable term for ${term.sourceForm}: ${conflictingTarget} != ${term.target}`,
       );
     }
   }

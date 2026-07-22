@@ -755,7 +755,6 @@ function sourceBlocksForWindows(
 function termsForWindows(
   terms: readonly StableTerm[],
   windows: readonly Pick<PersistedLosslessWindow, "blockIds" | "globalIndexes">[],
-  blockById: ReadonlyMap<string, BookContext["losslessBlocks"][number]>,
   context: BookContext,
   glossary: LoadedGlossary | undefined,
 ): StableTerm[] {
@@ -1030,7 +1029,6 @@ async function runLosslessBook(
       const anchorStableTerms = termsForWindows(
         establishedTerms,
         selected,
-        blockById,
         context,
         options.glossary,
       );
@@ -1151,7 +1149,6 @@ async function runLosslessBook(
               stableTerms: termsForWindows(
                 activeTerms,
                 request.windows,
-                blockById,
                 context,
                 options.glossary,
               ),
