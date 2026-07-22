@@ -41,14 +41,16 @@ flowchart LR
   R["React 渲染进程\n文稿工作台"] -->|"严格 IPC 合约"| M["Electron 主进程"]
   M --> S["Desktop project service"]
   S --> L["SourceLedger / doctorBook\n只读原文检查"]
-  S --> D["LosslessBookStore\n只读状态投影"]
+  S --> D["LosslessBookStore.openReadOnly()\n只读状态投影"]
   L --> F["source_manifest.json"]
   D --> B["book.db（可选）"]
 ```
 
 Electron 主进程是唯一能接触文件系统与 V5 核心的进程。渲染进程只能通过预加载脚本暴露的、固定形状的 IPC 调用取得可序列化的 `DesktopProjectSnapshot` 和 `DoctorReport`；它不能执行任意文件路径、Shell 命令、SQL 或网络请求。
 
-新桌面服务从 `SourceLedger`、`doctorBook` 与 `LosslessBookStore` 建立只读投影，而不是解析 CLI 的终端文本。已有 CLI 仍是 V5 的命令行入口；桌面服务是同一内核的第二个适配器。
+新桌面服务从 `SourceLedger`、`doctorBook` 与 `LosslessBookStore.openReadOnly()` 建立只读投影，而不是解析 CLI 的终端文本。已有 CLI 仍是 V5 的命令行入口；桌面服务是同一内核的第二个适配器。
+
+现有 `LosslessBookStore` 构造器会创建父目录并设置 WAL，不能被 GUI 当作只读读取器直接使用。核心因此新增显式的 `openReadOnly(path)` 工厂：以 Node `DatabaseSync` 的 `readOnly: true` 打开已存在数据库、跳过目录创建与 `journal_mode=WAL` 写入，随后复用现有 run、窗口与状态查询。任何写入方法仍会因 SQLite 只读连接失败；桌面服务只调用读取方法并始终关闭连接。
 
 ## 数据与交互
 
@@ -74,7 +76,7 @@ Electron 主进程是唯一能接触文件系统与 V5 核心的进程。渲染�
 
 - 预加载脚本开启 `contextIsolation`，关闭渲染进程 Node 集成；只暴露最小 API。
 - 所有 IPC 请求使用判别式请求类型和路径后缀校验；主进程把错误转换为稳定、可显示的结构化结果。
-- SQLite 只以只读方式打开。任何缺失、歧义 run、源版本不匹配或数据库损坏都显示为不可继续状态，不能由 GUI 自动“修复”。
+- SQLite 只通过 `LosslessBookStore.openReadOnly()` 打开。任何缺失、歧义 run、源版本不匹配或数据库损坏都显示为不可继续状态，不能由 GUI 自动“修复”。
 - 当前阶段不读取 `config.yaml` 中的 API Key，不从 OpenCode 认证文件加载密钥，也不向渲染进程暴露密钥。
 
 ## 便携版准备
@@ -87,6 +89,7 @@ Electron 主进程是唯一能接触文件系统与 V5 核心的进程。渲染�
 
 自动测试覆盖：
 
+- `LosslessBookStore.openReadOnly()` 不创建缺失路径、不设置 WAL 且保留既有状态查询；
 - desktop snapshot 对无状态项目、单一 run、多个 run 和损坏 store 的可预测投影；
 - IPC 路由只允许定义的请求，并拒绝越界、目录和错误后缀输入；
 - `doctor` 适配器保持无模型调用，并保留现有 glossary 报告；
