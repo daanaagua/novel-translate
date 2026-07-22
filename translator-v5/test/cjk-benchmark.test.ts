@@ -38,6 +38,18 @@ test("benchmark selects complete paragraphs and reports hashes without prose", (
   assert.doesNotMatch(JSON.stringify(report), /fixture-api-key/u);
 });
 
+test("benchmark prefers the first complete paragraph after its target over a later open quote", () => {
+  const source = `前言。\n\n${"甲".repeat(18)}。\n\n\"${"乙".repeat(18)}. 仍在同一引语中\"\n\n结尾。`;
+  const sample = selectBenchmarkSample(source, 20, {
+    language: "ko",
+    maxOvershootScalars: 26,
+  });
+
+  assert.equal(sample.selectionBoundary, "paragraph");
+  assert.ok(sample.text.endsWith("。\n\n"));
+  assert.equal(sample.text.includes("\""), false);
+});
+
 test("benchmark normalizes a UTF-8 BOM and uses Unicode scalar coordinates", () => {
   const sample = selectBenchmarkSample("\uFEFFA😀。\n\nB。", 100, { language: "ja" });
 

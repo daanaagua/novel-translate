@@ -253,31 +253,42 @@ function requirePositiveSafeInteger(value: number, label: string): number {
   return value;
 }
 
-function lastParagraphEndUtf16(text: string): number | undefined {
-  let latest: number | undefined;
+function paragraphEndsUtf16(text: string): number[] {
+  const ends: number[] = [];
   for (const match of text.matchAll(/(?:\r\n|\r|\n)[ \t]*(?:(?:\r\n|\r|\n)[ \t]*)+/gu)) {
     if (match.index !== undefined) {
-      latest = match.index + match[0].length;
+      ends.push(match.index + match[0].length);
     }
   }
-  return latest;
+  return ends;
 }
 
-function lastSentenceEndUtf16(text: string): number | undefined {
-  let latest: number | undefined;
+function sentenceEndsUtf16(text: string): number[] {
+  const ends: number[] = [];
   for (const match of text.matchAll(/[.!?。！？](?:["'”’」』）】〕])*/gu)) {
     if (match.index !== undefined) {
-      latest = match.index + match[0].length;
+      ends.push(match.index + match[0].length);
     }
   }
-  return latest;
+  return ends;
 }
 
 function chooseBoundary(
   prefix: string,
+  targetUtf16: number,
 ): { utf16Offset: number; boundary: Exclude<BenchmarkSelectionBoundary, "whole_source" | "cap"> } | undefined {
-  const paragraph = lastParagraphEndUtf16(prefix);
-  const sentence = lastSentenceEndUtf16(prefix);
+  const paragraphs = paragraphEndsUtf16(prefix);
+  const sentences = sentenceEndsUtf16(prefix);
+  const paragraphAfterTarget = paragraphs.find((offset) => offset >= targetUtf16);
+  if (paragraphAfterTarget !== undefined) {
+    return { utf16Offset: paragraphAfterTarget, boundary: "paragraph" };
+  }
+  const sentenceAfterTarget = sentences.find((offset) => offset >= targetUtf16);
+  if (sentenceAfterTarget !== undefined) {
+    return { utf16Offset: sentenceAfterTarget, boundary: "sentence" };
+  }
+  const paragraph = paragraphs.at(-1);
+  const sentence = sentences.at(-1);
   if (paragraph === undefined && sentence === undefined) {
     return undefined;
   }
@@ -445,8 +456,9 @@ export function selectBenchmarkSample(
     targetScalars + maxOvershootScalars,
   );
   const upperBoundUtf16 = utf16OffsetAtScalar(canonicalSource, upperBoundScalars);
+  const targetUtf16 = utf16OffsetAtScalar(canonicalSource, targetScalars);
   const prefix = canonicalSource.slice(0, upperBoundUtf16);
-  const boundary = chooseBoundary(prefix);
+  const boundary = chooseBoundary(prefix, targetUtf16);
   const selectedUtf16End = boundary?.utf16Offset ?? utf16OffsetAtScalar(canonicalSource, targetScalars);
   const selectedScalarCount = scalarOffsetAtUtf16(canonicalSource, selectedUtf16End);
   const text = canonicalSource.slice(0, selectedUtf16End);
