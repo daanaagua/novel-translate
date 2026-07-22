@@ -917,9 +917,53 @@ git status --short
 - [x] 以失败测试锁定 `package.json` 缺少 Electron 主入口的问题，并声明 `"main": "out/main/index.js"`。
 - [x] 使用 `electron-builder --win --x64 --dir` 验证未压缩应用可构建，再启动 `FolioLoom.exe` 确认窗口标题为“FolioLoom · 翻译中”；未生成 portable EXE/ZIP 发布物。
 
+## 任务 6：将 Windows 系统控制按钮融入暗色工作台
+
+**文件：**
+
+- 修改：`translator-v5/src/desktop/main/runtime.ts`
+- 修改：`translator-v5/src/desktop/main/index.ts`
+- 修改：`translator-v5/test/desktop-main-security.test.ts`
+- 创建：`translator-v5/src/desktop/renderer/src/components/WindowTitlebar.tsx`
+- 修改：`translator-v5/src/desktop/renderer/src/App.tsx`
+- 修改：`translator-v5/src/desktop/renderer/src/App.test.tsx`
+- 修改：`translator-v5/src/desktop/renderer/src/styles.css`
+
+- [ ] **步骤 1：先写窗口外观与渲染标题栏的失败测试**
+
+在 `desktop-main-security.test.ts` 断言纯函数 `desktopWindowChrome()` 返回 `applicationMenu: null`、`titleBarStyle: "hidden"`、42px 暗色 `titleBarOverlay` 与 `autoHideMenuBar: true`。在 `App.test.tsx` 断言页面存在“FolioLoom · 翻译中”的 `banner`，且不出现 `File / Edit / View / Window`。
+
+- [ ] **步骤 2：运行定向测试并确认因 API 与标题栏缺失而失败**
+
+运行：
+
+```powershell
+Set-Location translator-v5
+node --test --import tsx test/desktop-main-security.test.ts
+npx.cmd vitest run --config vitest.desktop.config.ts src/desktop/renderer/src/App.test.tsx
+```
+
+- [ ] **步骤 3：实现 Electron 原生 overlay 与 42px 拖拽栏**
+
+`desktopWindowChrome()` 返回唯一窗口外观契约；`index.ts` 将其 `applicationMenu` 交给 `Menu.setApplicationMenu()`，并把 `windowOptions` 展开到 `BrowserWindow`。不使用 `frame: false`，不新增窗口控制 IPC。渲染层新增无交互的 `WindowTitlebar`，工作台改为标题栏/侧栏/主内容三个 grid area；标题栏使用 `-webkit-app-region: drag`，右侧为系统按钮保留空间。
+
+- [ ] **步骤 4：验证定向测试、完整桌面测试、类型检查与 production build**
+
+```powershell
+npm.cmd run desktop:test
+npm.cmd run desktop:typecheck
+npm.cmd test
+npm.cmd run typecheck
+npm.cmd run desktop:build
+```
+
+- [ ] **步骤 5：启动本地窗口，确认暗色标题栏、系统按钮和菜单移除后提交**
+
+启动 production build，确认窗口仍能拖动、最小化、最大化和关闭，且不显示白色标题栏或默认应用菜单；退出全部 FolioLoom 进程后提交。
+
 ## 计划自检
 
-- **规格覆盖：** 任务 1 实现真实只读 SQLite；任务 2 读取 manifest、真实 run 与无模型 doctor；任务 3 限制 Electron 安全边界和文件选择；任务 4 实现“翻译中”的文稿工作台、真实数据及诚实空态；任务 5 配置 Windows x64 portable 元数据、开发命令、自动验证和人工验收。
+- **规格覆盖：** 任务 1 实现真实只读 SQLite；任务 2 读取 manifest、真实 run 与无模型 doctor；任务 3 限制 Electron 安全边界和文件选择；任务 4 实现“翻译中”的文稿工作台、真实数据及诚实空态；任务 5 配置 Windows x64 portable 元数据、开发命令、自动验证和人工验收；任务 6 使用原生 overlay 融合窗口控制并移除默认菜单。
 - **非目标保护：** 所有任务都不引入模型 provider、API Key 读取、翻译运行、SQLite 写操作、知识库编辑、Python 导入侧车、自动更新或发布二进制。
 - **类型一致性：** 渲染器唯一依赖 `FolioLoomDesktopApi` 和 `DesktopResult<T>`；IPC、项目服务和测试使用同一份 `DesktopProjectSnapshot`、`DesktopDoctorReport`、`DesktopProjectRequest` 声明；`LosslessBookStore.openReadOnly()` 是唯一桌面状态库入口。
 - **占位符检查：** 本计划的文件、函数、状态字面量、测试命令、Builder 配置、文案和提交信息均已明确，不依赖未命名的实现步骤。
