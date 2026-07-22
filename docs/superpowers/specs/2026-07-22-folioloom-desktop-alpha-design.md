@@ -97,3 +97,9 @@ Electron 主进程是唯一能接触文件系统与 V5 核心的进程。渲染�
 - production renderer 与 Electron 主进程可完成一次本地构建。
 
 人工验收：开发模式启动后，用户能选中一个现有 manifest、看见真实项目概览、运行 doctor、切换工作区；窗口视觉保持已确认的文稿工作台方向，且不包含已删除的引语。
+
+## Windows 融合标题栏补充（2026-07-22）
+
+Windows 桌面窗口采用 Electron 原生标题栏叠加方案，而不是无边框窗口与自绘控制按钮。`BrowserWindow` 使用 `titleBarStyle: "hidden"` 和高度 42px 的暗色 `titleBarOverlay`，保留系统提供的最小化、最大化、关闭、窗口贴靠与无障碍行为；渲染层提供同高的深色拖拽区域，并在左侧低调显示“FolioLoom · 翻译中”。
+
+默认 `File / Edit / View / Window` 应用菜单完全移除。实现不得为窗口按钮新增 IPC channel，不得使用 `frame: false`，也不得让拖拽区域覆盖右上角系统按钮或页面中的可交互控件。自动测试锁定窗口选项、菜单移除和渲染层标题栏；production build 后以 Windows 窗口烟雾检查确认白色原生栏与菜单不再出现。
