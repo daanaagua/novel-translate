@@ -17,7 +17,7 @@
 - 创建：`translator-v5/test/glossary-profile.test.ts`
 - 修改：`translator-v5/src/domain/types.ts`
 
-- [ ] **步骤 1：编写失败的术语表加载测试**
+- [x] **步骤 1：编写失败的术语表加载测试**
 
 ```ts
 test("loads simple and structured glossary entries with aliases", () => {
@@ -41,13 +41,13 @@ test("uses profile tokens instead of substring matching", () => {
 });
 ```
 
-- [ ] **步骤 2：运行定向测试并确认红灯**
+- [x] **步骤 2：运行定向测试并确认红灯**
 
 运行：`node --test --import tsx test/glossary-profile.test.ts`
 
 预期：失败，原因是 `glossary-profile.ts` 尚不存在。
 
-- [ ] **步骤 3：实现最小加载器与扩展术语类型**
+- [x] **步骤 3：实现最小加载器与扩展术语类型**
 
 ```ts
 export type StableTermPolicy = "locked" | "preferred" | "contextual";
@@ -69,13 +69,13 @@ export function loadGlossary(input: LoadGlossaryInput): LoadedGlossary {
 
 解析器只接受最简映射或 `folioloom-glossary-1` 结构，严格检查字段和容量上限；`locateTerms()` 使用 profile 词元序列，而不是 `includes()`。
 
-- [ ] **步骤 4：运行定向测试并确认绿灯**
+- [x] **步骤 4：运行定向测试并确认绿灯**
 
 运行：`node --test --import tsx test/glossary-profile.test.ts`
 
 预期：所有术语表加载、规范化、哈希、限制和冲突测试通过。
 
-- [ ] **步骤 5：提交独立变更**
+- [x] **步骤 5：提交独立变更**
 
 ```bash
 git add translator-v5/src/domain/types.ts translator-v5/src/glossary/glossary-profile.ts translator-v5/test/glossary-profile.test.ts

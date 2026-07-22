@@ -27,6 +27,8 @@ export interface V4Block {
   tokenCount: number;
 }
 
+export type StableTermPolicy = "locked" | "preferred" | "contextual";
+
 export interface StableTerm {
   conceptId: string;
   lexemeId: string;
@@ -34,6 +36,9 @@ export interface StableTerm {
   canonicalSource: string;
   target: string;
   locked: boolean;
+  policy?: StableTermPolicy;
+  note?: string;
+  origin?: "legacy" | "knowledge" | "glossary";
 }
 
 export interface EvidenceHit {
