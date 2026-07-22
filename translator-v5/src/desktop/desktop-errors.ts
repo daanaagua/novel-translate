@@ -64,6 +64,16 @@ const PUBLIC_ERRORS: Readonly<Record<string, PublicErrorDefinition>> = Object.fr
     nextAction: "请重新选择正确的编码后导入。",
     retryable: false,
   },
+  SOURCE_ENCODING_AMBIGUOUS: {
+    message: "无法确定书稿的文字编码",
+    nextAction: "请从程序给出的候选编码中选择一种，或重新选择书稿。",
+    retryable: false,
+  },
+  SOURCE_ENCODING_UNSUPPORTED: {
+    message: "无法读取这份书稿的文字编码",
+    nextAction: "请先把书稿转换为 UTF-8、Shift-JIS、EUC-JP、EUC-KR 或 CP949 后重试。",
+    retryable: false,
+  },
   DESKTOP_TRIAL_ALREADY_RUNNING: {
     message: "这本书正在试译",
     nextAction: "请等待当前试译结束，或先取消它。",

@@ -42,6 +42,33 @@ export interface DesktopProjectSnapshot {
   runSelection: "none" | "selected" | "required";
 }
 
+export type DesktopSourceEncoding =
+  | "utf-8"
+  | "utf-16le"
+  | "utf-16be"
+  | "utf-32le"
+  | "utf-32be"
+  | "shift_jis"
+  | "euc-jp"
+  | "euc-kr"
+  | "windows-949";
+
+export interface DesktopSourceEncodingRequired {
+  status: "encoding_required";
+  pendingImportId: string;
+  fileName: string;
+  encodings: readonly DesktopSourceEncoding[];
+}
+
+export type DesktopChooseSourceResult =
+  | { status: "ready"; project: DesktopProjectSnapshot }
+  | DesktopSourceEncodingRequired;
+
+export interface DesktopConfirmSourceEncodingRequest {
+  pendingImportId: string;
+  encoding: DesktopSourceEncoding;
+}
+
 export interface DesktopDoctorReport {
   sourceVersion: string;
   sourceChars: number;

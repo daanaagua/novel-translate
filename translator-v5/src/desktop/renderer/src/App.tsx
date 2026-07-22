@@ -1,6 +1,9 @@
 import { useEffect, useMemo, useState, type JSX } from "react";
 
 import type {
+  DesktopChooseSourceResult,
+  DesktopSourceEncoding,
+  DesktopSourceEncodingRequired,
   DesktopDiscoverModelsRequest,
   DesktopError,
   DesktopModelOption,
@@ -41,6 +44,7 @@ function unavailableResult<T = never>(): DesktopResult<T> {
 function unavailableApi(): FolioLoomDesktopApi {
   return {
     chooseSource: async () => unavailableResult(),
+    confirmSourceEncoding: async () => unavailableResult(),
     getOnboardingState: async () => unavailableResult(),
     discoverModels: async () => unavailableResult(),
     testModel: async () => unavailableResult(),
@@ -79,6 +83,7 @@ export function App({ api }: AppProps): JSX.Element {
   const [operationError, setOperationError] = useState<DesktopError>();
   const [trialProgress, setTrialProgress] = useState<DesktopTrialProgress>();
   const [trialResult, setTrialResult] = useState<DesktopTrialResult>();
+  const [pendingEncoding, setPendingEncoding] = useState<DesktopSourceEncodingRequired>();
 
   function acceptOnboarding(result: DesktopResult<DesktopOnboardingState>): boolean {
     if (!result.ok) {
@@ -108,8 +113,33 @@ export function App({ api }: AppProps): JSX.Element {
     setTrialProgress(progress);
   }), [desktopApi]);
 
+  async function acceptSourceChoice(
+    choice: DesktopChooseSourceResult,
+  ): Promise<void> {
+    if (choice.status === "encoding_required") {
+      setPendingEncoding(choice);
+      setOperationError(undefined);
+      return;
+    }
+    setPendingEncoding(undefined);
+    const stateResult = await desktopApi.getOnboardingState();
+    if (!stateResult.ok) {
+      setOnboarding((current) => ({
+        ...current,
+        project: choice.project,
+        readiness: { ...current.readiness, source: true, trial: false },
+      }));
+      setOperationError(stateResult.error);
+      return;
+    }
+    acceptOnboarding(stateResult);
+    setTrialProgress(undefined);
+    setTrialResult(undefined);
+  }
+
   async function chooseSource(): Promise<void> {
     setActiveWorkspace("overview");
+    setPendingEncoding(undefined);
     setBusyAction("choose-source");
     try {
       const sourceResult = await desktopApi.chooseSource();
@@ -118,20 +148,31 @@ export function App({ api }: AppProps): JSX.Element {
         return;
       }
 
-      const stateResult = await desktopApi.getOnboardingState();
-      if (!stateResult.ok) {
-        setOnboarding((current) => ({
-          ...current,
-          project: sourceResult.value,
-          readiness: { ...current.readiness, source: true, trial: false },
-        }));
-        setOperationError(stateResult.error);
+      await acceptSourceChoice(sourceResult.value);
+    } catch (error) {
+      setOperationError(errorFromUnknown(error));
+    } finally {
+      setBusyAction(undefined);
+    }
+  }
+
+  async function confirmSourceEncoding(encoding: DesktopSourceEncoding): Promise<void> {
+    if (pendingEncoding === undefined) return;
+    setBusyAction("confirm-encoding");
+    setOperationError(undefined);
+    try {
+      const result = await desktopApi.confirmSourceEncoding({
+        pendingImportId: pendingEncoding.pendingImportId,
+        encoding,
+      });
+      if (!result.ok) {
+        setPendingEncoding(undefined);
+        setOperationError(result.error);
         return;
       }
-      acceptOnboarding(stateResult);
-      setTrialProgress(undefined);
-      setTrialResult(undefined);
+      await acceptSourceChoice(result.value);
     } catch (error) {
+      setPendingEncoding(undefined);
       setOperationError(errorFromUnknown(error));
     } finally {
       setBusyAction(undefined);
@@ -246,7 +287,9 @@ export function App({ api }: AppProps): JSX.Element {
             operationError={operationError}
             trialProgress={trialProgress}
             trialResult={trialResult}
+            pendingEncoding={pendingEncoding}
             onChooseSource={chooseSource}
+            onConfirmSourceEncoding={confirmSourceEncoding}
             onDiscoverModels={discoverModels}
             onTestModel={testModel}
             onForgetCredential={forgetCredential}

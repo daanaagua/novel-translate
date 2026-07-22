@@ -3,6 +3,7 @@ import { cleanup, render, screen, waitFor } from "@testing-library/react";
 import { userEvent } from "@testing-library/user-event";
 
 import type {
+  DesktopChooseSourceResult,
   DesktopOnboardingState,
   DesktopProjectSnapshot,
   DesktopResult,
@@ -156,6 +157,7 @@ function testResult(onboarding: DesktopOnboardingState = readyOnboarding): Deskt
 function createApi(overrides: Partial<FolioLoomDesktopApi> = {}): FolioLoomDesktopApi {
   return {
     chooseSource: vi.fn().mockResolvedValue(failure("DESKTOP_SELECTION_CANCELLED", "已取消选择")),
+    confirmSourceEncoding: vi.fn().mockResolvedValue(failure("DESKTOP_INPUT_INVALID", "编码确认已失效")),
     getOnboardingState: vi.fn().mockResolvedValue(ok(emptyOnboarding)),
     discoverModels: vi.fn().mockResolvedValue(ok([])),
     testModel: vi.fn().mockResolvedValue(ok(testResult())),
@@ -198,7 +200,10 @@ describe("FolioLoom desktop onboarding", () => {
 
   it("uses the visible manuscript button to call the desktop bridge and advance to model setup", async () => {
     const user = userEvent.setup();
-    const chooseSource = vi.fn().mockResolvedValue(ok(project));
+    const chooseSource = vi.fn().mockResolvedValue(ok({
+      status: "ready",
+      project,
+    } satisfies DesktopChooseSourceResult));
     const getOnboardingState = vi.fn()
       .mockResolvedValueOnce(ok(emptyOnboarding))
       .mockResolvedValueOnce(ok(sourceOnlyOnboarding));
@@ -207,6 +212,37 @@ describe("FolioLoom desktop onboarding", () => {
     await user.click(await screen.findByRole("button", { name: "选择书稿" }));
 
     await waitFor(() => expect(chooseSource).toHaveBeenCalledTimes(1));
+    expect(await screen.findByRole("button", { name: "DeepSeek" })).toBeTruthy();
+  });
+
+  it("keeps an ambiguous source behind an opaque encoding choice before opening the project", async () => {
+    const user = userEvent.setup();
+    const pending: DesktopChooseSourceResult = {
+      status: "encoding_required",
+      pendingImportId: "8f0f8277-ec45-41dc-82e1-55586912908b",
+      fileName: "korean-novel.txt",
+      encodings: ["euc-kr", "windows-949"],
+    };
+    const chooseSource = vi.fn().mockResolvedValue(ok(pending));
+    const confirmSourceEncoding = vi.fn().mockResolvedValue(ok({
+      status: "ready",
+      project,
+    } satisfies DesktopChooseSourceResult));
+    const getOnboardingState = vi.fn()
+      .mockResolvedValueOnce(ok(emptyOnboarding))
+      .mockResolvedValueOnce(ok(sourceOnlyOnboarding));
+    render(<App api={createApi({ chooseSource, confirmSourceEncoding, getOnboardingState })} />);
+
+    await user.click(await screen.findByRole("button", { name: "选择书稿" }));
+    expect(await screen.findByRole("heading", { name: "请选择文字编码" })).toBeTruthy();
+    expect(screen.getByText("korean-novel.txt")).toBeTruthy();
+    expect(document.body.textContent).not.toContain(pending.pendingImportId);
+
+    await user.click(screen.getByRole("button", { name: /EUC-KR/u }));
+    await waitFor(() => expect(confirmSourceEncoding).toHaveBeenCalledWith({
+      pendingImportId: pending.pendingImportId,
+      encoding: "euc-kr",
+    }));
     expect(await screen.findByRole("button", { name: "DeepSeek" })).toBeTruthy();
   });
 

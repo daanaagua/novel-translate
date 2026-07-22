@@ -36,7 +36,7 @@ test("desktop build emits the preload file consumed by the main process", () => 
     },
   });
   assert.ok(exposedApi, "sandboxed preload must expose the desktop bridge");
-  for (const operation of ["chooseSource", "getOnboardingState", "testModel", "startTrial"]) {
+  for (const operation of ["chooseSource", "confirmSourceEncoding", "getOnboardingState", "testModel", "startTrial"]) {
     assert.equal(typeof exposedApi[operation], "function", `missing desktop bridge operation ${operation}`);
   }
   assert.equal(

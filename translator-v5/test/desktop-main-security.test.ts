@@ -128,6 +128,7 @@ test("preload exposes named onboarding operations without a generic IPC or crede
 
   for (const operation of [
     "chooseSource",
+    "confirmSourceEncoding",
     "getOnboardingState",
     "discoverModels",
     "testModel",

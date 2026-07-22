@@ -1,4 +1,6 @@
 import type {
+  DesktopChooseSourceResult,
+  DesktopConfirmSourceEncodingRequest,
   DesktopDiscoverModelsRequest,
   DesktopDoctorReport,
   DesktopModelOption,
@@ -12,7 +14,10 @@ import type {
 } from "../contracts.js";
 
 export interface FolioLoomDesktopApi {
-  chooseSource(): Promise<DesktopResult<DesktopProjectSnapshot>>;
+  chooseSource(): Promise<DesktopResult<DesktopChooseSourceResult>>;
+  confirmSourceEncoding(
+    request: DesktopConfirmSourceEncodingRequest,
+  ): Promise<DesktopResult<DesktopChooseSourceResult>>;
   getOnboardingState(): Promise<DesktopResult<DesktopOnboardingState>>;
   discoverModels(request: DesktopDiscoverModelsRequest): Promise<DesktopResult<readonly DesktopModelOption[]>>;
   testModel(request: DesktopTestModelRequest): Promise<DesktopResult<DesktopTestModelResult>>;

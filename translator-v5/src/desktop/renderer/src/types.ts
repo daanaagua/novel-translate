@@ -1,5 +1,6 @@
 export type BusyAction =
   | "choose-source"
+  | "confirm-encoding"
   | "discover-models"
   | "test-model"
   | "forget-credential"

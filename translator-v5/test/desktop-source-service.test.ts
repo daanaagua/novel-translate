@@ -4,11 +4,23 @@ import { tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import test from "node:test";
 
-import { DesktopSourceService } from "../src/desktop/desktop-source-service.js";
+import {
+  DesktopSourceService,
+  type DesktopSourceImportResult,
+  type DesktopSourceReadyResult,
+} from "../src/desktop/desktop-source-service.js";
 import { SourceLedger } from "../src/source/source-ledger.js";
 
 function fixtureDirectory(): string {
   return mkdtempSync(join(tmpdir(), "folioloom-desktop-source-service-"));
+}
+
+function ready(result: DesktopSourceImportResult): DesktopSourceReadyResult {
+  assert.equal(result.status, "ready");
+  if (result.status !== "ready") {
+    throw new Error("expected a ready source import");
+  }
+  return result;
 }
 
 test("desktop source service creates a reader-named project and never rewrites the selected manuscript", async () => {
@@ -22,7 +34,7 @@ test("desktop source service creates a reader-named project and never rewrites t
   writeFileSync(sourcePath, source);
   try {
     const service = new DesktopSourceService({ projectsRoot });
-    const imported = await service.importSource({ sourcePath, sourceLanguage: "auto" });
+    const imported = ready(await service.importSource({ sourcePath, sourceLanguage: "auto" }));
     const ledger = SourceLedger.open(imported.manifestPath);
 
     assert.equal(imported.reused, false);
@@ -45,8 +57,8 @@ test("desktop source service restores a project when the raw source hash was imp
   writeFileSync(renamedPath, "Identical source bytes.", "utf8");
   try {
     const service = new DesktopSourceService({ projectsRoot });
-    const first = await service.importSource({ sourcePath: firstPath, sourceLanguage: "en" });
-    const second = await service.importSource({ sourcePath: renamedPath, sourceLanguage: "en" });
+    const first = ready(await service.importSource({ sourcePath: firstPath, sourceLanguage: "en" }));
+    const second = ready(await service.importSource({ sourcePath: renamedPath, sourceLanguage: "en" }));
 
     assert.equal(first.reused, false);
     assert.equal(second.reused, true);
@@ -70,8 +82,8 @@ test("desktop source service keeps same-title manuscripts with different bytes a
   writeFileSync(secondPath, "Second manuscript.", "utf8");
   try {
     const service = new DesktopSourceService({ projectsRoot });
-    const first = await service.importSource({ sourcePath: firstPath, sourceLanguage: "en" });
-    const second = await service.importSource({ sourcePath: secondPath, sourceLanguage: "en" });
+    const first = ready(await service.importSource({ sourcePath: firstPath, sourceLanguage: "en" }));
+    const second = ready(await service.importSource({ sourcePath: secondPath, sourceLanguage: "en" }));
 
     assert.equal(first.reused, false);
     assert.equal(second.reused, false);
@@ -80,6 +92,43 @@ test("desktop source service keeps same-title manuscripts with different bytes a
     assert.match(basename(second.projectDirectory), /^Same-Title-[a-f0-9]{12}$/u);
     assert.equal(dirname(first.manifestPath), first.projectDirectory);
     assert.equal(dirname(second.manifestPath), second.projectDirectory);
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("ambiguous source import exposes only an opaque pending id and allowed encodings", async () => {
+  const directory = fixtureDirectory();
+  const projectsRoot = join(directory, "Projects");
+  const sourcePath = join(directory, "ambiguous-korean.txt");
+  const source = Buffer.concat(Array.from({ length: 3 }, () =>
+    Buffer.from([0xc7, 0xd1, 0xb1, 0xb9, 0xbe, 0xee])));
+  writeFileSync(sourcePath, source);
+  try {
+    const service = new DesktopSourceService({ projectsRoot });
+    const pending = await service.importSource({ sourcePath, sourceLanguage: "ko" });
+    assert.equal(pending.status, "encoding_required");
+    if (pending.status !== "encoding_required") return;
+    assert.match(pending.pendingImportId, /^[a-f0-9-]{16,}$/u);
+    assert.equal(pending.fileName, "ambiguous-korean.txt");
+    assert.deepEqual([...pending.encodings].sort(), ["euc-kr", "windows-949"].sort());
+    assert.doesNotMatch(JSON.stringify(pending), /[A-Z]:\\|SOURCE_ENCODING|韓国語|한국어/u);
+
+    const imported = await service.confirmEncoding({
+      pendingImportId: pending.pendingImportId,
+      encoding: "euc-kr",
+    });
+    assert.equal(imported.status, "ready");
+    if (imported.status !== "ready") return;
+    assert.equal(SourceLedger.open(imported.manifestPath).sourceText, "한국어".repeat(3));
+    await assert.rejects(
+      service.confirmEncoding({ pendingImportId: pending.pendingImportId, encoding: "euc-kr" }),
+      /expired|used|invalid/iu,
+    );
+    await assert.rejects(
+      service.confirmEncoding({ pendingImportId: "forged", encoding: "utf-7" }),
+      /expired|used|invalid/iu,
+    );
   } finally {
     rmSync(directory, { recursive: true, force: true });
   }

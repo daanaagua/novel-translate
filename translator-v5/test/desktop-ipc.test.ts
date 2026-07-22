@@ -5,6 +5,7 @@ import { join } from "node:path";
 import test from "node:test";
 
 import type {
+  DesktopChooseSourceResult,
   DesktopDoctorReport,
   DesktopProjectRequest,
   DesktopProjectSnapshot,
@@ -76,6 +77,7 @@ interface IpcFixtureOptions {
   pickedSource?: "cancel" | "source" | "invalid";
   existingReadyModel?: boolean;
   testStatus?: "ready" | "limited" | "failed";
+  sourceEncodingRequired?: boolean;
 }
 
 interface IpcFixture {
@@ -87,6 +89,7 @@ interface IpcFixture {
   trustedEvent: unknown;
   snapshotCalls: number;
   sourceImports: readonly string[];
+  encodingConfirmations: readonly unknown[];
   modelCalls: {
     discoveries: readonly unknown[];
     tests: readonly unknown[];
@@ -110,6 +113,7 @@ function registerFixtureHandlers(options: IpcFixtureOptions = {}): IpcFixture {
   const activeRunIds = options.activeRunIds ?? [];
   const handlers = new Map<string, DesktopIpcHandler>();
   const sourceImports: string[] = [];
+  const encodingConfirmations: unknown[] = [];
   const discoveries: unknown[] = [];
   const tests: unknown[] = [];
   const forgotten: unknown[] = [];
@@ -208,7 +212,18 @@ function registerFixtureHandlers(options: IpcFixtureOptions = {}): IpcFixture {
     sourceService: {
       async importSource(request) {
         sourceImports.push(request.sourcePath);
-        return { manifestPath: importedManifestPath };
+        return options.sourceEncodingRequired
+          ? {
+            status: "encoding_required" as const,
+            pendingImportId: "8f0f8277-ec45-41dc-82e1-55586912908b",
+            fileName: "chapter.epub",
+            encodings: ["euc-kr" as const, "windows-949" as const],
+          }
+          : { status: "ready" as const, manifestPath: importedManifestPath };
+      },
+      async confirmEncoding(request) {
+        encodingConfirmations.push(request);
+        return { status: "ready" as const, manifestPath: importedManifestPath };
       },
     },
     modelService: {
@@ -279,6 +294,9 @@ function registerFixtureHandlers(options: IpcFixtureOptions = {}): IpcFixture {
     get sourceImports() {
       return sourceImports;
     },
+    get encodingConfirmations() {
+      return encodingConfirmations;
+    },
     get modelCalls() {
       return { discoveries, tests, forgotten };
     },
@@ -307,6 +325,7 @@ test("IPC only registers the desktop allowlist", () => {
   try {
     assert.deepEqual([...fixture.handlers.keys()].sort(), [
       "folioloom:choose-source",
+      "folioloom:confirm-source-encoding",
       "folioloom:choose-project",
       "folioloom:choose-store",
       "folioloom:discover-models",
@@ -372,10 +391,59 @@ test("choose-source accepts only manuscript formats and cancellation preserves t
 test("choose-source imports a selected manuscript without exposing a path-taking renderer API", async () => {
   const fixture = registerFixtureHandlers({ pickedSource: "source" });
   try {
-    const result = await handler(fixture, "folioloom:choose-source")(fixture.trustedEvent) as DesktopResult<DesktopProjectSnapshot>;
+    const result = await handler(fixture, "folioloom:choose-source")(fixture.trustedEvent) as DesktopResult<DesktopChooseSourceResult>;
     assert.equal(result.ok, true);
+    if (result.ok) assert.equal(result.value.status, "ready");
     assert.deepEqual(fixture.sourceImports, [fixture.sourcePath]);
     assert.equal(fixture.currentRequest?.manifestPath.endsWith("Imported\\source_manifest.json"), true);
+  } finally {
+    rmSync(fixture.directory, { recursive: true, force: true });
+  }
+});
+
+test("ambiguous source selection exposes an opaque encoding choice and confirms it once", async () => {
+  const fixture = registerFixtureHandlers({ pickedSource: "source", sourceEncodingRequired: true });
+  try {
+    const before = fixture.currentRequest;
+    const selected = await handler(fixture, "folioloom:choose-source")(
+      fixture.trustedEvent,
+    ) as DesktopResult<DesktopChooseSourceResult>;
+    assert.equal(selected.ok, true);
+    if (!selected.ok) throw new Error("expected a successful source choice");
+    assert.equal(selected.value.status, "encoding_required");
+    if (selected.value.status !== "encoding_required") {
+      throw new Error("expected an encoding choice");
+    }
+    assert.deepEqual(selected.value.encodings, ["euc-kr", "windows-949"]);
+    assert.equal(selected.value.fileName, "chapter.epub");
+    assert.doesNotMatch(JSON.stringify(selected.value), /[A-Z]:\\|sourcePath|manifestPath/u);
+    assert.deepEqual(fixture.currentRequest, before);
+
+    const confirmed = await handler(fixture, "folioloom:confirm-source-encoding")(
+      fixture.trustedEvent,
+      {
+        pendingImportId: selected.value.pendingImportId,
+        encoding: "euc-kr",
+      },
+    ) as DesktopResult<DesktopChooseSourceResult>;
+    assert.equal(confirmed.ok, true);
+    if (confirmed.ok) assert.equal(confirmed.value.status, "ready");
+    assert.deepEqual(fixture.encodingConfirmations, [{
+      pendingImportId: selected.value.pendingImportId,
+      encoding: "euc-kr",
+    }]);
+    assert.equal(fixture.currentRequest?.manifestPath.endsWith("Imported\\source_manifest.json"), true);
+
+    const injected = await handler(fixture, "folioloom:confirm-source-encoding")(
+      fixture.trustedEvent,
+      {
+        pendingImportId: selected.value.pendingImportId,
+        encoding: "euc-kr",
+        sourcePath: "C:\\outside.txt",
+      },
+    ) as DesktopResult<unknown>;
+    assert.equal(injected.ok, false);
+    assert.equal(fixture.encodingConfirmations.length, 1);
   } finally {
     rmSync(fixture.directory, { recursive: true, force: true });
   }

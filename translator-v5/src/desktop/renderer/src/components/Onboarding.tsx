@@ -6,6 +6,8 @@ import type {
   DesktopModelOption,
   DesktopOnboardingState,
   DesktopResult,
+  DesktopSourceEncoding,
+  DesktopSourceEncodingRequired,
   DesktopTestModelRequest,
   DesktopTestModelResult,
   DesktopTrialProgress,
@@ -13,6 +15,7 @@ import type {
 } from "../../../contracts.js";
 import type { BusyAction } from "../types.js";
 import { ProviderSetup } from "./ProviderSetup.js";
+import { EncodingChooser } from "./EncodingChooser.js";
 import { redactTechnicalDetails, TechnicalDetails } from "./TechnicalDetails.js";
 
 interface OnboardingProps {
@@ -21,7 +24,9 @@ interface OnboardingProps {
   operationError?: DesktopError;
   trialProgress?: DesktopTrialProgress;
   trialResult?: DesktopTrialResult;
+  pendingEncoding?: DesktopSourceEncodingRequired;
   onChooseSource(): Promise<void>;
+  onConfirmSourceEncoding(encoding: DesktopSourceEncoding): Promise<void>;
   onDiscoverModels(request: DesktopDiscoverModelsRequest): Promise<DesktopResult<readonly DesktopModelOption[]>>;
   onTestModel(request: DesktopTestModelRequest): Promise<DesktopResult<DesktopTestModelResult>>;
   onForgetCredential(providerId: string): Promise<DesktopResult<DesktopOnboardingState>>;
@@ -47,7 +52,9 @@ export function Onboarding({
   operationError,
   trialProgress,
   trialResult,
+  pendingEncoding,
   onChooseSource,
+  onConfirmSourceEncoding,
   onDiscoverModels,
   onTestModel,
   onForgetCredential,
@@ -84,14 +91,23 @@ export function Onboarding({
                 {busyAction === "choose-source" ? "正在选择…" : "选择书稿"}
               </button>
             </section>
-            <aside className="welcome-card">
-              <p className="eyebrow">支持格式</p>
-              <h2>直接选择原稿</h2>
-              <p>程序会复制原文件用于翻译，不会改动你选择的书稿。</p>
-              <div className="format-list" aria-label="支持的书稿格式">
-                <span>TXT</span><span>EPUB</span><span>DOCX</span><span>Markdown</span>
-              </div>
-            </aside>
+            {pendingEncoding === undefined ? (
+              <aside className="welcome-card">
+                <p className="eyebrow">支持格式</p>
+                <h2>直接选择原稿</h2>
+                <p>程序会复制原文件用于翻译，不会改动你选择的书稿。</p>
+                <div className="format-list" aria-label="支持的书稿格式">
+                  <span>TXT</span><span>EPUB</span><span>DOCX</span><span>Markdown</span>
+                </div>
+              </aside>
+            ) : (
+              <EncodingChooser
+                pending={pendingEncoding}
+                busy={busyAction !== undefined}
+                onConfirm={onConfirmSourceEncoding}
+                onChooseAnother={onChooseSource}
+              />
+            )}
           </div>
           {errorPanel}
         </div>

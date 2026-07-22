@@ -1,6 +1,8 @@
 import { basename, extname } from "node:path";
 
 import type {
+  DesktopChooseSourceResult,
+  DesktopConfirmSourceEncodingRequest,
   DesktopDoctorReport,
   DesktopModelOption,
   DesktopModelProbe,
@@ -17,12 +19,18 @@ import type {
   DesktopDiscoverModelsRequest as ServiceDiscoverModelsRequest,
   DesktopTestModelRequest as ServiceTestModelRequest,
 } from "../desktop-model-service.js";
-import type { DesktopSourceImportRequest, DesktopSourceImportResult } from "../desktop-source-service.js";
+import type {
+  DesktopConfirmEncodingRequest,
+  DesktopSourceEncodingRequiredResult,
+  DesktopSourceImportRequest,
+  DesktopSourceReadyResult,
+} from "../desktop-source-service.js";
 import type { ProviderEffort, ProviderId } from "../../providers/types.js";
 import { DesktopInputError, fail, ok, toDesktopError } from "../desktop-errors.js";
 
 export const DESKTOP_IPC_CHANNELS = [
   "folioloom:choose-source",
+  "folioloom:confirm-source-encoding",
   "folioloom:onboarding-state",
   "folioloom:discover-models",
   "folioloom:test-model",
@@ -66,7 +74,10 @@ export interface DesktopIpcProjectService {
 export interface DesktopIpcSourceService {
   importSource(
     request: Pick<DesktopSourceImportRequest, "sourcePath" | "sourceLanguage" | "explicitEncoding">,
-  ): Promise<Pick<DesktopSourceImportResult, "manifestPath">>;
+  ): Promise<DesktopSourceEncodingRequiredResult | Pick<DesktopSourceReadyResult, "status" | "manifestPath">>;
+  confirmEncoding(
+    request: DesktopConfirmEncodingRequest,
+  ): Promise<Pick<DesktopSourceReadyResult, "status" | "manifestPath">>;
 }
 
 export interface DesktopIpcModelSnapshot {
@@ -113,6 +124,10 @@ const manuscriptFilter = [{ name: "书稿", extensions: ["txt", "md", "markdown"
 const manifestFilter = [{ name: "FolioLoom 项目", extensions: ["json"] }];
 const storeFilter = [{ name: "FolioLoom 状态库", extensions: ["db"] }];
 const PROVIDER_ID = /^[a-z][a-z0-9-]{0,63}$/u;
+const SOURCE_ENCODINGS = new Set([
+  "utf-8", "utf-16le", "utf-16be", "utf-32le", "utf-32be",
+  "shift_jis", "euc-jp", "euc-kr", "windows-949",
+]);
 
 function failure<T = never>(code: string, message: string): DesktopResult<T> {
   return fail({ code, message, retryable: false });
@@ -122,15 +137,15 @@ function noOpenProject(): DesktopResult<DesktopProjectSnapshot> {
   return failure("DESKTOP_NO_PROJECT", "open an initialized project first");
 }
 
-function canceledSelection(): DesktopResult<DesktopProjectSnapshot> {
+function canceledSelection(): DesktopResult<never> {
   return failure("DESKTOP_SELECTION_CANCELLED", "no file was selected");
 }
 
-function invalidSelection(message: string): DesktopResult<DesktopProjectSnapshot> {
+function invalidSelection(message: string): DesktopResult<never> {
   return failure("DESKTOP_INPUT_INVALID", message);
 }
 
-function untrustedEvent(): DesktopResult<DesktopProjectSnapshot> {
+function untrustedEvent(): DesktopResult<never> {
   return failure("DESKTOP_UNTRUSTED_IPC", "IPC caller is not the trusted FolioLoom renderer");
 }
 
@@ -242,6 +257,23 @@ function testModelRequest(value: unknown): ServiceTestModelRequest {
   };
 }
 
+function confirmSourceEncodingRequest(value: unknown): DesktopConfirmSourceEncodingRequest {
+  const input = exactRecord(
+    value,
+    "confirm-source-encoding payload",
+    ["pendingImportId", "encoding"],
+  );
+  const pendingImportId = requiredText(input.pendingImportId, "pendingImportId");
+  const encoding = requiredText(input.encoding, "encoding");
+  if (!SOURCE_ENCODINGS.has(encoding)) {
+    return inputError("encoding is unsupported");
+  }
+  return {
+    pendingImportId,
+    encoding: encoding as DesktopConfirmSourceEncodingRequest["encoding"],
+  };
+}
+
 function publicProviders(snapshot: DesktopIpcModelSnapshot): readonly DesktopOnboardingProvider[] {
   return snapshot.providers.map((provider) => ({
     id: provider.id,
@@ -338,6 +370,18 @@ export function registerDesktopIpc(dependencies: DesktopIpcDependencies): void {
     return result;
   };
 
+  const activateImportedSource = (
+    imported: Pick<DesktopSourceReadyResult, "manifestPath">,
+  ): DesktopResult<DesktopChooseSourceResult> => {
+    const request: DesktopProjectRequest = { manifestPath: imported.manifestPath };
+    const result = snapshot(request);
+    if (!result.ok) {
+      return fail(result.error);
+    }
+    dependencies.setCurrentRequest(request);
+    return ok({ status: "ready", project: result.value });
+  };
+
   const currentProject = (): DesktopResult<DesktopProjectSnapshot | undefined> => {
     const current = dependencies.getCurrentRequest();
     if (current === undefined) {
@@ -365,12 +409,21 @@ export function registerDesktopIpc(dependencies: DesktopIpcDependencies): void {
       return invalidSelection("sourcePath must use a supported manuscript extension");
     }
     const imported = await dependencies.sourceService.importSource({ sourcePath });
-    const request: DesktopProjectRequest = { manifestPath: imported.manifestPath };
-    const result = snapshot(request);
-    if (result.ok) {
-      dependencies.setCurrentRequest(request);
+    if (imported.status === "encoding_required") {
+      return ok({
+        status: imported.status,
+        pendingImportId: imported.pendingImportId,
+        fileName: imported.fileName,
+        encodings: [...imported.encodings],
+      });
     }
-    return result;
+    return activateImportedSource(imported);
+  }));
+
+  handleTrusted("folioloom:confirm-source-encoding", async (_event, ...args) => resultFrom(async () => {
+    const request = confirmSourceEncodingRequest(oneArgument(args, "confirm-source-encoding"));
+    const imported = await dependencies.sourceService.confirmEncoding(request);
+    return activateImportedSource(imported);
   }));
 
   handleTrusted("folioloom:onboarding-state", async (_event, ...args) => resultFrom(() => {
