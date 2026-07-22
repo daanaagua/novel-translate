@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import test from "node:test";
 import { DatabaseSync } from "node:sqlite";
 
@@ -14,6 +14,8 @@ import {
 } from "@earendil-works/pi-ai";
 
 import { runBook } from "../src/fullbook/book-runner.js";
+import { BookContext } from "../src/fullbook/book-context.js";
+import { loadGlossary } from "../src/glossary/glossary-profile.js";
 import { planBookWindows } from "../src/fullbook/window-planner.js";
 import { buildLosslessBlocks } from "../src/source/block-builder.js";
 import { SourceLedger } from "../src/source/source-ledger.js";
@@ -361,6 +363,54 @@ test("failed lossless doctor blocks every model call", async () => {
 
   await assert.rejects(runBook(fixture.options as never), /HASH_MISMATCH/);
   assert.equal(fixture.faux.state.callCount, 0);
+});
+
+test("lossless runner injects only glossary terms relevant to each physical request", async () => {
+  const fixture = losslessFixture("BOOK ONE\n\nTyphon spoke.\n\nCHAPTER ONE\n\nSeverian listened.");
+  const glossaryPath = join(dirname(fixture.canonicalPath), "glossary.json");
+  writeFileSync(glossaryPath, JSON.stringify({
+    Typhon: "提丰",
+    Severian: "塞万里安",
+  }), "utf8");
+  const context = BookContext.openLossless({ manifestPath: fixture.options.manifestPath });
+  const glossary = loadGlossary({
+    glossaryPath,
+    blocks: context.losslessBlocks,
+    profile: context.languageProfile,
+  });
+  context.close();
+  const prompts: string[] = [];
+  fixture.faux.setResponses([
+    (request) => {
+      prompts.push(userText(request));
+      return losslessBatchResponse(request);
+    },
+    (request) => {
+      prompts.push(userText(request));
+      return losslessBatchResponse(request);
+    },
+  ]);
+
+  const result = await runBook({
+    ...fixture.options,
+    glossary,
+    tinyWindowTokens: 1,
+    maxWindowsPerRequest: 1,
+    maxConcurrency: 1,
+  } as never);
+
+  assert.equal(result.status.completedWindows, 2, JSON.stringify({
+    status: result.status,
+    windows: result.windows.map((window) => ({
+      id: window.windowId,
+      status: window.status,
+    })),
+    promptCount: prompts.length,
+  }));
+  assert.match(prompts[0] ?? "", /"sourceForm":"Typhon"/u);
+  assert.doesNotMatch(prompts[0] ?? "", /"sourceForm":"Severian"/u);
+  assert.match(prompts[1] ?? "", /"sourceForm":"Severian"/u);
+  assert.doesNotMatch(prompts[1] ?? "", /"sourceForm":"Typhon"/u);
 });
 
 test("one malformed window in a batch cannot erase its valid earlier sibling", async () => {

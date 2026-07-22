@@ -15,6 +15,10 @@ import { ModelProviderError, PiRuntime } from "../agents/pi-runtime.js";
 import { runTranslationBatch } from "../agents/translation-batch.js";
 import { entityLinkAsTerms, type EntityLink } from "../domain/entity-links.js";
 import type { StableTerm, V4Block } from "../domain/types.js";
+import {
+  relevantGlossaryTerms,
+  type LoadedGlossary,
+} from "../glossary/glossary-profile.js";
 import { DEFAULT_BUDGET_LIMITS } from "../kernel/budget.js";
 import { BudgetLedger } from "../kernel/budget.js";
 import { RunLease } from "../kernel/run-lease.js";
@@ -221,6 +225,7 @@ export interface LosslessBookRunOptions {
   streamFn: StreamFn;
   windowOptions?: WindowPlanOptions;
   styleState?: StyleState;
+  glossary?: LoadedGlossary;
   maxWindows?: number;
   maxConcurrency?: number;
   maxAttempts?: number;
@@ -604,6 +609,9 @@ function waveAnchorInputHash(
       canonicalSource: term.canonicalSource,
       target: term.target,
       locked: term.locked,
+      ...(term.policy === undefined ? {} : { policy: term.policy }),
+      ...(term.note === undefined ? {} : { note: term.note }),
+      ...(term.origin === undefined ? {} : { origin: term.origin }),
     })),
   })).digest("hex");
 }
@@ -691,14 +699,20 @@ function termsFromKnowledge(
         && typeof term.canonicalSource === "string"
         && typeof term.target === "string"
         && typeof term.locked === "boolean") {
-        terms.push(term as StableTerm);
+        terms.push({
+          ...(term as StableTerm),
+          origin: term.origin ?? "knowledge",
+        });
       }
     }
     if (revision.kind === "entity_alias_link"
       && revision.payload !== null
       && typeof revision.payload === "object"
       && !Array.isArray(revision.payload)) {
-      terms.push(...entityLinkAsTerms(revision.payload as EntityLink));
+      terms.push(...entityLinkAsTerms(revision.payload as EntityLink).map((term) => ({
+        ...term,
+        origin: term.origin ?? "knowledge",
+      })));
     }
   }
   return terms;
@@ -710,10 +724,50 @@ function uniqueTerms(
 ): StableTerm[] {
   const byForm = new Map<string, StableTerm>();
   for (const term of terms) {
-    byForm.set(context.languageProfile.normalizeSourceForm(term.sourceForm), { ...term });
+    const normalized = context.languageProfile.normalizeSourceForm(term.sourceForm);
+    const previous = byForm.get(normalized);
+    const priority = (value: StableTerm): number => {
+      if (value.origin === "glossary") {
+        return 3;
+      }
+      if (value.origin === "legacy") {
+        return 2;
+      }
+      return 1;
+    };
+    if (previous === undefined || priority(term) >= priority(previous)) {
+      byForm.set(normalized, { ...term });
+    }
   }
   return [...byForm.values()].sort((left, right) =>
     left.sourceForm.localeCompare(right.sourceForm));
+}
+
+function sourceBlocksForWindows(
+  windows: readonly Pick<PersistedLosslessWindow, "blockIds">[],
+  blockById: ReadonlyMap<string, BookContext["losslessBlocks"][number]>,
+): BookContext["losslessBlocks"] {
+  return windows.flatMap((window) => window.blockIds
+    .map((blockId) => blockById.get(blockId))
+    .filter((block): block is BookContext["losslessBlocks"][number] => block !== undefined));
+}
+
+function termsForWindows(
+  terms: readonly StableTerm[],
+  windows: readonly Pick<PersistedLosslessWindow, "blockIds" | "globalIndexes">[],
+  blockById: ReadonlyMap<string, BookContext["losslessBlocks"][number]>,
+  context: BookContext,
+  glossary: LoadedGlossary | undefined,
+): StableTerm[] {
+  const nonGlossary = terms.filter((term) => term.origin !== "glossary");
+  if (glossary === undefined) {
+    return uniqueTerms(nonGlossary, context);
+  }
+  const glossaryRelevant = relevantGlossaryTerms(
+    glossary,
+    windows.flatMap((window) => window.globalIndexes),
+  );
+  return uniqueTerms([...nonGlossary, ...glossaryRelevant], context);
 }
 
 function waveKnowledgeCandidates(
@@ -956,34 +1010,43 @@ async function runLosslessBook(
         })),
       ])) as Record<string, EffectiveStyleProjection>;
       const establishedTerms = uniqueTerms([
-        ...context.stableTerms,
+        ...context.stableTerms.map((term) => ({
+          ...term,
+          origin: term.origin ?? "legacy" as const,
+        })),
+        ...(options.glossary?.stableTerms ?? []),
         ...termsFromKnowledge(snapshot.revisions),
       ], context);
-      const selectedBlocks = selected.flatMap((window) => window.blockIds
-        .map((blockId) => blockById.get(blockId))
-        .filter((block): block is NonNullable<typeof block> => block !== undefined))
-        .map(losslessAsV4);
+      const selectedSourceBlocks = sourceBlocksForWindows(selected, blockById);
+      const selectedBlocks = selectedSourceBlocks.map(losslessAsV4);
+      const anchorStableTerms = termsForWindows(
+        establishedTerms,
+        selected,
+        blockById,
+        context,
+        options.glossary,
+      );
       const corpusBlocks = context.losslessBlocks.map(losslessAsV4);
       const anchorCandidates = collectWindowAnchorCandidates(
         selectedBlocks.map((block) => withoutStructureHeadingLines(block, context))
           .filter((block): block is V4Block => block !== undefined),
         corpusBlocks.map((block) => withoutStructureHeadingLines(block, context))
           .filter((block): block is V4Block => block !== undefined),
-        establishedTerms,
+        anchorStableTerms,
         [],
         context.languageProfile,
       );
       const anchorBudget = new BudgetLedger();
       let waveAnchorSnapshot: WaveAnchorSnapshot | undefined;
       if (anchorCandidates.length >= 2) {
-        const inputHash = waveAnchorInputHash(context, anchorCandidates, establishedTerms);
+        const inputHash = waveAnchorInputHash(context, anchorCandidates, anchorStableTerms);
         const cached = store.waveAnchorDecision(runId, inputHash);
         if (cached !== undefined) {
           waveAnchorSnapshot = parseWaveAnchorSnapshot(cached, inputHash);
         } else {
           const outcome: LexicalAnchorOutcome = await new LexicalAnchorer(new PiRuntime()).run({
             candidates: anchorCandidates,
-            stableTerms: establishedTerms,
+            stableTerms: anchorStableTerms,
             model: options.model,
             streamFn: options.streamFn,
             budget: anchorBudget,
@@ -1002,7 +1065,10 @@ async function runLosslessBook(
       }
       const activeTerms = uniqueTerms([
         ...establishedTerms,
-        ...(waveAnchorSnapshot?.terms ?? []),
+        ...(waveAnchorSnapshot?.terms ?? []).map((term) => ({
+          ...term,
+          origin: term.origin ?? "knowledge" as const,
+        })),
       ], context);
       const unpersistedWaveKnowledge = waveKnowledgeCandidates(
         runId,
@@ -1074,7 +1140,13 @@ async function runLosslessBook(
             const result = await runTranslationBatch({
               request,
               blocks: context.losslessBlocks,
-              stableTerms: activeTerms,
+              stableTerms: termsForWindows(
+                activeTerms,
+                request.windows,
+                blockById,
+                context,
+                options.glossary,
+              ),
               snapshot,
               model: options.model,
               streamFn: options.streamFn,

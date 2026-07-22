@@ -2,7 +2,7 @@
 
 > **面向 AI 代理的工作者：** 必须使用 `superpowers:executing-plans` 逐任务实现此计划。步骤使用复选框语法跟踪进度。
 
-**目标：** 让 FolioLoom 的 `book doctor` 与 `book run` 接受可复现的 JSON 术语表，在本地确定性地定位术语，并仅向当前翻译请求注入相关条目。
+**目标：** 让 FolioLoom 的 `book doctor` 与 `book run` 接受可复现的 JSON 术语表，在本地确定性地定位术语，并仅向当前翻译请求注入相关的导入条目。
 
 **架构：** `glossary-profile` 独立完成解析、语义哈希、别形展开和基于 `SourceLanguageProfile` 的定位。Book runner 将快照作为最高优先级稳定术语并入现有术语流，CLI 将摘要哈希写入既有 run metadata，从而复用恢复一致性保护。
 
@@ -86,7 +86,6 @@ git commit -m "feat: load deterministic glossary snapshots"
 
 **文件：**
 - 修改：`translator-v5/src/fullbook/book-runner.ts`
-- 修改：`translator-v5/src/agents/translation-batch.ts`
 - 修改：`translator-v5/test/book-runner.test.ts`
 - 修改：`translator-v5/test/translation-batch.test.ts`
 
@@ -127,11 +126,11 @@ const establishedTerms = uniqueTerms([
 
 await runTranslationBatch({
   // existing input
-  stableTerms: relevantStableTerms(activeTerms, request.windows, context, options.glossary),
+  stableTerms: termsForWindows(activeTerms, request.windows, blockById, context, options.glossary),
 });
 ```
 
-更新 `uniqueTerms()`：`origin: "glossary"` 优先；发生不同 target 的用户术语/旧术语冲突时在请求前抛错。`translation-batch` 的锁定校验不重写，继续以 `locked: true` 工作，并在 prompt 中保留 `policy` 与 `note`。
+更新 `uniqueTerms()`：`origin: "glossary"` 优先；发生不同 target 的用户术语/旧术语冲突时在请求前抛错。只按请求筛选导入术语，既有知识快照和本波锚点继续遵循原有的全局连续性投影。`translation-batch` 的锁定校验不重写，继续以 `locked: true` 工作，并在 prompt 中保留 `policy` 与 `note`。
 
 - [ ] **步骤 4：运行定向测试并确认绿灯**
 
@@ -142,7 +141,7 @@ await runTranslationBatch({
 - [ ] **步骤 5：提交独立变更**
 
 ```bash
-git add translator-v5/src/fullbook/book-runner.ts translator-v5/src/agents/translation-batch.ts translator-v5/test/book-runner.test.ts translator-v5/test/translation-batch.test.ts
+git add translator-v5/src/fullbook/book-runner.ts translator-v5/test/book-runner.test.ts translator-v5/test/translation-batch.test.ts
 git commit -m "feat: inject glossary terms by translation window"
 ```
 

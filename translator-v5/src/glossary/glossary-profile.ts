@@ -426,6 +426,6 @@ export function relevantGlossaryTerms(
   const requested = new Set(globalIndexes);
   return glossary.stableTerms.filter((term) =>
     (glossary.occurrenceIndexesByLexeme[term.lexemeId] ?? [])
-      .some((index) => requested.has(index)))
+    .some((index) => requested.has(index)))
     .map((term) => ({ ...term }));
 }
