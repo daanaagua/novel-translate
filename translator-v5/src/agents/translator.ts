@@ -14,6 +14,10 @@ import {
 import type { SourceLanguageProfile } from "../language/types.js";
 import { normalizeChineseQuoteTexts } from "../style/chinese-quote-normalization.js";
 import { simplifyChineseTranslation } from "../style/chinese-script-normalization.js";
+import {
+  normalizeTranslatedSceneSeparators,
+  sourceTextForTranslation,
+} from "../source/layout-separators.js";
 import type {
   CandidateCollector,
   ResolutionCandidate,
@@ -115,8 +119,13 @@ export function normalizeCandidateTypography(
   candidate: TranslationCandidate,
   _styleState: StyleState,
   preservedTargetForms: readonly string[] = [],
+  sourceTextByBlockId: ReadonlyMap<string, string> = new Map(),
 ): TranslationCandidate {
-  const normalized = normalizeChineseQuoteTexts(candidate.translations.map((item) => item.text));
+  const normalized = normalizeChineseQuoteTexts(candidate.translations.map((item) =>
+    normalizeTranslatedSceneSeparators(
+      item.text,
+      sourceTextByBlockId.get(item.blockId),
+    )));
   return {
     ...candidate,
     notes: [...candidate.notes],
@@ -246,8 +255,17 @@ export class Translator {
       .map((term) => ({ sourceForm: term.sourceForm, target: term.target }));
     let candidate = input.collector.translations().slice(before).at(-1);
     const preservedTargetForms = terms.filter((term) => term.locked).map((term) => term.target);
+    const sourceTextByBlockId = new Map(input.island.blocks.map((block) => [
+      block.id,
+      block.sourceText,
+    ]));
     if (candidate !== undefined) {
-      candidate = normalizeCandidateTypography(candidate, input.styleState, preservedTargetForms);
+      candidate = normalizeCandidateTypography(
+        candidate,
+        input.styleState,
+        preservedTargetForms,
+        sourceTextByBlockId,
+      );
     }
     let validation = this.#validator.validate(
       input.island.blocks,
@@ -279,6 +297,7 @@ export class Translator {
           repair.candidate,
           input.styleState,
           preservedTargetForms,
+          sourceTextByBlockId,
         );
         validation = this.#validator.validate(
           input.island.blocks,
@@ -316,7 +335,7 @@ export class Translator {
       `SOURCE LANGUAGE ${input.sourceLanguageProfile?.displayName ?? "English"} (${input.sourceLanguageProfile?.id ?? "en"})`,
       "SOURCE BLOCKS",
       input.island.blocks.map((block) =>
-        `[${block.id}]\n${block.sourceText}`,
+        `[${block.id}]\n${sourceTextForTranslation(block.sourceText)}`,
       ).join("\n\n"),
       "RELEVANT STABLE TERMS",
       terms.map((term) => `${term.sourceForm} => ${term.target}`).join("\n") || "(none)",

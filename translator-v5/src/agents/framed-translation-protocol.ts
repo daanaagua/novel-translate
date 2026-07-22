@@ -1,5 +1,7 @@
 import { createHash } from "node:crypto";
 
+import { hasSemanticText } from "../text/semantic-text.js";
+
 export const FRAMED_TRANSLATION_PROTOCOL_VERSION = "framed-v1";
 
 const MARKER_PREFIX = "@@FOLIOLOOM:";
@@ -139,7 +141,7 @@ export function parseFramedTranslationResponse(
 
     if (line === active.frame.endLine) {
       const text = active.lines.join("\n");
-      if (text.trim().length === 0) {
+      if (!hasSemanticText(text)) {
         errors.push(`empty frame for block ${active.frame.blockId}`);
       } else if (!active.duplicate) {
         completed.set(active.frame.blockId, text);
@@ -177,4 +179,3 @@ export function parseFramedTranslationResponse(
     errors,
   };
 }
-

@@ -2,6 +2,14 @@ import type { V4Block } from "../domain/types.js";
 import { getSourceLanguageProfile } from "../language/profiles.js";
 import type { SourceLanguageProfile } from "../language/types.js";
 import { normalizeSourceSceneSeparators } from "../source/layout-separators.js";
+import {
+  alignmentFingerprint,
+  hanGraphemeLength,
+  hasSemanticText,
+  hasInvalidUnicodeScalar,
+  letterGraphemeLength,
+  semanticCharacterLength,
+} from "../text/semantic-text.js";
 import type { TranslationCandidate } from "../tools/candidate-collector.js";
 import type { ValidationFailure } from "../tools/repair-tools.js";
 
@@ -19,21 +27,20 @@ export interface TranslationValidationPolicy {
 function paragraphCount(text: string): number {
   return normalizeSourceSceneSeparators(text)
     .split(/(?:\r?\n)[\t ]*(?:\r?\n)+/u)
-    .map((item) => item.trim())
-    .filter(Boolean)
+    .filter(hasSemanticText)
     .length;
 }
 
 function meaningfulLength(text: string): number {
-  return [...text.replace(/\s+/gu, "")].length;
+  return semanticCharacterLength(text);
 }
 
-const MIN_CROSS_BLOCK_PARAGRAPH_CHARACTERS = 72;
+const MIN_CROSS_BLOCK_PARAGRAPH_CHARACTERS = 48;
 
 function normalizedLongParagraphs(text: string): Set<string> {
-  return new Set(text
+  return new Set(normalizeSourceSceneSeparators(text)
     .split(/(?:\r?\n)[\t ]*(?:\r?\n)+/u)
-    .map((paragraph) => paragraph.replace(/\s+/gu, "").trim())
+    .map(alignmentFingerprint)
     .filter((paragraph) => (
       [...paragraph].length >= MIN_CROSS_BLOCK_PARAGRAPH_CHARACTERS
     )));
@@ -46,6 +53,7 @@ const SYSTEM_LEAK_PATTERNS = [
   /["']toolCallId["']\s*:/iu,
   /\{\s*["']translations["']\s*:/iu,
 ];
+const SOURCE_LAYOUT_TOKEN_PATTERN = /(?:\[[ \t]*\[[ \t]*\][ \t]*\]|［[ \t]*［[ \t]*］[ \t]*］)/u;
 
 function isolatedSourceIdentifiers(sourceText: string): string[] {
   return sourceText.split(/\r?\n/u).flatMap((line) => {
@@ -68,46 +76,56 @@ export class TranslationValidator {
       block.id,
       normalizedLongParagraphs(block.sourceText),
     ]));
-    const occurrences = new Map<string, Set<string>>();
-    for (const translation of candidate.translations) {
-      for (const paragraph of normalizedLongParagraphs(translation.text)) {
-        const blockIds = occurrences.get(paragraph) ?? new Set<string>();
-        blockIds.add(translation.blockId);
-        occurrences.set(paragraph, blockIds);
-      }
-    }
-    const overlaps = new Map<string, Set<string>>();
-    for (const blockIds of occurrences.values()) {
-      const ids = [...blockIds];
-      if (ids.length < 2) {
-        continue;
-      }
-      for (let leftIndex = 0; leftIndex < ids.length; leftIndex += 1) {
-        for (let rightIndex = leftIndex + 1; rightIndex < ids.length; rightIndex += 1) {
-          const left = ids[leftIndex] as string;
-          const right = ids[rightIndex] as string;
-          const leftSource = sourceParagraphs.get(left) ?? new Set<string>();
-          const rightSource = sourceParagraphs.get(right) ?? new Set<string>();
-          const sourceAlsoRepeats = [...leftSource].some((paragraph) =>
-            rightSource.has(paragraph));
-          if (sourceAlsoRepeats) {
-            continue;
-          }
-          const leftPeers = overlaps.get(left) ?? new Set<string>();
-          const rightPeers = overlaps.get(right) ?? new Set<string>();
-          leftPeers.add(right);
-          rightPeers.add(left);
-          overlaps.set(left, leftPeers);
-          overlaps.set(right, rightPeers);
+    const targetParagraphs = new Map(candidate.translations.map((translation) => [
+      translation.blockId,
+      normalizedLongParagraphs(translation.text),
+    ]));
+    const signatureCounts = (
+      paragraphsByBlock: ReadonlyMap<string, Set<string>>,
+    ): Map<string, { blockIds: string[]; count: number }> => {
+      const blockIdsByParagraph = new Map<string, string[]>();
+      for (const [blockId, paragraphs] of paragraphsByBlock) {
+        for (const paragraph of paragraphs) {
+          const blockIds = blockIdsByParagraph.get(paragraph) ?? [];
+          blockIds.push(blockId);
+          blockIdsByParagraph.set(paragraph, blockIds);
         }
       }
+      const counts = new Map<string, { blockIds: string[]; count: number }>();
+      for (const blockIds of blockIdsByParagraph.values()) {
+        const ordered = [...new Set(blockIds)].sort();
+        if (ordered.length < 2) {
+          continue;
+        }
+        const signature = ordered.join("\u0000");
+        const previous = counts.get(signature);
+        counts.set(signature, {
+          blockIds: ordered,
+          count: (previous?.count ?? 0) + 1,
+        });
+      }
+      return counts;
+    };
+    const sourceSignatures = signatureCounts(sourceParagraphs);
+    const targetSignatures = signatureCounts(targetParagraphs);
+    const overlaps = new Map<string, { groups: number; maximumGroupSize: number }>();
+    for (const [signature, target] of targetSignatures) {
+      const groundedCount = sourceSignatures.get(signature)?.count ?? 0;
+      if (target.count <= groundedCount) {
+        continue;
+      }
+      for (const blockId of target.blockIds) {
+        const previous = overlaps.get(blockId);
+        overlaps.set(blockId, {
+          groups: (previous?.groups ?? 0) + (target.count - groundedCount),
+          maximumGroupSize: Math.max(previous?.maximumGroupSize ?? 0, target.blockIds.length),
+        });
+      }
     }
-    const failures = [...overlaps.entries()].map(([blockId, peers]): ValidationFailure => ({
+    const failures = [...overlaps.entries()].map(([blockId, summary]): ValidationFailure => ({
       code: "cross_block_translation_overlap",
       blockId,
-      message: `target repeats a long paragraph assigned to distinct block(s): ${[
-        ...peers,
-      ].sort().join(", ")}`,
+      message: `target contains ${summary.groups} ungrounded repeated long paragraph group(s) spanning up to ${summary.maximumGroupSize} blocks`,
       repairable: true,
     }));
     return { valid: failures.length === 0, failures };
@@ -164,7 +182,7 @@ export class TranslationValidator {
     let targetLength = 0;
     for (const translation of candidate.translations) {
       const source = blockById.get(translation.blockId);
-      if (typeof translation.text !== "string" || translation.text.trim().length === 0) {
+      if (typeof translation.text !== "string" || !hasSemanticText(translation.text)) {
         failures.push({
           code: "empty_translation",
           blockId: translation.blockId,
@@ -224,11 +242,44 @@ export class TranslationValidator {
           repairable: true,
         });
       }
+      if (SOURCE_LAYOUT_TOKEN_PATTERN.test(translation.text)) {
+        failures.push({
+          code: "source_layout_token_leak",
+          blockId: translation.blockId,
+          message: "translation contains an extraction-only source layout token; preserve the scene break as an ordinary paragraph boundary",
+          repairable: true,
+        });
+      }
+      if (translation.text.includes("\uFFFD")) {
+        failures.push({
+          code: "invalid_unicode_output",
+          blockId: translation.blockId,
+          message: "translation contains the Unicode replacement character",
+          repairable: true,
+        });
+      }
+      if (hasInvalidUnicodeScalar(translation.text)) {
+        failures.push({
+          code: "invalid_unicode_output",
+          blockId: translation.blockId,
+          message: "translation contains invalid, noncharacter, or private-use Unicode scalars",
+          repairable: true,
+        });
+      }
+      if (/[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F-\u009F]/u.test(translation.text)) {
+        failures.push({
+          code: "invalid_unicode_output",
+          blockId: translation.blockId,
+          message: "translation contains prohibited Unicode control characters",
+          repairable: true,
+        });
+      }
       const blockSourceLength = meaningfulLength(source.sourceText);
       const blockTargetLength = meaningfulLength(translation.text);
-      const ratioBounds = profile.translationLengthRatioBounds;
-      if (ratioBounds !== undefined
-        && blockSourceLength >= ratioBounds.minSourceCharacters) {
+      const ratioBounds = [...(profile.translationLengthRatioBands ?? [])]
+        .filter((band) => blockSourceLength >= band.minSourceCharacters)
+        .sort((left, right) => right.minSourceCharacters - left.minSourceCharacters)[0];
+      if (ratioBounds !== undefined) {
         const ratio = blockTargetLength / blockSourceLength;
         if (ratio < ratioBounds.min) {
           failures.push({
@@ -242,6 +293,30 @@ export class TranslationValidator {
             code: "abnormal_block_expansion",
             blockId: translation.blockId,
             message: `target/source character ratio ${ratio.toFixed(3)} exceeds ${ratioBounds.max.toFixed(2)} for ${profile.id}`,
+            repairable: true,
+          });
+        }
+        const sourceLetterLength = letterGraphemeLength(source.sourceText);
+        const targetLetterLength = letterGraphemeLength(translation.text);
+        if (sourceLetterLength >= 8
+          && targetLetterLength / sourceLetterLength < ratioBounds.min * 0.5) {
+          failures.push({
+            code: "insufficient_lexical_content",
+            blockId: translation.blockId,
+            message: `target readable-letter ratio ${(targetLetterLength / sourceLetterLength).toFixed(3)} is below ${(ratioBounds.min * 0.5).toFixed(2)} for ${profile.id}`,
+            repairable: true,
+          });
+        }
+        const isolatedIdentifiers = isolatedSourceIdentifiers(source.sourceText);
+        const sourceIsIdentifierOnly = isolatedIdentifiers.includes(source.sourceText.trim());
+        if (sourceLetterLength >= 8
+          && !sourceIsIdentifierOnly
+          && targetLetterLength > 0
+          && hanGraphemeLength(translation.text) / targetLetterLength < 0.5) {
+          failures.push({
+            code: "target_script_mismatch",
+            blockId: translation.blockId,
+            message: "translation has insufficient Chinese-script prose for a zh-Hans target",
             repairable: true,
           });
         }

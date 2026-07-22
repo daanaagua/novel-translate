@@ -1,5 +1,6 @@
 import type { V4Block } from "../domain/types.js";
 import { BudgetLedger } from "../kernel/budget.js";
+import { hasSemanticText } from "../text/semantic-text.js";
 import {
   CandidateCollector,
   type TranslationCandidate,
@@ -58,7 +59,7 @@ export class RepairTools {
       if (!this.#targetBlockIds.has(translation.blockId)) {
         throw new Error(`unknown target block: ${translation.blockId}`);
       }
-      if (typeof translation.text !== "string" || translation.text.trim().length === 0) {
+      if (typeof translation.text !== "string" || !hasSemanticText(translation.text)) {
         throw new TypeError(`empty translation: ${translation.blockId}`);
       }
     }

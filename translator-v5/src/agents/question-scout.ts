@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 
 import type { V4Block } from "../domain/types.js";
+import { sourceTextForTranslation } from "../source/layout-separators.js";
 import {
   ALLOWED_QUESTION_KINDS,
   type ResearchQuestion,
@@ -74,7 +75,7 @@ export class QuestionScout {
 
   prompt(): string {
     const blocks = this.#targetBlocks.map((block) =>
-      `[${block.id} | global=${block.globalIndex}]\n${block.sourceText}`,
+      `[${block.id} | global=${block.globalIndex}]\n${sourceTextForTranslation(block.sourceText)}`,
     ).join("\n\n");
     const subjects = this.#subjects.map((subject) =>
       `${subject.subjectId}: ${subject.forms.join(" | ")}`,

@@ -5,6 +5,8 @@ import type {
 } from "../domain/types.js";
 import { EvidenceIndex } from "../index/evidence-index.js";
 import { BudgetLedger } from "../kernel/budget.js";
+import { sourceTextForTranslation } from "../source/layout-separators.js";
+import { hasSemanticText } from "../text/semantic-text.js";
 import {
   CandidateCollector,
   ALLOWED_QUESTION_KINDS,
@@ -477,16 +479,20 @@ export class ResearchTools {
     let offTargetChars = 0;
     let remaining = this.#budget.remaining("evidenceChars");
     for (const hit of hits) {
+      const modelQuote = sourceTextForTranslation(hit.quote);
+      if (!hasSemanticText(modelQuote)) {
+        continue;
+      }
       const offTarget = !this.#targetBlockIndexes.has(hit.globalIndex);
-      if (offTarget && hit.quote.length > remaining) {
+      if (offTarget && modelQuote.length > remaining) {
         clipped = true;
         continue;
       }
       if (offTarget) {
-        offTargetChars += hit.quote.length;
-        remaining -= hit.quote.length;
+        offTargetChars += modelQuote.length;
+        remaining -= modelQuote.length;
       }
-      const issued = { ...hit, channel };
+      const issued = { ...hit, quote: modelQuote, channel };
       returned.push(issued);
       const records = this.#issuedEvidence.get(hit.evidenceId) ?? [];
       records.push({ hit: issued, channel });

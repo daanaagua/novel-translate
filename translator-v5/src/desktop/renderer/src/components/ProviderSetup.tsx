@@ -20,6 +20,7 @@ interface ConnectionFeedback {
 interface ProviderSetupProps {
   providers: readonly DesktopOnboardingProvider[];
   activeModel?: DesktopModelSummary;
+  latestProbe?: DesktopModelProbe;
   busy: boolean;
   onDiscoverModels(request: DesktopDiscoverModelsRequest): Promise<DesktopResult<readonly DesktopModelOption[]>>;
   onTestModel(request: DesktopTestModelRequest): Promise<DesktopResult<DesktopTestModelResult>>;
@@ -62,6 +63,7 @@ function probeFeedback(report: DesktopModelProbe): ConnectionFeedback {
 export function ProviderSetup({
   providers,
   activeModel,
+  latestProbe,
   busy,
   onDiscoverModels,
   onTestModel,
@@ -88,8 +90,13 @@ export function ProviderSetup({
   const [customBaseUrl, setCustomBaseUrl] = useState("");
   const [discoveredModels, setDiscoveredModels] = useState<readonly DesktopModelOption[]>([]);
   const [testingConnection, setTestingConnection] = useState(false);
-  const [connectionFeedback, setConnectionFeedback] = useState<ConnectionFeedback>();
+  const [connectionFeedback, setConnectionFeedback] = useState<ConnectionFeedback | undefined>(
+    () => latestProbe === undefined || (activeModel !== undefined && latestProbe.status !== "ready")
+      ? undefined
+      : probeFeedback(latestProbe),
+  );
   const synchronizedActiveModel = useRef<string | undefined>(undefined);
+  const synchronizedProviderId = useRef(providerId);
 
   const selectedProvider = providers.find((provider) => provider.id === providerId) ?? directProviders[0] ?? additionalProviders[0];
 
@@ -116,12 +123,14 @@ export function ProviderSetup({
 
   useLayoutEffect(() => {
     if (selectedProvider === undefined) return;
+    const providerChanged = synchronizedProviderId.current !== selectedProvider.id;
+    synchronizedProviderId.current = selectedProvider.id;
     const savedModel = activeModel?.providerId === selectedProvider.id ? activeModel : undefined;
     setModelId(savedModel?.modelId ?? firstModel(selectedProvider));
     setReasoningEffort(savedModel?.reasoningEffort ?? selectedProvider.efforts[0] ?? "");
     setDiscoveredModels([]);
     setApiKey("");
-    setConnectionFeedback(undefined);
+    if (providerChanged) setConnectionFeedback(undefined);
   }, [selectedProvider?.id]);
 
   const listedModelOptions = discoveredModels.length > 0
@@ -175,6 +184,12 @@ export function ProviderSetup({
       };
       const result = await onTestModel(request);
       if (!result.ok) {
+        setConnectionFeedback({
+          status: "failed",
+          message: result.error.message.trim().length === 0
+            ? "连接测试未能完成，请检查设置后重试。"
+            : `连接测试失败：${result.error.message.trim()}`,
+        });
         return;
       }
       setConnectionFeedback(probeFeedback(result.value.report));

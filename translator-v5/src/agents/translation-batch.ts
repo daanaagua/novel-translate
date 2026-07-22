@@ -5,6 +5,7 @@ import type { V4Block } from "../domain/types.js";
 import type { BudgetLedger } from "../kernel/budget.js";
 import type { LosslessBlock } from "../source/types.js";
 import { normalizeTranslatedSceneSeparators } from "../source/layout-separators.js";
+import { hasSemanticText } from "../text/semantic-text.js";
 import { normalizeChineseQuoteTexts } from "../style/chinese-quote-normalization.js";
 import { simplifyChineseTranslation } from "../style/chinese-script-normalization.js";
 import type { StyleObservationSubmission } from "../style/types.js";
@@ -210,7 +211,7 @@ function validateSubmission(
         return failed(`duplicate blockId for ${window.windowId}: ${translation.blockId}`);
       }
       seen.add(blockId);
-      if (translation.text.trim().length === 0) {
+      if (!hasSemanticText(translation.text)) {
         return failed(`empty translation for block ${blockId}`);
       }
       translations.push({ blockId, text: translation.text });
@@ -239,6 +240,7 @@ function validateSubmission(
     windows: normalizeWindowTypography(
       windows,
       input.stableTerms.filter((term) => term.locked).map((term) => term.target),
+      new Map(input.blocks.map((block) => [block.id, block.sourceText])),
     ),
     responseErrors,
   };
@@ -270,12 +272,16 @@ function candidateFor(window: TranslationBatchWindowResult): TranslationCandidat
 function normalizeWindowTypography(
   windows: readonly TranslationBatchWindowResult[],
   preservedTargetForms: readonly string[],
+  sourceTextByBlockId: ReadonlyMap<string, string>,
 ): TranslationBatchWindowResult[] {
   let state = { openDoubleQuoteDepth: 0 };
   return windows.map((window) => {
     const normalized = normalizeChineseQuoteTexts(
       window.translations.map((translation) =>
-        normalizeTranslatedSceneSeparators(translation.text)),
+        normalizeTranslatedSceneSeparators(
+          translation.text,
+          sourceTextByBlockId.get(translation.blockId),
+        )),
       state,
     );
     state = normalized.state;
@@ -490,6 +496,7 @@ async function validateAndRepair(
   const windows = normalizeWindowTypography(
     patchedWindows,
     input.stableTerms.filter((term) => term.locked).map((term) => term.target),
+    new Map(input.blocks.map((block) => [block.id, block.sourceText])),
   );
   const validatedWindows = windows.map((window): TranslationBatchWindowResult => {
     const item = invalidById.get(window.windowId);

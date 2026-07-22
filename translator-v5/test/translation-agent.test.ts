@@ -19,6 +19,7 @@ import type { V4Block } from "../src/domain/types.js";
 import { EvidenceIndex } from "../src/index/evidence-index.js";
 import { BudgetLedger } from "../src/kernel/budget.js";
 import { getSourceLanguageProfile } from "../src/language/profiles.js";
+import { normalizeTranslatedSceneSeparators } from "../src/source/layout-separators.js";
 import { CandidateCollector } from "../src/tools/candidate-collector.js";
 import { TranslationTools } from "../src/tools/translation-tools.js";
 import { TranslationValidator } from "../src/validators/translation-validator.js";
@@ -125,7 +126,7 @@ test("translation agent receives minimal context and may retrieve evidence", asy
 
 test("on-demand evidence lookup is literal-form bounded and position safe", async () => {
   const target = chapterBlock(0, "Rakesh changed her version of the scape.");
-  const future = chapterBlock(1, "The scape was a shared virtual sensory scene.");
+  const future = chapterBlock(1, "The scape was a shared[[]]virtual sensory scene.");
   const evidenceIndex = EvidenceIndex.fromBlocks([target, future]);
   try {
     const createTools = () => new TranslationTools({
@@ -143,6 +144,8 @@ test("on-demand evidence lookup is literal-form bounded and position safe", asyn
       channel: "translator_global",
     });
     assert.ok(global.evidence.some((hit) => hit.globalIndex === future.globalIndex));
+    assert.ok(global.evidence.every((hit) => !hit.quote.includes("[[]]")));
+    assert.ok(global.evidence.some((hit) => hit.quote.includes("shared\n\nvirtual")));
 
     const narrative = await createTools().requestTranslationEvidence({
       question: "What can the narrator know at this point?",
@@ -321,16 +324,21 @@ test("exact paragraph overlap is removed before adjacent blocks are translated",
 });
 
 test("typography is normalized and untranslated prose words are rejected", () => {
-  const block = chapterBlock(0, "The sailors looked up.");
+  const block = chapterBlock(0, "The sailors looked up.[[]]Next scene.");
   const normalized = normalizeCandidateTypography({
-    translations: [{ blockId: block.id, text: "「sailors 抬头望去。」" }],
+    translations: [{ blockId: block.id, text: "「sailors 抬头望去。」[[]]下一场。" }],
     notes: [],
     repaired: false,
-  }, { dialogueQuotes: "Chinese curly double quotes" });
-  assert.equal(normalized.translations[0]?.text, "“sailors 抬头望去。”");
+  }, { dialogueQuotes: "Chinese curly double quotes" }, [], new Map([
+    [block.id, block.sourceText],
+  ]));
+  assert.equal(normalized.translations[0]?.text, "“sailors 抬头望去。”[[]]下一场。");
   const validation = new TranslationValidator().validate([block], normalized);
   assert.ok(validation.failures.some((failure) =>
     failure.code === "untranslated_latin"),
+  );
+  assert.ok(validation.failures.some((failure) =>
+    failure.code === "source_layout_token_leak"),
   );
 });
 
@@ -342,6 +350,35 @@ test("typography normalization simplifies prose without rewriting locked targets
   }, { dialogueQuotes: "Chinese curly double quotes" }, ["龍"]);
 
   assert.equal(normalized.translations[0]?.text, "龍与黑杀队完成了训练。");
+});
+
+test("target normalization never guesses that bracket content is a scene marker", () => {
+  const source = "前场[[]]后场";
+  for (const marker of ["[[]]", "[ [] ]", "［［］］"]) {
+    assert.equal(
+      normalizeTranslatedSceneSeparators(`甲${marker}乙`, source),
+      `甲${marker}乙`,
+    );
+  }
+  assert.equal(
+    normalizeTranslatedSceneSeparators("数组 [] 为空", "The array is empty."),
+    "数组 [] 为空",
+  );
+  assert.equal(
+    normalizeTranslatedSceneSeparators("数组 [] 为空", source),
+    "数组 [] 为空",
+  );
+  assert.equal(
+    normalizeTranslatedSceneSeparators(
+      "数组 [] 为空；真正的场景边界在这里[[]]下一场",
+      "场一[[]]场二",
+    ),
+    "数组 [] 为空；真正的场景边界在这里[[]]下一场",
+  );
+  assert.equal(
+    normalizeTranslatedSceneSeparators("甲[\n[]\n]乙", source),
+    "甲[\n[]\n]乙",
+  );
 });
 
 test("validator preserves exact isolated source identifiers without allowing copied prose", () => {
@@ -436,6 +473,168 @@ test("CJK literary blocks reject implausible per-block shortening and expansion"
     failure.code === "abnormal_block_expansion" && failure.blockId === expandedBlock.id));
 });
 
+test("default language profiles reject one-block omissions hidden by a healthy sibling", () => {
+  const first = chapterBlock(0, "a".repeat(399));
+  const second = chapterBlock(1, "b".repeat(500));
+  const validation = new TranslationValidator().validate(
+    [first, second],
+    {
+      translations: [
+        { blockId: first.id, text: "短" },
+        { blockId: second.id, text: "丙".repeat(350) },
+      ],
+      notes: [],
+      repaired: false,
+    },
+    { sourceLanguageProfile: getSourceLanguageProfile("en") },
+  );
+
+  assert.ok(validation.failures.some((failure) =>
+    failure.code === "abnormal_block_shortening" && failure.blockId === first.id));
+});
+
+test("CJK short-scene bands reject a token translation below the long-block threshold", () => {
+  const source = "가".repeat(399);
+  const item = chapterBlock(0, source);
+  const validation = new TranslationValidator().validate(
+    [item],
+    {
+      translations: [{ blockId: item.id, text: `短${"\u200B".repeat(350)}\uFFFD` }],
+      notes: [],
+      repaired: false,
+    },
+    { sourceLanguageProfile: getSourceLanguageProfile("ko") },
+  );
+
+  assert.ok(validation.failures.some((failure) =>
+    failure.code === "abnormal_block_shortening" && failure.blockId === item.id));
+  assert.ok(validation.failures.some((failure) =>
+    failure.code === "invalid_unicode_output" && failure.blockId === item.id));
+});
+
+test("CJK micro blocks and invisible padding cannot bypass completeness checks", () => {
+  const korean = getSourceLanguageProfile("ko");
+  const micro = chapterBlock(0, "가".repeat(23));
+  const padded = chapterBlock(1, "나".repeat(399));
+  const validation = new TranslationValidator().validate(
+    [micro, padded],
+    {
+      translations: [
+        { blockId: micro.id, text: "短" },
+        { blockId: padded.id, text: `短${"\u0000".repeat(350)}` },
+      ],
+      notes: [],
+      repaired: false,
+    },
+    { sourceLanguageProfile: korean },
+  );
+
+  assert.ok(validation.failures.some((failure) =>
+    failure.code === "abnormal_block_shortening" && failure.blockId === micro.id));
+  assert.ok(validation.failures.some((failure) =>
+    failure.code === "abnormal_block_shortening" && failure.blockId === padded.id));
+  assert.ok(validation.failures.some((failure) =>
+    failure.code === "invalid_unicode_output" && failure.blockId === padded.id));
+});
+
+test("grapheme and invalid-scalar padding cannot forge CJK translation length", () => {
+  const korean = getSourceLanguageProfile("ko");
+  const paddings = [
+    "\u0301".repeat(350),
+    "\u20DD".repeat(350),
+    "\uFFFF".repeat(350),
+    "\uFDD0".repeat(350),
+    "\uD800".repeat(350),
+  ];
+  for (const [index, padding] of paddings.entries()) {
+    const item = chapterBlock(index, "가".repeat(399));
+    const validation = new TranslationValidator().validate(
+      [item],
+      {
+        translations: [{ blockId: item.id, text: `短${padding}` }],
+        notes: [],
+        repaired: false,
+      },
+      { sourceLanguageProfile: korean },
+    );
+    assert.ok(validation.failures.some((failure) =>
+      failure.code === "abnormal_block_shortening" && failure.blockId === item.id));
+    if (index >= 2) {
+      assert.ok(validation.failures.some((failure) =>
+        failure.code === "invalid_unicode_output" && failure.blockId === item.id));
+    }
+  }
+});
+
+test("punctuation, digits, and emoji cannot impersonate translated prose", () => {
+  const korean = getSourceLanguageProfile("ko");
+  for (const [index, noise] of [".", "。", "1", "🙂"].entries()) {
+    const item = chapterBlock(index, "가".repeat(23));
+    const validation = new TranslationValidator().validate(
+      [item],
+      {
+        translations: [{ blockId: item.id, text: noise.repeat(23) }],
+        notes: [],
+        repaired: false,
+      },
+      { sourceLanguageProfile: korean },
+    );
+    assert.ok(validation.failures.some((failure) =>
+      failure.code === "insufficient_lexical_content" && failure.blockId === item.id));
+  }
+});
+
+test("source-script prose cannot pass as a Chinese translation", () => {
+  for (const profileId of ["ja", "ko"] as const) {
+    const item = chapterBlock(0, profileId === "ja" ? "あ".repeat(23) : "가".repeat(23));
+    const validation = new TranslationValidator().validate(
+      [item],
+      {
+        translations: [{ blockId: item.id, text: "A".repeat(23) }],
+        notes: [],
+        repaired: false,
+      },
+      { sourceLanguageProfile: getSourceLanguageProfile(profileId) },
+    );
+    assert.ok(validation.failures.some((failure) =>
+      failure.code === "target_script_mismatch" && failure.blockId === item.id));
+  }
+});
+
+test("a small Chinese prefix cannot disguise a mostly non-Chinese target", () => {
+  const item = chapterBlock(0, "가".repeat(399));
+  const validation = new TranslationValidator().validate(
+    [item],
+    {
+      translations: [{ blockId: item.id, text: `${"甲".repeat(35)}${"α".repeat(315)}` }],
+      notes: [],
+      repaired: false,
+    },
+    { sourceLanguageProfile: getSourceLanguageProfile("ko") },
+  );
+  assert.ok(validation.failures.some((failure) =>
+    failure.code === "target_script_mismatch" && failure.blockId === item.id));
+});
+
+test("zero-width padding cannot hide a copied cross-block paragraph", () => {
+  const first = chapterBlock(0, "甲源".repeat(100));
+  const second = chapterBlock(1, "乙源".repeat(100));
+  const repeated = "重复内容".repeat(15);
+  const validation = new TranslationValidator().validateCrossBlockAlignment(
+    [first, second],
+    {
+      translations: [
+        { blockId: first.id, text: repeated },
+        { blockId: second.id, text: `${repeated.slice(0, 30)}\u200B${repeated.slice(30)}` },
+      ],
+      notes: [],
+      repaired: false,
+    },
+  );
+
+  assert.equal(validation.valid, false);
+});
+
 test("validator rejects long target paragraphs copied across distinct source blocks", () => {
   const korean = getSourceLanguageProfile("ko");
   const first = chapterBlock(0, "가나다라마바사".repeat(100));
@@ -458,6 +657,49 @@ test("validator rejects long target paragraphs copied across distinct source blo
     failure.code === "cross_block_translation_overlap" && failure.blockId === first.id));
   assert.ok(validation.failures.some((failure) =>
     failure.code === "cross_block_translation_overlap" && failure.blockId === second.id));
+});
+
+test("one legitimate repeated source paragraph cannot exempt an extra target duplicate", () => {
+  const repeatedSource = "가나다라마바사아자차카타파하".repeat(6);
+  const first = chapterBlock(0, `${repeatedSource}\n\n${"첫째본문".repeat(100)}`);
+  const second = chapterBlock(1, `${repeatedSource}\n\n${"둘째본문".repeat(100)}`);
+  const legitimateTarget = "这是原文中本就重复出现的长段内容".repeat(6);
+  const leakedTarget = "这是模型额外串入两个文本块的错误长段内容".repeat(6);
+  const validation = new TranslationValidator().validateCrossBlockAlignment(
+    [first, second],
+    {
+      translations: [
+        { blockId: first.id, text: `${legitimateTarget}\n\n${leakedTarget}\n\n${"甲".repeat(300)}` },
+        { blockId: second.id, text: `${legitimateTarget}\n\n${leakedTarget}\n\n${"乙".repeat(300)}` },
+      ],
+      notes: [],
+      repaired: false,
+    },
+  );
+
+  assert.equal(validation.valid, false);
+  assert.ok(validation.failures.some((failure) => failure.blockId === first.id));
+  assert.ok(validation.failures.some((failure) => failure.blockId === second.id));
+});
+
+test("a source scene marker exposes a legitimate repeated paragraph to alignment", () => {
+  const sharedSource = "共同源段".repeat(30);
+  const first = chapterBlock(0, `${"第一场景".repeat(30)}[[]]${sharedSource}`);
+  const second = chapterBlock(1, `${"第二场景".repeat(30)}[[]]${sharedSource}`);
+  const sharedTarget = "共同译文".repeat(30);
+  const validation = new TranslationValidator().validateCrossBlockAlignment(
+    [first, second],
+    {
+      translations: [
+        { blockId: first.id, text: `${"甲".repeat(100)}\n\n${sharedTarget}` },
+        { blockId: second.id, text: `${"乙".repeat(100)}\n\n${sharedTarget}` },
+      ],
+      notes: [],
+      repaired: false,
+    },
+  );
+
+  assert.equal(validation.valid, true);
 });
 
 test("one repair pass can replace an invalid island candidate", async () => {

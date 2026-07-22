@@ -137,6 +137,59 @@ test("embedded scene separators force a lossless block boundary even below the t
   assert.equal(blocks.map((block) => block.sourceText).join(""), source);
 });
 
+test("token cuts never isolate or split an embedded scene separator", () => {
+  const cases = [
+    { source: `${"x".repeat(63)}[[]]${"y".repeat(100)}`, cap: 20 },
+    { source: `${"x".repeat(62)}[[]]`, cap: 20 },
+    { source: `[[]]${"가".repeat(24)}`, cap: 1 },
+    { source: `${"가".repeat(24)}[[]]`, cap: 1 },
+    { source: `${"가".repeat(24)}[[]][[]]${"나".repeat(24)}`, cap: 2 },
+    { source: `${"x".repeat(63)}${"[[]]".repeat(100)}${"y".repeat(100)}`, cap: 20 },
+  ];
+  for (const [index, fixture] of cases.entries()) {
+    const blocks = buildLosslessBlocks(fixture.source, [], {
+      maxSourceTokens: fixture.cap,
+      sourceVersion: `scene-token-edge-${index}`,
+      languageProfile: getSourceLanguageProfile("ko"),
+    });
+
+    assert.equal(blocks.map((block) => block.sourceText).join(""), fixture.source);
+    assert.equal(
+      blocks.some((block) => block.sourceText.includes("[[]]")
+        && block.sourceText.replaceAll("[[]]", "").trim().length === 0),
+      false,
+    );
+    assert.equal(
+      blocks.some((block) => /^(?:\[|\[\[|\[\[\])$/u.test(block.sourceText)),
+      false,
+    );
+    if (fixture.cap === 20) {
+      assert.equal(blocks.every((block) => block.tokenCount <= fixture.cap), true);
+    }
+  }
+});
+
+test("a layout-only source is rejected before it can enter the translation protocol", () => {
+  assert.throws(
+    () => buildLosslessBlocks("[[]]\n\n[[]]", [], {
+      maxSourceTokens: 1,
+      sourceVersion: "layout-only-source",
+      languageProfile: getSourceLanguageProfile("ko"),
+    }),
+    /source contains no translatable content/u,
+  );
+  for (const invisible of ["\u200B", `[[]]\u200B`, "\uFFFD"]) {
+    assert.throws(
+      () => buildLosslessBlocks(invisible, [], {
+        maxSourceTokens: 1,
+        sourceVersion: `invisible-${invisible.codePointAt(0)}`,
+        languageProfile: getSourceLanguageProfile("ko"),
+      }),
+      /source contains no translatable content/u,
+    );
+  }
+});
+
 function manifestFor(source: string, label: string): string {
   const directory = mkdtempSync(join(tmpdir(), `v5-acceptance-${label}-`));
   const hasBom = source.startsWith("\uFEFF");

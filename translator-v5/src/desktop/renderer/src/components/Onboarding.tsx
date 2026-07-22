@@ -202,6 +202,7 @@ export function Onboarding({
             <ProviderSetup
               providers={onboarding.providers}
               activeModel={onboarding.activeModel}
+              latestProbe={onboarding.latestProbe}
               busy={busyAction !== undefined}
               onDiscoverModels={onDiscoverModels}
               onTestModel={onTestModel}

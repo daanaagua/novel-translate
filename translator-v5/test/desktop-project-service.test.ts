@@ -179,7 +179,7 @@ test("snapshot exposes reader-facing source diagnostics without internal project
       assert.equal(result.value.detectedLanguage, "英语");
       assert.equal(result.value.sourceEncoding, "utf-8");
       assert.equal(result.value.encodingConfidence, 1);
-      assert.equal(result.value.languageProfileVersion, "source-language-profile-3");
+      assert.equal(result.value.languageProfileVersion, "source-language-profile-4");
       assert.equal(result.value.title, "original");
       assert.equal("manifestPath" in result.value, false);
       assert.equal("glossaryPath" in result.value, false);

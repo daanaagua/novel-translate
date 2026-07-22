@@ -10,6 +10,7 @@ import {
   targetLanguageLabel,
 } from "../language/target.js";
 import type { LosslessBlock } from "../source/types.js";
+import { sourceTextForTranslation } from "../source/layout-separators.js";
 import type {
   EffectiveStyleProjection,
   StyleObservationSubmission,
@@ -187,7 +188,7 @@ function windowsForPrompt(input: TranslationRequestInput): Array<{
       if (block === undefined) {
         throw new Error(`physical request references unknown block: ${blockId}`);
       }
-      return { blockId, sourceText: block.sourceText };
+      return { blockId, sourceText: sourceTextForTranslation(block.sourceText) };
     }),
   }));
 }

@@ -8,7 +8,7 @@ export interface BoundaryCandidate {
   kind: "paragraph" | "sentence" | "heading" | "layout";
 }
 
-export interface TranslationLengthRatioBounds {
+export interface TranslationLengthRatioBand {
   min: number;
   max: number;
   minSourceCharacters: number;
@@ -71,7 +71,7 @@ export interface SourceLanguageProfile {
   readonly displayName: string;
   readonly locale: string;
   readonly scripts: readonly SourceScript[];
-  readonly translationLengthRatioBounds?: TranslationLengthRatioBounds;
+  readonly translationLengthRatioBands?: readonly TranslationLengthRatioBand[];
   detectStructureHeading(line: string): StructureHeading | null;
   collectBoundaryCandidates(text: string): BoundaryCandidate[];
   collectScriptStats(text: string): ScriptStats;

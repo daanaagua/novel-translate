@@ -13,6 +13,7 @@ import {
 import type { BudgetLedger } from "../kernel/budget.js";
 import { getSourceLanguageProfile } from "../language/profiles.js";
 import type { SourceLanguageProfile } from "../language/types.js";
+import { sourceTextForTranslation } from "../source/layout-separators.js";
 import { simplifyChineseTranslation } from "../style/chinese-script-normalization.js";
 import { assertNotAborted, Type, type TypedToolSpec } from "../tools/tool-spec.js";
 import { PiRuntime, type PiRunResult } from "./pi-runtime.js";
@@ -76,8 +77,8 @@ export function collectRepeatedAnchorCandidates(
   profile: SourceLanguageProfile = getSourceLanguageProfile("en"),
 ): AnchorCandidate[] {
   return profile.collectAnchorCandidates({
-    targetTexts: blocks.map((block) => block.sourceText),
-    corpusTexts: blocks.map((block) => block.sourceText),
+    targetTexts: blocks.map((block) => sourceTextForTranslation(block.sourceText)),
+    corpusTexts: blocks.map((block) => sourceTextForTranslation(block.sourceText)),
     establishedSourceForms: establishedForms(stableTerms),
     limit: 24,
   }).filter((candidate) => candidate.corpusFrequency >= 2)
@@ -100,8 +101,8 @@ export function collectWindowAnchorCandidates(
   profile: SourceLanguageProfile = getSourceLanguageProfile("en"),
 ): AnchorCandidate[] {
   return profile.collectAnchorCandidates({
-    targetTexts: targetBlocks.map((block) => block.sourceText),
-    corpusTexts: corpusBlocks.map((block) => block.sourceText),
+    targetTexts: targetBlocks.map((block) => sourceTextForTranslation(block.sourceText)),
+    corpusTexts: corpusBlocks.map((block) => sourceTextForTranslation(block.sourceText)),
     establishedSourceForms: [
       ...establishedForms(stableTerms),
       ...decidedSourceForms,

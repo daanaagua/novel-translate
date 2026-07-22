@@ -533,7 +533,7 @@ test("two tiny logical windows use one physical model session and commit indepen
     assert.deepEqual(store.listTranslationRuns()[0]?.metadata, {
       sourceLanguageProfile: {
         id: "en",
-        version: "source-language-profile-3",
+        version: "source-language-profile-4",
         compatibilityMode: false,
       },
       sourceAnomalies: {

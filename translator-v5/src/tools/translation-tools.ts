@@ -9,6 +9,8 @@ import type {
 import type { EvidenceIndex } from "../index/evidence-index.js";
 import type { NarrativeMemoryRecord } from "../fullbook/types.js";
 import { BudgetLedger } from "../kernel/budget.js";
+import { sourceTextForTranslation } from "../source/layout-separators.js";
+import { hasSemanticText } from "../text/semantic-text.js";
 import {
   CandidateCollector,
   type ResolutionCandidate,
@@ -173,11 +175,17 @@ export class TranslationTools {
       if (remainingChars <= 0) {
         break;
       }
-      const quote = hit.quote.slice(0, Math.min(900, remainingChars));
-      remainingChars -= quote.length;
+      const visibleQuote = sourceTextForTranslation(hit.quote);
+      if (!hasSemanticText(visibleQuote)) {
+        continue;
+      }
+      const quote = [...visibleQuote]
+        .slice(0, Math.min(900, remainingChars))
+        .join("");
+      remainingChars -= [...quote].length;
       evidence.push({ ...hit, quote });
     }
-    const evidenceChars = evidence.reduce((total, hit) => total + hit.quote.length, 0);
+    const evidenceChars = evidence.reduce((total, hit) => total + [...hit.quote].length, 0);
     this.#budget.consumeMany({
       translationToolCalls: 1,
       researchToolCalls: 1,
@@ -417,7 +425,7 @@ export class TranslationTools {
       if (seen.has(translation.blockId)) {
         throw new Error(`duplicate target block: ${translation.blockId}`);
       }
-      if (typeof translation.text !== "string" || translation.text.trim().length === 0) {
+      if (typeof translation.text !== "string" || !hasSemanticText(translation.text)) {
         throw new TypeError(`empty translation: ${translation.blockId}`);
       }
       seen.add(translation.blockId);

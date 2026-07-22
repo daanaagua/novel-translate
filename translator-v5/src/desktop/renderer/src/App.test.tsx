@@ -541,6 +541,44 @@ describe("FolioLoom desktop onboarding", () => {
     expect((apiKey as HTMLInputElement).value).toBe("sk-limited-retry");
   });
 
+  it("shows the persisted failed probe after restart when no model is active", async () => {
+    const restarted: DesktopOnboardingState = {
+      ...sourceOnlyOnboarding,
+      latestProbe: {
+        status: "failed",
+        message: "上次连接模型时网络超时。",
+        retryable: true,
+      },
+    };
+    render(<App api={createApi({
+      getOnboardingState: vi.fn().mockResolvedValue(ok(restarted)),
+    })} />);
+
+    expect(await screen.findByText("上次连接模型时网络超时。")).toBeTruthy();
+  });
+
+  it("keeps the API Key and reports an IPC connection error beside the button", async () => {
+    const user = userEvent.setup();
+    render(<App api={createApi({
+      getOnboardingState: vi.fn().mockResolvedValue(ok(sourceOnlyOnboarding)),
+      testModel: vi.fn().mockResolvedValue({
+        ok: false,
+        error: {
+          code: "PROVIDER_UNREACHABLE",
+          message: "连接服务超时，请稍后重试。",
+          retryable: true,
+        },
+      }),
+    })} />);
+
+    const apiKey = await screen.findByLabelText("API Key");
+    await user.type(apiKey, "sk-keep-after-ipc-error");
+    await user.click(screen.getByRole("button", { name: "测试连接" }));
+
+    expect(await screen.findByText("连接测试失败：连接服务超时，请稍后重试。")).toBeTruthy();
+    expect((apiKey as HTMLInputElement).value).toBe("sk-keep-after-ipc-error");
+  });
+
   it("locks provider selection while model discovery is in flight", async () => {
     const user = userEvent.setup();
     let resolveDiscover!: (value: DesktopResult<readonly { id: string; displayName: string }[]>) => void;

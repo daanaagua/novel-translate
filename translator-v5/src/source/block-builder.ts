@@ -7,6 +7,12 @@ import {
   type TokenEstimationCursor,
   type TokenEstimator,
 } from "./token-estimator.js";
+import {
+  embeddedSceneSeparatorSpans,
+  normalizeSourceSceneSeparators,
+  sourceTextForTranslation,
+} from "./layout-separators.js";
+import { hasSemanticText } from "../text/semantic-text.js";
 import type {
   LosslessBlock,
   SourceInput,
@@ -23,6 +29,16 @@ export interface BlockBuilderOptions {
 }
 
 interface CandidateCut extends BoundaryCandidate {}
+
+interface ScalarLayoutSpan {
+  start: number;
+  end: number;
+}
+
+interface SemanticScalarIndex {
+  readonly prefixCounts: Uint32Array;
+  readonly nextSemanticEnds: Int32Array;
+}
 
 const DEFAULT_MAX_SOURCE_TOKENS = 1_500;
 const DEFAULT_TOKEN_ESTIMATOR = new WeightedTokenEstimator();
@@ -138,6 +154,13 @@ function candidateCuts(
     weight: 0,
     kind: "sentence",
   }, coordinates.length);
+  for (const span of embeddedSceneSeparatorSpans(text)) {
+    addCandidate(strongestByOffset, {
+      scalarOffset: coordinates.toScalarIndex(span.utf16End),
+      weight: 120,
+      kind: "layout",
+    }, coordinates.length);
+  }
   for (const candidate of profile.collectBoundaryCandidates(text)) {
     addCandidate(strongestByOffset, candidate, coordinates.length);
   }
@@ -166,6 +189,88 @@ function candidateCuts(
     || right.weight - left.weight
     || left.kind.localeCompare(right.kind)
   ));
+}
+
+function scalarLayoutSpans(
+  text: string,
+  coordinates: UnicodeScalarMap,
+): ScalarLayoutSpan[] {
+  return embeddedSceneSeparatorSpans(text).map((span) => ({
+    start: coordinates.toScalarIndex(span.utf16Start),
+    end: coordinates.toScalarIndex(span.utf16End),
+  }));
+}
+
+function protectLayoutCut(
+  end: number,
+  spans: readonly ScalarLayoutSpan[],
+  semanticIndex: SemanticScalarIndex,
+  sourceLength: number,
+): number {
+  let low = 0;
+  let high = spans.length - 1;
+  let crossing: ScalarLayoutSpan | undefined;
+  while (low <= high) {
+    const middle = Math.floor((low + high) / 2);
+    const span = spans[middle] as ScalarLayoutSpan;
+    if (end < span.start) {
+      high = middle - 1;
+    } else if (end >= span.end) {
+      low = middle + 1;
+    } else {
+      crossing = span;
+      break;
+    }
+  }
+  if (crossing === undefined) {
+    return end;
+  }
+  if (end === crossing.start
+    && semanticRangeHasContent(semanticIndex, crossing.end, sourceLength)) {
+    return end;
+  }
+  return crossing.end;
+}
+
+function hasTranslatableSourceContent(text: string): boolean {
+  return hasSemanticText(normalizeSourceSceneSeparators(text));
+}
+
+function buildSemanticScalarIndex(
+  text: string,
+  layoutSpans: readonly ScalarLayoutSpan[],
+): SemanticScalarIndex {
+  const scalars = [...text];
+  const prefixCounts = new Uint32Array(scalars.length + 1);
+  const semantic = new Uint8Array(scalars.length);
+  let layoutIndex = 0;
+  for (let index = 0; index < scalars.length; index += 1) {
+    while ((layoutSpans[layoutIndex]?.end ?? Number.POSITIVE_INFINITY) <= index) {
+      layoutIndex += 1;
+    }
+    const layout = layoutSpans[layoutIndex];
+    const insideLayout = layout !== undefined && index >= layout.start && index < layout.end;
+    semantic[index] = !insideLayout && hasSemanticText(scalars[index] as string) ? 1 : 0;
+    prefixCounts[index + 1] = (prefixCounts[index] as number) + semantic[index];
+  }
+  const nextSemanticEnds = new Int32Array(scalars.length + 1);
+  nextSemanticEnds.fill(-1);
+  let nextEnd = -1;
+  for (let index = scalars.length - 1; index >= 0; index -= 1) {
+    if (semantic[index] === 1) {
+      nextEnd = index + 1;
+    }
+    nextSemanticEnds[index] = nextEnd;
+  }
+  return { prefixCounts, nextSemanticEnds };
+}
+
+function semanticRangeHasContent(
+  index: SemanticScalarIndex,
+  start: number,
+  end: number,
+): boolean {
+  return (index.prefixCounts[end] as number) > (index.prefixCounts[start] as number);
 }
 
 function maximumEndWithBoundedFallback(
@@ -304,6 +409,9 @@ export function buildLosslessBlocks(
   if (coordinates.length === 0) {
     return [];
   }
+  if (!hasTranslatableSourceContent(text)) {
+    throw new RangeError("source contains no translatable content");
+  }
   const maxSourceTokens = positiveInteger(
     options.maxSourceTokens ?? DEFAULT_MAX_SOURCE_TOKENS,
     "maxSourceTokens",
@@ -319,10 +427,13 @@ export function buildLosslessBlocks(
   const estimatorVersionValue = estimatorVersion(estimator);
   const estimationCursor = estimatorCursorFor(estimator, text, profile);
   const cuts = candidateCuts(source, annotations, profile);
-  const layoutStarts = [...new Set(
+  const softCuts = cuts.filter((candidate) => candidate.kind !== "layout");
+  const layoutSpans = scalarLayoutSpans(text, coordinates);
+  const semanticIndex = buildSemanticScalarIndex(text, layoutSpans);
+  const layoutEnds = [...new Set(
     cuts.filter((candidate) => candidate.kind === "layout")
       .map((candidate) => candidate.scalarOffset),
-  )].filter((start) => start > 0);
+  )].filter((end) => end > 0);
   const sortedAnnotations = [...annotations].sort((left, right) => (
     left.start - right.start || left.end - right.end || left.id.localeCompare(right.id)
   ));
@@ -349,23 +460,46 @@ export function buildLosslessBlocks(
       estimationCursor,
       budgetStructuredFields,
     );
-    while ((cuts[candidateIndex]?.scalarOffset ?? Number.POSITIVE_INFINITY) <= cursor) {
+    while ((softCuts[candidateIndex]?.scalarOffset ?? Number.POSITIVE_INFINITY) <= cursor) {
       candidateIndex += 1;
     }
     while ((structureStarts[structureIndex] ?? Number.POSITIVE_INFINITY) <= cursor) {
       structureIndex += 1;
     }
-    while ((layoutStarts[layoutIndex] ?? Number.POSITIVE_INFINITY) <= cursor) {
+    while ((layoutEnds[layoutIndex] ?? Number.POSITIVE_INFINITY) <= cursor
+      || (layoutEnds[layoutIndex] !== undefined
+        && !semanticRangeHasContent(
+          semanticIndex,
+          cursor,
+          layoutEnds[layoutIndex] as number,
+        ))) {
       layoutIndex += 1;
     }
     const nextStructureStart = structureStarts[structureIndex];
-    const nextLayoutStart = layoutStarts[layoutIndex];
-    const nextHardBoundary = [nextStructureStart, nextLayoutStart]
+    const nextLayoutEnd = layoutEnds[layoutIndex];
+    const nextHardBoundary = [nextStructureStart, nextLayoutEnd]
       .filter((value): value is number => value !== undefined && value <= maximumEnd)
       .sort((left, right) => left - right)[0];
-    const end = nextHardBoundary
-      ?? preferredCandidateEnd(cuts, candidateIndex, cursor, maximumEnd)
+    let end = nextHardBoundary
+      ?? preferredCandidateEnd(softCuts, candidateIndex, cursor, maximumEnd)
       ?? maximumEnd;
+    end = protectLayoutCut(end, layoutSpans, semanticIndex, coordinates.length);
+    if (!semanticRangeHasContent(semanticIndex, cursor, end)) {
+      const nextSemanticEnd = semanticIndex.nextSemanticEnds[end] as number;
+      if (nextSemanticEnd < 0) {
+        throw new RangeError("source contains a trailing nonsemantic fragment without a prose block");
+      }
+      end = protectLayoutCut(
+        nextSemanticEnd,
+        layoutSpans,
+        semanticIndex,
+        coordinates.length,
+      );
+    }
+    if (end < coordinates.length
+      && !semanticRangeHasContent(semanticIndex, end, coordinates.length)) {
+      end = coordinates.length;
+    }
     const blockText = coordinates.slice(cursor, end);
     const sourceHash = sha256(blockText);
     while ((sortedAnnotations[annotationIndex]?.start ?? Number.POSITIVE_INFINITY) < end) {
@@ -383,7 +517,7 @@ export function buildLosslessBlocks(
       globalIndex: blocks.length,
       tokenCount: estimateTokens(
         estimator,
-        blockText,
+        sourceTextForTranslation(blockText),
         profile,
         structure === undefined ? 0 : 1,
       ),

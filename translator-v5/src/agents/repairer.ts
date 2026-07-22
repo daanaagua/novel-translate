@@ -4,6 +4,7 @@ import type { Model } from "@earendil-works/pi-ai";
 import type { ProvisionalSnapshot } from "../domain/provisional-snapshot.js";
 import type { V4Block } from "../domain/types.js";
 import type { BudgetLedger } from "../kernel/budget.js";
+import { sourceTextForTranslation } from "../source/layout-separators.js";
 import {
   CandidateCollector,
   type TranslationCandidate,
@@ -61,7 +62,7 @@ export class Repairer {
       JSON.stringify(input.failures),
       "SOURCE BLOCKS",
       input.blocks.map((block) =>
-        `[${block.id}]\n${block.sourceText}`,
+        `[${block.id}]\n${sourceTextForTranslation(block.sourceText)}`,
       ).join("\n\n"),
       "FAILED CANDIDATE",
       JSON.stringify(input.failedCandidate.translations),

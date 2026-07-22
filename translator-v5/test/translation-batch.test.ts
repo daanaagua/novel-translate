@@ -204,7 +204,7 @@ test("batch normalizes every forbidden double-quote glyph before initial validat
   assert.equal(/["‛‟〝〞„]/u.test(result.windows[0]?.translations[0]?.text ?? ""), false);
 });
 
-test("batch converts embedded source scene markers into ordinary paragraph boundaries", async () => {
+test("batch preserves model-produced scene paragraphs without extraction markers", async () => {
   const sourceBlocks = [block(
     "block-0",
     0,
@@ -216,7 +216,7 @@ test("batch converts embedded source scene markers into ordinary paragraph bound
     "finalize_translation_batch",
     { windows: [{
       windowId: sourceRequest.windows[0]?.windowId,
-      translations: [{ blockId: "block-0", text: "前一场景结束。[[]]后一场景开始。[]第三场景开始。" }],
+      translations: [{ blockId: "block-0", text: "前一场景结束。\n\n后一场景开始。\n\n第三场景开始。" }],
       notes: [],
     }] },
   ), { stopReason: "toolUse" })]);
@@ -295,6 +295,64 @@ test("batch repairs long translated paragraphs duplicated across logical windows
   assert.deepEqual(result.windows.map((window) => window.status), ["completed", "completed"]);
   assert.equal(result.windows[0]?.translations[0]?.text, "甲".repeat(500));
   assert.equal(result.windows[1]?.translations[0]?.text, "乙".repeat(500));
+});
+
+test("batch repairs a silently shortened Korean scene below the strict long-block band", async () => {
+  const sourceBlocks = [
+    block("block-0", 0, "가".repeat(401)),
+    block("block-1", 1, "나".repeat(399)),
+  ];
+  const sourceRequest: PhysicalRequestPlan = {
+    requestId: "request-short-korean-scene",
+    sourceTokens: 4,
+    windows: sourceBlocks.map((item, ordinal) => ({
+      windowId: `window-${ordinal}`,
+      ordinal,
+      chapterId: "chapter-0",
+      chapterTitle: null,
+      blockIds: [item.id],
+      globalIndexes: [ordinal],
+      sourceTokens: item.tokenCount,
+      sourceChars: item.sourceText.length,
+      oversized: false,
+    })),
+  };
+  const faux = fauxProvider();
+  faux.setResponses([
+    fauxAssistantMessage(fauxToolCall("finalize_translation_batch", {
+      windows: [
+        {
+          windowId: "window-0",
+          translations: [{ blockId: "block-0", text: "甲".repeat(300) }],
+          notes: [],
+        },
+        {
+          windowId: "window-1",
+          translations: [{ blockId: "block-1", text: "短" }],
+          notes: [],
+        },
+      ],
+    }), { stopReason: "toolUse" }),
+    fauxAssistantMessage(fauxToolCall("submit_repaired_translation", {
+      translations: [{ blockId: "block-1", text: "乙".repeat(240) }],
+      notes: [],
+    }), { stopReason: "toolUse" }),
+  ]);
+
+  const result = await runTranslationBatch({
+    request: sourceRequest,
+    blocks: sourceBlocks,
+    stableTerms: [],
+    snapshot: { id: "snapshot-0", revisions: [] },
+    sourceLanguageProfile: getSourceLanguageProfile("ko"),
+    model: faux.getModel(),
+    streamFn: faux.provider.streamSimple.bind(faux.provider),
+    budget: new BudgetLedger(),
+  });
+
+  assert.equal(faux.state.callCount, 2);
+  assert.deepEqual(result.windows.map((window) => window.status), ["completed", "completed"]);
+  assert.equal(result.windows[1]?.translations[0]?.text, "乙".repeat(240));
 });
 
 test("batch normalizes traditional prose before validation and preserves locked targets", async () => {

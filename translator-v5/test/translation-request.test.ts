@@ -119,6 +119,31 @@ test("framed text requests expose exact nonce markers and no translation tool sc
   }
 });
 
+test("model-visible source converts extraction scene markers without changing lossless blocks", () => {
+  const base = fixture();
+  const sourceBlocks = [block("block-layout", 0, "前场[[]]后场[[]]")];
+  const request: PhysicalRequestPlan = {
+    requestId: "request-layout",
+    sourceTokens: 10,
+    windows: [{
+      windowId: "window-layout",
+      ordinal: 0,
+      chapterId: "chapter-0",
+      chapterTitle: null,
+      blockIds: ["block-layout"],
+      globalIndexes: [0],
+      sourceTokens: 10,
+      sourceChars: sourceBlocks[0]!.sourceText.length,
+      oversized: false,
+    }],
+  };
+  const prepared = prepareTranslationRequest({ ...base, blocks: sourceBlocks, request });
+
+  assert.doesNotMatch(prepared.prompt, /\[\[\]\]/u);
+  assert.match(prepared.prompt, /前场\\n\\n后场/u);
+  assert.equal(sourceBlocks[0]?.sourceText, "前场[[]]后场[[]]");
+});
+
 function revision(
   revisionId: string,
   normalizedSubject: string,

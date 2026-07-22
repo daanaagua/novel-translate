@@ -10,10 +10,15 @@ import type {
   SourceToken,
   StructureHeading,
 } from "./types.js";
-import { embeddedSceneSeparatorEndOffsets } from "../source/layout-separators.js";
 
-const PROFILE_VERSION = "source-language-profile-3";
+const PROFILE_VERSION = "source-language-profile-4";
 const DEFAULT_CANDIDATE_LIMIT = 24;
+const DEFAULT_TRANSLATION_LENGTH_RATIO_BANDS = Object.freeze([
+  Object.freeze({ minSourceCharacters: 1, min: 0.08, max: 10 }),
+  Object.freeze({ minSourceCharacters: 24, min: 0.08, max: 5 }),
+  Object.freeze({ minSourceCharacters: 80, min: 0.08, max: 3 }),
+  Object.freeze({ minSourceCharacters: 400, min: 0.18, max: 1.5 }),
+]);
 
 interface ProfileDefinition {
   id: string;
@@ -26,11 +31,11 @@ interface ProfileDefinition {
   leadingContractions?: readonly string[];
   aliasCuePatterns?: readonly RegExp[];
   namingCuePatterns?: readonly RegExp[];
-  translationLengthRatioBounds?: {
+  translationLengthRatioBands?: readonly {
     min: number;
     max: number;
     minSourceCharacters: number;
-  };
+  }[];
 }
 
 const DEFINITIONS: readonly ProfileDefinition[] = [
@@ -126,11 +131,12 @@ const DEFINITIONS: readonly ProfileDefinition[] = [
       "\u3059\u308b", "\u3057\u305f", "\u3057\u3066", "\u3042\u308b", "\u3042\u3063\u305f", "\u3067\u3059", "\u307e\u3059",
     ],
     script: "kana",
-    translationLengthRatioBounds: {
-      min: 0.6,
-      max: 1.25,
-      minSourceCharacters: 400,
-    },
+    translationLengthRatioBands: [
+      { minSourceCharacters: 1, min: 0.08, max: 6 },
+      { minSourceCharacters: 24, min: 0.08, max: 3 },
+      { minSourceCharacters: 80, min: 0.25, max: 2 },
+      { minSourceCharacters: 400, min: 0.6, max: 1.25 },
+    ],
     aliasCuePatterns: [/(?:\u5225\u540d|\u3068\u3057\u3066\u77e5\u3089)/u],
     namingCuePatterns: [/(?:\u6c0f|\u69d8|\u6bbf|\u3055\u3093)\b/u],
   },
@@ -154,11 +160,12 @@ const DEFINITIONS: readonly ProfileDefinition[] = [
       "이것", "그것", "저것", "이유", "벌써", "결국", "예전", "일종", "정식", "의견",
     ],
     script: "hangul",
-    translationLengthRatioBounds: {
-      min: 0.6,
-      max: 1.25,
-      minSourceCharacters: 400,
-    },
+    translationLengthRatioBands: [
+      { minSourceCharacters: 1, min: 0.08, max: 6 },
+      { minSourceCharacters: 24, min: 0.08, max: 3 },
+      { minSourceCharacters: 80, min: 0.25, max: 2 },
+      { minSourceCharacters: 400, min: 0.6, max: 1.25 },
+    ],
     aliasCuePatterns: [/(?:\ubcc4\uba85|(?:\ub77c\uace0|\uc73c\ub85c|\ub85c)\s*\ubd88\ub9ac|\ub77c\uace0\s*\ud55c\ub2e4)/u],
     namingCuePatterns: [/(?:\uc528|\ub2d8|\uc7a5\uad70|\ub300\uac10)/u],
   },
@@ -319,13 +326,6 @@ function cjkBoundaryCandidates(
 ): BoundaryCandidate[] {
   const candidates: BoundaryCandidate[] = [];
   const utf16Boundaries: Utf16BoundaryCandidate[] = [];
-  for (const utf16Offset of embeddedSceneSeparatorEndOffsets(text)) {
-    utf16Boundaries.push({
-      utf16Offset,
-      weight: 120,
-      kind: "layout",
-    });
-  }
   for (const match of text.matchAll(/(?:\r\n|\r|\n)[ \t]*(?:(?:\r\n|\r|\n)[ \t]*)+/gu)) {
     if (match.index !== undefined) {
       utf16Boundaries.push({
@@ -737,11 +737,11 @@ function buildProfile(definition: ProfileDefinition): SourceLanguageProfile {
     displayName: definition.displayName,
     locale: definition.locale,
     scripts: scriptsFor(definition),
-    ...(definition.translationLengthRatioBounds === undefined
-      ? {}
-      : { translationLengthRatioBounds: Object.freeze({
-        ...definition.translationLengthRatioBounds,
-      }) }),
+    translationLengthRatioBands: definition.translationLengthRatioBands === undefined
+      ? DEFAULT_TRANSLATION_LENGTH_RATIO_BANDS
+      : Object.freeze(
+        definition.translationLengthRatioBands.map((band) => Object.freeze({ ...band })),
+      ),
     detectStructureHeading(line: string): StructureHeading | null {
       return structureHeading(line, definition);
     },
