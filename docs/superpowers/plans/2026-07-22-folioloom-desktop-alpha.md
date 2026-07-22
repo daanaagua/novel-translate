@@ -198,7 +198,7 @@ git commit -m "feat: add read-only lossless store access"
 - 创建：`translator-v5/test/desktop-project-service.test.ts`
 - 创建：`translator-v5/test/desktop-preferences.test.ts`
 
-- [ ] **步骤 1：先定义共享数据契约与失败测试**
+- [x] **步骤 1：先定义共享数据契约与失败测试**
 
 `contracts.ts` 定义纯 JSON 类型，禁止将 `DatabaseSync`、`SourceLedger`、Error 对象或函数穿越 IPC。固定状态字面量如下：
 
@@ -319,7 +319,7 @@ test("doctor calls no provider and preserves the glossary report", () => {
 
 在 `desktop-preferences.test.ts` 写入临时 JSON 文件，验证保存与读取只保留绝对 `manifestPath`、可选 `storePath` 和可选 `runId`，损坏 JSON 返回 `undefined` 而不抛出。
 
-- [ ] **步骤 2：运行新增 Node 测试，确认模块不存在**
+- [x] **步骤 2：运行新增 Node 测试，确认模块不存在**
 
 运行：
 
@@ -330,7 +330,7 @@ npm.cmd test -- --test-name-pattern="snapshot opens|snapshot uses|snapshot requi
 
 预期：FAIL，模块 `../src/desktop/desktop-project-service.js` 与 `../src/desktop/desktop-preferences.js` 尚不存在。
 
-- [ ] **步骤 3：实现输入验证、投影与单文件偏好存储**
+- [x] **步骤 3：实现输入验证、投影与单文件偏好存储**
 
 `desktop-errors.ts` 提供 `DesktopInputError`，并将 `SourceIntegrityError` 的 `code`、普通 Error 的 `message` 变成 `{ code, message, retryable: false }`。服务入口只接受绝对、存在的 `source_manifest.json` 和现有普通 `.db` 文件；`realpathSync` 后验证 basename/extension，拒绝目录、非 JSON manifest 与非 `.db` store。项目标题固定从 `basename(ledger.rawPath, extname(ledger.rawPath))` 推导，不猜测或改写作品名。
 
@@ -390,7 +390,7 @@ export class DesktopProjectService {
 
 `DesktopPreferences` 使用 `{ schema: "folioloom-desktop-preferences-1", recent?: DesktopProjectRequest }`。保存时先创建 Electron userData 下的父目录，再写入同目录临时文件并 `renameSync`；读取使用 `readFileSync`，遇到 JSON 解析错误、未知 schema 或缺失 manifest 字段时返回 `undefined`。
 
-- [ ] **步骤 4：运行服务、偏好和全量 V5 测试**
+- [x] **步骤 4：运行服务、偏好和全量 V5 测试**
 
 运行：
 
@@ -403,7 +403,7 @@ npm.cmd run typecheck
 
 预期：全部 PASS；`doctorBook()` 的报告仍有 `modelCallsAllowed: false`，测试不创建 provider。
 
-- [ ] **步骤 5：提交桌面领域层**
+- [x] **步骤 5：提交桌面领域层**
 
 ```powershell
 git add translator-v5/src/desktop translator-v5/test/desktop-project-service.test.ts translator-v5/test/desktop-preferences.test.ts
