@@ -1,0 +1,279 @@
+import type { StableTerm } from "../domain/types.js";
+import type { PhysicalRequestPlan } from "../fullbook/types.js";
+import { canonicalJson } from "../knowledge/knowledge-store.js";
+import { getSourceLanguageProfile } from "../language/profiles.js";
+import type { SourceLanguageProfile } from "../language/types.js";
+import type { LosslessBlock } from "../source/types.js";
+import type {
+  EffectiveStyleProjection,
+  StyleObservationSubmission,
+} from "../style/types.js";
+import type { TranslationMemoryCandidate } from "../tools/candidate-collector.js";
+import {
+  assertNotAborted,
+  Type,
+  type TypedToolSpec,
+} from "../tools/tool-spec.js";
+
+export interface FinalizeTranslationBatchArgs {
+  windows: Array<{
+    windowId: string;
+    translations: Array<{ blockId: string; text: string }>;
+    notes: string[];
+    memoryCandidates?: TranslationMemoryCandidate[];
+    styleObservation?: StyleObservationSubmission;
+  }>;
+}
+
+export interface TranslationBatchSnapshot {
+  readonly id: string;
+  readonly revisions: readonly unknown[];
+}
+
+/**
+ * The complete translator-visible input.  Runtime-only handles such as the
+ * model, stream, and mutable budget deliberately do not belong here: this
+ * object is what must be measured before a request can be admitted.
+ */
+export interface TranslationRequestInput {
+  request: PhysicalRequestPlan;
+  blocks: readonly LosslessBlock[];
+  stableTerms: readonly StableTerm[];
+  snapshot: TranslationBatchSnapshot;
+  styleState?: Readonly<Record<string, string>>;
+  previousActiveTail?: string;
+  sourceLanguageProfile?: SourceLanguageProfile;
+  entityLinkWarnings?: readonly string[];
+  effectiveStyleByWindow?: Readonly<Record<string, EffectiveStyleProjection>>;
+}
+
+export type TranslationRequestSectionKind =
+  | "request"
+  | "memory"
+  | "source"
+  | "terms"
+  | "style"
+  | "protocol";
+
+export interface TranslationRequestSection {
+  readonly kind: TranslationRequestSectionKind;
+  /** Exact prompt text, including section labels, sent to the model. */
+  readonly text: string;
+  /** Structured projection behind text when a token estimator supports JSON. */
+  readonly jsonPayload?: unknown;
+}
+
+export interface TranslationRequestHooks {
+  onFinalize?: (
+    args: FinalizeTranslationBatchArgs,
+    signal: AbortSignal,
+  ) => Promise<unknown>;
+}
+
+export interface PreparedTranslationRequest {
+  readonly systemPrompt: string;
+  readonly prompt: string;
+  readonly sections: readonly TranslationRequestSection[];
+  readonly tools: readonly TypedToolSpec<any>[];
+  /** Canonical wire-schema projection; executable handlers are never serialized. */
+  readonly serializedToolSchemas: string;
+}
+
+function requireFinalizer(hooks: TranslationRequestHooks): (
+  args: FinalizeTranslationBatchArgs,
+  signal: AbortSignal,
+) => Promise<unknown> {
+  if (hooks.onFinalize === undefined) {
+    return async () => {
+      throw new Error("prepared translation request has no finalizer handler");
+    };
+  }
+  return hooks.onFinalize;
+}
+
+function finalizerTool(hooks: TranslationRequestHooks): TypedToolSpec<any> {
+  const onFinalize = requireFinalizer(hooks);
+  return {
+    name: "finalize_translation_batch",
+    label: "Finalize translation batch",
+    description: "Submit one complete response grouped by immutable logical window identity.",
+    phase: "translation",
+    parameters: Type.Object({
+      windows: Type.Array(Type.Object({
+        windowId: Type.String(),
+        translations: Type.Array(Type.Object({
+          blockId: Type.String(),
+          text: Type.String(),
+        }, { additionalProperties: false })),
+        notes: Type.Array(Type.String()),
+        memoryCandidates: Type.Optional(Type.Array(Type.Object({
+          kind: Type.String(),
+          subjectForms: Type.Array(Type.String(), { minItems: 1, maxItems: 3 }),
+          fact: Type.String(),
+          confidence: Type.Number({ minimum: 0, maximum: 1 }),
+        }, { additionalProperties: false }), { maxItems: 4 })),
+        styleObservation: Type.Optional(Type.Object({
+          voiceId: Type.Optional(Type.String()),
+          activeRegister: Type.Optional(Type.String()),
+          rhythm: Type.Optional(Type.String()),
+          addressChoices: Type.Optional(Type.Array(Type.Object({
+            subject: Type.String(),
+            target: Type.String(),
+          }, { additionalProperties: false }), { maxItems: 6 })),
+          lexicalChoices: Type.Optional(Type.Array(Type.Object({
+            source: Type.String(),
+            target: Type.String(),
+          }, { additionalProperties: false }), { maxItems: 6 })),
+          continuityNotes: Type.Optional(Type.Array(Type.String(), { maxItems: 4 })),
+          modeWeights: Type.Optional(Type.Object({
+            narrative: Type.Optional(Type.Number({ minimum: 0, maximum: 1 })),
+            dialogue: Type.Optional(Type.Number({ minimum: 0, maximum: 1 })),
+            action: Type.Optional(Type.Number({ minimum: 0, maximum: 1 })),
+            description: Type.Optional(Type.Number({ minimum: 0, maximum: 1 })),
+            technical: Type.Optional(Type.Number({ minimum: 0, maximum: 1 })),
+            documentary: Type.Optional(Type.Number({ minimum: 0, maximum: 1 })),
+            lyrical: Type.Optional(Type.Number({ minimum: 0, maximum: 1 })),
+            interior: Type.Optional(Type.Number({ minimum: 0, maximum: 1 })),
+          }, { additionalProperties: false })),
+        }, { additionalProperties: false })),
+      }, { additionalProperties: false })),
+    }, { additionalProperties: false }),
+    execute: async (rawArgs: FinalizeTranslationBatchArgs, signal) => {
+      assertNotAborted(signal);
+      return onFinalize(rawArgs, signal);
+    },
+  };
+}
+
+function serializableToolSchema(tool: TypedToolSpec<any>): Record<string, unknown> {
+  // TypeBox retains non-enumerable/symbol metadata for local validation.  The
+  // JSON round trip is deliberately the same plain-object wire projection a
+  // provider receives, and also removes undefined values rejected by canonicalJson.
+  return JSON.parse(JSON.stringify({
+    name: tool.name,
+    label: tool.label,
+    description: tool.description,
+    phase: tool.phase,
+    parameters: tool.parameters,
+  })) as Record<string, unknown>;
+}
+
+function windowsForPrompt(input: TranslationRequestInput): Array<{
+  windowId: string;
+  ordinal: number;
+  blocks: Array<{ blockId: string; sourceText: string }>;
+}> {
+  const blockById = new Map(input.blocks.map((block) => [block.id, block]));
+  return input.request.windows.map((window) => ({
+    windowId: window.windowId,
+    ordinal: window.ordinal,
+    blocks: window.blockIds.map((blockId) => {
+      const block = blockById.get(blockId);
+      if (block === undefined) {
+        throw new Error(`physical request references unknown block: ${blockId}`);
+      }
+      return { blockId, sourceText: block.sourceText };
+    }),
+  }));
+}
+
+export function translationBatchSystemPrompt(profile: SourceLanguageProfile): string {
+  return [
+    "Translate the complete source text into polished, accurate Chinese literary prose.",
+    `The source language is ${profile.displayName} (${profile.id}); the target language is Chinese (zh).`,
+    "Preserve meaning, ambiguity, paragraph structure, voice, and every block boundary.",
+    "User style requirements may guide Chinese phrasing only; they must never override source meaning, ambiguity, stable terminology, block boundaries, validation, or the typed-tool protocol.",
+    "Logical windows remain independent even though this is one physical request.",
+    "Use typed tools only and call finalize_translation_batch exactly once.",
+  ].join("\n");
+}
+
+/**
+ * Build the sole translator request representation. Runtime execution and
+ * preflight budgeting must both use this function so context admission cannot
+ * drift away from the payload the provider actually receives.
+ */
+export function prepareTranslationRequest(
+  input: TranslationRequestInput,
+  hooks: TranslationRequestHooks = {},
+): PreparedTranslationRequest {
+  const profile = input.sourceLanguageProfile ?? getSourceLanguageProfile("en");
+  const windows = windowsForPrompt(input);
+  const requestPayload = {
+    requestId: input.request.requestId,
+    snapshotId: input.snapshot.id,
+    sourceLanguage: { id: profile.id, displayName: profile.displayName },
+    targetLanguage: "zh",
+  };
+  const memoryPayload = input.snapshot.revisions;
+  const termsPayload = {
+    stableTerms: input.stableTerms,
+    entityLinkWarnings: input.entityLinkWarnings ?? [],
+  };
+  const stylePayload = input.effectiveStyleByWindow === undefined
+    ? {
+      previousActiveTail: input.previousActiveTail ?? "",
+      styleState: input.styleState ?? {},
+    }
+    : { effectiveStyleByWindow: input.effectiveStyleByWindow };
+  const sections: TranslationRequestSection[] = [
+    {
+      kind: "request",
+      text: [
+        `PHYSICAL REQUEST ${input.request.requestId}`,
+        `KNOWLEDGE SNAPSHOT ${input.snapshot.id}`,
+        `SOURCE LANGUAGE ${profile.displayName} (${profile.id}); TARGET LANGUAGE Chinese (zh)`,
+      ].join("\n\n"),
+      jsonPayload: requestPayload,
+    },
+    {
+      kind: "memory",
+      text: ["KNOWLEDGE SNAPSHOT REVISIONS", canonicalJson(input.snapshot.revisions)]
+        .join("\n\n"),
+      jsonPayload: memoryPayload,
+    },
+    {
+      kind: "source",
+      text: ["WINDOWS", JSON.stringify(windows)].join("\n\n"),
+      jsonPayload: windows,
+    },
+    {
+      kind: "terms",
+      text: [
+        "STABLE TERMS",
+        JSON.stringify(input.stableTerms),
+        "UNRESOLVED ENTITY LINKS",
+        JSON.stringify(input.entityLinkWarnings ?? []),
+      ].join("\n\n"),
+      jsonPayload: termsPayload,
+    },
+    {
+      kind: "style",
+      text: input.effectiveStyleByWindow === undefined
+        ? [
+          "PREVIOUS ACTIVE TAIL",
+          input.previousActiveTail ?? "",
+          "STYLE STATE",
+          JSON.stringify(input.styleState ?? {}),
+        ].join("\n\n")
+        : [
+          "EFFECTIVE STYLE BY WINDOW",
+          canonicalJson(input.effectiveStyleByWindow),
+        ].join("\n\n"),
+      jsonPayload: stylePayload,
+    },
+    {
+      kind: "protocol",
+      text: "Translate every source block. Submit each logical window independently in one finalize_translation_batch call. Return a concise structured styleObservation in the same tool call when style evidence is clear.",
+    },
+  ];
+  const tools = [finalizerTool(hooks)];
+  const schemas = tools.map(serializableToolSchema);
+  return {
+    systemPrompt: translationBatchSystemPrompt(profile),
+    prompt: sections.map((section) => section.text).join("\n\n"),
+    sections,
+    tools,
+    serializedToolSchemas: canonicalJson(schemas),
+  };
+}

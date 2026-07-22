@@ -1,3 +1,5 @@
+import type { SourceLanguageProfile } from "../language/types.js";
+
 export type StructureKind =
   | "volume_heading"
   | "chapter_heading"
@@ -22,6 +24,8 @@ export interface LosslessBlock {
   sourceHash: string;
   globalIndex: number;
   tokenCount: number;
+  /** Present for newly built plans; absent records use the explicit legacy protocol. */
+  estimatorVersion?: string;
   structureId: string | null;
   structureTitle: string | null;
 }
@@ -132,6 +136,7 @@ export interface ScalarSource {
   readonly coordinates: UnicodeScalarMap;
   readonly sourceVersion?: string;
   readonly sourceLanguage?: string;
+  readonly languageProfile?: SourceLanguageProfile;
 }
 
 export type SourceInput = string | ScalarSource;

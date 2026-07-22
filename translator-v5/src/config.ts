@@ -2,6 +2,19 @@ import { readFileSync } from "node:fs";
 
 import { parse } from "yaml";
 
+import type { ProviderEffort } from "./providers/types.js";
+
+const PROVIDER_EFFORTS: readonly ProviderEffort[] = [
+  "off",
+  "on",
+  "minimal",
+  "low",
+  "medium",
+  "high",
+  "xhigh",
+  "max",
+];
+
 export interface PilotModelConfig {
   readonly provider: string;
   readonly model: string;
@@ -42,7 +55,7 @@ class LoadedPilotModelConfig implements PilotModelConfig {
     public readonly model: string,
     public readonly baseUrl: string,
     public readonly timeoutMs: number,
-    public readonly reasoningEffort: string,
+    public readonly reasoningEffort: ProviderEffort,
     private readonly apiKey: string,
   ) {}
 
@@ -69,6 +82,14 @@ function requireText(value: unknown, label: string): string {
   return value.trim();
 }
 
+function requireReasoningEffort(value: unknown, label: string): ProviderEffort {
+  const effort = requireText(value, label);
+  if (!PROVIDER_EFFORTS.includes(effort as ProviderEffort)) {
+    throw new Error(`${label} must be a supported reasoning effort`);
+  }
+  return effort as ProviderEffort;
+}
+
 export function loadPilotConfig(
   configPath: string,
   role: string,
@@ -91,13 +112,32 @@ export function loadPilotConfig(
     requireText(providerConfig.models?.[role], `model role ${role}`),
     requireText(providerConfig.base_url, `llm.providers.${provider}.base_url`),
     timeoutSeconds * 1000,
-    requireText(
+    requireReasoningEffort(
       providerConfig.request_options?.[role]?.reasoning_effort ?? "high",
       `request_options.${role}.reasoning_effort`,
     ),
     options.apiKeyOverride === undefined
       ? requireText(providerConfig.api_key, `llm.providers.${provider}.api_key`)
       : requireText(options.apiKeyOverride, "apiKeyOverride"),
+  );
+}
+
+/**
+ * Return a runtime-only config projection with a different reasoning effort.
+ * The original configuration remains unchanged and the API key stays private
+ * to the returned object just as it does for a configuration loaded from disk.
+ */
+export function withReasoningEffort(
+  config: PilotModelConfig,
+  reasoningEffort: string,
+): PilotModelConfig {
+  return new LoadedPilotModelConfig(
+    config.provider,
+    config.model,
+    config.baseUrl,
+    config.timeoutMs,
+    requireReasoningEffort(reasoningEffort, "reasoningEffort"),
+    config.apiKeyForRuntime(),
   );
 }
 

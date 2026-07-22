@@ -13,7 +13,10 @@ import {
   type Context,
 } from "@earendil-works/pi-ai";
 
-import { runBook } from "../src/fullbook/book-runner.js";
+import {
+  BookRequestCapacityError,
+  runBook,
+} from "../src/fullbook/book-runner.js";
 import { BookContext } from "../src/fullbook/book-context.js";
 import { loadGlossary } from "../src/glossary/glossary-profile.js";
 import { planBookWindows } from "../src/fullbook/window-planner.js";
@@ -337,7 +340,7 @@ test("two tiny logical windows use one physical model session and commit indepen
     assert.deepEqual(store.listTranslationRuns()[0]?.metadata, {
       sourceLanguageProfile: {
         id: "en",
-        version: "source-language-profile-1",
+        version: "source-language-profile-2",
         compatibilityMode: false,
       },
       sourceAnomalies: {
@@ -351,7 +354,16 @@ test("two tiny logical windows use one physical model session and commit indepen
         },
         findings: [],
       },
+      translationRuntime: {
+        mode: "quality",
+        primary: { modelId: "faux-1" },
+        escalation: { modelId: "faux-1" },
+      },
     });
+    const scheduler = store.latestSchedulerSnapshot("run-lossless");
+    assert.ok(scheduler);
+    assert.equal(scheduler.inFlight, 0);
+    assert.equal(scheduler.inFlightTokens, 0);
   } finally {
     store.close();
   }
@@ -362,6 +374,20 @@ test("failed lossless doctor blocks every model call", async () => {
   writeFileSync(fixture.canonicalPath, "Corrupt.", "utf8");
 
   await assert.rejects(runBook(fixture.options as never), /HASH_MISMATCH/);
+  assert.equal(fixture.faux.state.callCount, 0);
+});
+
+test("complete request admission rejects a tiny context before any provider call", async () => {
+  const fixture = losslessFixture("The bell rings above the empty court.");
+  const model = {
+    ...fixture.faux.getModel(),
+    contextWindow: 256,
+    maxTokens: 128,
+  };
+  await assert.rejects(
+    runBook({ ...fixture.options, model } as never),
+    (error: unknown) => error instanceof BookRequestCapacityError,
+  );
   assert.equal(fixture.faux.state.callCount, 0);
 });
 
@@ -529,6 +555,47 @@ test("lossless provider errors stay retryable and never become human incidents",
   store.close();
   assert.equal(status.humanRequiredWindows, 0);
   assert.equal(status.pendingWindows, 2);
+});
+
+test("fast mode retries an invalid physical request with only the escalation runtime", async () => {
+  const fixture = losslessFixture("EDGEWOOD\n\nBOOK ONE");
+  const primary = fauxProvider();
+  const escalation = fauxProvider();
+  primary.setResponses([fauxAssistantMessage(fauxToolCall(
+    "finalize_translation_batch",
+    { windows: [] },
+  ), { stopReason: "toolUse" })]);
+  escalation.setResponses([fauxAssistantMessage(fauxToolCall(
+    "finalize_translation_batch",
+    fixture.submission,
+  ), { stopReason: "toolUse" })]);
+  const primaryModel = primary.getModel();
+  const primaryStream = primary.provider.streamSimple.bind(primary.provider);
+
+  const result = await runBook({
+    ...fixture.options,
+    model: primaryModel,
+    streamFn: primaryStream,
+    runtimeSet: {
+      mode: "fast",
+      primary: {
+        model: primaryModel,
+        streamFn: primaryStream,
+        effort: "off",
+        thinkingLevel: "off",
+      },
+      escalation: {
+        model: escalation.getModel(),
+        streamFn: escalation.provider.streamSimple.bind(escalation.provider),
+        effort: "high",
+        thinkingLevel: "high",
+      },
+    },
+  } as never);
+
+  assert.equal(primary.state.callCount, 1);
+  assert.equal(escalation.state.callCount, 1);
+  assert.equal(result.status.completedWindows, 2);
 });
 
 test("lossless runner resumes the same isolated run and promotes the remaining ordinal", async () => {

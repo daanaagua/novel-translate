@@ -11,6 +11,7 @@ import { dirname, join, resolve } from "node:path";
 import { DatabaseSync, type StatementSync } from "node:sqlite";
 
 import type { CommitPromotion } from "../fullbook/commit-coordinator.js";
+import type { AdaptiveSchedulerSnapshot } from "../fullbook/adaptive-scheduler.js";
 import type { BookWindowPlan, BookWindowStatus } from "../fullbook/types.js";
 import { supportedSourceLanguageIds } from "../language/profiles.js";
 import {
@@ -25,6 +26,7 @@ import {
   type KnowledgeSnapshot,
 } from "../knowledge/snapshot.js";
 import { blockId } from "../source/block-builder.js";
+import { LEGACY_TOKEN_ESTIMATOR_VERSION } from "../source/token-estimator.js";
 import type { LosslessBlock, StructureAnnotation } from "../source/types.js";
 import { scalarLength } from "../source/types.js";
 import { parseStyleObservation } from "../style/style-observation.js";
@@ -64,6 +66,8 @@ export interface CertifiedSourceInput {
 }
 
 export interface DerivedPlan {
+  /** Omitted only by plans created before versioned token estimation. */
+  estimatorVersion?: string;
   blocks: readonly LosslessBlock[];
   annotations: readonly StructureAnnotation[];
 }
@@ -703,7 +707,9 @@ export class LosslessBookStore {
     const fingerprint = hashText(jsonText(normalized, "derived plan"));
     if (source.plan_fingerprint !== null) {
       if (source.plan_fingerprint !== fingerprint) {
-        throw new Error(`derived plan for ${sourceVersion} already contains different data`);
+        throw new Error(
+          `derived plan for ${sourceVersion} already contains different data or a different estimator version`,
+        );
       }
       return;
     }
@@ -753,7 +759,11 @@ export class LosslessBookStore {
       if (Number(result.changes) !== 1) {
         throw new Error(`derived plan changed concurrently for ${sourceVersion}`);
       }
-      this.#appendEvent(null, "derived_plan_registered", { sourceVersion, fingerprint });
+      this.#appendEvent(null, "derived_plan_registered", {
+        sourceVersion,
+        fingerprint,
+        estimatorVersion: normalized.estimatorVersion,
+      });
     });
   }
 
@@ -2027,6 +2037,33 @@ export class LosslessBookStore {
     }
   }
 
+  latestSchedulerSnapshot(runId: string): AdaptiveSchedulerSnapshot | undefined {
+    this.#run(runId);
+    const row = one<{ payload_json: string }>(this.#database.prepare(`
+      SELECT payload_json FROM events
+      WHERE run_id=? AND kind='adaptive_scheduler_snapshot'
+      ORDER BY sequence DESC LIMIT 1
+    `), runId);
+    if (row === undefined) {
+      return undefined;
+    }
+    const payload = JSON.parse(row.payload_json) as { snapshot?: unknown };
+    if (payload === null || typeof payload !== "object" || payload.snapshot === undefined) {
+      throw new Error(`corrupt adaptive scheduler snapshot for ${runId}`);
+    }
+    return structuredClone(payload.snapshot) as AdaptiveSchedulerSnapshot;
+  }
+
+  saveSchedulerSnapshot(runId: string, snapshot: AdaptiveSchedulerSnapshot): void {
+    this.#run(runId);
+    if (snapshot.inFlight !== 0 || snapshot.inFlightTokens !== 0) {
+      throw new TypeError("only an idle adaptive scheduler snapshot can be persisted");
+    }
+    this.#transaction(() => {
+      this.#appendEvent(runId, "adaptive_scheduler_snapshot", { snapshot });
+    });
+  }
+
   #initializeSchema(): void {
     this.#database.exec("BEGIN IMMEDIATE");
     try {
@@ -2160,6 +2197,20 @@ export class LosslessBookStore {
     if (!Array.isArray(plan.annotations) || !Array.isArray(plan.blocks)) {
       throw new TypeError("derived plan annotations and blocks must be arrays");
     }
+    const declaredEstimatorVersion = plan.estimatorVersion === undefined
+      ? undefined
+      : requireNonempty(plan.estimatorVersion, "derived plan estimatorVersion");
+    const observedEstimatorVersions = new Set(plan.blocks.map((block, index) => (
+      block.estimatorVersion === undefined
+        ? LEGACY_TOKEN_ESTIMATOR_VERSION
+        : requireNonempty(block.estimatorVersion, `block[${index}].estimatorVersion`)
+    )));
+    if (declaredEstimatorVersion === undefined && observedEstimatorVersions.size > 1) {
+      throw new Error("derived plan mixes estimator versions without an explicit plan version");
+    }
+    const estimatorVersion = declaredEstimatorVersion
+      ?? observedEstimatorVersions.values().next().value
+      ?? LEGACY_TOKEN_ESTIMATOR_VERSION;
     const annotationIds = new Set<string>();
     const annotations = plan.annotations.map((annotation, index) => {
       const id = requireNonempty(annotation.id, `annotation[${index}].id`);
@@ -2224,6 +2275,14 @@ export class LosslessBookStore {
         throw new Error("logical block global indexes must be unique and continuous");
       }
       requireSafeInteger(block.tokenCount, `block[${index}].tokenCount`);
+      const blockEstimatorVersion = block.estimatorVersion === undefined
+        ? estimatorVersion
+        : requireNonempty(block.estimatorVersion, `block[${index}].estimatorVersion`);
+      if (blockEstimatorVersion !== estimatorVersion) {
+        throw new Error(
+          `block ${id} estimator version does not match derived plan estimator version`,
+        );
+      }
       if (block.structureId !== null && !annotationIds.has(block.structureId)) {
         throw new Error(`block ${id} references unknown structure ${block.structureId}`);
       }
@@ -2236,6 +2295,7 @@ export class LosslessBookStore {
         sourceHash: block.sourceHash,
         globalIndex,
         tokenCount: block.tokenCount,
+        estimatorVersion: blockEstimatorVersion,
         structureId: block.structureId,
         structureTitle: block.structureTitle,
       };
@@ -2246,7 +2306,7 @@ export class LosslessBookStore {
     if (reconstructedCanonical.digest("hex") !== source.canonical_sha256) {
       throw new Error("reconstructed canonical hash does not match certified source");
     }
-    return { annotations, blocks };
+    return { estimatorVersion, annotations, blocks };
   }
 
   #validateWindows(run: RunRow, windows: readonly BookWindowPlan[]): BookWindowPlan[] {

@@ -12,7 +12,12 @@ import { auditLosslessBookStore } from "../src/report.js";
 import { auditSourceCoverage } from "../src/source/auditor.js";
 import { buildLosslessBlocks } from "../src/source/block-builder.js";
 import { annotateStructure } from "../src/source/structure-annotator.js";
+import {
+  WeightedTokenEstimator,
+  WEIGHTED_TOKEN_ESTIMATOR_VERSION,
+} from "../src/source/token-estimator.js";
 import { scalarLength, scalarSlice } from "../src/source/types.js";
+import { getSourceLanguageProfile } from "../src/language/profiles.js";
 import { LosslessBookStore } from "../src/storage/lossless-book-store.js";
 
 function xorshift32(seed: number): () => number {
@@ -101,6 +106,21 @@ test("property: block ids do not depend on structure titles", () => {
     buildLosslessBlocks(source, annotations, options).map((block) => block.id),
     buildLosslessBlocks(source, renamed, options).map((block) => block.id),
   );
+});
+
+test("Japanese blocks prefer a full stop without following whitespace", () => {
+  const japanese = getSourceLanguageProfile("ja");
+  const estimator = new WeightedTokenEstimator();
+  const blocks = buildLosslessBlocks("彼は学校へ行く。彼は帰る。", [], {
+    maxSourceTokens: 8,
+    sourceVersion: "ja-v1",
+    languageProfile: japanese,
+    tokenEstimator: estimator,
+  });
+
+  assert.equal(blocks[0]?.sourceText, "彼は学校へ行く。");
+  assert.equal(blocks[0]?.tokenCount, estimator.estimateText("彼は学校へ行く。", japanese).tokens);
+  assert.equal(blocks[0]?.estimatorVersion, WEIGHTED_TOKEN_ESTIMATOR_VERSION);
 });
 
 function manifestFor(source: string, label: string): string {

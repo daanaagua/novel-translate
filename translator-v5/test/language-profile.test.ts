@@ -68,6 +68,23 @@ test("Japanese and Korean profiles expose headings, sentence boundaries, and bou
   assert.ok(koreanCandidates.length <= 24);
 });
 
+test("Korean boundary collection does not repeatedly rescan UTF-16 prefixes", () => {
+  const source = new String("\uac00\n\n".repeat(512));
+  let sliceCalls = 0;
+  Object.defineProperty(source, "slice", {
+    value(start?: number, end?: number): string {
+      sliceCalls += 1;
+      return String.prototype.slice.call(source, start, end);
+    },
+  });
+
+  const candidates = getSourceLanguageProfile("ko")
+    .collectBoundaryCandidates(source as unknown as string);
+
+  assert.ok(candidates.filter((candidate) => candidate.kind === "paragraph").length >= 512);
+  assert.equal(sliceCalls, 0);
+});
+
 test("Kana and Hangul prose residue is detected without treating Han alone as Japanese", () => {
   const japanese = getSourceLanguageProfile("ja");
   const korean = getSourceLanguageProfile("ko");

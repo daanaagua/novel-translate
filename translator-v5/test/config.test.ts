@@ -8,6 +8,7 @@ import test from "node:test";
 import {
   loadOpenCodeApiKey,
   loadPilotConfig,
+  withReasoningEffort,
 } from "../src/config.js";
 
 const fixturePath = fileURLToPath(
@@ -38,4 +39,19 @@ test("loads an OpenCode provider credential without serializing it", () => {
   } finally {
     rmSync(directory, { recursive: true, force: true });
   }
+});
+
+test("projects reasoning effort immutably without exposing the runtime credential", () => {
+  const source = loadPilotConfig(fixturePath, "draft");
+  const projected = withReasoningEffort(source, "off");
+
+  assert.notEqual(projected, source);
+  assert.equal(source.reasoningEffort, "high");
+  assert.equal(projected.reasoningEffort, "off");
+  assert.equal(projected.provider, source.provider);
+  assert.equal(projected.model, source.model);
+  assert.equal(projected.baseUrl, source.baseUrl);
+  assert.equal(projected.timeoutMs, source.timeoutMs);
+  assert.equal(projected.apiKeyForRuntime(), "secret-test-key");
+  assert.equal(JSON.stringify(projected).includes("secret-test-key"), false);
 });

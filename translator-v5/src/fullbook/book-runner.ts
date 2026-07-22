@@ -13,6 +13,7 @@ import {
 } from "../agents/lexical-anchorer.js";
 import { ModelProviderError, PiRuntime } from "../agents/pi-runtime.js";
 import { runTranslationBatch } from "../agents/translation-batch.js";
+import type { TranslationRequestInput } from "../agents/translation-request.js";
 import { entityLinkAsTerms, type EntityLink } from "../domain/entity-links.js";
 import type { StableTerm, V4Block } from "../domain/types.js";
 import {
@@ -29,6 +30,7 @@ import {
 } from "../knowledge/knowledge-store.js";
 import { createKnowledgeSnapshot } from "../knowledge/snapshot.js";
 import { SourceLedger } from "../source/source-ledger.js";
+import { WeightedTokenEstimator } from "../source/token-estimator.js";
 import { analyzeSourceAnomalies } from "../source/anomaly-report.js";
 import {
   runTranslationWindow,
@@ -59,13 +61,26 @@ import type {
   VoiceProfile,
 } from "../style/types.js";
 import { BookContext } from "./book-context.js";
+import {
+  AdaptiveScheduler,
+  type SchedulerObservationStatus,
+} from "./adaptive-scheduler.js";
 import { CommitCoordinator } from "./commit-coordinator.js";
 import {
   boundedActiveTail,
   memoriesFromSnapshot,
 } from "./memory-projection.js";
 import type { WindowExecutionSummary } from "./types.js";
+import type {
+  PhysicalRequestPlan,
+  TranslationRuntime,
+  TranslationRuntimeSet,
+} from "./types.js";
 import { packPhysicalRequests } from "./request-batcher.js";
+import {
+  RequestBudgeter,
+  type RequestBudgetAssessment,
+} from "./request-budgeter.js";
 import {
   nextConcurrency,
   planBookWindows,
@@ -123,6 +138,7 @@ function assertSourceVersionUnchanged(context: BookContext): void {
 function runMetadataWithLanguageProfile(
   metadata: unknown,
   context: BookContext,
+  runtimeSet?: TranslationRuntimeSet,
 ): Record<string, unknown> {
   const userMetadata = typeof metadata === "object"
     && metadata !== null
@@ -139,7 +155,37 @@ function runMetadataWithLanguageProfile(
       compatibilityMode: context.sourceLedger.sourceLanguageCompatibilityMode,
     },
     sourceAnomalies: analyzeSourceAnomalies(context.sourceLedger.sourceText),
+    ...(runtimeSet === undefined ? {} : {
+      translationRuntime: {
+        mode: runtimeSet.mode,
+        primary: {
+          modelId: runtimeSet.primary.model.id,
+          ...(runtimeSet.primary.effort === undefined
+            ? {}
+            : { effort: runtimeSet.primary.effort }),
+          ...(runtimeSet.primary.thinkingLevel === undefined
+            ? {}
+            : { thinkingLevel: runtimeSet.primary.thinkingLevel }),
+        },
+        escalation: {
+          modelId: runtimeSet.escalation.model.id,
+          ...(runtimeSet.escalation.effort === undefined
+            ? {}
+            : { effort: runtimeSet.escalation.effort }),
+          ...(runtimeSet.escalation.thinkingLevel === undefined
+            ? {}
+            : { thinkingLevel: runtimeSet.escalation.thinkingLevel }),
+        },
+      },
+    }),
   };
+}
+
+function runtimeMetadata(metadata: unknown): unknown | undefined {
+  if (metadata === null || typeof metadata !== "object" || Array.isArray(metadata)) {
+    return undefined;
+  }
+  return (metadata as Record<string, unknown>).translationRuntime;
 }
 
 function losslessStyleConstitution(style: StyleState | undefined): BookStyleConstitution {
@@ -223,11 +269,14 @@ export interface LosslessBookRunOptions {
   runMeta: LosslessBookRunMeta;
   model: Model<any>;
   streamFn: StreamFn;
+  /** Optional explicit dual-runtime policy. Legacy callers remain quality mode. */
+  runtimeSet?: TranslationRuntimeSet;
   windowOptions?: WindowPlanOptions;
   styleState?: StyleState;
   glossary?: LoadedGlossary;
   maxWindows?: number;
   maxConcurrency?: number;
+  maxInFlightTokens?: number;
   maxAttempts?: number;
   hardDeadlineMs?: number;
   tinyWindowTokens?: number;
@@ -238,6 +287,19 @@ export interface LosslessBookRunOptions {
    * entered the store remains atomic and is never interrupted mid-transaction.
    */
   signal?: AbortSignal;
+}
+
+export class BookRequestCapacityError extends Error {
+  readonly code = "REQUEST_CONTEXT_EXCEEDED" as const;
+  readonly retryable = false;
+
+  constructor(requestId: string, assessment: RequestBudgetAssessment) {
+    super(
+      `REQUEST_CONTEXT_EXCEEDED: ${requestId} reserves ${assessment.totalReserved} tokens `
+      + `for a ${assessment.contextWindowTokens}-token context`,
+    );
+    this.name = "BookRequestCapacityError";
+  }
 }
 
 export interface LosslessBookRunResult {
@@ -879,16 +941,162 @@ function throwIfAborted(signal: AbortSignal | undefined): void {
   signal?.throwIfAborted();
 }
 
+function normalizeRuntimeSet(options: LosslessBookRunOptions): TranslationRuntimeSet {
+  const runtimeSet: TranslationRuntimeSet = options.runtimeSet ?? {
+    mode: "quality" as const,
+    primary: { model: options.model, streamFn: options.streamFn },
+    escalation: { model: options.model, streamFn: options.streamFn },
+  };
+  if (runtimeSet.primary.model.id !== runtimeSet.escalation.model.id) {
+    throw new TypeError("primary and escalation runtimes must use the same model identity");
+  }
+  if (runtimeSet.mode === "quality"
+    && (runtimeSet.primary.effort !== runtimeSet.escalation.effort
+      || runtimeSet.primary.thinkingLevel !== runtimeSet.escalation.thinkingLevel
+      || runtimeSet.primary.model !== runtimeSet.escalation.model
+      || runtimeSet.primary.streamFn !== runtimeSet.escalation.streamFn)) {
+    throw new TypeError("quality mode cannot change effort during retries or repair");
+  }
+  return runtimeSet;
+}
+
+function reasoningReserveTokens(runtime: TranslationRuntime): number {
+  switch (runtime.effort ?? runtime.thinkingLevel) {
+    case undefined:
+    case "off":
+      return 0;
+    case "minimal":
+      return 512;
+    case "low":
+      return 1_024;
+    case "medium":
+    case "on":
+      return 2_048;
+    case "high":
+      return 4_096;
+    case "xhigh":
+      return 6_144;
+    case "max":
+      return 8_192;
+  }
+}
+
+function outputReserveTokens(request: PhysicalRequestPlan, runtime: TranslationRuntime): number {
+  return Math.min(
+    runtime.model.maxTokens,
+    Math.max(768, Math.ceil(request.sourceTokens * 1.6) + 512),
+  );
+}
+
+interface AdmittedRequest<TInput> {
+  request: PhysicalRequestPlan;
+  input: TInput;
+  assessment: RequestBudgetAssessment;
+}
+
+function admitTranslationRequests<TInput extends TranslationRequestInput>(
+  requests: readonly PhysicalRequestPlan[],
+  runtime: TranslationRuntime,
+  estimator: WeightedTokenEstimator,
+  buildInput: (request: PhysicalRequestPlan) => TInput,
+): AdmittedRequest<TInput>[] {
+  const admitted: AdmittedRequest<TInput>[] = [];
+  const queue = [...requests];
+  while (queue.length > 0) {
+    const request = queue.shift() as PhysicalRequestPlan;
+    const input = buildInput(request);
+    const assessment = new RequestBudgeter(estimator, {
+      contextWindowTokens: runtime.model.contextWindow,
+      outputTokens: outputReserveTokens(request, runtime),
+      reasoningReserveTokens: Math.min(
+        reasoningReserveTokens(runtime),
+        runtime.model.maxTokens,
+      ),
+      safetyMarginTokens: Math.max(512, Math.ceil(runtime.model.contextWindow * 0.02)),
+    }).assess(input);
+    if (assessment.fits) {
+      admitted.push({ request, input, assessment });
+      continue;
+    }
+    if (assessment.decision === "split_request" && request.windows.length > 1) {
+      queue.unshift(...packPhysicalRequests(request.windows, {
+        tinyWindowTokens: 1,
+        maxRequestTokens: Math.max(1, request.sourceTokens),
+        maxWindowsPerRequest: 1,
+      }));
+      continue;
+    }
+    throw new BookRequestCapacityError(request.requestId, assessment);
+  }
+  return admitted;
+}
+
+interface ScheduledResult<T> {
+  value: T;
+  status: SchedulerObservationStatus;
+}
+
+async function runWithAdaptiveScheduler<TInput, TOutput>(
+  items: readonly AdmittedRequest<TInput>[],
+  scheduler: AdaptiveScheduler,
+  worker: (item: AdmittedRequest<TInput>) => Promise<ScheduledResult<TOutput>>,
+  signal?: AbortSignal,
+): Promise<TOutput[]> {
+  const pending = [...items];
+  const running = new Set<Promise<void>>();
+  const completed: TOutput[] = [];
+  while (pending.length > 0 || running.size > 0) {
+    throwIfAborted(signal);
+    let admittedAny = false;
+    for (let index = 0; index < pending.length;) {
+      const item = pending[index] as AdmittedRequest<TInput>;
+      const permit = scheduler.tryAcquire(item.assessment.totalReserved);
+      if (permit === undefined) {
+        index += 1;
+        continue;
+      }
+      pending.splice(index, 1);
+      admittedAny = true;
+      const startedAt = performance.now();
+      let task: Promise<void>;
+      task = (async () => {
+        const result = await worker(item);
+        completed.push(result.value);
+        scheduler.observe({
+          status: result.status,
+          durationMs: performance.now() - startedAt,
+          estimatedTokens: item.assessment.totalReserved,
+        });
+      })().finally(() => {
+        permit.release();
+        running.delete(task);
+      });
+      running.add(task);
+    }
+    if (running.size === 0 && pending.length > 0) {
+      const smallest = Math.min(...pending.map((item) => item.assessment.totalReserved));
+      throw new RangeError(
+        `maxInFlightTokens cannot admit the smallest request reservation (${smallest})`,
+      );
+    }
+    if (running.size > 0 && (!admittedAny || pending.length === 0)) {
+      await Promise.race(running);
+    }
+  }
+  return completed;
+}
+
 async function runLosslessBook(
   options: LosslessBookRunOptions,
 ): Promise<LosslessBookRunResult> {
   const startedAt = performance.now();
+  const runtimeSet = normalizeRuntimeSet(options);
   const maxWindows = nonNegativeInteger(
     options.maxWindows ?? Number.MAX_SAFE_INTEGER,
     "maxWindows",
   );
   const maxConcurrency = positiveInteger(
-    options.maxConcurrency ?? DEFAULT_MAX_CONCURRENCY,
+    options.maxConcurrency ?? (runtimeSet.mode === "fast" ? 4 : DEFAULT_MAX_CONCURRENCY),
     "maxConcurrency",
   );
   const maxAttempts = positiveInteger(
@@ -906,6 +1114,13 @@ async function runLosslessBook(
   const maxWindowsPerRequest = positiveInteger(
     options.maxWindowsPerRequest ?? 4,
     "maxWindowsPerRequest",
+  );
+  const maxInFlightTokens = positiveInteger(
+    options.maxInFlightTokens ?? Math.min(
+      runtimeSet.primary.model.contextWindow * maxConcurrency,
+      256_000,
+    ),
+    "maxInFlightTokens",
   );
   const runId = requiredIdentifier(options.runMeta.runId, "runMeta.runId");
   const protocolVersion = requiredIdentifier(
@@ -930,11 +1145,11 @@ async function runLosslessBook(
       `glossary snapshot source version mismatch: expected ${glossaryExpectedSourceVersion}, found ${options.glossary.sourceVersion}`,
     );
   }
-  const modelId = options.runMeta.modelId ?? options.model.id;
-  if (modelId !== options.model.id) {
+  const modelId = options.runMeta.modelId ?? runtimeSet.primary.model.id;
+  if (modelId !== runtimeSet.primary.model.id) {
     context.close();
     throw new Error(
-      `run model mismatch: metadata declares ${modelId}, provider model is ${options.model.id}`,
+      `run model mismatch: metadata declares ${modelId}, provider model is ${runtimeSet.primary.model.id}`,
     );
   }
   let lease: ReturnType<typeof RunLease.acquire>;
@@ -965,6 +1180,24 @@ async function runLosslessBook(
       annotations: context.annotations,
     });
     const initialSnapshot = createKnowledgeSnapshot(runId, []);
+    const requestedMetadata = runMetadataWithLanguageProfile(
+      options.runMeta.metadata,
+      context,
+      runtimeSet,
+    );
+    const existingRun = store.listTranslationRuns().find((item) => item.runId === runId);
+    const existingRuntimeMetadata = runtimeMetadata(existingRun?.metadata);
+    if (existingRun !== undefined) {
+      if (existingRuntimeMetadata === undefined && runtimeSet.mode !== "quality") {
+        throw new Error("legacy translation runs can only resume in quality mode");
+      }
+      if (existingRuntimeMetadata !== undefined
+        && canonicalJson(existingRuntimeMetadata) !== canonicalJson(
+          runtimeMetadata(requestedMetadata),
+        )) {
+        throw new Error(`translation runtime policy mismatch for ${runId}`);
+      }
+    }
     store.createTranslationRun({
       runId,
       sourceVersion: context.sourceLedger.sourceVersion,
@@ -972,7 +1205,7 @@ async function runLosslessBook(
       modelId,
       initialSnapshotId: initialSnapshot.id,
       initialSnapshot,
-      metadata: runMetadataWithLanguageProfile(options.runMeta.metadata, context),
+      metadata: existingRun?.metadata ?? requestedMetadata,
     });
     const planned = planBookWindows(context.losslessBlocks, {
       ...options.windowOptions,
@@ -980,6 +1213,14 @@ async function runLosslessBook(
     });
     store.initializeWindowPlan(runId, planned);
     store.recoverInterruptedWindows(runId);
+    const estimator = new WeightedTokenEstimator();
+    const schedulerSnapshot = store.latestSchedulerSnapshot(runId);
+    const scheduler = new AdaptiveScheduler({
+      initialConcurrency: Math.min(2, maxConcurrency),
+      maxConcurrency,
+      maxInFlightTokens,
+      ...(schedulerSnapshot === undefined ? {} : { snapshot: schedulerSnapshot }),
+    });
     const blockById = new Map(context.losslessBlocks.map((block) => [block.id, block]));
     const styleConstitution = losslessStyleConstitution(options.styleState);
     const voiceProfiles = losslessVoiceProfiles(options.styleState);
@@ -1064,8 +1305,8 @@ async function runLosslessBook(
           const outcome: LexicalAnchorOutcome = await new LexicalAnchorer(new PiRuntime()).run({
             candidates: anchorCandidates,
             stableTerms: anchorStableTerms,
-            model: options.model,
-            streamFn: options.streamFn,
+            model: runtimeSet.escalation.model,
+            streamFn: runtimeSet.escalation.streamFn,
             budget: anchorBudget,
             sourceLanguageProfile: context.languageProfile,
             signal: options.signal,
@@ -1111,7 +1352,9 @@ async function runLosslessBook(
       });
       let retryWindows = selected;
       let providerFailure: ModelProviderError | undefined;
+      let firstProviderFailure: ModelProviderError | undefined;
       let initialRequestCount = 0;
+      let retryRound = 0;
       let anchorBudgetPending = Object.keys(anchorBudget.snapshot()).length > 0;
       const persistedBudgetFor = (
         window: PersistedLosslessWindow,
@@ -1136,12 +1379,46 @@ async function runLosslessBook(
           retryWindows.map((window) => ({ ...window, status: "pending" as const })),
           { tinyWindowTokens, maxRequestTokens, maxWindowsPerRequest },
         );
+        const executionRuntime = retryRound === 0
+          ? runtimeSet.primary
+          : runtimeSet.escalation;
+        const requestInputs = admitTranslationRequests(
+          requests,
+          executionRuntime,
+          estimator,
+          (request): TranslationRequestInput => ({
+            request,
+            blocks: context.losslessBlocks,
+            stableTerms: termsForWindows(
+              activeTerms,
+              request.windows,
+              context,
+              options.glossary,
+            ),
+            snapshot,
+            styleState: options.styleState,
+            sourceLanguageProfile: context.languageProfile,
+            entityLinkWarnings,
+            effectiveStyleByWindow: Object.fromEntries(request.windows.map((window) => [
+              window.windowId,
+              effectiveStyleByWindow[window.windowId] as EffectiveStyleProjection,
+            ])),
+          }),
+        );
         if (initialRequestCount === 0) {
-          initialRequestCount = requests.length;
+          initialRequestCount = requestInputs.length;
+        }
+        const oversizedReservation = requestInputs.find((item) =>
+          item.assessment.totalReserved > maxInFlightTokens);
+        if (oversizedReservation !== undefined) {
+          throw new RangeError(
+            `maxInFlightTokens cannot admit request ${oversizedReservation.request.requestId} `
+            + `(${oversizedReservation.assessment.totalReserved} tokens)`,
+          );
         }
         const claimed = new Map<string, PersistedLosslessWindow>();
         throwIfAborted(options.signal);
-        for (const request of requests) {
+        for (const { request } of requestInputs) {
           for (const window of request.windows) {
             claimed.set(window.windowId, store.claimWindow(runId, window.windowId));
           }
@@ -1153,39 +1430,48 @@ async function runLosslessBook(
           result?: Awaited<ReturnType<typeof runTranslationBatch>>;
           error?: unknown;
         };
-        const completionOrder: CompletedRequest[] = [];
-        await Promise.all(requests.map(async (request) => {
-          const budget = new BudgetLedger();
-          try {
-            throwIfAborted(options.signal);
-            const result = await runTranslationBatch({
-              request,
-              blocks: context.losslessBlocks,
-              stableTerms: termsForWindows(
-                activeTerms,
-                request.windows,
-                context,
-                options.glossary,
-              ),
-              snapshot,
-              model: options.model,
-              streamFn: options.streamFn,
-              budget,
-              styleState: options.styleState,
-              sourceLanguageProfile: context.languageProfile,
-              entityLinkWarnings,
-              effectiveStyleByWindow: Object.fromEntries(request.windows.map((window) => [
-                window.windowId,
-                effectiveStyleByWindow[window.windowId] as EffectiveStyleProjection,
-              ])),
-              signal: options.signal,
-              deadlineMs: options.hardDeadlineMs,
-            });
-            completionOrder.push({ request, budget, result });
-          } catch (error) {
-            completionOrder.push({ request, budget, error });
-          }
-        }));
+        const completionOrder = await runWithAdaptiveScheduler(
+          requestInputs,
+          scheduler,
+          async ({ request, input }): Promise<ScheduledResult<CompletedRequest>> => {
+            const budget = new BudgetLedger();
+            try {
+              throwIfAborted(options.signal);
+              const result = await runTranslationBatch({
+                ...input,
+                model: executionRuntime.model,
+                streamFn: executionRuntime.streamFn,
+                thinkingLevel: executionRuntime.thinkingLevel,
+                repairRuntime: {
+                  model: runtimeSet.escalation.model,
+                  streamFn: runtimeSet.escalation.streamFn,
+                  thinkingLevel: runtimeSet.escalation.thinkingLevel,
+                },
+                budget,
+                signal: options.signal,
+                deadlineMs: options.hardDeadlineMs,
+              });
+              return {
+                value: { request, budget, result },
+                status: "success",
+              };
+            } catch (error) {
+              const status: SchedulerObservationStatus = error instanceof ModelProviderError
+                && (error.kind === "throttled"
+                  || error.kind === "timeout"
+                  || error.kind === "busy"
+                  || error.kind === "context")
+                ? error.kind
+                : "failed";
+              return {
+                value: { request, budget, error },
+                status,
+              };
+            }
+          },
+          options.signal,
+        );
+        store.saveSchedulerSnapshot(runId, scheduler.snapshot());
 
         throwIfAborted(options.signal);
 
@@ -1210,12 +1496,19 @@ async function runLosslessBook(
         const nextRetries: PersistedLosslessWindow[] = [];
         for (const completed of completionOrder) {
           if (completed.error !== undefined) {
-            const message = completed.error instanceof Error
-              ? completed.error.message
-              : String(completed.error);
+            const completedError = completed.error;
+            const message = completedError instanceof Error
+              ? completedError.message
+              : String(completedError);
             for (const requestWindow of completed.request.windows) {
               const window = claimed.get(requestWindow.windowId) as PersistedLosslessWindow;
-              const external = completed.error instanceof ModelProviderError;
+              const external = completedError instanceof ModelProviderError;
+              if (external && firstProviderFailure === undefined) {
+                firstProviderFailure = completedError;
+              }
+              const boundedProviderRetry = external
+                && completedError.retryable
+                && window.attemptCount < maxAttempts;
               const retry = external || window.attemptCount < maxAttempts;
               store.failWindow(runId, window.windowId, {
                 error: message,
@@ -1229,13 +1522,22 @@ async function runLosslessBook(
                   ? ["external model provider failure; run aborted without human task"]
                   : [message],
               });
-              if (!external && retry) {
+              if ((!external && retry) || boundedProviderRetry) {
                 nextRetries.push(store.pendingWindows(runId)
                   .find((item) => item.windowId === window.windowId) as PersistedLosslessWindow);
               }
             }
-            if (completed.error instanceof ModelProviderError) {
-              providerFailure = completed.error;
+            if (completedError instanceof ModelProviderError
+              && (!completedError.retryable
+                || completed.request.windows.some((requestWindow) =>
+                  (claimed.get(requestWindow.windowId)?.attemptCount ?? maxAttempts) >= maxAttempts))) {
+              const definitiveFailure = completedError.kind === "auth"
+                || completedError.kind === "quota"
+                || completedError.kind === "protocol"
+                || completedError.kind === "context";
+              providerFailure = definitiveFailure
+                ? completedError
+                : (firstProviderFailure ?? completedError);
             }
             continue;
           }
@@ -1318,6 +1620,7 @@ async function runLosslessBook(
           }
         }
         retryWindows = nextRetries;
+        retryRound += 1;
       }
 
       const initialRequests = packPhysicalRequests(

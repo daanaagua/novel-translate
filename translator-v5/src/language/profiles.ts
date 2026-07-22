@@ -230,10 +230,6 @@ function scriptStats(text: string): ScriptStats {
   return stats;
 }
 
-function scalarOffsetAt(text: string, utf16Offset: number): number {
-  return [...text.slice(0, utf16Offset)].length;
-}
-
 function structureHeading(
   line: string,
   definition: ProfileDefinition,
@@ -252,15 +248,62 @@ const CLOSING_PUNCTUATION = new Set([
   "\"", "'", "\u201d", "\u2019", "\u300d", "\u300f", "\uff09", "\u3011", "\u3015",
 ]);
 
+interface Utf16BoundaryCandidate {
+  utf16Offset: number;
+  weight: number;
+  kind: BoundaryCandidate["kind"];
+}
+
+function appendUtf16BoundariesAsScalars(
+  scalars: readonly string[],
+  boundaries: readonly Utf16BoundaryCandidate[],
+  candidates: BoundaryCandidate[],
+): void {
+  const ordered = [...boundaries].sort((left, right) => (
+    left.utf16Offset - right.utf16Offset
+    || right.weight - left.weight
+    || left.kind.localeCompare(right.kind)
+  ));
+  let boundaryIndex = 0;
+  let utf16Offset = 0;
+  while ((ordered[boundaryIndex]?.utf16Offset ?? Number.POSITIVE_INFINITY) <= 0) {
+    const boundary = ordered[boundaryIndex] as Utf16BoundaryCandidate;
+    candidates.push({
+      scalarOffset: 0,
+      weight: boundary.weight,
+      kind: boundary.kind,
+    });
+    boundaryIndex += 1;
+  }
+  for (let scalarIndex = 0; scalarIndex < scalars.length; scalarIndex += 1) {
+    const scalar = scalars[scalarIndex] as string;
+    const nextUtf16Offset = utf16Offset + scalar.length;
+    while ((ordered[boundaryIndex]?.utf16Offset ?? Number.POSITIVE_INFINITY)
+      <= nextUtf16Offset) {
+      const boundary = ordered[boundaryIndex] as Utf16BoundaryCandidate;
+      candidates.push({
+        scalarOffset: boundary.utf16Offset <= utf16Offset
+          ? scalarIndex
+          : scalarIndex + 1,
+        weight: boundary.weight,
+        kind: boundary.kind,
+      });
+      boundaryIndex += 1;
+    }
+    utf16Offset = nextUtf16Offset;
+  }
+}
+
 function cjkBoundaryCandidates(
   text: string,
   definition: ProfileDefinition,
 ): BoundaryCandidate[] {
   const candidates: BoundaryCandidate[] = [];
+  const utf16Boundaries: Utf16BoundaryCandidate[] = [];
   for (const match of text.matchAll(/(?:\r\n|\r|\n)[ \t]*(?:(?:\r\n|\r|\n)[ \t]*)+/gu)) {
     if (match.index !== undefined) {
-      candidates.push({
-        scalarOffset: scalarOffsetAt(text, match.index + match[0].length),
+      utf16Boundaries.push({
+        utf16Offset: match.index + match[0].length,
         weight: 70,
         kind: "paragraph",
       });
@@ -292,13 +335,14 @@ function cjkBoundaryCandidates(
     }
     const heading = structureHeading(match[0], definition);
     if (heading !== null) {
-      candidates.push({
-        scalarOffset: scalarOffsetAt(text, match.index),
+      utf16Boundaries.push({
+        utf16Offset: match.index,
         weight: heading.boundaryWeight,
         kind: "heading",
       });
     }
   }
+  appendUtf16BoundariesAsScalars(scalars, utf16Boundaries, candidates);
 
   const strongestByOffset = new Map<number, BoundaryCandidate>();
   for (const candidate of candidates) {

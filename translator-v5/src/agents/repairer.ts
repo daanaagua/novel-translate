@@ -1,4 +1,4 @@
-import type { StreamFn } from "@earendil-works/pi-agent-core";
+import type { StreamFn, ThinkingLevel } from "@earendil-works/pi-agent-core";
 import type { Model } from "@earendil-works/pi-ai";
 
 import type { ProvisionalSnapshot } from "../domain/provisional-snapshot.js";
@@ -23,6 +23,7 @@ interface RepairInput {
   budget: BudgetLedger;
   model: Model<any>;
   streamFn: StreamFn;
+  thinkingLevel?: ThinkingLevel;
   signal?: AbortSignal;
   deadlineMs?: number;
 }
@@ -39,6 +40,7 @@ export interface BatchRepairInput {
   budget: BudgetLedger;
   model: Model<any>;
   streamFn: StreamFn;
+  thinkingLevel?: ThinkingLevel;
   signal?: AbortSignal;
   deadlineMs?: number;
 }
@@ -86,6 +88,7 @@ export class Repairer {
       maxTurns: 1,
       signal: input.signal,
       deadlineMs: input.deadlineMs,
+      thinkingLevel: input.thinkingLevel,
     }, input.streamFn);
     const patch = input.collector.translations().slice(before).at(-1);
     return {

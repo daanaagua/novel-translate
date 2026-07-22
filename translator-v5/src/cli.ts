@@ -8,13 +8,24 @@ import {
   PiRuntime,
 } from "./agents/pi-runtime.js";
 import { RecoveryAgent } from "./agents/recovery-agent.js";
-import { loadOpenCodeApiKey, loadPilotConfig } from "./config.js";
+import {
+  loadOpenCodeApiKey,
+  loadPilotConfig,
+  withReasoningEffort,
+  type PilotModelConfig,
+} from "./config.js";
 import {
   LOSSLESS_BOOK_PROTOCOL_VERSION,
   preflightBook,
   runBook,
+  type LosslessBookRunOptions,
+  type LosslessBookRunResult,
 } from "./fullbook/book-runner.js";
 import { BookContext } from "./fullbook/book-context.js";
+import type {
+  TranslationRunMode,
+  TranslationRuntimeSet,
+} from "./fullbook/types.js";
 import {
   loadGlossary,
   type GlossaryImportReport,
@@ -23,6 +34,8 @@ import {
 import { planBookWindows, type WindowPlanOptions } from "./fullbook/window-planner.js";
 import { preflightPilot, runPilot } from "./pilot-runner.js";
 import { BudgetLedger } from "./kernel/budget.js";
+import { toInternalThinking } from "./providers/registry.js";
+import type { ProviderEffort } from "./providers/types.js";
 import { projectRecoveryRule, isIncidentCode } from "./recovery/registry.js";
 import {
   createStoreRecoveryIncident,
@@ -90,6 +103,8 @@ export interface CliOptions {
   styleProfile?: string;
   prompt?: string;
   glossary?: string;
+  runMode?: TranslationRunMode;
+  maxInFlightTokens?: number;
 }
 
 export interface BookDoctorReport {
@@ -106,9 +121,14 @@ export interface BookDoctorReport {
   glossary?: GlossaryImportReport;
 }
 
-interface CliRuntimeDependencies {
+type RuntimeAwareBookRunOptions = LosslessBookRunOptions & {
+  runtimeSet: TranslationRuntimeSet;
+};
+
+export interface CliRuntimeDependencies {
   createModel: typeof createDeepSeekModel;
   createStreamFn: typeof createDeepSeekStreamFn;
+  runBook?: (options: RuntimeAwareBookRunOptions) => Promise<LosslessBookRunResult>;
 }
 
 export interface CliErrorPayload {
@@ -267,6 +287,20 @@ function positiveFlag(
     throw new Error(`${name} must be a positive integer`);
   }
   return parsed;
+}
+
+function runModeFlag(
+  values: ReadonlyMap<string, string>,
+  name: string,
+): TranslationRunMode {
+  const raw = values.get(name);
+  if (raw === undefined) {
+    return "quality";
+  }
+  if (raw !== "quality" && raw !== "fast") {
+    throw new Error(`${name} must be quality or fast`);
+  }
+  return raw;
 }
 
 function parseFlags(
@@ -596,7 +630,7 @@ export function parseArgs(argv: readonly string[]): CliOptions {
         "--opencode-auth", "--run", "--max-windows", "--max-concurrency",
         "--max-attempts", "--max-blocks", "--max-source-tokens",
         "--hard-deadline-ms", "--style-profile", "--prompt",
-        "--glossary",
+        "--glossary", "--run-mode", "--max-in-flight-tokens",
       ],
     );
     return {
@@ -610,6 +644,8 @@ export function parseArgs(argv: readonly string[]): CliOptions {
       runId: identifierValue(values, "--run"),
       maxWindows: positiveFlag(values, "--max-windows"),
       maxConcurrency: positiveFlag(values, "--max-concurrency"),
+      runMode: runModeFlag(values, "--run-mode"),
+      maxInFlightTokens: positiveFlag(values, "--max-in-flight-tokens"),
       maxAttempts: positiveFlag(values, "--max-attempts"),
       hardDeadlineMs: positiveFlag(values, "--hard-deadline-ms"),
       maxBlocks: positiveFlag(values, "--max-blocks"),
@@ -664,6 +700,38 @@ function loadRuntimeConfig(options: CliOptions) {
     : loadPilotConfig(requireOption(options, "config"), "draft", {
       apiKeyOverride: loadOpenCodeApiKey(options.openCodeAuth, baseConfig.provider),
     });
+}
+
+/**
+ * Project one credential-bearing config into the immutable runtime choices for
+ * a translation run.  Only model/stream closures enter this object; it is not
+ * serialized or persisted by the CLI.
+ */
+export function buildTranslationRuntimeSet(
+  config: PilotModelConfig,
+  mode: TranslationRunMode,
+  factories: Pick<CliRuntimeDependencies, "createModel" | "createStreamFn">,
+): TranslationRuntimeSet {
+  const makeRuntime = (candidate: PilotModelConfig) => ({
+    // `withReasoningEffort` is the validation boundary for both source and
+    // derived configs, so this narrow cast cannot introduce an unchecked wire value.
+    effort: candidate.reasoningEffort as ProviderEffort,
+    model: factories.createModel(candidate),
+    streamFn: factories.createStreamFn(candidate),
+    thinkingLevel: candidate.reasoningEffort === "off"
+      ? "off" as const
+      : toInternalThinking(candidate.reasoningEffort as ProviderEffort),
+  });
+  const qualityConfig = withReasoningEffort(config, config.reasoningEffort);
+  const primaryConfig = mode === "fast"
+    ? withReasoningEffort(qualityConfig, "off")
+    : qualityConfig;
+  const primary = makeRuntime(primaryConfig);
+  return {
+    mode,
+    primary,
+    escalation: mode === "quality" ? primary : makeRuntime(qualityConfig),
+  };
 }
 
 export async function main(
@@ -866,10 +934,15 @@ export async function main(
       runMetadataForGlossary(glossary, selectedRun?.metadata),
     );
     const config = loadRuntimeConfig(options);
-    const model = runtime.createModel(config);
-    const streamFn = runtime.createStreamFn(config);
+    const runtimeSet = buildTranslationRuntimeSet(
+      config,
+      options.runMode ?? "quality",
+      runtime,
+    );
+    const bookRunner = dependencyOverrides.runBook
+      ?? ((runOptions: RuntimeAwareBookRunOptions) => runBook(runOptions));
     const runId = selectedRunId ?? randomUUID();
-    const result = await runBook({
+    const result = await bookRunner({
       manifestPath: requireOption(options, "manifest"),
       ...(options.legacyV4Db === undefined ? {} : { legacyV4DbPath: options.legacyV4Db }),
       storePath: requireOption(options, "store"),
@@ -886,8 +959,9 @@ export async function main(
             modelId: selectedRun.modelId,
             metadata: runMetadata,
           },
-      model,
-      streamFn,
+      model: runtimeSet.primary.model,
+      streamFn: runtimeSet.primary.streamFn,
+      runtimeSet,
       styleState: style.styleState,
       ...(glossary === undefined ? {} : { glossary }),
       windowOptions: {
@@ -896,6 +970,7 @@ export async function main(
       },
       maxWindows: options.maxWindows,
       maxConcurrency: options.maxConcurrency,
+      maxInFlightTokens: options.maxInFlightTokens,
       maxAttempts: options.maxAttempts,
       hardDeadlineMs: options.hardDeadlineMs,
     });

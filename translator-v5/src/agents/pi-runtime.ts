@@ -3,13 +3,14 @@ import {
   type AgentMessage,
   type AgentTool,
   type StreamFn,
+  type ThinkingLevel,
 } from "@earendil-works/pi-agent-core";
 import {
   type Api,
   type AssistantMessage,
+  isContextOverflow,
   type Model,
   type StopReason,
-  type ThinkingLevel,
   type Usage,
 } from "@earendil-works/pi-ai";
 
@@ -70,8 +71,65 @@ export interface PiToolError {
   message: string;
 }
 
+export type ModelProviderErrorKind =
+  | "auth"
+  | "quota"
+  | "throttled"
+  | "timeout"
+  | "busy"
+  | "context"
+  | "protocol"
+  | "unknown";
+
 export class ModelProviderError extends Error {
   override readonly name = "ModelProviderError";
+
+  public constructor(
+    message: string,
+    public readonly kind: ModelProviderErrorKind = classifyProviderErrorMessage(message),
+    public readonly retryable: boolean = retryableProviderErrorKind(kind),
+  ) {
+    super(message);
+  }
+}
+
+function retryableProviderErrorKind(kind: ModelProviderErrorKind): boolean {
+  return kind === "throttled" || kind === "timeout" || kind === "busy";
+}
+
+export function classifyProviderErrorMessage(message: string): ModelProviderErrorKind {
+  const normalized = message.normalize("NFKC").toLocaleLowerCase();
+  if (/(?:insufficient[_ -]?quota|quota exceeded|billing|out of budget|usage limit|credit balance)/u
+    .test(normalized)) {
+    return "quota";
+  }
+  if (/(?:\b40[13]\b|unauthori[sz]ed|forbidden|authentication failed|invalid[^\n]{0,32}(?:api[ _-]?key|credential)|no api[ _-]?key|permission denied)/u
+    .test(normalized)) {
+    return "auth";
+  }
+  if (/(?:\b429\b|rate[ _-]?limit|too many requests|throttl|resourceexhausted)/u
+    .test(normalized)) {
+    return "throttled";
+  }
+  if (/(?:timed? out|timeout|deadline exceeded|etimedout)/u.test(normalized)) {
+    return "timeout";
+  }
+  if (/(?:malformed|invalid)[^\n]{0,48}(?:tool[ _-]?call|json|schema|stream)|(?:tool[ _-]?call)[^\n]{0,32}(?:malformed|invalid)|protocol error/u
+    .test(normalized)) {
+    return "protocol";
+  }
+  if (/(?:\b5(?:00|02|03|04|24)\b|overload|service unavailable|server error|internal error|network error|connection (?:error|refused|lost)|fetch failed|socket hang up|upstream connect)/u
+    .test(normalized)) {
+    return "busy";
+  }
+  return "unknown";
+}
+
+function classifyProviderAssistantError(message: AssistantMessage): ModelProviderErrorKind {
+  if (isContextOverflow(message)) {
+    return "context";
+  }
+  return classifyProviderErrorMessage(message.errorMessage ?? "unknown provider failure");
 }
 
 export interface PiRunResult {
@@ -273,8 +331,10 @@ export class PiRuntime {
     const messages = [...agent.state.messages];
     const lastAssistant = messages.findLast(assistant);
     if (lastAssistant?.stopReason === "error") {
+      const providerMessage = lastAssistant.errorMessage ?? "unknown provider failure";
       throw new ModelProviderError(
-        `model provider error: ${lastAssistant.errorMessage ?? "unknown provider failure"}`,
+        `model provider error: ${providerMessage}`,
+        classifyProviderAssistantError(lastAssistant),
       );
     }
     return {

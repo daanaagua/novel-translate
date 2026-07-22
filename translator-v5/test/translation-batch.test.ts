@@ -13,6 +13,7 @@ import {
   runTranslationBatch,
   translationBatchSystemPrompt,
 } from "../src/agents/translation-batch.js";
+import { prepareTranslationRequest } from "../src/agents/translation-request.js";
 import type { PhysicalRequestPlan } from "../src/fullbook/types.js";
 import { BudgetLedger } from "../src/kernel/budget.js";
 import { canonicalJson } from "../src/knowledge/knowledge-store.js";
@@ -75,6 +76,40 @@ test("batch protocol states that user style requirements cannot override integri
 test("batch protocol names Korean sources rather than treating them as undetermined", () => {
   const prompt = translationBatchSystemPrompt(getSourceLanguageProfile("ko"));
   assert.match(prompt, /The source language is Korean \(ko\)/u);
+});
+
+test("batch runtime uses the same prepared prompt as complete-request budgeting", async () => {
+  const prepared = prepareTranslationRequest({
+    request,
+    blocks,
+    stableTerms: [],
+    snapshot: { id: "snapshot-0", revisions: [] },
+  });
+  const faux = fauxProvider();
+  faux.setResponses([fauxAssistantMessage(fauxToolCall(
+    "finalize_translation_batch",
+    { windows: request.windows.map((window) => ({
+      windowId: window.windowId,
+      translations: window.blockIds.map((blockId) => ({ blockId, text: `translated ${blockId}` })),
+      notes: [],
+    })) },
+  ), { stopReason: "toolUse" })]);
+
+  const result = await runTranslationBatch({
+    request,
+    blocks,
+    stableTerms: [],
+    snapshot: { id: "snapshot-0", revisions: [] },
+    model: faux.getModel(),
+    streamFn: faux.provider.streamSimple.bind(faux.provider),
+    budget: new BudgetLedger(),
+  });
+  const prompt = (result.run.messages[0] as {
+    content?: Array<{ type: string; text?: string }>;
+  }).content?.[0]?.text ?? "";
+
+  assert.equal(prompt, prepared.prompt);
+  assert.deepEqual(result.run.toolNames, prepared.tools.map((tool) => tool.name));
 });
 
 test("batch isolates one malformed logical window without discarding its valid sibling", async () => {
@@ -338,6 +373,53 @@ test("batch validation repairs only the invalid block once and preserves its val
   assert.match(repairPrompts[0] ?? "", /stable_term_mismatch/);
   assert.match(repairPrompts[0] ?? "", /block-0/);
   assert.doesNotMatch(repairPrompts[0] ?? "", /\[block-1\]/);
+});
+
+test("batch uses the explicit escalation runtime only for targeted repair", async () => {
+  const primary = fauxProvider();
+  const escalation = fauxProvider();
+  primary.setResponses([fauxAssistantMessage(fauxToolCall("finalize_translation_batch", {
+    windows: [{
+      windowId: "window-0",
+      translations: [{ blockId: "block-0", text: "错误译文。" }],
+      notes: [],
+    }, {
+      windowId: "window-1",
+      translations: [{ blockId: "block-1", text: "贝塔。" }],
+      notes: [],
+    }],
+  }), { stopReason: "toolUse" })]);
+  escalation.setResponses([fauxAssistantMessage(fauxToolCall("submit_repaired_translation", {
+    translations: [{ blockId: "block-0", text: "阿尔法。" }],
+    notes: [],
+  }), { stopReason: "toolUse" })]);
+
+  const result = await runTranslationBatch({
+    request,
+    blocks,
+    stableTerms: [{
+      conceptId: "alpha",
+      lexemeId: "alpha-lexeme",
+      sourceForm: "Alpha",
+      canonicalSource: "Alpha",
+      target: "阿尔法",
+      locked: true,
+    }],
+    snapshot: { id: "snapshot-0", revisions: [] },
+    model: primary.getModel(),
+    streamFn: primary.provider.streamSimple.bind(primary.provider),
+    thinkingLevel: "off",
+    repairRuntime: {
+      model: escalation.getModel(),
+      streamFn: escalation.provider.streamSimple.bind(escalation.provider),
+      thinkingLevel: "high",
+    },
+    budget: new BudgetLedger(),
+  } as never);
+
+  assert.equal(primary.state.callCount, 1);
+  assert.equal(escalation.state.callCount, 1);
+  assert.equal(result.windows[0]?.translations[0]?.text, "阿尔法。");
 });
 
 test("one invalid repair fails only that logical window and never triggers a second repair", async () => {

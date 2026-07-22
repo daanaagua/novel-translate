@@ -355,6 +355,22 @@ test("source and derived plan registration are idempotent but never overwrite mi
   store.close();
 });
 
+test("derived plan identity does not silently reuse a legacy token estimate", () => {
+  const store = new LosslessBookStore(fixturePath());
+  store.registerSource(sourceInput());
+  store.replaceDerivedPlan("source-v1", { blocks: blocks(), annotations: [] });
+
+  assert.throws(() => store.replaceDerivedPlan("source-v1", {
+    estimatorVersion: "weighted-unicode-v1",
+    blocks: blocks().map((block) => ({
+      ...block,
+      estimatorVersion: "weighted-unicode-v1",
+    })),
+    annotations: [],
+  }), /different data|estimator version/i);
+  store.close();
+});
+
 test("first derived plan registration verifies block hashes, ids, and reconstructed canonical hash", () => {
   const canonical = "Alpha.";
   const sourceVersion = "source-certified";

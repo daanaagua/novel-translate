@@ -1,3 +1,25 @@
+import type { StreamFn, ThinkingLevel } from "@earendil-works/pi-agent-core";
+import type { Api, Model } from "@earendil-works/pi-ai";
+
+import type { ProviderEffort } from "../providers/types.js";
+
+export type TranslationRunMode = "quality" | "fast";
+
+export interface TranslationRuntime {
+  model: Model<Api>;
+  streamFn: StreamFn;
+  /** Provider-facing label retained for diagnostics and durable run metadata. */
+  effort?: ProviderEffort;
+  /** Agent-facing level; `off` must remain explicit rather than becoming a default. */
+  thinkingLevel?: ThinkingLevel;
+}
+
+export interface TranslationRuntimeSet {
+  mode: TranslationRunMode;
+  primary: TranslationRuntime;
+  escalation: TranslationRuntime;
+}
+
 export type BookWindowStatus =
   | "pending"
   | "running"

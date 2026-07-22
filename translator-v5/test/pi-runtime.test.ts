@@ -9,6 +9,7 @@ import {
 
 import {
   createDeepSeekModel,
+  ModelProviderError,
   PiRuntime,
 } from "../src/agents/pi-runtime.js";
 import { BudgetLedger } from "../src/kernel/budget.js";
@@ -180,6 +181,66 @@ test("Pi surfaces provider errors instead of misclassifying them as human review
     }, streamFrom(faux)),
     /authentication failed/i,
   );
+});
+
+test("Pi classifies provider failures for bounded runtime recovery", async () => {
+  const cases = [
+    { message: "401: invalid api key", kind: "auth", retryable: false },
+    { message: "insufficient_quota: billing limit reached", kind: "quota", retryable: false },
+    { message: "429: rate limit exceeded", kind: "throttled", retryable: true },
+    { message: "request timed out while reading the stream", kind: "timeout", retryable: true },
+    { message: "503: service unavailable", kind: "busy", retryable: true },
+    { message: "input exceeds the context window", kind: "context", retryable: false },
+    { message: "malformed tool-call stream", kind: "protocol", retryable: false },
+    { message: "fixture mystery failure", kind: "unknown", retryable: false },
+  ] as const;
+
+  for (const fixture of cases) {
+    const faux = fauxProvider();
+    faux.setResponses([fauxAssistantMessage([], {
+      stopReason: "error",
+      errorMessage: fixture.message,
+    })]);
+    try {
+      await new PiRuntime().run({
+        systemPrompt: "Use the tools.",
+        prompt: "Translate the fixture.",
+        phase: "translation",
+        model: faux.getModel(),
+        tools: [],
+        budget: new BudgetLedger(),
+      }, streamFrom(faux));
+      assert.fail(`expected ${fixture.kind} provider failure`);
+    } catch (error) {
+      assert.ok(error instanceof ModelProviderError);
+      assert.equal(error.kind, fixture.kind);
+      assert.equal(error.retryable, fixture.retryable);
+    }
+  }
+});
+
+test("Pi preserves an explicit off or high thinking level at the stream boundary", async () => {
+  for (const thinkingLevel of ["off", "high"] as const) {
+    const faux = fauxProvider();
+    faux.setResponses([fauxAssistantMessage("fixture response")]);
+    let observedReasoning: unknown = "not-called";
+    const stream = (model: Parameters<typeof faux.provider.streamSimple>[0],
+      context: Parameters<typeof faux.provider.streamSimple>[1],
+      options: Parameters<typeof faux.provider.streamSimple>[2]) => {
+      observedReasoning = options?.reasoning;
+      return faux.provider.streamSimple(model, context, options);
+    };
+    await new PiRuntime().run({
+      systemPrompt: "Return the fixture.",
+      prompt: "Run once.",
+      phase: "translation",
+      model: faux.getModel(),
+      tools: [],
+      budget: new BudgetLedger(),
+      thinkingLevel,
+    }, stream);
+    assert.equal(observedReasoning, thinkingLevel === "off" ? undefined : "high");
+  }
 });
 
 test("DeepSeek model metadata carries compatibility controls but no API key", () => {

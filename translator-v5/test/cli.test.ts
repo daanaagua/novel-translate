@@ -7,7 +7,13 @@ import { dirname, join, resolve } from "node:path";
 import test from "node:test";
 import { DatabaseSync } from "node:sqlite";
 
-import { main, parseArgs, resolveRunSelection } from "../src/cli.js";
+import {
+  buildTranslationRuntimeSet,
+  main,
+  parseArgs,
+  resolveRunSelection,
+} from "../src/cli.js";
+import type { PilotModelConfig } from "../src/config.js";
 import { BookContext } from "../src/fullbook/book-context.js";
 import { planBookWindows } from "../src/fullbook/window-planner.js";
 import { createKnowledgeSnapshot } from "../src/knowledge/snapshot.js";
@@ -156,6 +162,128 @@ test("CLI parses formal lossless run and optional run selection", () => {
   assert.equal(parseArgs([
     "book", "export", "--store", "state.db", "--output", "out", "--run", "run-1",
   ]).runId, "run-1");
+});
+
+test("CLI parses and validates dual-runtime book-run controls", () => {
+  const fast = parseArgs([
+    "book", "run",
+    "--manifest", "source_manifest.json",
+    "--store", "state.db",
+    "--config", "config.yaml",
+    "--run-mode", "fast",
+    "--max-in-flight-tokens", "12000",
+  ]);
+  assert.equal(fast.command, "book-run");
+  assert.equal(fast.runMode, "fast");
+  assert.equal(fast.maxInFlightTokens, 12_000);
+  const quality = parseArgs([
+    "book", "run",
+    "--manifest", "source_manifest.json",
+    "--store", "state.db",
+    "--config", "config.yaml",
+  ]);
+  assert.equal(quality.runMode, "quality");
+  assert.throws(
+    () => parseArgs([
+      "book", "run", "--manifest", "source_manifest.json", "--store", "state.db",
+      "--config", "config.yaml", "--run-mode", "turbo",
+    ]),
+    /--run-mode must be quality or fast/i,
+  );
+  assert.throws(
+    () => parseArgs([
+      "book", "run", "--manifest", "source_manifest.json", "--store", "state.db",
+      "--config", "config.yaml", "--max-in-flight-tokens", "0",
+    ]),
+    /--max-in-flight-tokens must be a positive integer/i,
+  );
+});
+
+test("dual runtime keeps quality effort and creates a non-thinking fast primary", () => {
+  const source: PilotModelConfig = {
+    provider: "deepseek",
+    model: "deepseek-v4-flash",
+    baseUrl: "https://example.invalid/v1",
+    timeoutMs: 1_000,
+    reasoningEffort: "high",
+    apiKeyForRuntime: () => "test-only-key",
+    toJSON: () => ({ apiKeyConfigured: true }),
+  };
+  const createdEfforts: string[] = [];
+  const factories = {
+    createModel: (config: PilotModelConfig) => {
+      createdEfforts.push(config.reasoningEffort);
+      return { id: `model-${config.reasoningEffort}` } as never;
+    },
+    createStreamFn: () => (() => {
+      throw new Error("stream is not used by this unit test");
+    }) as never,
+  };
+  const fast = buildTranslationRuntimeSet(source, "fast", factories);
+  assert.deepEqual(createdEfforts, ["off", "high"]);
+  assert.equal(fast.mode, "fast");
+  assert.equal(fast.primary.effort, "off");
+  assert.equal(fast.primary.thinkingLevel, "off");
+  assert.equal(fast.escalation.effort, "high");
+  assert.equal(fast.escalation.thinkingLevel, "high");
+  assert.equal(source.reasoningEffort, "high");
+
+  createdEfforts.length = 0;
+  const quality = buildTranslationRuntimeSet(source, "quality", factories);
+  assert.deepEqual(createdEfforts, ["high"]);
+  assert.equal(quality.mode, "quality");
+  assert.equal(quality.primary, quality.escalation);
+  assert.equal(quality.primary.effort, "high");
+});
+
+test("book run passes the selected runtime set and in-flight token cap to the runner", async () => {
+  const manifest = sourceManifest("Runtime wiring source.");
+  const storePath = join(dirname(manifest), "runtime-wiring.db");
+  const configPath = resolve("test/fixtures/config.yaml");
+  const createdEfforts: string[] = [];
+  let received: Record<string, unknown> | undefined;
+  const output: string[] = [];
+  const originalLog = console.log;
+  console.log = (...values: unknown[]) => output.push(values.join(" "));
+  try {
+    await main([
+      "book", "run",
+      "--manifest", manifest,
+      "--store", storePath,
+      "--config", configPath,
+      "--run-mode", "fast",
+      "--max-in-flight-tokens", "4096",
+    ], {
+      createModel: (config: PilotModelConfig) => {
+        createdEfforts.push(config.reasoningEffort);
+        return { id: `model-${config.reasoningEffort}` } as never;
+      },
+      createStreamFn: () => (() => {
+        throw new Error("stream is not used by this wiring test");
+      }) as never,
+      runBook: (async (options: unknown) => {
+        received = options as Record<string, unknown>;
+        return { artifacts: null } as never;
+      }) as never,
+    });
+  } finally {
+    console.log = originalLog;
+  }
+  assert.deepEqual(createdEfforts, ["off", "high"]);
+  assert.equal(received?.maxInFlightTokens, 4_096);
+  const runtimeSet = received?.runtimeSet as {
+    mode?: string;
+    primary?: { effort?: string; thinkingLevel?: string; model?: { id?: string } };
+    escalation?: { effort?: string; thinkingLevel?: string; model?: { id?: string } };
+  };
+  assert.equal(runtimeSet.mode, "fast");
+  assert.equal(runtimeSet.primary?.effort, "off");
+  assert.equal(runtimeSet.primary?.thinkingLevel, "off");
+  assert.equal(runtimeSet.primary?.model?.id, "model-off");
+  assert.equal(runtimeSet.escalation?.effort, "high");
+  assert.equal(runtimeSet.escalation?.thinkingLevel, "high");
+  assert.equal(runtimeSet.escalation?.model?.id, "model-high");
+  assert.equal(output.join("\n").includes("secret-test-key"), false);
 });
 
 test("CLI parses a style profile and a bounded style prompt for book run", () => {
