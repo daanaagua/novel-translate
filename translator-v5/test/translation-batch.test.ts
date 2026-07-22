@@ -453,6 +453,37 @@ test("batch accepts only the first terminating submission in one model session",
   assert.equal(budget.snapshot().translationToolCalls, 1);
 });
 
+test("batch stops a malformed tool loop after one corrective turn", async () => {
+  const faux = fauxProvider();
+  faux.setResponses([
+    fauxAssistantMessage(fauxToolCall("shell", { command: "ignored" }), { stopReason: "toolUse" }),
+    fauxAssistantMessage(fauxToolCall("shell", { command: "still ignored" }), { stopReason: "toolUse" }),
+    fauxAssistantMessage(fauxToolCall("finalize_translation_batch", {
+      windows: request.windows.map((window) => ({
+        windowId: window.windowId,
+        translations: window.blockIds.map((blockId) => ({ blockId, text: "不应抵达。" })),
+        notes: [],
+      })),
+    }), { stopReason: "toolUse" }),
+  ]);
+
+  const result = await runTranslationBatch({
+    request,
+    blocks,
+    stableTerms: [],
+    snapshot: { id: "snapshot-0", revisions: [] },
+    model: faux.getModel(),
+    streamFn: faux.provider.streamSimple.bind(faux.provider),
+    budget: new BudgetLedger(),
+  });
+
+  assert.equal(result.run.modelCalls, 2);
+  assert.equal(result.repairRuns.length, 0);
+  assert.equal(faux.state.callCount, 2);
+  assert.equal(result.run.turnLimitReached, true);
+  assert.ok(result.windows.every((window) => window.status === "failed"));
+});
+
 test("batch projects bounded structured style and returns the same-call style observation", async () => {
   const faux = fauxProvider();
   faux.setResponses([fauxAssistantMessage(fauxToolCall(

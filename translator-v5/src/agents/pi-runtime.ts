@@ -8,6 +8,7 @@ import {
 import {
   type Api,
   type AssistantMessage,
+  createAssistantMessageEventStream,
   isContextOverflow,
   type Model,
   type StopReason,
@@ -225,8 +226,31 @@ export class PiRuntime {
     const toolNames: string[] = [];
     const toolErrors: PiToolError[] = [];
     let modelCalls = 0;
+    let turnStarts = 0;
     let deadlineExceeded = false;
     let turnLimitReached = false;
+
+    const boundedStreamFn: StreamFn = (model, context, options) => {
+      if (!turnLimitReached) {
+        return streamFn(model, context, options);
+      }
+      const stream = createAssistantMessageEventStream();
+      const message: AssistantMessage = {
+        role: "assistant",
+        content: [],
+        api: model.api,
+        provider: model.provider,
+        model: model.id,
+        usage: structuredClone(ZERO_USAGE),
+        stopReason: "stop",
+        timestamp: Date.now(),
+      };
+      queueMicrotask(() => {
+        stream.push({ type: "done", reason: "stop", message });
+        stream.end(message);
+      });
+      return stream;
+    };
 
     const agent = new Agent({
       initialState: {
@@ -236,7 +260,7 @@ export class PiRuntime {
         tools: toAgentTools(spec.tools),
         messages: [],
       },
-      streamFn,
+      streamFn: boundedStreamFn,
       toolExecution: "parallel",
       beforeToolCall: async ({ toolCall }) => {
         try {
@@ -272,6 +296,11 @@ export class PiRuntime {
     const unsubscribe = agent.subscribe((event) => {
       switch (event.type) {
         case "turn_start":
+          turnStarts += 1;
+          if (spec.maxTurns !== undefined && turnStarts > spec.maxTurns) {
+            turnLimitReached = true;
+            break;
+          }
           spec.budget.consumeMany({
             modelCalls: 1,
             [turnCounter(spec.phase)]: 1,

@@ -440,6 +440,9 @@ export async function runTranslationBatch(
     tools: prepared.tools,
     budget: input.budget,
     terminateTools: ["finalize_translation_batch"],
+    // A malformed typed-tool call gets one corrective turn. More turns have no
+    // new evidence and only turn a provider-format error into a long stall.
+    maxTurns: 2,
     signal: input.signal,
     deadlineMs: input.deadlineMs,
     thinkingLevel: input.thinkingLevel,
