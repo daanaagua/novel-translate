@@ -107,5 +107,8 @@ test("provider model discovery de-duplicates live ids and labels a fallback hone
     },
   });
   assert.equal(fallback[0]?.source, "fallback");
-  assert.equal(fallback.some((model) => model.id === "deepseek-chat"), true);
+  assert.deepEqual(fallback.slice(0, 2), [
+    { id: "deepseek-v4-flash", source: "fallback" },
+    { id: "deepseek-v4-pro", source: "fallback" },
+  ]);
 });

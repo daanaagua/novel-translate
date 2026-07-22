@@ -4,6 +4,7 @@ import { openAICompletionsApi } from "@earendil-works/pi-ai/api/openai-completio
 import { openAIResponsesApi } from "@earendil-works/pi-ai/api/openai-responses.lazy";
 
 import { providerRegistry, toInternalThinking } from "./registry.js";
+import { providerWirePolicy, type ProviderWirePolicy } from "./wire-policy.js";
 import type {
   ModelProfile,
   ProviderRuntime,
@@ -23,24 +24,12 @@ function requireCredential(value: SecretCredential): SecretCredential {
   return value;
 }
 
-function thinkingMap(resolved: ResolvedProviderProfile): Record<string, string | null> | undefined {
-  if (resolved.definition.capabilities.thinkingFormat === "qwen") {
-    return undefined;
-  }
-  const effort = resolved.profile.reasoningEffort;
-  const internal = effort === undefined ? undefined : toInternalThinking(effort);
-  if (internal === undefined || effort === undefined) {
-    return undefined;
-  }
-  return { [internal]: effort };
-}
-
-function chatCompat(resolved: ResolvedProviderProfile): OpenAICompletionsCompat {
-  const capabilities = resolved.definition.capabilities;
+function chatCompat(resolved: ResolvedProviderProfile, policy: ProviderWirePolicy): OpenAICompletionsCompat {
   return {
-    thinkingFormat: capabilities.thinkingFormat,
-    supportsReasoningEffort: capabilities.reasoning && capabilities.thinkingFormat !== "qwen",
-    requiresReasoningContentOnAssistantMessages: capabilities.requiresReasoningContentOnAssistantMessages,
+    thinkingFormat: policy.thinkingFormat,
+    supportsReasoningEffort: policy.supportsReasoningEffort,
+    requiresReasoningContentOnAssistantMessages: policy.requiresReasoningReplay(resolved.profile.reasoningEffort),
+    maxTokensField: policy.outputTokenField === "max_tokens" ? "max_tokens" : "max_completion_tokens",
     supportsStrictMode: true,
     ...(resolved.definition.id === "kimi-cn" ? { deferredToolsMode: "kimi" as const } : {}),
   };
@@ -48,6 +37,7 @@ function chatCompat(resolved: ResolvedProviderProfile): OpenAICompletionsCompat 
 
 function createModel(resolved: ResolvedProviderProfile, baseUrl: string): Model<Api> {
   const capabilities = resolved.definition.capabilities;
+  const policy = providerWirePolicy(resolved);
   const common = {
     id: resolved.profile.modelId,
     name: resolved.profile.modelId,
@@ -58,7 +48,7 @@ function createModel(resolved: ResolvedProviderProfile, baseUrl: string): Model<
     cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
     contextWindow: capabilities.contextWindow,
     maxTokens: capabilities.maxTokens,
-    thinkingLevelMap: thinkingMap(resolved),
+    thinkingLevelMap: policy.thinkingLevelMap,
   };
   if (resolved.definition.apiFamily === "openai-responses") {
     const model: Model<"openai-responses"> = {
@@ -73,7 +63,7 @@ function createModel(resolved: ResolvedProviderProfile, baseUrl: string): Model<
   const model: Model<"openai-completions"> = {
     ...common,
     api: "openai-completions",
-    compat: chatCompat(resolved),
+    compat: chatCompat(resolved, policy),
   };
   return model;
 }

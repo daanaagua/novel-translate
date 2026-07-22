@@ -13,7 +13,10 @@ type FakeMode =
   | "plain-text"
   | "reject-continuity"
   | "invalid-json"
-  | "timeout";
+  | "timeout"
+  | "truncated-once"
+  | "truncated-always"
+  | "off-omits-reasoning";
 
 interface FakeProviderOptions {
   mode?: FakeMode;
@@ -51,12 +54,12 @@ function sse(response: ServerResponse, events: readonly unknown[]): void {
   response.end("data: [DONE]\n\n");
 }
 
-function chatToolEvents(): readonly unknown[] {
+function chatToolEvents(includeReasoning = true): readonly unknown[] {
   return [
     {
       choices: [{
         delta: {
-          reasoning_content: "preserve this reasoning across the second turn",
+          ...(includeReasoning ? { reasoning_content: "preserve this reasoning across the second turn" } : {}),
           tool_calls: [{
             index: 0,
             id: "call-probe",
@@ -77,6 +80,22 @@ function chatToolEvents(): readonly unknown[] {
       }],
     },
   ];
+}
+
+function truncatedChatToolEvents(): readonly unknown[] {
+  return [{
+    choices: [{
+      delta: {
+        tool_calls: [{
+          index: 0,
+          id: "call-probe",
+          type: "function",
+          function: { name: "return_probe_token", arguments: '{"token":"FOLIO' },
+        }],
+      },
+      finish_reason: "length",
+    }],
+  }];
 }
 
 function responsesToolEvents(): readonly unknown[] {
@@ -113,6 +132,7 @@ function isSecondResponsesTurn(body: Record<string, unknown>): boolean {
 
 async function startFakeProvider(options: FakeProviderOptions = {}): Promise<FakeProvider> {
   const requests: CapturedRequest[] = [];
+  let firstTurnCount = 0;
   const server: Server = createServer(async (request, response) => {
     const body = await bodyOf(request);
     const path = request.url ?? "/";
@@ -147,13 +167,17 @@ async function startFakeProvider(options: FakeProviderOptions = {}): Promise<Fak
         : [{ choices: [{ delta: { content: "FOLIOLOOM_READY" } }] }]);
       return;
     }
+    if (options.mode === "truncated-always" || (options.mode === "truncated-once" && firstTurnCount++ === 0)) {
+      sse(response, responses ? responsesToolEvents() : truncatedChatToolEvents());
+      return;
+    }
     if (options.mode === "plain-text") {
       sse(response, responses
         ? [{ type: "response.output_text.delta", delta: "plain text only" }, { type: "response.completed" }]
         : [{ choices: [{ delta: { content: "plain text only" } }] }]);
       return;
     }
-    sse(response, responses ? responsesToolEvents() : chatToolEvents());
+    sse(response, responses ? responsesToolEvents() : chatToolEvents(options.mode !== "off-omits-reasoning"));
   });
 
   await new Promise<void>((resolve, reject) => {
@@ -210,12 +234,48 @@ test("capability probe verifies a local chat provider stream, fragmented tool ca
   assert.equal(report.checks.every((check) => check.status === "passed"), true);
   assert.equal(provider.requests.length, 2);
   assert.equal(provider.requests[0]?.body.reasoning_effort, "max");
-  assert.equal(provider.requests[0]?.body.max_tokens, 32);
+  assert.equal(provider.requests[0]?.body.max_completion_tokens, 512);
   assert.equal(provider.requests[1]?.body.messages instanceof Array, true);
   const messages = provider.requests[1]?.body.messages as Array<Record<string, unknown>>;
   const assistant = messages.find((message) => message.role === "assistant");
   assert.equal(assistant?.reasoning_content, "preserve this reasoning across the second turn");
   assert.equal(messages.some((message) => message.content === "Reply only FOLIOLOOM_READY."), true);
+});
+
+test("a length-truncated tool call is retried once instead of reported unsupported", async (t) => {
+  const provider = await startFakeProvider({ mode: "truncated-once" });
+  t.after(() => provider.close());
+
+  const report = await probe("deepseek", provider);
+
+  assert.equal(report.status, "ready");
+  assert.equal(provider.requests.length, 3);
+  assert.equal(provider.requests[0]?.body.max_completion_tokens, 512);
+  assert.equal(provider.requests[1]?.body.max_completion_tokens, 2048);
+});
+
+test("two length terminations return PROBE_OUTPUT_TRUNCATED", async (t) => {
+  const provider = await startFakeProvider({ mode: "truncated-always" });
+  t.after(() => provider.close());
+
+  const report = await probe("deepseek", provider);
+
+  assert.equal(report.status, "failed");
+  assert.equal(report.code, "PROBE_OUTPUT_TRUNCATED");
+  assert.equal(provider.requests.length, 2);
+});
+
+test("DeepSeek off skips reasoning continuity and remains ready", async (t) => {
+  const provider = await startFakeProvider({ mode: "off-omits-reasoning" });
+  t.after(() => provider.close());
+
+  const report = await probe("deepseek", provider, "off");
+
+  assert.equal(report.status, "ready");
+  assert.equal(report.checks.find((check) => check.id === "reasoning_continuity")?.status, "skipped");
+  const messages = provider.requests[1]?.body.messages as Array<Record<string, unknown>>;
+  const assistant = messages.find((message) => message.role === "assistant");
+  assert.equal(Object.hasOwn(assistant ?? {}, "reasoning_content"), false);
 });
 
 test("capability probe reports a missing tool call as limited", async (t) => {
@@ -287,7 +347,7 @@ test("capability probe uses the local OpenAI Responses shape when that family is
 
   assert.equal(report.status, "ready");
   assert.equal(provider.requests[0]?.path.endsWith("/responses"), true);
-  assert.equal(provider.requests[0]?.body.max_output_tokens, 32);
+  assert.equal(provider.requests[0]?.body.max_output_tokens, 512);
   assert.equal(provider.requests[1]?.body.input instanceof Array, true);
   assert.equal(provider.requests[1]?.body.instructions, "Reply only FOLIOLOOM_READY.");
 });

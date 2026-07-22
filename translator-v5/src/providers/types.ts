@@ -12,6 +12,8 @@ export type ProviderId =
 
 export type ProviderApiFamily = "openai-chat" | "openai-responses";
 
+export type ProviderOutputTokenField = "max_tokens" | "max_completion_tokens" | "max_output_tokens";
+
 export type ProviderThinkingFormat = "openai" | "deepseek" | "qwen";
 
 export type ProviderEffort = "off" | "on" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
@@ -35,6 +37,7 @@ export interface ProviderCapabilities {
   supportsTools: boolean;
   contextWindow: number;
   maxTokens: number;
+  outputTokenField: ProviderOutputTokenField;
 }
 
 export interface ProviderDefinition {
@@ -89,6 +92,7 @@ export type ProviderProbeErrorCode =
   | "PROVIDER_BUSY"
   | "TOOL_CALL_UNSUPPORTED"
   | "REASONING_CONTINUITY_UNSUPPORTED"
+  | "PROBE_OUTPUT_TRUNCATED"
   | "REQUEST_TIMEOUT"
   | "PROVIDER_PROTOCOL_INVALID"
   | "PROVIDER_UNREACHABLE"

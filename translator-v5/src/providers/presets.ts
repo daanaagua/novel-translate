@@ -13,7 +13,7 @@ export const PROVIDER_PRESETS: readonly ProviderDefinition[] = Object.freeze([
     defaultBaseUrl: "https://api.deepseek.com/v1",
     keyPlaceholder: "DeepSeek API Key",
     modelDiscovery: "standard-models",
-    fallbackModels: ["deepseek-chat", "deepseek-reasoner"],
+    fallbackModels: ["deepseek-v4-flash", "deepseek-v4-pro"],
     allowManualModel: true,
     allowCustomBaseUrl: false,
     capabilities: {
@@ -23,6 +23,7 @@ export const PROVIDER_PRESETS: readonly ProviderDefinition[] = Object.freeze([
       thinkingFormat: "deepseek",
       requiresReasoningContentOnAssistantMessages: true,
       supportsTools: true,
+      outputTokenField: "max_completion_tokens",
     },
   },
   {
@@ -42,6 +43,7 @@ export const PROVIDER_PRESETS: readonly ProviderDefinition[] = Object.freeze([
       thinkingFormat: "openai",
       requiresReasoningContentOnAssistantMessages: true,
       supportsTools: true,
+      outputTokenField: "max_tokens",
     },
   },
   {
@@ -61,6 +63,7 @@ export const PROVIDER_PRESETS: readonly ProviderDefinition[] = Object.freeze([
       thinkingFormat: "qwen",
       requiresReasoningContentOnAssistantMessages: true,
       supportsTools: true,
+      outputTokenField: "max_completion_tokens",
     },
   },
   {
@@ -80,6 +83,7 @@ export const PROVIDER_PRESETS: readonly ProviderDefinition[] = Object.freeze([
       thinkingFormat: "openai",
       requiresReasoningContentOnAssistantMessages: false,
       supportsTools: true,
+      outputTokenField: "max_completion_tokens",
     },
   },
   {
@@ -98,6 +102,7 @@ export const PROVIDER_PRESETS: readonly ProviderDefinition[] = Object.freeze([
       efforts: ["minimal", "low", "medium", "high"],
       requiresReasoningContentOnAssistantMessages: true,
       supportsTools: true,
+      outputTokenField: "max_output_tokens",
     },
   },
   {
@@ -116,6 +121,7 @@ export const PROVIDER_PRESETS: readonly ProviderDefinition[] = Object.freeze([
       efforts: [],
       requiresReasoningContentOnAssistantMessages: false,
       supportsTools: true,
+      outputTokenField: "max_completion_tokens",
     },
   },
   {
@@ -134,6 +140,7 @@ export const PROVIDER_PRESETS: readonly ProviderDefinition[] = Object.freeze([
       efforts: [],
       requiresReasoningContentOnAssistantMessages: false,
       supportsTools: true,
+      outputTokenField: "max_completion_tokens",
     },
   },
 ]);

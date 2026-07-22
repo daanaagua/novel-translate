@@ -45,8 +45,24 @@ test("provider runtime maps DeepSeek raw max without serializing the credential"
   }
   const model = runtime.model as Model<"openai-completions">;
   assert.equal(model.compat?.thinkingFormat, "deepseek");
+  assert.equal(model.compat?.maxTokensField, "max_completion_tokens");
   assert.equal(model.compat?.requiresReasoningContentOnAssistantMessages, true);
   assert.equal(JSON.stringify(runtime.model).includes(credential), false);
+});
+
+test("provider runtime does not replay DeepSeek reasoning when the effort is off", () => {
+  const runtime = createProviderRuntime({
+    providerId: "deepseek",
+    modelId: "deepseek-v4-flash",
+    reasoningEffort: "off",
+  }, "provider-runtime-fixture-secret");
+
+  if (runtime.model.api !== "openai-completions") {
+    throw new TypeError("expected the DeepSeek runtime to use chat completions");
+  }
+  const model = runtime.model as Model<"openai-completions">;
+  assert.equal(model.compat?.requiresReasoningContentOnAssistantMessages, false);
+  assert.equal(model.thinkingLevelMap, undefined);
 });
 
 test("provider runtime uses the OpenAI Responses API without exposing credentials", () => {

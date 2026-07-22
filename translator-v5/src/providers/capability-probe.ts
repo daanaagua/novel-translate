@@ -1,4 +1,5 @@
 import { ProviderRegistry, providerRegistry } from "./registry.js";
+import { providerWirePolicy, type ProviderWirePolicy } from "./wire-policy.js";
 import type {
   CapabilityCheck,
   CapabilityCheckId,
@@ -11,7 +12,7 @@ import type {
 } from "./types.js";
 
 const DEFAULT_TIMEOUT_MS = 30_000;
-const PROBE_MAX_OUTPUT_TOKENS = 32;
+const PROBE_RETRY_MAX_OUTPUT_TOKENS = 2_048;
 const CHECK_IDS: readonly CapabilityCheckId[] = [
   "stream",
   "tool_call",
@@ -41,6 +42,7 @@ interface StreamResult {
   text: string;
   reasoning: string;
   responseId?: string;
+  finishReason?: string;
   toolCalls: readonly ToolCall[];
 }
 
@@ -100,6 +102,14 @@ function timeoutMs(value: number | undefined): number {
   return effective;
 }
 
+function remainingTimeoutMs(deadline: number): number {
+  const remaining = deadline - Date.now();
+  if (remaining <= 0) {
+    throw new ProbeFailure("REQUEST_TIMEOUT", "The provider did not respond before the probe timeout.");
+  }
+  return remaining;
+}
+
 function providerFailure(status: number, raw: string, credential: SecretCredential): ProbeFailure {
   const details = redact(`HTTP ${status}: ${raw.slice(0, 1_000)}`, credential);
   if (status === 401 || status === 403) {
@@ -140,9 +150,15 @@ function toolCallAt(calls: Map<number, ToolCall>, index: number): ToolCall {
   return created;
 }
 
-function consumeChatEvent(value: unknown, result: { text: string; reasoning: string; calls: Map<number, ToolCall> }): void {
+function consumeChatEvent(value: unknown, result: {
+  text: string;
+  reasoning: string;
+  calls: Map<number, ToolCall>;
+  finishReason?: string;
+}): void {
   const event = asRecord(value);
   const firstChoice = event !== undefined && Array.isArray(event.choices) ? asRecord(event.choices[0]) : undefined;
+  result.finishReason = asString(firstChoice?.finish_reason) ?? result.finishReason;
   const delta = firstChoice === undefined ? undefined : asRecord(firstChoice.delta);
   if (delta === undefined) {
     return;
@@ -168,7 +184,12 @@ function consumeChatEvent(value: unknown, result: { text: string; reasoning: str
   }
 }
 
-function consumeResponsesEvent(value: unknown, result: { text: string; reasoning: string; calls: Map<string, ToolCall> }): void {
+function consumeResponsesEvent(value: unknown, result: {
+  text: string;
+  reasoning: string;
+  calls: Map<string, ToolCall>;
+  finishReason?: string;
+}): void {
   const event = asRecord(value);
   if (event === undefined) {
     return;
@@ -206,6 +227,13 @@ function consumeResponsesEvent(value: unknown, result: { text: string; reasoning
     const target = result.calls.get(itemId) ?? { id: itemId, name: "", arguments: "" };
     target.arguments += asString(event.delta) ?? "";
     result.calls.set(itemId, target);
+    return;
+  }
+  if (type === "response.completed") {
+    const response = asRecord(event.response);
+    if (response?.status === "incomplete" && asRecord(response.incomplete_details)?.reason === "max_output_tokens") {
+      result.finishReason = "length";
+    }
   }
 }
 
@@ -311,12 +339,15 @@ async function postStream(
   }
 }
 
-function firstChatRequest(resolved: ResolvedProviderProfile): Record<string, unknown> {
+function firstChatRequest(
+  resolved: ResolvedProviderProfile,
+  policy: ProviderWirePolicy,
+  outputTokens: number,
+): Record<string, unknown> {
   const effort = resolved.profile.reasoningEffort;
   const body: Record<string, unknown> = {
     model: resolved.profile.modelId,
     stream: true,
-    max_tokens: PROBE_MAX_OUTPUT_TOKENS,
     messages: [{ role: "user", content: `Call ${PROBE_TOOL_NAME} with token ${PROBE_TOKEN}.` }],
     tools: [{
       type: "function",
@@ -332,49 +363,39 @@ function firstChatRequest(resolved: ResolvedProviderProfile): Record<string, unk
       },
     }],
   };
-  if (
-    effort !== undefined
-    && effort !== "off"
-    && resolved.definition.capabilities.thinkingFormat !== "qwen"
-  ) {
-    body.reasoning_effort = effort;
-  }
-  if (resolved.definition.capabilities.thinkingFormat === "deepseek") {
-    body.thinking = { type: effort === "off" ? "disabled" : "enabled" };
-  } else if (resolved.definition.capabilities.thinkingFormat === "qwen") {
-    body.enable_thinking = effort !== undefined && effort !== "off";
-  }
+  body[policy.outputTokenField] = outputTokens;
+  Object.assign(body, policy.serializeThinking(effort));
   return body;
 }
 
 function secondChatRequest(
   resolved: ResolvedProviderProfile,
+  policy: ProviderWirePolicy,
   first: StreamResult,
   toolCall: ToolCall,
+  outputTokens: number,
 ): Record<string, unknown> {
-  const firstRequest = firstChatRequest(resolved);
+  const firstRequest = firstChatRequest(resolved, policy, outputTokens);
   const messages = firstRequest.messages as Array<Record<string, unknown>>;
-  messages.push({
-    role: "assistant",
-    content: first.text || null,
-    tool_calls: [{
-      id: toolCall.id,
-      type: "function",
-      function: { name: toolCall.name, arguments: toolCall.arguments },
-    }],
-    ...(first.reasoning.length > 0 ? { reasoning_content: first.reasoning } : {}),
-  });
+  messages.push(policy.serializeAssistantContinuation({
+    text: first.text,
+    reasoning: first.reasoning,
+    toolCall,
+  }, resolved.profile.reasoningEffort));
   messages.push({ role: "tool", tool_call_id: toolCall.id, content: PROBE_TOKEN });
   messages.push({ role: "user", content: `Reply only ${READY_TOKEN}.` });
   return firstRequest;
 }
 
-function firstResponsesRequest(resolved: ResolvedProviderProfile): Record<string, unknown> {
+function firstResponsesRequest(
+  resolved: ResolvedProviderProfile,
+  policy: ProviderWirePolicy,
+  outputTokens: number,
+): Record<string, unknown> {
   const effort = resolved.profile.reasoningEffort;
-  return {
+  const body: Record<string, unknown> = {
     model: resolved.profile.modelId,
     stream: true,
-    max_output_tokens: PROBE_MAX_OUTPUT_TOKENS,
     input: [{ role: "user", content: [{ type: "input_text", text: `Call ${PROBE_TOOL_NAME} with token ${PROBE_TOKEN}.` }] }],
     tools: [{
       type: "function",
@@ -388,17 +409,21 @@ function firstResponsesRequest(resolved: ResolvedProviderProfile): Record<string
       },
       strict: true,
     }],
-    ...(effort === undefined || effort === "off" ? {} : { reasoning: { effort } }),
   };
+  body[policy.outputTokenField] = outputTokens;
+  Object.assign(body, policy.serializeThinking(effort));
+  return body;
 }
 
 function secondResponsesRequest(
   resolved: ResolvedProviderProfile,
+  policy: ProviderWirePolicy,
   first: StreamResult,
   toolCall: ToolCall,
+  outputTokens: number,
 ): Record<string, unknown> {
   return {
-    ...firstResponsesRequest(resolved),
+    ...firstResponsesRequest(resolved, policy, outputTokens),
     ...(first.responseId === undefined ? {} : { previous_response_id: first.responseId }),
     instructions: `Reply only ${READY_TOKEN}.`,
     input: [{ type: "function_call_output", call_id: toolCall.id, output: PROBE_TOKEN }],
@@ -438,49 +463,101 @@ function isReasoningFailure(failure: ProbeFailure): boolean {
   return failure.code === "PROVIDER_REQUEST_REJECTED" && /reasoning|thinking/i.test(failure.technicalDetails ?? failure.message);
 }
 
+function isOutputTruncated(result: Pick<StreamResult, "finishReason">): boolean {
+  return result.finishReason === "length";
+}
+
+async function withTruncationRetry<T extends Pick<StreamResult, "finishReason">>(
+  initialOutputTokens: number,
+  attempt: (outputTokens: number) => Promise<T>,
+): Promise<T> {
+  const first = await attempt(initialOutputTokens);
+  if (!isOutputTruncated(first)) {
+    return first;
+  }
+  const retry = await attempt(PROBE_RETRY_MAX_OUTPUT_TOKENS);
+  if (isOutputTruncated(retry)) {
+    throw new ProbeFailure(
+      "PROBE_OUTPUT_TRUNCATED",
+      "The provider repeatedly ended the compatibility probe because the output limit was reached.",
+    );
+  }
+  return retry;
+}
+
 export async function probeProviderCapabilities(request: ProviderCapabilityProbeRequest): Promise<CapabilityReport> {
   const registry = request.registry ?? providerRegistry;
   const resolved = registry.resolve(request.profile);
+  const policy = providerWirePolicy(resolved);
   const checks = initialChecks();
   const fetcher = request.fetch ?? globalThis.fetch;
   const timeout = timeoutMs(request.timeoutMs);
-  const first: StreamResult = { text: "", reasoning: "", toolCalls: [] };
-  const chatCalls = new Map<number, ToolCall>();
-  const responsesCalls = new Map<string, ToolCall>();
-  const chatFirst = { text: "", reasoning: "", calls: chatCalls };
-  const responsesFirst = { text: "", reasoning: "", calls: responsesCalls };
-  const isResponses = resolved.definition.apiFamily === "openai-responses";
-  const firstBody = isResponses ? firstResponsesRequest(resolved) : firstChatRequest(resolved);
+  const deadline = Date.now() + timeout;
+  const isResponses = policy.apiFamily === "openai-responses";
+  const effort = resolved.profile.reasoningEffort;
+  const initialOutputTokens = policy.initialProbeTokens(effort);
+  const firstAttempt = async (outputTokens: number): Promise<StreamResult> => {
+    if (isResponses) {
+      const collector = {
+        text: "",
+        reasoning: "",
+        calls: new Map<string, ToolCall>(),
+        finishReason: undefined as string | undefined,
+      };
+      const result: StreamResult = { text: "", reasoning: "", toolCalls: [] };
+      await postStream(
+        endpoint(resolved),
+        firstResponsesRequest(resolved, policy, outputTokens),
+        request.credential,
+        fetcher,
+        remainingTimeoutMs(deadline),
+        (event) => {
+          consumeResponsesEvent(event, collector);
+          const payload = asRecord(event);
+          if (payload?.type === "response.completed") {
+            result.responseId = asString(asRecord(payload.response)?.id);
+          }
+        },
+      );
+      return {
+        text: collector.text,
+        reasoning: collector.reasoning,
+        responseId: result.responseId,
+        finishReason: collector.finishReason,
+        toolCalls: [...collector.calls.values()],
+      };
+    }
+    const collector = {
+      text: "",
+      reasoning: "",
+      calls: new Map<number, ToolCall>(),
+      finishReason: undefined as string | undefined,
+    };
+    await postStream(
+      endpoint(resolved),
+      firstChatRequest(resolved, policy, outputTokens),
+      request.credential,
+      fetcher,
+      remainingTimeoutMs(deadline),
+      (event) => consumeChatEvent(event, collector),
+    );
+    return {
+      text: collector.text,
+      reasoning: collector.reasoning,
+      finishReason: collector.finishReason,
+      toolCalls: [...collector.calls.values()],
+    };
+  };
+  let first: StreamResult;
   try {
-    await postStream(endpoint(resolved), firstBody, request.credential, fetcher, timeout, (event) => {
-      if (isResponses) {
-        consumeResponsesEvent(event, responsesFirst);
-        const payload = asRecord(event);
-        if (payload?.type === "response.completed") {
-          first.responseId = asString(asRecord(payload.response)?.id);
-        }
-      } else {
-        consumeChatEvent(event, chatFirst);
-      }
-    });
+    first = await withTruncationRetry(initialOutputTokens, firstAttempt);
   } catch (error) {
     return failedReport(checks, error instanceof ProbeFailure
       ? error
       : new ProbeFailure("PROVIDER_PROTOCOL_INVALID", "The provider probe failed unexpectedly."));
   }
 
-  // The stream result is accumulated inside the mutable collectors above.
-  if (isResponses) {
-    first.text = responsesFirst.text;
-    first.reasoning = responsesFirst.reasoning;
-    first.toolCalls = [...responsesCalls.values()];
-  } else {
-    first.text = chatFirst.text;
-    first.reasoning = chatFirst.reasoning;
-    first.toolCalls = [...chatCalls.values()];
-  }
   checks.set("stream", check("stream", "passed", "Received a structured streaming response."));
-  const effort = resolved.profile.reasoningEffort;
   checks.set("effort", effort === undefined || effort === "off"
     ? check("effort", "skipped", "No reasoning effort was requested.")
     : check("effort", "passed", `Accepted the requested ${effort} reasoning effort.`));
@@ -497,26 +574,59 @@ export async function probeProviderCapabilities(request: ProviderCapabilityProbe
   }
   checks.set("tool_call", check("tool_call", "passed", "Received and reconstructed a fragmented tool call."));
 
-  const second: StreamResult = { text: "", reasoning: "", toolCalls: [] };
-  const chatSecond = { text: "", reasoning: "", calls: new Map<number, ToolCall>() };
-  const responsesSecond = { text: "", reasoning: "", calls: new Map<string, ToolCall>() };
-  const secondBody = isResponses
-    ? secondResponsesRequest(resolved, first, toolCall)
-    : secondChatRequest(resolved, first, toolCall);
+  const secondAttempt = async (outputTokens: number): Promise<StreamResult> => {
+    if (isResponses) {
+      const collector = {
+        text: "",
+        reasoning: "",
+        calls: new Map<string, ToolCall>(),
+        finishReason: undefined as string | undefined,
+      };
+      await postStream(
+        endpoint(resolved),
+        secondResponsesRequest(resolved, policy, first, toolCall, outputTokens),
+        request.credential,
+        fetcher,
+        remainingTimeoutMs(deadline),
+        (event) => consumeResponsesEvent(event, collector),
+      );
+      return {
+        text: collector.text,
+        reasoning: collector.reasoning,
+        finishReason: collector.finishReason,
+        toolCalls: [...collector.calls.values()],
+      };
+    }
+    const collector = {
+      text: "",
+      reasoning: "",
+      calls: new Map<number, ToolCall>(),
+      finishReason: undefined as string | undefined,
+    };
+    await postStream(
+      endpoint(resolved),
+      secondChatRequest(resolved, policy, first, toolCall, outputTokens),
+      request.credential,
+      fetcher,
+      remainingTimeoutMs(deadline),
+      (event) => consumeChatEvent(event, collector),
+    );
+    return {
+      text: collector.text,
+      reasoning: collector.reasoning,
+      finishReason: collector.finishReason,
+      toolCalls: [...collector.calls.values()],
+    };
+  };
+  let second: StreamResult;
   try {
-    await postStream(endpoint(resolved), secondBody, request.credential, fetcher, timeout, (event) => {
-      if (isResponses) {
-        consumeResponsesEvent(event, responsesSecond);
-      } else {
-        consumeChatEvent(event, chatSecond);
-      }
-    });
+    second = await secondAttempt(initialOutputTokens);
   } catch (error) {
     const failure = error instanceof ProbeFailure
       ? error
       : new ProbeFailure("PROVIDER_PROTOCOL_INVALID", "The second tool-call turn failed unexpectedly.");
     checks.set("tool_round_trip", check("tool_round_trip", "failed", failure.message));
-    if (isReasoningFailure(failure)) {
+    if (policy.requiresReasoningReplay(effort) && isReasoningFailure(failure)) {
       checks.set("reasoning_continuity", check("reasoning_continuity", "failed", "The provider rejected preserved reasoning on the second turn."));
       return {
         status: "limited",
@@ -529,9 +639,6 @@ export async function probeProviderCapabilities(request: ProviderCapabilityProbe
     return failedReport(checks, failure);
   }
 
-  second.text = isResponses ? responsesSecond.text : chatSecond.text;
-  second.reasoning = isResponses ? responsesSecond.reasoning : chatSecond.reasoning;
-
   if (!second.text.includes(READY_TOKEN)) {
     checks.set("tool_round_trip", check("tool_round_trip", "failed", "The provider did not complete the second tool-call turn."));
     return {
@@ -542,7 +649,7 @@ export async function probeProviderCapabilities(request: ProviderCapabilityProbe
     };
   }
   checks.set("tool_round_trip", check("tool_round_trip", "passed", "Completed a second turn after the tool result."));
-  if (resolved.definition.capabilities.requiresReasoningContentOnAssistantMessages && !isResponses && first.reasoning.length === 0) {
+  if (policy.requiresReasoningReplay(effort) && first.reasoning.length === 0) {
     checks.set("reasoning_continuity", check("reasoning_continuity", "failed", "The provider omitted reasoning needed for a compatible second turn."));
     return {
       status: "limited",
@@ -551,7 +658,7 @@ export async function probeProviderCapabilities(request: ProviderCapabilityProbe
       message: "Tool calls work, but the provider did not preserve reasoning for the second turn.",
     };
   }
-  checks.set("reasoning_continuity", resolved.definition.capabilities.requiresReasoningContentOnAssistantMessages
+  checks.set("reasoning_continuity", policy.requiresReasoningReplay(effort)
     ? check("reasoning_continuity", "passed", "Preserved reasoning context through the second turn.")
     : check("reasoning_continuity", "skipped", "This provider does not require serialized reasoning continuity."));
   return {
