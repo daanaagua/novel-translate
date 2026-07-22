@@ -7,6 +7,10 @@ import type { EvidenceIndex } from "../index/evidence-index.js";
 import type { NarrativeMemoryRecord } from "../fullbook/types.js";
 import type { BudgetLedger } from "../kernel/budget.js";
 import { getSourceLanguageProfile } from "../language/profiles.js";
+import {
+  SIMPLIFIED_CHINESE_SCRIPT_REQUIREMENT,
+  targetLanguageLabel,
+} from "../language/target.js";
 import type { SourceLanguageProfile } from "../language/types.js";
 import { normalizeChineseQuoteTexts } from "../style/chinese-quote-normalization.js";
 import type {
@@ -206,7 +210,8 @@ export class Translator {
     const run = await this.runtime.run({
       systemPrompt: [
         "Translate the complete source island into polished, accurate Chinese literary prose.",
-        `The source language is ${sourceLanguageProfile.displayName} (${sourceLanguageProfile.id}); the target language is Chinese (zh).`,
+        `The source language is ${sourceLanguageProfile.displayName} (${sourceLanguageProfile.id}); the target language is ${targetLanguageLabel()}.`,
+        SIMPLIFIED_CHINESE_SCRIPT_REQUIREMENT,
         "Preserve meaning, ambiguity, paragraph structure, voice, and all block boundaries.",
         "Use translator-global facts only to disambiguate wording; do not add facts unavailable to the narrator.",
         "Do not leave ordinary source-language prose words untranslated unless the stable terminology explicitly preserves them.",

@@ -19,7 +19,7 @@ const DEFAULT_CONSTITUTION: Omit<BookStyleConstitution, "schemaVersion" | "versi
   imagery: "保留意象、比喻及其陌生联系，不替换成陈词滥调",
   dialogue: "对白符合人物关系和场景，不机械追求字面对齐",
   technicalProse: "科学和技术说明优先准确、清楚、术语一致",
-  typography: "使用规范中文标点、引号和段落格式",
+  typography: "使用简体中文与规范中文标点、引号和段落格式",
   additionalInstruction: "",
 };
 

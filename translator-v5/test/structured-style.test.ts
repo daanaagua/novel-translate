@@ -10,6 +10,10 @@ import { createStyleObservation } from "../src/style/style-observation.js";
 import { projectEffectiveStyle } from "../src/style/style-projection.js";
 import type { VoiceProfile } from "../src/style/types.js";
 
+test("default book typography explicitly selects simplified Chinese", () => {
+  assert.match(createBookStyleConstitution().typography, /简体中文/u);
+});
+
 test("structured style keeps the book constitution immutable while local evidence decays", () => {
   const constitution = createBookStyleConstitution({
     register: "典雅、克制，不使用网络流行语",

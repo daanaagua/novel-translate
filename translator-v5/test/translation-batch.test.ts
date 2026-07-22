@@ -93,6 +93,8 @@ test("batch protocol states that user style requirements cannot override integri
 test("batch protocol names Korean sources rather than treating them as undetermined", () => {
   const prompt = translationBatchSystemPrompt(getSourceLanguageProfile("ko"));
   assert.match(prompt, /The source language is Korean \(ko\)/u);
+  assert.match(prompt, /Simplified Chinese \(zh-Hans\)/u);
+  assert.match(prompt, /Use simplified Chinese characters consistently/u);
 });
 
 test("batch runtime uses the same prepared prompt as complete-request budgeting", async () => {

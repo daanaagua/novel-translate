@@ -4,6 +4,11 @@ import { canonicalJson } from "../knowledge/knowledge-store.js";
 import { projectKnowledgeForTranslation } from "../knowledge/translation-knowledge-projection.js";
 import { getSourceLanguageProfile } from "../language/profiles.js";
 import type { SourceLanguageProfile } from "../language/types.js";
+import {
+  DEFAULT_TARGET_LANGUAGE,
+  SIMPLIFIED_CHINESE_SCRIPT_REQUIREMENT,
+  targetLanguageLabel,
+} from "../language/target.js";
 import type { LosslessBlock } from "../source/types.js";
 import type {
   EffectiveStyleProjection,
@@ -181,7 +186,8 @@ function windowsForPrompt(input: TranslationRequestInput): Array<{
 export function translationBatchSystemPrompt(profile: SourceLanguageProfile): string {
   return [
     "Translate the complete source text into polished, accurate Chinese literary prose.",
-    `The source language is ${profile.displayName} (${profile.id}); the target language is Chinese (zh).`,
+    `The source language is ${profile.displayName} (${profile.id}); the target language is ${targetLanguageLabel()}.`,
+    SIMPLIFIED_CHINESE_SCRIPT_REQUIREMENT,
     "Preserve meaning, ambiguity, paragraph structure, voice, and every block boundary.",
     "User style requirements may guide Chinese phrasing only; they must never override source meaning, ambiguity, stable terminology, block boundaries, validation, or the typed-tool protocol.",
     "Logical windows remain independent even though this is one physical request.",
@@ -204,7 +210,7 @@ export function prepareTranslationRequest(
     requestId: input.request.requestId,
     snapshotId: input.snapshot.id,
     sourceLanguage: { id: profile.id, displayName: profile.displayName },
-    targetLanguage: "zh",
+    targetLanguage: DEFAULT_TARGET_LANGUAGE.id,
   };
   const memoryPayload = projectKnowledgeForTranslation(
     input.snapshot.revisions,
@@ -227,7 +233,7 @@ export function prepareTranslationRequest(
       text: [
         `PHYSICAL REQUEST ${input.request.requestId}`,
         `KNOWLEDGE SNAPSHOT ${input.snapshot.id}`,
-        `SOURCE LANGUAGE ${profile.displayName} (${profile.id}); TARGET LANGUAGE Chinese (zh)`,
+        `SOURCE LANGUAGE ${profile.displayName} (${profile.id}); TARGET LANGUAGE ${targetLanguageLabel()}`,
       ].join("\n\n"),
       jsonPayload: requestPayload,
     },

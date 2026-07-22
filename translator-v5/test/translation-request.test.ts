@@ -78,6 +78,7 @@ test("one request builder serializes all translator-visible projections and one 
   const prepared = prepareTranslationRequest(fixture());
 
   assert.match(prepared.systemPrompt, /Translate the complete source text/u);
+  assert.match(prepared.systemPrompt, /Simplified Chinese \(zh-Hans\)/u);
   assert.match(prepared.prompt, /KNOWLEDGE SNAPSHOT PROJECTION/u);
   assert.match(prepared.prompt, /Opening source paragraph/u);
   assert.match(prepared.prompt, /STABLE TERMS/u);
@@ -94,6 +95,11 @@ test("one request builder serializes all translator-visible projections and one 
   assert.deepEqual(prepared.tools.map((tool) => tool.name), ["finalize_translation_batch"]);
   assert.match(prepared.serializedToolSchemas, /finalize_translation_batch/u);
   assert.match(prepared.serializedToolSchemas, /styleObservation/u);
+  const requestSection = prepared.sections.find((section) => section.kind === "request");
+  assert.equal(
+    (requestSection?.jsonPayload as { targetLanguage?: string } | undefined)?.targetLanguage,
+    "zh-Hans",
+  );
 });
 
 function revision(
