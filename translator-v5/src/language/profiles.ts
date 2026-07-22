@@ -128,12 +128,13 @@ const DEFINITIONS: readonly ProfileDefinition[] = [
     locale: "ko",
     volumePatterns: [
       /^\uc81c\s*(?:\d+|[\p{Script=Hangul}\p{Script=Han}\p{N}]+)\s*\uad8c$/u,
+      /^(?:\uc81c\s*)?\d+\s*\ubd80$/u,
     ],
     chapterPatterns: [
-      /^\uc81c\s*(?:\d+|[\p{Script=Hangul}\p{Script=Han}\p{N}]+)\s*\uc7a5$/u,
-      /^\d+\s*\uc7a5$/u,
+      /^(?:\uc81c\s*)?(?:\d+|[\p{Script=Hangul}\p{Script=Han}\p{N}]+)\s*(?:\uc7a5|\ud654|\ud68c)$/u,
       /^(?:\uc11c\uc7a5|\uc885\uc7a5|\ud504\ub864\ub85c\uadf8|\uc5d0\ud544\ub85c\uadf8)$/u,
       /^(?:\[|\u3010)\s*[\p{L}\p{N}\s-]{1,32}\s*(?:\]|\u3011)$/u,
+      /^[\u25a0\u25c6\u25cf\u25b6\u25c7]\s*[\p{L}\p{N}\s:：\u00b7'\u2019"\u201c\u201d!?！？,，\u2014\u2013-]{1,48}\s*[\u25a1\u25a0\u25c6\u25cf\u25c0\u25c7]$/u,
     ],
     stopWords: [
       "\uadf8\ub7ec\ub098", "\uadf8\ub9ac\uace0", "\uadf8\ub7f0", "\uc774\ub7f0", "\uac83\uc740", "\uac83\uc774", "\uc5c6\uc5c8\ub2e4",

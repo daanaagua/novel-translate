@@ -39,6 +39,9 @@ test("Japanese and Korean profiles expose headings, sentence boundaries, and bou
   assert.equal(japanese.detectStructureHeading(japaneseChapter)?.kind, "chapter_heading");
   assert.equal(korean.detectStructureHeading(koreanChapter)?.kind, "chapter_heading");
   assert.equal(korean.detectStructureHeading(koreanVolume)?.kind, "volume_heading");
+  assert.equal(korean.detectStructureHeading("제12화")?.kind, "chapter_heading");
+  assert.equal(korean.detectStructureHeading("12회")?.kind, "chapter_heading");
+  assert.equal(korean.detectStructureHeading("■ 운명의 시작 □")?.kind, "chapter_heading");
   assert.deepEqual(
     annotateStructure(`${japaneseChapter}\n${japaneseVolume}`, "source-ja", japanese)
       .map((annotation) => annotation.kind),
