@@ -43,6 +43,10 @@ import { buildLosslessBlocks } from "./source/block-builder.js";
 import { SourceIntegrityError, SourceLedger } from "./source/source-ledger.js";
 import { annotateStructure } from "./source/structure-annotator.js";
 import { LosslessBookStore } from "./storage/lossless-book-store.js";
+import {
+  loadStyleProfile,
+  type LoadedStyleProfile,
+} from "./style/style-profile.js";
 
 export type CliCommand =
   | "preview"
@@ -78,6 +82,8 @@ export interface CliOptions {
   maxBlocks?: number;
   maxSourceTokens?: number;
   hardDeadlineMs?: number;
+  styleProfile?: string;
+  prompt?: string;
 }
 
 export interface BookDoctorReport {
@@ -309,6 +315,48 @@ function pathValue(
   return resolve(value);
 }
 
+function metadataRecord(metadata: unknown): Record<string, unknown> {
+  if (metadata !== null && typeof metadata === "object" && !Array.isArray(metadata)) {
+    return { ...(metadata as Record<string, unknown>) };
+  }
+  return metadata === undefined ? {} : { userMetadata: metadata };
+}
+
+function hasStyleProfileMetadata(metadata: unknown): boolean {
+  return metadata !== null
+    && typeof metadata === "object"
+    && !Array.isArray(metadata)
+    && typeof (metadata as Record<string, unknown>).styleProfileHash === "string";
+}
+
+function runMetadataForStyle(
+  style: LoadedStyleProfile,
+  previousMetadata: unknown | undefined,
+): unknown {
+  if (previousMetadata === undefined) {
+    return {
+      createdBy: "book-cli",
+      ...(style.profileHash === undefined ? {} : {
+        styleProfileHash: style.profileHash,
+        styleProfileSource: style.source,
+      }),
+    };
+  }
+  if (style.profileHash === undefined) {
+    if (hasStyleProfileMetadata(previousMetadata)) {
+      throw new Error(
+        "resuming a style-configured run requires the same --style-profile and/or --prompt",
+      );
+    }
+    return previousMetadata;
+  }
+  return {
+    ...metadataRecord(previousMetadata),
+    styleProfileHash: style.profileHash,
+    styleProfileSource: style.source,
+  };
+}
+
 export function parseArgs(argv: readonly string[]): CliOptions {
   if (argv[0] === "preview") {
     const { values, booleans } = parseFlags(
@@ -454,7 +502,7 @@ export function parseArgs(argv: readonly string[]): CliOptions {
         "--manifest", "--v4-db", "--store", "--config", "--output",
         "--opencode-auth", "--run", "--max-windows", "--max-concurrency",
         "--max-attempts", "--max-blocks", "--max-source-tokens",
-        "--hard-deadline-ms",
+        "--hard-deadline-ms", "--style-profile", "--prompt",
       ],
     );
     return {
@@ -472,6 +520,8 @@ export function parseArgs(argv: readonly string[]): CliOptions {
       hardDeadlineMs: positiveFlag(values, "--hard-deadline-ms"),
       maxBlocks: positiveFlag(values, "--max-blocks"),
       maxSourceTokens: positiveFlag(values, "--max-source-tokens"),
+      styleProfile: pathValue(values, "--style-profile", false),
+      prompt: identifierValue(values, "--prompt"),
     };
   }
   if (action === "status") {
@@ -703,6 +753,10 @@ export async function main(
     } finally {
       selectionStore.close();
     }
+    const style = loadStyleProfile({
+      ...(options.styleProfile === undefined ? {} : { profilePath: options.styleProfile }),
+      ...(options.prompt === undefined ? {} : { cliPrompt: options.prompt }),
+    });
     const config = loadRuntimeConfig(options);
     const model = runtime.createModel(config);
     const streamFn = runtime.createStreamFn(config);
@@ -716,16 +770,17 @@ export async function main(
             runId,
             protocolVersion: LOSSLESS_BOOK_PROTOCOL_VERSION,
             modelId: config.model,
-            metadata: { createdBy: "book-cli" },
+            metadata: runMetadataForStyle(style, undefined),
           }
         : {
             runId,
             protocolVersion: selectedRun.protocolVersion,
             modelId: selectedRun.modelId,
-            metadata: selectedRun.metadata,
+            metadata: runMetadataForStyle(style, selectedRun.metadata),
           },
       model,
       streamFn,
+      styleState: style.styleState,
       windowOptions: {
         maxBlocks: options.maxBlocks,
         maxSourceTokens: options.maxSourceTokens,

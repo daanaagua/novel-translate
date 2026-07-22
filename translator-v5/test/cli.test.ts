@@ -152,6 +152,20 @@ test("CLI parses formal lossless run and optional run selection", () => {
   ]).runId, "run-1");
 });
 
+test("CLI parses a style profile and a bounded style prompt for book run", () => {
+  const run = parseArgs([
+    "book", "run",
+    "--manifest", "source_manifest.json",
+    "--store", "state.db",
+    "--config", "config.yaml",
+    "--style-profile", "style.yaml",
+    "--prompt", "对白避免网络流行语",
+  ]);
+  assert.equal(run.command, "book-run");
+  assert.equal(run.styleProfile, resolve("style.yaml"));
+  assert.equal(run.prompt, "对白避免网络流行语");
+});
+
 test("CLI parses book recover with a strict structured incident", () => {
   assert.deepEqual(parseArgs([
     "book", "recover", "--store", "state.db", "--run", "run-1",
@@ -293,6 +307,29 @@ test("book doctor audits the lossless pipeline without constructing a provider",
   });
   assert.ok(Number(report.blockCount) > 0);
   assert.ok(Number(report.windowCount) > 0);
+});
+
+test("book run validates a style profile before constructing a provider", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "v5-cli-style-"));
+  const styleProfile = join(directory, "style.yaml");
+  writeFileSync(styleProfile, "style:\n  unsupported: no\n", "utf8");
+  let providerConstructions = 0;
+  await assert.rejects(
+    main([
+      "book", "run",
+      "--manifest", join(directory, "missing-source-manifest.json"),
+      "--store", join(directory, "book.db"),
+      "--config", join(directory, "missing-config.yaml"),
+      "--style-profile", styleProfile,
+    ], {
+      createModel: () => {
+        providerConstructions += 1;
+        throw new Error("provider must not be constructed");
+      },
+    }),
+    /unknown style field: unsupported/i,
+  );
+  assert.equal(providerConstructions, 0);
 });
 
 test("book doctor manifest failures exit nonzero with structured stable errors", () => {

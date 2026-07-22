@@ -620,6 +620,28 @@ test("resuming a run rejects protocol, model, metadata, and initial snapshot dri
   store.close();
 });
 
+test("resuming a run rejects a changed style profile hash", () => {
+  const store = new LosslessBookStore(fixturePath());
+  const meta = {
+    ...runMeta("model-a", "style"),
+    metadata: {
+      fixture: "style",
+      styleProfileHash: "style-one",
+      styleProfileSource: { profile: true, cliPrompt: false },
+    },
+  };
+  initialize(store, meta);
+  assert.equal(store.createTranslationRun(meta), "run-style");
+  assert.throws(() => store.createTranslationRun({
+    ...meta,
+    metadata: {
+      ...meta.metadata,
+      styleProfileHash: "style-two",
+    },
+  }), /metadata mismatch/i);
+  store.close();
+});
+
 test("failWindow is run-scoped and records stable retry and terminal state", () => {
   const store = new LosslessBookStore(fixturePath());
   initialize(store, runMeta("model-a", "a"), windowsApart());

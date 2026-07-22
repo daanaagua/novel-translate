@@ -156,7 +156,7 @@ git commit -m "feat: project user style instructions"
 - 修改：`translator-v5/test/cli.test.ts`
 - 修改：`translator-v5/test/lossless-book-store.test.ts`
 
-- [ ] **步骤 1：编写失败测试**
+- [x] **步骤 1：编写失败测试**
 
 ```ts
 test("CLI parses a style profile and a bounded style prompt for book run", () => {
@@ -182,13 +182,13 @@ test("resuming a run rejects a changed style profile hash", () => {
 });
 ```
 
-- [ ] **步骤 2：运行测试并确认红灯**
+- [x] **步骤 2：运行测试并确认红灯**
 
 运行：`npm.cmd test -- test/cli.test.ts test/lossless-book-store.test.ts`
 
 预期：CLI 测试失败，因为两个新 flag 不被识别。
 
-- [ ] **步骤 3：接入 CLI 和 run metadata**
+- [x] **步骤 3：接入 CLI 和 run metadata**
 
 ```ts
 const style = loadStyleProfile({
@@ -214,13 +214,13 @@ await runBook({
 
 将 `--style-profile` 和 `--prompt` 加入严格 flag 白名单。调用 `runBook()` 前加载，以便任何输入错误都发生在模型构造和调用之前。
 
-- [ ] **步骤 4：运行测试并确认绿灯**
+- [x] **步骤 4：运行测试并确认绿灯**
 
 运行：`node --test --import tsx test/cli.test.ts test/lossless-book-store.test.ts`
 
 预期：CLI 参数、新 metadata 和既有恢复检查全部通过。
 
-- [ ] **步骤 5：提交该独立变更**
+- [x] **步骤 5：提交该独立变更**
 
 ```bash
 git add translator-v5/src/cli.ts translator-v5/test/cli.test.ts translator-v5/test/lossless-book-store.test.ts
