@@ -107,6 +107,12 @@ const emptyOnboarding: DesktopOnboardingState = {
   readiness: { source: false, model: false, trial: false },
 };
 
+const sourceOnlyOnboarding: DesktopOnboardingState = {
+  ...emptyOnboarding,
+  project,
+  readiness: { source: true, model: false, trial: false },
+};
+
 const readyOnboarding: DesktopOnboardingState = {
   ...emptyOnboarding,
   project,
@@ -174,9 +180,37 @@ describe("FolioLoom desktop onboarding", () => {
     expect(screen.getByRole("button", { name: "选择书稿" })).toBeTruthy();
   });
 
-  it("renders six direct providers and keeps the custom interface under more services", async () => {
+  it("keeps the approved five-workspace shell and lets the reader move between its pages", async () => {
     const user = userEvent.setup();
     render(<App api={createApi()} />);
+
+    for (const name of ["项目概览", "翻译运行", "术语与记忆", "审阅队列", "导出"]) {
+      expect(await screen.findByRole("button", { name })).toBeTruthy();
+    }
+
+    await user.click(screen.getByRole("button", { name: "术语与记忆" }));
+    expect(await screen.findByRole("heading", { name: "术语与记忆" })).toBeTruthy();
+    await user.click(screen.getByRole("button", { name: "项目概览" }));
+    expect(await screen.findByRole("heading", { name: "开始翻译一本书" })).toBeTruthy();
+  });
+
+  it("uses the visible manuscript button to call the desktop bridge and advance to model setup", async () => {
+    const user = userEvent.setup();
+    const chooseSource = vi.fn().mockResolvedValue(ok(project));
+    const getOnboardingState = vi.fn()
+      .mockResolvedValueOnce(ok(emptyOnboarding))
+      .mockResolvedValueOnce(ok(sourceOnlyOnboarding));
+    render(<App api={createApi({ chooseSource, getOnboardingState })} />);
+
+    await user.click(await screen.findByRole("button", { name: "选择书稿" }));
+
+    await waitFor(() => expect(chooseSource).toHaveBeenCalledTimes(1));
+    expect(await screen.findByRole("button", { name: "DeepSeek" })).toBeTruthy();
+  });
+
+  it("renders six direct providers and keeps the custom interface under more services", async () => {
+    const user = userEvent.setup();
+    render(<App api={createApi({ getOnboardingState: vi.fn().mockResolvedValue(ok(sourceOnlyOnboarding)) })} />);
 
     for (const name of ["DeepSeek", "Kimi", "阿里云百炼", "火山方舟", "OpenAI", "硅基流动"]) {
       expect(await screen.findByRole("button", { name })).toBeTruthy();
@@ -194,7 +228,7 @@ describe("FolioLoom desktop onboarding", () => {
 
   it("uses raw provider effort values without translating or normalizing them", async () => {
     const user = userEvent.setup();
-    render(<App api={createApi()} />);
+    render(<App api={createApi({ getOnboardingState: vi.fn().mockResolvedValue(ok(sourceOnlyOnboarding)) })} />);
 
     await user.click(await screen.findByRole("button", { name: "DeepSeek" }));
 
@@ -206,7 +240,10 @@ describe("FolioLoom desktop onboarding", () => {
   it("clears the API Key field after the connection promise settles", async () => {
     const user = userEvent.setup();
     const testModel = vi.fn().mockResolvedValue(ok(testResult()));
-    render(<App api={createApi({ testModel })} />);
+    render(<App api={createApi({
+      getOnboardingState: vi.fn().mockResolvedValue(ok(sourceOnlyOnboarding)),
+      testModel,
+    })} />);
 
     const apiKey = await screen.findByLabelText("API Key");
     await user.type(apiKey, "sk-temporary-key");
@@ -280,7 +317,10 @@ describe("FolioLoom desktop onboarding", () => {
       "API Key 未被接受，请检查后重试。",
       `headers={"x-api-key":"${secret}"}`,
     ));
-    const { container } = render(<App api={createApi({ testModel })} />);
+    const { container } = render(<App api={createApi({
+      getOnboardingState: vi.fn().mockResolvedValue(ok(sourceOnlyOnboarding)),
+      testModel,
+    })} />);
 
     await user.type(await screen.findByLabelText("API Key"), secret);
     await user.click(screen.getByRole("button", { name: "测试连接" }));

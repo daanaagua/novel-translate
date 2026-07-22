@@ -58,46 +58,79 @@ export function Onboarding({
   const modelReady = onboarding.activeModel?.capability === "ready";
   const trialEnabled = sourceReady && modelReady && busyAction === undefined;
   const trialRunning = busyAction === "start-trial" || busyAction === "cancel-trial";
+  const errorPanel = operationError === undefined ? null : (
+    <section className="operation-error" role="status">
+      <p>{redactTechnicalDetails(operationError.message)}</p>
+      {operationError.nextAction === undefined ? null : <p>{redactTechnicalDetails(operationError.nextAction)}</p>}
+      <TechnicalDetails details={operationError.technicalDetails} />
+    </section>
+  );
+
+  if (!sourceReady) {
+    return (
+      <main className="onboarding-scroll">
+        <div className="content-column welcome-page">
+          <div className="welcome-grid">
+            <section className="welcome-copy">
+              <p className="eyebrow">FolioLoom / Start</p>
+              <h1>开始翻译一本书</h1>
+              <p className="onboarding-lead">选择书稿，连接你自己的模型，然后先用一个片段确认翻译效果。</p>
+              <button
+                className="primary-button"
+                type="button"
+                disabled={busyAction !== undefined}
+                onClick={() => { void onChooseSource(); }}
+              >
+                {busyAction === "choose-source" ? "正在选择…" : "选择书稿"}
+              </button>
+            </section>
+            <aside className="welcome-card">
+              <p className="eyebrow">支持格式</p>
+              <h2>直接选择原稿</h2>
+              <p>程序会复制原文件用于翻译，不会改动你选择的书稿。</p>
+              <div className="format-list" aria-label="支持的书稿格式">
+                <span>TXT</span><span>EPUB</span><span>DOCX</span><span>Markdown</span>
+              </div>
+            </aside>
+          </div>
+          {errorPanel}
+        </div>
+      </main>
+    );
+  }
 
   return (
     <main className="onboarding-scroll">
-      <div className="onboarding-column">
-        <header className="onboarding-header">
-          <p className="eyebrow">FolioLoom</p>
-          <h1>开始翻译一本书</h1>
-          <p className="onboarding-lead">先选入原文，再接上你自己的模型。准备好后，从一小段试译开始。</p>
+      <div className="content-column setup-page">
+        <header className="project-header">
+          <div>
+            <p className="eyebrow">项目概览</p>
+            <h1>{onboarding.project?.title}</h1>
+            <p className="section-copy">{onboarding.project?.sourceLanguage} · {formatChars(onboarding.project?.sourceChars ?? 0)} 字符</p>
+          </div>
+          <button
+            className="quiet-button"
+            type="button"
+            disabled={busyAction !== undefined}
+            onClick={() => { void onChooseSource(); }}
+          >
+            更换书稿
+          </button>
         </header>
 
-        <section className={`setup-step${sourceReady ? " is-complete" : ""}`} aria-labelledby="source-step-title">
-          <div className="step-marker" aria-hidden="true">1</div>
-          <div className="step-content">
+        <div className="setup-workspace-grid">
+          <section className="setup-card source-card">
+            <div className="card-status is-ready" aria-hidden="true">✓</div>
             <p className="eyebrow">书稿</p>
-            <h2 id="source-step-title">选择要翻译的书稿</h2>
-            {sourceReady && onboarding.project !== undefined ? (
-              <div className="source-summary">
-                <strong>{onboarding.project.title}</strong>
-                <span>{onboarding.project.sourceLanguage} · {formatChars(onboarding.project.sourceChars)} 字符</span>
-              </div>
-            ) : (
-              <p className="section-copy">支持 TXT、EPUB、DOCX 和 Markdown。</p>
-            )}
-            <button
-              className="primary-button"
-              type="button"
-              disabled={busyAction !== undefined}
-              onClick={() => { void onChooseSource(); }}
-            >
-              {busyAction === "choose-source" ? "正在选择…" : "选择书稿"}
-            </button>
-          </div>
-        </section>
+            <h2>原文已准备</h2>
+            <p className="section-copy">支持 TXT、EPUB、DOCX 和 Markdown；原文件保持不变。</p>
+          </section>
 
-        <section className={`setup-step${modelReady ? " is-complete" : ""}`} aria-labelledby="model-step-title">
-          <div className="step-marker" aria-hidden="true">2</div>
-          <div className="step-content">
+          <section className={`setup-card model-card${modelReady ? " is-ready" : ""}`} aria-labelledby="model-step-title">
+            <div className={`card-status${modelReady ? " is-ready" : ""}`} aria-hidden="true">{modelReady ? "✓" : "2"}</div>
             <p className="eyebrow">模型</p>
             <h2 id="model-step-title">连接你的模型</h2>
-            <p className="section-copy">密钥只用于当前操作；你可以随时更换服务或重新测试。</p>
+            <p className="section-copy">选择服务，填写 API Key、模型和思考强度，再测试实际连接。</p>
             <ProviderSetup
               providers={onboarding.providers}
               activeModel={onboarding.activeModel}
@@ -106,15 +139,15 @@ export function Onboarding({
               onTestModel={onTestModel}
               onForgetCredential={onForgetCredential}
             />
-          </div>
-        </section>
+          </section>
+        </div>
 
-        <section className={`setup-step${trialResult !== undefined ? " is-complete" : ""}`} aria-labelledby="trial-step-title">
-          <div className="step-marker" aria-hidden="true">3</div>
-          <div className="step-content">
+        <section className={`setup-card trial-card${trialResult !== undefined ? " is-ready" : ""}`} aria-labelledby="trial-step-title">
+          <div className={`card-status${trialResult !== undefined ? " is-ready" : ""}`} aria-hidden="true">{trialResult !== undefined ? "✓" : "3"}</div>
+          <div>
             <p className="eyebrow">试译</p>
             <h2 id="trial-step-title">先试译一小段</h2>
-            <p className="section-copy">确认书稿和模型后，再开始阅读和翻译。</p>
+            <p className="section-copy">连接检查通过后，用一个片段确认模型能完整走通翻译流程。</p>
             {trialProgress === undefined ? null : (
               <p className={`trial-status is-${trialProgress.stage}`} role="status">
                 {TRIAL_STAGE_LABELS[trialProgress.stage]}
@@ -156,13 +189,7 @@ export function Onboarding({
           </div>
         </section>
 
-        {operationError === undefined ? null : (
-          <section className="operation-error" role="status">
-            <p>{redactTechnicalDetails(operationError.message)}</p>
-            {operationError.nextAction === undefined ? null : <p>{redactTechnicalDetails(operationError.nextAction)}</p>}
-            <TechnicalDetails details={operationError.technicalDetails} />
-          </section>
-        )}
+        {errorPanel}
       </div>
     </main>
   );

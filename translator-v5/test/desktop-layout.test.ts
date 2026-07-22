@@ -35,6 +35,6 @@ test("desktop layout contains scrolling below the integrated titlebar", () => {
   assert.match(onboarding, /(?:^|\n)\s*overflow-y:\s*auto;/);
   assert.match(onboarding, /(?:^|\n)\s*scrollbar-width:\s*none;/);
 
-  const onboardingColumn = declarationsFor(/\.onboarding-column/);
-  assert.doesNotMatch(onboardingColumn, /100vh/);
+  const contentColumn = declarationsFor(/\.content-column/);
+  assert.doesNotMatch(contentColumn, /100vh/);
 });

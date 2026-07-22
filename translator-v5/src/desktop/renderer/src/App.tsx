@@ -5,7 +5,6 @@ import type {
   DesktopError,
   DesktopModelOption,
   DesktopOnboardingState,
-  DesktopProjectSnapshot,
   DesktopResult,
   DesktopTestModelRequest,
   DesktopTestModelResult,
@@ -16,7 +15,8 @@ import type { FolioLoomDesktopApi } from "../../preload/folioloom-api.js";
 import { Onboarding } from "./components/Onboarding.js";
 import { Sidebar } from "./components/Sidebar.js";
 import { WindowTitlebar } from "./components/WindowTitlebar.js";
-import type { BusyAction } from "./types.js";
+import { WorkspacePlaceholder } from "./components/WorkspacePlaceholder.js";
+import type { BusyAction, WorkspaceId } from "./types.js";
 
 interface AppProps {
   api?: FolioLoomDesktopApi;
@@ -73,6 +73,7 @@ function errorFromUnknown(error: unknown): DesktopError {
 export function App({ api }: AppProps): JSX.Element {
   const fallbackApi = useMemo(browserApi, []);
   const desktopApi = api ?? fallbackApi;
+  const [activeWorkspace, setActiveWorkspace] = useState<WorkspaceId>("overview");
   const [onboarding, setOnboarding] = useState<DesktopOnboardingState>(emptyOnboarding);
   const [busyAction, setBusyAction] = useState<BusyAction>();
   const [operationError, setOperationError] = useState<DesktopError>();
@@ -108,6 +109,7 @@ export function App({ api }: AppProps): JSX.Element {
   }), [desktopApi]);
 
   async function chooseSource(): Promise<void> {
+    setActiveWorkspace("overview");
     setBusyAction("choose-source");
     try {
       const sourceResult = await desktopApi.chooseSource();
@@ -231,21 +233,33 @@ export function App({ api }: AppProps): JSX.Element {
   return (
     <div className="workbench-shell">
       <WindowTitlebar />
-      <Sidebar onboarding={onboarding} />
+      <Sidebar
+        activeWorkspace={activeWorkspace}
+        hasProject={onboarding.project !== undefined}
+        onSelectWorkspace={setActiveWorkspace}
+      />
       <div className="workbench-main">
-        <Onboarding
-          onboarding={onboarding}
-          busyAction={busyAction}
-          operationError={operationError}
-          trialProgress={trialProgress}
-          trialResult={trialResult}
-          onChooseSource={chooseSource}
-          onDiscoverModels={discoverModels}
-          onTestModel={testModel}
-          onForgetCredential={forgetCredential}
-          onStartTrial={startTrial}
-          onCancelTrial={cancelTrial}
-        />
+        {activeWorkspace === "overview" ? (
+          <Onboarding
+            onboarding={onboarding}
+            busyAction={busyAction}
+            operationError={operationError}
+            trialProgress={trialProgress}
+            trialResult={trialResult}
+            onChooseSource={chooseSource}
+            onDiscoverModels={discoverModels}
+            onTestModel={testModel}
+            onForgetCredential={forgetCredential}
+            onStartTrial={startTrial}
+            onCancelTrial={cancelTrial}
+          />
+        ) : (
+          <WorkspacePlaceholder
+            workspace={activeWorkspace}
+            snapshot={onboarding.project}
+            onChooseProject={() => { void chooseSource(); }}
+          />
+        )}
       </div>
     </div>
   );

@@ -1,7 +1,7 @@
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
 
-export const ELECTRON_VITE_PRELOAD_ENTRY = "index.mjs";
+export const ELECTRON_VITE_PRELOAD_ENTRY = "index.cjs";
 
 export interface DesktopWindowChrome {
   applicationMenu: null;

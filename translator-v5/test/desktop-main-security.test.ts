@@ -29,11 +29,11 @@ test("desktop chrome keeps native controls in a dark overlay and removes the app
   });
 });
 
-test("preload path points to Electron Vite's emitted MJS preload entry", () => {
+test("sandboxed preload path points to Electron Vite's emitted CommonJS entry", () => {
   const mainDirectory = join(tmpdir(), "folioloom", "out", "main");
   assert.equal(
     preloadEntryPath(mainDirectory),
-    join(mainDirectory, "..", "preload", "index.mjs"),
+    join(mainDirectory, "..", "preload", "index.cjs"),
   );
 });
 
