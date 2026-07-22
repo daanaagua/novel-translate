@@ -3,6 +3,19 @@ import { pathToFileURL } from "node:url";
 
 export const ELECTRON_VITE_PRELOAD_ENTRY = "index.mjs";
 
+export interface DesktopWindowChrome {
+  applicationMenu: null;
+  windowOptions: {
+    autoHideMenuBar: true;
+    titleBarStyle: "hidden";
+    titleBarOverlay: {
+      color: "#0c0f13";
+      symbolColor: "#edf2f7";
+      height: 42;
+    };
+  };
+}
+
 export interface DesktopRendererTargetOptions {
   isPackaged: boolean;
   rendererFilePath: string;
@@ -19,6 +32,21 @@ export interface DesktopNavigationWebContents {
     listener: (event: { preventDefault(): void }, url: string) => void,
   ): unknown;
   setWindowOpenHandler(handler: (details: unknown) => { action: "deny" }): void;
+}
+
+export function desktopWindowChrome(): DesktopWindowChrome {
+  return {
+    applicationMenu: null,
+    windowOptions: {
+      autoHideMenuBar: true,
+      titleBarStyle: "hidden",
+      titleBarOverlay: {
+        color: "#0c0f13",
+        symbolColor: "#edf2f7",
+        height: 42,
+      },
+    },
+  };
 }
 
 function record(value: unknown): Record<string, unknown> | undefined {

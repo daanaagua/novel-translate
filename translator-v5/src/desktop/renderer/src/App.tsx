@@ -9,6 +9,7 @@ import type {
 import type { FolioLoomDesktopApi } from "../../preload/folioloom-api.js";
 import { ProjectOverview } from "./components/ProjectOverview.js";
 import { Sidebar } from "./components/Sidebar.js";
+import { WindowTitlebar } from "./components/WindowTitlebar.js";
 import { WorkspacePlaceholder } from "./components/WorkspacePlaceholder.js";
 import type { BusyAction, WorkspaceId } from "./types.js";
 
@@ -135,6 +136,7 @@ export function App({ api }: AppProps): JSX.Element {
 
   return (
     <div className="workbench-shell">
+      <WindowTitlebar />
       <Sidebar
         activeWorkspace={activeWorkspace}
         hasProject={snapshot !== undefined}

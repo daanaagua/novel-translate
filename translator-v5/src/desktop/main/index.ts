@@ -2,13 +2,14 @@ import { existsSync, rmSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { app, BrowserWindow, dialog, ipcMain } from "electron";
+import { app, BrowserWindow, dialog, ipcMain, Menu } from "electron";
 
 import type { DesktopProjectRequest } from "../contracts.js";
 import { DesktopPreferences } from "../desktop-preferences.js";
 import { DesktopProjectService } from "../desktop-project-service.js";
 import { registerDesktopIpc } from "./ipc.js";
 import {
+  desktopWindowChrome,
   installNavigationGuards,
   isTrustedDesktopIpcEvent,
   preloadEntryPath,
@@ -17,6 +18,7 @@ import {
 
 const currentDirectory = dirname(fileURLToPath(import.meta.url));
 const trustedRendererUrls = new Map<number, string>();
+const desktopChrome = desktopWindowChrome();
 
 function createWindow(): BrowserWindow {
   const rendererFilePath = join(currentDirectory, "../renderer/index.html");
@@ -26,6 +28,7 @@ function createWindow(): BrowserWindow {
     rendererUrl: process.env.ELECTRON_RENDERER_URL,
   });
   const window = new BrowserWindow({
+    ...desktopChrome.windowOptions,
     width: 1440,
     height: 920,
     minWidth: 1100,
@@ -66,6 +69,7 @@ function loadRecentRequest(preferences: DesktopPreferences, preferencesPath: str
 }
 
 void app.whenReady().then(() => {
+  Menu.setApplicationMenu(desktopChrome.applicationMenu);
   const preferencesPath = join(app.getPath("userData"), "desktop-preferences.json");
   const preferences = new DesktopPreferences(preferencesPath);
   const projectService = new DesktopProjectService();

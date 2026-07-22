@@ -125,6 +125,13 @@ const multiRunSnapshot: DesktopProjectSnapshot = {
 };
 
 describe("FolioLoom desktop workbench", () => {
+  it("renders one integrated application titlebar", () => {
+    render(<App api={emptyApi} />);
+
+    expect(screen.getByRole("banner", { name: "应用标题栏" })).toBeTruthy();
+    expect(screen.getByText("FolioLoom · 翻译中")).toBeTruthy();
+  });
+
   it("uses a relative production logo asset path for Electron file pages", () => {
     const { container } = render(<App api={emptyApi} />);
     const mark = container.querySelector<HTMLImageElement>(".brand-mark");

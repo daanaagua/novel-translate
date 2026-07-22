@@ -49,14 +49,43 @@ button:focus-visible {
 .workbench-shell {
   min-height: 100vh;
   display: grid;
-  grid-template-columns: 276px minmax(0, 1fr);
+  grid-template:
+    "titlebar titlebar" 42px
+    "sidebar main" minmax(0, 1fr)
+    / 276px minmax(0, 1fr);
   background:
     radial-gradient(circle at 85% -12%, rgb(103 210 191 / 8%), transparent 30rem),
     var(--canvas);
 }
 
+.window-titlebar {
+  grid-area: titlebar;
+  z-index: 10;
+  height: 42px;
+  display: flex;
+  align-items: center;
+  padding: 0 152px 0 20px;
+  border-bottom: 1px solid var(--line-soft);
+  background: var(--canvas-deep);
+  color: var(--muted);
+  user-select: none;
+  -webkit-app-region: drag;
+}
+
+.window-titlebar-label {
+  overflow: hidden;
+  font-family: Georgia, "Noto Serif SC", serif;
+  font-size: 13px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  line-height: 1;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .sidebar {
-  min-height: 100vh;
+  grid-area: sidebar;
+  min-height: calc(100vh - 42px);
   display: flex;
   flex-direction: column;
   padding: 30px 18px 24px;
@@ -197,6 +226,7 @@ button:focus-visible {
 }
 
 .workbench-main {
+  grid-area: main;
   min-width: 0;
   padding: 48px clamp(32px, 6vw, 104px) 70px;
 }
@@ -615,7 +645,11 @@ code {
 
 @media (max-width: 860px) {
   .workbench-shell {
-    grid-template-columns: 1fr;
+    grid-template:
+      "titlebar" 42px
+      "sidebar" auto
+      "main" minmax(0, 1fr)
+      / 1fr;
   }
 
   .sidebar {

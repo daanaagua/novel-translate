@@ -929,11 +929,11 @@ git status --short
 - 修改：`translator-v5/src/desktop/renderer/src/App.test.tsx`
 - 修改：`translator-v5/src/desktop/renderer/src/styles.css`
 
-- [ ] **步骤 1：先写窗口外观与渲染标题栏的失败测试**
+- [x] **步骤 1：先写窗口外观与渲染标题栏的失败测试**
 
 在 `desktop-main-security.test.ts` 断言纯函数 `desktopWindowChrome()` 返回 `applicationMenu: null`、`titleBarStyle: "hidden"`、42px 暗色 `titleBarOverlay` 与 `autoHideMenuBar: true`。在 `App.test.tsx` 断言页面存在“FolioLoom · 翻译中”的 `banner`，且不出现 `File / Edit / View / Window`。
 
-- [ ] **步骤 2：运行定向测试并确认因 API 与标题栏缺失而失败**
+- [x] **步骤 2：运行定向测试并确认因 API 与标题栏缺失而失败**
 
 运行：
 
@@ -943,11 +943,11 @@ node --test --import tsx test/desktop-main-security.test.ts
 npx.cmd vitest run --config vitest.desktop.config.ts src/desktop/renderer/src/App.test.tsx
 ```
 
-- [ ] **步骤 3：实现 Electron 原生 overlay 与 42px 拖拽栏**
+- [x] **步骤 3：实现 Electron 原生 overlay 与 42px 拖拽栏**
 
 `desktopWindowChrome()` 返回唯一窗口外观契约；`index.ts` 将其 `applicationMenu` 交给 `Menu.setApplicationMenu()`，并把 `windowOptions` 展开到 `BrowserWindow`。不使用 `frame: false`，不新增窗口控制 IPC。渲染层新增无交互的 `WindowTitlebar`，工作台改为标题栏/侧栏/主内容三个 grid area；标题栏使用 `-webkit-app-region: drag`，右侧为系统按钮保留空间。
 
-- [ ] **步骤 4：验证定向测试、完整桌面测试、类型检查与 production build**
+- [x] **步骤 4：验证定向测试、完整桌面测试、类型检查与 production build**
 
 ```powershell
 npm.cmd run desktop:test
@@ -957,7 +957,7 @@ npm.cmd run typecheck
 npm.cmd run desktop:build
 ```
 
-- [ ] **步骤 5：启动本地窗口，确认暗色标题栏、系统按钮和菜单移除后提交**
+- [x] **步骤 5：启动本地窗口，确认暗色标题栏、系统按钮和菜单移除后提交**
 
 启动 production build，确认窗口仍能拖动、最小化、最大化和关闭，且不显示白色标题栏或默认应用菜单；退出全部 FolioLoom 进程后提交。
 

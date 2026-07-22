@@ -5,12 +5,28 @@ import { pathToFileURL } from "node:url";
 import test from "node:test";
 
 import {
+  desktopWindowChrome,
   installNavigationGuards,
   isTrustedDesktopIpcEvent,
   preloadEntryPath,
   resolveDesktopRendererTarget,
   type DesktopNavigationWebContents,
 } from "../src/desktop/main/runtime.js";
+
+test("desktop chrome keeps native controls in a dark overlay and removes the application menu", () => {
+  assert.deepEqual(desktopWindowChrome(), {
+    applicationMenu: null,
+    windowOptions: {
+      autoHideMenuBar: true,
+      titleBarStyle: "hidden",
+      titleBarOverlay: {
+        color: "#0c0f13",
+        symbolColor: "#edf2f7",
+        height: 42,
+      },
+    },
+  });
+});
 
 test("preload path points to Electron Vite's emitted MJS preload entry", () => {
   const mainDirectory = join(tmpdir(), "folioloom", "out", "main");
