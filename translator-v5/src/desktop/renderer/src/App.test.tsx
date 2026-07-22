@@ -237,7 +237,7 @@ describe("FolioLoom desktop onboarding", () => {
     expect(screen.queryByRole("button", { name: "最大" })).toBeNull();
   });
 
-  it("clears the API Key field after the connection promise settles", async () => {
+  it("clears the API Key and shows confirmation only after a ready connection", async () => {
     const user = userEvent.setup();
     const testModel = vi.fn().mockResolvedValue(ok(testResult()));
     render(<App api={createApi({
@@ -254,6 +254,56 @@ describe("FolioLoom desktop onboarding", () => {
       apiKey: "sk-temporary-key",
     })));
     await waitFor(() => expect((apiKey as HTMLInputElement).value).toBe(""));
+    expect(screen.getByRole("status").textContent).toContain("连接成功，API Key 已安全保存。");
+  });
+
+  it("keeps the API Key and shows the provider report when a connection test does not pass", async () => {
+    const user = userEvent.setup();
+    const failedOnboarding: DesktopOnboardingState = {
+      ...sourceOnlyOnboarding,
+      latestProbe: {
+        status: "failed",
+        code: "PROVIDER_UNREACHABLE",
+        message: "无法连接模型服务，请检查网络或服务设置。",
+        retryable: true,
+      },
+    };
+    const testModel = vi.fn().mockResolvedValue(ok({
+      report: failedOnboarding.latestProbe!,
+      onboarding: failedOnboarding,
+    } satisfies DesktopTestModelResult));
+    render(<App api={createApi({
+      getOnboardingState: vi.fn().mockResolvedValue(ok(sourceOnlyOnboarding)),
+      testModel,
+    })} />);
+
+    const apiKey = await screen.findByLabelText("API Key");
+    await user.type(apiKey, "sk-retry-without-retyping");
+    await user.click(screen.getByRole("button", { name: "测试连接" }));
+
+    expect(await screen.findByText("无法连接模型服务，请检查网络或服务设置。")).toBeTruthy();
+    expect((apiKey as HTMLInputElement).value).toBe("sk-retry-without-retyping");
+  });
+
+  it("shows an in-place testing state while the provider probe is running", async () => {
+    const user = userEvent.setup();
+    let resolveTest!: (value: DesktopResult<DesktopTestModelResult>) => void;
+    const testModel = vi.fn().mockImplementation(() => new Promise<DesktopResult<DesktopTestModelResult>>((resolve) => {
+      resolveTest = resolve;
+    }));
+    render(<App api={createApi({
+      getOnboardingState: vi.fn().mockResolvedValue(ok(sourceOnlyOnboarding)),
+      testModel,
+    })} />);
+
+    await user.type(await screen.findByLabelText("API Key"), "sk-pending-probe");
+    await user.click(screen.getByRole("button", { name: "测试连接" }));
+
+    const pending = await screen.findByRole("button", { name: "正在测试…" });
+    expect((pending as HTMLButtonElement).disabled).toBe(true);
+
+    resolveTest(ok(testResult()));
+    expect(await screen.findByText("连接成功，API Key 已安全保存。")).toBeTruthy();
   });
 
   it("keeps the trial action disabled until the model is ready", async () => {

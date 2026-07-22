@@ -2,6 +2,7 @@ import { useEffect, useMemo, useState, type JSX } from "react";
 
 import type {
   DesktopDiscoverModelsRequest,
+  DesktopModelProbe,
   DesktopModelOption,
   DesktopModelSummary,
   DesktopOnboardingProvider,
@@ -10,6 +11,11 @@ import type {
   DesktopTestModelRequest,
   DesktopTestModelResult,
 } from "../../../contracts.js";
+
+interface ConnectionFeedback {
+  status: DesktopModelProbe["status"];
+  message: string;
+}
 
 interface ProviderSetupProps {
   providers: readonly DesktopOnboardingProvider[];
@@ -22,6 +28,22 @@ interface ProviderSetupProps {
 
 function firstModel(provider: DesktopOnboardingProvider | undefined): string {
   return provider?.fallbackModelIds[0] ?? "";
+}
+
+function probeFeedback(report: DesktopModelProbe): ConnectionFeedback {
+  if (report.status === "ready") {
+    return { status: "ready", message: "连接成功，API Key 已安全保存。" };
+  }
+  if (report.status === "limited") {
+    return {
+      status: "limited",
+      message: report.message?.trim() || "已经连接到模型，但它没有通过完整能力检查。",
+    };
+  }
+  return {
+    status: "failed",
+    message: report.message?.trim() || "连接测试失败，请检查 API Key、模型和网络后重试。",
+  };
 }
 
 export function ProviderSetup({
@@ -47,6 +69,8 @@ export function ProviderSetup({
   const [reasoningEffort, setReasoningEffort] = useState("");
   const [customBaseUrl, setCustomBaseUrl] = useState("");
   const [discoveredModels, setDiscoveredModels] = useState<readonly DesktopModelOption[]>([]);
+  const [testingConnection, setTestingConnection] = useState(false);
+  const [connectionFeedback, setConnectionFeedback] = useState<ConnectionFeedback>();
 
   const selectedProvider = providers.find((provider) => provider.id === providerId) ?? directProviders[0] ?? additionalProviders[0];
 
@@ -56,6 +80,7 @@ export function ProviderSetup({
     setReasoningEffort(selectedProvider.efforts[0] ?? "");
     setDiscoveredModels([]);
     setApiKey("");
+    setConnectionFeedback(undefined);
   }, [selectedProvider?.id]);
 
   const modelOptions = discoveredModels.length > 0
@@ -82,6 +107,8 @@ export function ProviderSetup({
 
   async function testConnection(): Promise<void> {
     if (selectedProvider === undefined || modelId === "") return;
+    setTestingConnection(true);
+    setConnectionFeedback(undefined);
     try {
       const request: DesktopTestModelRequest = {
         providerId: selectedProvider.id,
@@ -90,10 +117,21 @@ export function ProviderSetup({
         ...(reasoningEffort === "" ? {} : { reasoningEffort }),
         ...(selectedProvider.allowCustomBaseUrl && customBaseUrl !== "" ? { customBaseUrl } : {}),
       };
-      await onTestModel(request);
+      const result = await onTestModel(request);
+      if (!result.ok) {
+        return;
+      }
+      setConnectionFeedback(probeFeedback(result.value.report));
+      if (result.value.report.status === "ready") {
+        setApiKey("");
+      }
+    } catch {
+      setConnectionFeedback({
+        status: "failed",
+        message: "连接测试未能完成，请检查设置后重试。",
+      });
     } finally {
-      // A key may enter a one-shot request but must never stay in renderer state.
-      setApiKey("");
+      setTestingConnection(false);
     }
   }
 
@@ -155,7 +193,10 @@ export function ProviderSetup({
               autoComplete="off"
               value={apiKey}
               placeholder={selectedProvider.keyPlaceholder}
-              onChange={(event) => setApiKey(event.target.value)}
+              onChange={(event) => {
+                setApiKey(event.target.value);
+                setConnectionFeedback(undefined);
+              }}
               type="password"
             />
           </label>
@@ -218,7 +259,7 @@ export function ProviderSetup({
 
           <div className="provider-actions">
             <button className="primary-button" type="button" onClick={() => { void testConnection(); }} disabled={!canTest}>
-              测试连接
+              {testingConnection ? "正在测试…" : "测试连接"}
             </button>
             {configured ? (
               <button className="quiet-button" type="button" onClick={() => { void onForgetCredential(selectedProvider.id); }} disabled={busy}>
@@ -227,6 +268,11 @@ export function ProviderSetup({
             ) : null}
             {activeModel?.providerId === selectedProvider.id ? <span className="model-status">当前已选择 {activeModel.modelId}</span> : null}
           </div>
+          {connectionFeedback === undefined ? null : (
+            <p className={`connection-feedback is-${connectionFeedback.status}`} role="status" aria-live="polite">
+              {connectionFeedback.message}
+            </p>
+          )}
         </div>
       )}
     </section>

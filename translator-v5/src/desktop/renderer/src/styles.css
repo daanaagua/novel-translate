@@ -533,6 +533,29 @@ h2 {
   font-size: 12px;
 }
 
+.connection-feedback {
+  margin: 0;
+  padding: 10px 12px;
+  border: 1px solid color-mix(in srgb, var(--teal), transparent 68%);
+  border-radius: 10px;
+  background: rgb(116 212 192 / 7%);
+  color: var(--teal);
+  font-size: 13px;
+  line-height: 1.55;
+}
+
+.connection-feedback.is-limited {
+  border-color: rgb(222 184 107 / 35%);
+  background: rgb(222 184 107 / 7%);
+  color: #dec184;
+}
+
+.connection-feedback.is-failed {
+  border-color: color-mix(in srgb, var(--danger), transparent 68%);
+  background: rgb(239 167 167 / 6%);
+  color: var(--danger);
+}
+
 .source-summary {
   display: grid;
   gap: 4px;
