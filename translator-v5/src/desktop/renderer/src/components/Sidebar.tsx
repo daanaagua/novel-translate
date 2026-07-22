@@ -23,6 +23,7 @@ export function Sidebar({ activeWorkspace, hasProject, onSelectWorkspace }: Side
         <p className="nav-label">工作区</p>
         {WORKSPACES.map((workspace, index) => {
           const selected = workspace.id === activeWorkspace;
+          const available = workspace.id === "overview";
           return (
             <button
               className={`nav-item${selected ? " is-active" : ""}`}
@@ -30,7 +31,10 @@ export function Sidebar({ activeWorkspace, hasProject, onSelectWorkspace }: Side
               key={workspace.id}
               aria-label={workspace.label}
               aria-current={selected ? "page" : undefined}
-              onClick={() => onSelectWorkspace(workspace.id)}
+              disabled={!available}
+              onClick={() => {
+                if (available) onSelectWorkspace(workspace.id);
+              }}
             >
               <span className="nav-index" aria-hidden="true">0{index + 1}</span>
               <span>

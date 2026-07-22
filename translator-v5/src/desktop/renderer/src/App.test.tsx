@@ -180,7 +180,7 @@ describe("FolioLoom desktop onboarding", () => {
     expect(screen.getByRole("button", { name: "选择书稿" })).toBeTruthy();
   });
 
-  it("keeps the approved five-workspace shell and lets the reader move between its pages", async () => {
+  it("keeps unavailable workspaces visible but non-interactive", async () => {
     const user = userEvent.setup();
     render(<App api={createApi()} />);
 
@@ -188,9 +188,11 @@ describe("FolioLoom desktop onboarding", () => {
       expect(await screen.findByRole("button", { name })).toBeTruthy();
     }
 
-    await user.click(screen.getByRole("button", { name: "术语与记忆" }));
-    expect(await screen.findByRole("heading", { name: "术语与记忆" })).toBeTruthy();
-    await user.click(screen.getByRole("button", { name: "项目概览" }));
+    expect((screen.getByRole("button", { name: "项目概览" }) as HTMLButtonElement).disabled).toBe(false);
+    const memory = screen.getByRole("button", { name: "术语与记忆" }) as HTMLButtonElement;
+    expect(memory.disabled).toBe(true);
+
+    await user.click(memory);
     expect(await screen.findByRole("heading", { name: "开始翻译一本书" })).toBeTruthy();
   });
 
@@ -235,6 +237,27 @@ describe("FolioLoom desktop onboarding", () => {
     expect(screen.getByRole("button", { name: "high" })).toBeTruthy();
     expect(screen.getByRole("button", { name: "max" })).toBeTruthy();
     expect(screen.queryByRole("button", { name: "最大" })).toBeNull();
+  });
+
+  it("starts the provider form from the saved active model", async () => {
+    const savedKimi: DesktopOnboardingState = {
+      ...readyOnboarding,
+      providers: providers.map((provider) => provider.id === "kimi-cn"
+        ? { ...provider, credentialStatus: "available", credentialPersistence: "encrypted" }
+        : provider),
+      activeModel: {
+        providerId: "kimi-cn",
+        modelId: "moonshot-v1-8k",
+        reasoningEffort: "high",
+        capability: "ready",
+      },
+    };
+    render(<App api={createApi({ getOnboardingState: vi.fn().mockResolvedValue(ok(savedKimi)) })} />);
+
+    const kimi = await screen.findByRole("button", { name: "Kimi" });
+    expect(kimi.getAttribute("aria-pressed")).toBe("true");
+    expect((screen.getByLabelText("模型") as HTMLSelectElement).value).toBe("moonshot-v1-8k");
+    expect(screen.getByRole("button", { name: "high" }).getAttribute("aria-pressed")).toBe("true");
   });
 
   it("clears the API Key and shows confirmation only after a ready connection", async () => {
@@ -285,6 +308,48 @@ describe("FolioLoom desktop onboarding", () => {
     expect((apiKey as HTMLInputElement).value).toBe("sk-retry-without-retyping");
   });
 
+  it("keeps the API Key when a connection test is limited", async () => {
+    const user = userEvent.setup();
+    const limitedProbe = {
+      status: "limited" as const,
+      message: "连接正常，但该模型不支持完整流程。",
+    };
+    const limitedOnboarding: DesktopOnboardingState = {
+      ...sourceOnlyOnboarding,
+      latestProbe: limitedProbe,
+    };
+    render(<App api={createApi({
+      getOnboardingState: vi.fn().mockResolvedValue(ok(sourceOnlyOnboarding)),
+      testModel: vi.fn().mockResolvedValue(ok({ report: limitedProbe, onboarding: limitedOnboarding })),
+    })} />);
+
+    const apiKey = await screen.findByLabelText("API Key");
+    await user.type(apiKey, "sk-limited-retry");
+    await user.click(screen.getByRole("button", { name: "测试连接" }));
+
+    expect(await screen.findByText("连接正常，但该模型不支持完整流程。")).toBeTruthy();
+    expect((apiKey as HTMLInputElement).value).toBe("sk-limited-retry");
+  });
+
+  it("locks provider selection while model discovery is in flight", async () => {
+    const user = userEvent.setup();
+    let resolveDiscover!: (value: DesktopResult<readonly { id: string; displayName: string }[]>) => void;
+    const discoverModels = vi.fn().mockImplementation(() => new Promise<DesktopResult<readonly { id: string; displayName: string }[]>>((resolve) => {
+      resolveDiscover = resolve;
+    }));
+    render(<App api={createApi({
+      getOnboardingState: vi.fn().mockResolvedValue(ok(sourceOnlyOnboarding)),
+      discoverModels,
+    })} />);
+
+    await user.click(await screen.findByRole("button", { name: "获取模型" }));
+    await waitFor(() => expect(discoverModels).toHaveBeenCalledTimes(1));
+    expect((screen.getByRole("button", { name: "Kimi" }) as HTMLButtonElement).disabled).toBe(true);
+
+    resolveDiscover(ok([{ id: "deepseek-live", displayName: "DeepSeek Live" }]));
+    await waitFor(() => expect((screen.getByRole("button", { name: "Kimi" }) as HTMLButtonElement).disabled).toBe(false));
+  });
+
   it("shows an in-place testing state while the provider probe is running", async () => {
     const user = userEvent.setup();
     let resolveTest!: (value: DesktopResult<DesktopTestModelResult>) => void;
@@ -301,9 +366,38 @@ describe("FolioLoom desktop onboarding", () => {
 
     const pending = await screen.findByRole("button", { name: "正在测试…" });
     expect((pending as HTMLButtonElement).disabled).toBe(true);
+    expect((screen.getByRole("button", { name: "Kimi" }) as HTMLButtonElement).disabled).toBe(true);
 
     resolveTest(ok(testResult()));
     expect(await screen.findByText("连接成功，API Key 已安全保存。")).toBeTruthy();
+  });
+
+  it("clears ready feedback and readiness after forgetting the active credential", async () => {
+    const user = userEvent.setup();
+    const configuredReady: DesktopOnboardingState = {
+      ...readyOnboarding,
+      providers: providers.map((provider) => provider.id === "deepseek"
+        ? { ...provider, credentialStatus: "available", credentialPersistence: "encrypted" }
+        : provider),
+    };
+    const testModel = vi.fn().mockResolvedValue(ok(testResult(configuredReady)));
+    const forgetCredential = vi.fn().mockResolvedValue(ok(sourceOnlyOnboarding));
+    render(<App api={createApi({
+      getOnboardingState: vi.fn().mockResolvedValue(ok(sourceOnlyOnboarding)),
+      testModel,
+      forgetCredential,
+    })} />);
+
+    await user.type(await screen.findByLabelText("API Key"), "sk-forget-after-ready");
+    await user.click(screen.getByRole("button", { name: "测试连接" }));
+    expect(await screen.findByText("连接成功，API Key 已安全保存。")).toBeTruthy();
+
+    await user.click(screen.getByRole("button", { name: "忘记此密钥" }));
+    await waitFor(() => expect(forgetCredential).toHaveBeenCalledWith("deepseek"));
+
+    expect(screen.queryByText("连接成功，API Key 已安全保存。")).toBeNull();
+    expect((screen.getByRole("button", { name: "开始试译" }) as HTMLButtonElement).disabled).toBe(true);
+    expect(screen.queryByText("当前已选择 deepseek-reasoner")).toBeNull();
   });
 
   it("keeps the trial action disabled until the model is ready", async () => {

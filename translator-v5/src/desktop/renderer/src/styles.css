@@ -173,7 +173,7 @@ h2 {
   text-align: left;
 }
 
-.nav-item:hover {
+.nav-item:hover:not(:disabled) {
   border-color: var(--line-soft);
   background: rgb(255 255 255 / 2%);
   color: var(--ink);

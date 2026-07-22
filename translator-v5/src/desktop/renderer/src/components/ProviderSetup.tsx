@@ -30,6 +30,18 @@ function firstModel(provider: DesktopOnboardingProvider | undefined): string {
   return provider?.fallbackModelIds[0] ?? "";
 }
 
+function initialProviderId(
+  directProviders: readonly DesktopOnboardingProvider[],
+  additionalProviders: readonly DesktopOnboardingProvider[],
+  activeModel: DesktopModelSummary | undefined,
+): string {
+  const providers = [...directProviders, ...additionalProviders];
+  if (activeModel !== undefined && providers.some((provider) => provider.id === activeModel.providerId)) {
+    return activeModel.providerId;
+  }
+  return directProviders[0]?.id ?? additionalProviders[0]?.id ?? "";
+}
+
 function probeFeedback(report: DesktopModelProbe): ConnectionFeedback {
   if (report.status === "ready") {
     return { status: "ready", message: "连接成功，API Key 已安全保存。" };
@@ -62,8 +74,12 @@ export function ProviderSetup({
     () => providers.filter((provider) => provider.allowCustomBaseUrl),
     [providers],
   );
-  const [showMoreServices, setShowMoreServices] = useState(false);
-  const [providerId, setProviderId] = useState(() => directProviders[0]?.id ?? additionalProviders[0]?.id ?? "");
+  const [showMoreServices, setShowMoreServices] = useState(
+    () => activeModel !== undefined && additionalProviders.some((provider) => provider.id === activeModel.providerId),
+  );
+  const [providerId, setProviderId] = useState(
+    () => initialProviderId(directProviders, additionalProviders, activeModel),
+  );
   const [apiKey, setApiKey] = useState("");
   const [modelId, setModelId] = useState("");
   const [reasoningEffort, setReasoningEffort] = useState("");
@@ -76,18 +92,24 @@ export function ProviderSetup({
 
   useEffect(() => {
     if (selectedProvider === undefined) return;
-    setModelId(firstModel(selectedProvider));
-    setReasoningEffort(selectedProvider.efforts[0] ?? "");
+    const savedModel = activeModel?.providerId === selectedProvider.id ? activeModel : undefined;
+    setModelId(savedModel?.modelId ?? firstModel(selectedProvider));
+    setReasoningEffort(savedModel?.reasoningEffort ?? selectedProvider.efforts[0] ?? "");
     setDiscoveredModels([]);
     setApiKey("");
     setConnectionFeedback(undefined);
   }, [selectedProvider?.id]);
 
-  const modelOptions = discoveredModels.length > 0
+  const listedModelOptions = discoveredModels.length > 0
     ? discoveredModels
     : (selectedProvider?.fallbackModelIds ?? []).map((id) => ({ id, displayName: id }));
+  const modelOptions = modelId !== "" && !listedModelOptions.some((model) => model.id === modelId)
+    ? [{ id: modelId, displayName: modelId }, ...listedModelOptions]
+    : listedModelOptions;
+  const formLocked = busy || testingConnection;
 
   function chooseProvider(nextProvider: DesktopOnboardingProvider): void {
+    if (formLocked) return;
     if (nextProvider.allowCustomBaseUrl) setShowMoreServices(true);
     setProviderId(nextProvider.id);
   }
@@ -135,8 +157,17 @@ export function ProviderSetup({
     }
   }
 
+  async function forgetCredential(): Promise<void> {
+    if (selectedProvider === undefined) return;
+    const result = await onForgetCredential(selectedProvider.id);
+    if (result.ok) {
+      setApiKey("");
+      setConnectionFeedback(undefined);
+    }
+  }
+
   const configured = selectedProvider !== undefined && selectedProvider.credentialStatus !== "missing";
-  const canTest = selectedProvider !== undefined && modelId !== "" && !busy;
+  const canTest = selectedProvider !== undefined && modelId !== "" && !formLocked;
 
   return (
     <section className="provider-setup" aria-label="模型设置">
@@ -150,6 +181,7 @@ export function ProviderSetup({
               key={provider.id}
               onClick={() => chooseProvider(provider)}
               aria-pressed={provider.id === selectedProvider?.id}
+              disabled={formLocked}
             >
               {provider.displayName}
             </button>
@@ -161,6 +193,7 @@ export function ProviderSetup({
             type="button"
             aria-expanded={showMoreServices}
             onClick={() => setShowMoreServices((shown) => !shown)}
+            disabled={formLocked}
           >
             更多服务
           </button>
@@ -174,6 +207,7 @@ export function ProviderSetup({
                 key={provider.id}
                 onClick={() => chooseProvider(provider)}
                 aria-pressed={provider.id === selectedProvider?.id}
+                disabled={formLocked}
               >
                 {provider.displayName}
               </button>
@@ -198,6 +232,7 @@ export function ProviderSetup({
                 setConnectionFeedback(undefined);
               }}
               type="password"
+              disabled={formLocked}
             />
           </label>
 
@@ -210,6 +245,7 @@ export function ProviderSetup({
                 value={customBaseUrl}
                 placeholder="https://api.example.com/v1"
                 onChange={(event) => setCustomBaseUrl(event.target.value)}
+                disabled={formLocked}
               />
             </label>
           ) : null}
@@ -217,11 +253,11 @@ export function ProviderSetup({
           <div className="field model-field">
             <span>模型</span>
             <div className="model-row">
-              <select value={modelId} onChange={(event) => setModelId(event.target.value)} aria-label="模型">
+              <select value={modelId} onChange={(event) => setModelId(event.target.value)} aria-label="模型" disabled={formLocked}>
                 {modelOptions.length === 0 ? <option value="">请选择模型</option> : null}
                 {modelOptions.map((model) => <option value={model.id} key={model.id}>{model.displayName}</option>)}
               </select>
-              <button className="quiet-button" type="button" onClick={() => { void discoverModels(); }} disabled={busy}>
+              <button className="quiet-button" type="button" onClick={() => { void discoverModels(); }} disabled={formLocked}>
                 获取模型
               </button>
             </div>
@@ -234,6 +270,7 @@ export function ProviderSetup({
                 value={modelId}
                 placeholder="model-id"
                 onChange={(event) => setModelId(event.target.value)}
+                disabled={formLocked}
               />
             </label>
           ) : null}
@@ -249,6 +286,7 @@ export function ProviderSetup({
                     key={effort}
                     aria-pressed={reasoningEffort === effort}
                     onClick={() => setReasoningEffort(effort)}
+                    disabled={formLocked}
                   >
                     {effort}
                   </button>
@@ -262,7 +300,7 @@ export function ProviderSetup({
               {testingConnection ? "正在测试…" : "测试连接"}
             </button>
             {configured ? (
-              <button className="quiet-button" type="button" onClick={() => { void onForgetCredential(selectedProvider.id); }} disabled={busy}>
+              <button className="quiet-button" type="button" onClick={() => { void forgetCredential(); }} disabled={formLocked}>
                 忘记此密钥
               </button>
             ) : null}
