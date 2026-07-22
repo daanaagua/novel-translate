@@ -9,12 +9,16 @@ import {
   writeFile,
 } from "node:fs/promises";
 import { basename, dirname, extname, isAbsolute, join, posix, relative, resolve, sep } from "node:path";
-import { TextDecoder } from "node:util";
-
 import { XMLParser } from "fast-xml-parser";
 import * as yauzl from "yauzl";
 import type { Entry, ZipFile } from "yauzl";
 
+import {
+  decodeSourceBytes,
+  EncodingPolicyError,
+  type EncodingAlternative,
+  type SourceEncodingDecision,
+} from "./encoding-policy.js";
 import { detectLanguage, type DetectedLanguage } from "./language-detector.js";
 import { SourceLedger } from "./source-ledger.js";
 import { scalarLength, type CanonicalSegment, type ExcludedRawRange } from "./types.js";
@@ -39,6 +43,8 @@ export type SourceImportErrorCode =
   | "SOURCE_INPUT_INVALID"
   | "SOURCE_FORMAT_UNSUPPORTED"
   | "ENCODING_AMBIGUOUS"
+  | "SOURCE_ENCODING_AMBIGUOUS"
+  | "SOURCE_ENCODING_UNSUPPORTED"
   | "SOURCE_CHANGED_DURING_IMPORT"
   | "PROJECT_EXISTS"
   | "ARCHIVE_INVALID"
@@ -54,10 +60,21 @@ export type SourceImportErrorCode =
 export class SourceImportError extends Error {
   readonly code: SourceImportErrorCode;
 
-  constructor(code: SourceImportErrorCode, message: string) {
+  constructor(
+    code: SourceImportErrorCode,
+    message: string,
+    readonly alternatives: readonly EncodingAlternative[] = [],
+  ) {
     super(`${code}: ${message}`);
     this.name = "SourceImportError";
     this.code = code;
+  }
+
+  toJSON(): Record<string, unknown> {
+    return {
+      code: this.code,
+      alternatives: this.alternatives,
+    };
   }
 }
 
@@ -91,6 +108,7 @@ interface ExtractedSource {
   sourceText: string;
   canonicalSegments: CanonicalSegment[];
   encoding: string;
+  encodingDecision?: SourceEncodingDecision;
   extractor: string;
   excludedRawRanges: ExcludedRawRange[];
 }
@@ -105,8 +123,12 @@ function sha256(value: Buffer | string): string {
   return createHash("sha256").update(value).digest("hex");
 }
 
-function sourceError(code: SourceImportErrorCode, message: string): never {
-  throw new SourceImportError(code, message);
+function sourceError(
+  code: SourceImportErrorCode,
+  message: string,
+  alternatives: readonly EncodingAlternative[] = [],
+): never {
+  throw new SourceImportError(code, message, alternatives);
 }
 
 function normalizeNewlines(value: string): string {
@@ -143,86 +165,39 @@ function sourceFormat(path: string): ".txt" | ".md" | ".markdown" | ".docx" | ".
   return sourceError("SOURCE_FORMAT_UNSUPPORTED", `unsupported source extension: ${extension || "(none)"}`);
 }
 
-function normalizeEncoding(value: string): "utf-8" | "utf-16le" | "utf-16be" | "utf-32le" | "utf-32be" {
-  switch (value.trim().toLocaleLowerCase("en").replaceAll("_", "-")) {
-    case "utf8":
-    case "utf-8":
-      return "utf-8";
-    case "utf16le":
-    case "utf-16le":
-      return "utf-16le";
-    case "utf16be":
-    case "utf-16be":
-      return "utf-16be";
-    case "utf32le":
-    case "utf-32le":
-      return "utf-32le";
-    case "utf32be":
-    case "utf-32be":
-      return "utf-32be";
-    default:
-      return sourceError("ENCODING_AMBIGUOUS", `unsupported explicit encoding: ${value}`);
-  }
-}
-
-function utf32Decode(payload: Buffer, littleEndian: boolean): string {
-  if (payload.length % 4 !== 0) {
-    return sourceError("ENCODING_AMBIGUOUS", "UTF-32 payload is not divisible into scalar words");
-  }
-  const scalars: string[] = [];
-  for (let offset = 0; offset < payload.length; offset += 4) {
-    const scalar = littleEndian ? payload.readUInt32LE(offset) : payload.readUInt32BE(offset);
-    if (scalar > 0x10ffff || (scalar >= 0xd800 && scalar <= 0xdfff)) {
-      return sourceError("ENCODING_AMBIGUOUS", "UTF-32 payload contains an invalid Unicode scalar");
-    }
-    scalars.push(String.fromCodePoint(scalar));
-  }
-  return scalars.join("");
-}
-
-function decodeBytes(payload: Buffer, encoding: ReturnType<typeof normalizeEncoding>): string {
-  try {
-    if (encoding === "utf-32le") {
-      return utf32Decode(payload, true);
-    }
-    if (encoding === "utf-32be") {
-      return utf32Decode(payload, false);
-    }
-    return new TextDecoder(encoding, { fatal: true, ignoreBOM: true }).decode(payload);
-  } catch (error) {
-    return sourceError(
-      "ENCODING_AMBIGUOUS",
-      error instanceof Error ? error.message : `cannot decode ${encoding}`,
-    );
-  }
-}
-
-function decodePlainText(raw: Buffer, explicitEncoding: string | undefined): {
+function decodePlainText(
+  raw: Buffer,
+  explicitEncoding: string | undefined,
+  languageHint: string | undefined,
+): {
   text: string;
   encoding: string;
+  encodingDecision: SourceEncodingDecision;
   bomLength: number;
   bomPolicy?: string;
 } {
-  const bom = raw.subarray(0, 4);
-  const detected = bom[0] === 0x00 && bom[1] === 0x00 && bom[2] === 0xfe && bom[3] === 0xff
-    ? { encoding: "utf-32be" as const, length: 4, policy: "UTF32_BE_BOM" }
-    : bom[0] === 0xff && bom[1] === 0xfe && bom[2] === 0x00 && bom[3] === 0x00
-      ? { encoding: "utf-32le" as const, length: 4, policy: "UTF32_LE_BOM" }
-      : bom[0] === 0xef && bom[1] === 0xbb && bom[2] === 0xbf
-        ? { encoding: "utf-8" as const, length: 3, policy: "UTF8_BOM" }
-        : bom[0] === 0xfe && bom[1] === 0xff
-          ? { encoding: "utf-16be" as const, length: 2, policy: "UTF16_BE_BOM" }
-          : bom[0] === 0xff && bom[1] === 0xfe
-            ? { encoding: "utf-16le" as const, length: 2, policy: "UTF16_LE_BOM" }
-            : undefined;
-  const encoding = detected?.encoding ?? (explicitEncoding === undefined ? "utf-8" : normalizeEncoding(explicitEncoding));
-  const bomLength = detected?.length ?? 0;
-  return {
-    text: normalizeNewlines(decodeBytes(raw.subarray(bomLength), encoding)),
-    encoding,
-    bomLength,
-    ...(detected === undefined ? {} : { bomPolicy: detected.policy }),
-  };
+  try {
+    const decoded = decodeSourceBytes(raw, {
+      ...(explicitEncoding === undefined ? {} : { explicitEncoding }),
+      ...(languageHint === undefined ? {} : { languageHint }),
+    });
+    return {
+      text: normalizeNewlines(decoded.text),
+      encoding: decoded.decision.canonicalLabel,
+      encodingDecision: decoded.decision,
+      bomLength: decoded.bomLength,
+      ...(decoded.bomPolicy === undefined ? {} : { bomPolicy: decoded.bomPolicy }),
+    };
+  } catch (error) {
+    if (error instanceof EncodingPolicyError) {
+      return sourceError(
+        error.code,
+        error.message.replace(/^[A-Z_]+:\s*/u, ""),
+        error.alternatives,
+      );
+    }
+    throw error;
+  }
 }
 
 function record(value: unknown, code: SourceImportErrorCode, context: string): Record<string, unknown> {
@@ -725,6 +700,7 @@ async function extractSource(
   raw: Buffer,
   format: ReturnType<typeof sourceFormat>,
   explicitEncoding: string | undefined,
+  languageHint: string | undefined,
 ): Promise<ExtractedSource> {
   if (format === ".docx") {
     return extractDocx(raw);
@@ -732,7 +708,7 @@ async function extractSource(
   if (format === ".epub") {
     return extractEpub(raw);
   }
-  const plain = decodePlainText(raw, explicitEncoding);
+  const plain = decodePlainText(raw, explicitEncoding, languageHint);
   return {
     sourceText: plain.text,
     canonicalSegments: [{
@@ -745,6 +721,7 @@ async function extractSource(
       rawEnd: raw.length,
     }],
     encoding: plain.encoding,
+    encodingDecision: plain.encodingDecision,
     extractor: "plain-text-v2",
     excludedRawRanges: plain.bomPolicy === undefined
       ? []
@@ -807,7 +784,13 @@ export class SourceImporter {
     const format = sourceFormat(sourcePath);
     const raw = await this.#readSource(sourcePath);
     const rawSha256 = sha256(raw);
-    const extracted = await extractSource(raw, format, request.explicitEncoding);
+    const requestedLanguage = request.sourceLanguage.trim().toLocaleLowerCase("en");
+    const extracted = await extractSource(
+      raw,
+      format,
+      request.explicitEncoding,
+      requestedLanguage === "auto" ? undefined : requestedLanguage,
+    );
     const detectedLanguage = detectLanguage(extracted.sourceText);
     const language = sourceLanguage(request.sourceLanguage, detectedLanguage);
     const parent = dirname(projectDirectory);
@@ -833,6 +816,9 @@ export class SourceImporter {
         raw_sha256: rawSha256,
         source_format: format,
         encoding: extracted.encoding,
+        ...(extracted.encodingDecision === undefined
+          ? {}
+          : { encodingDecision: extracted.encodingDecision }),
         extractor: extracted.extractor,
         sourceLanguage: language,
         canonical_path: canonicalMember,

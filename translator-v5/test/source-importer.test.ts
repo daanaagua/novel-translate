@@ -224,6 +224,104 @@ test("source importer accepts all five Unicode BOM forms without losing scalar c
   }
 });
 
+test("source importer records a strict legacy Japanese encoding decision", async () => {
+  const shiftJis = Buffer.concat(Array.from({ length: 4 }, () => Buffer.from([
+    0x93, 0xfa, 0x96, 0x7b, 0x8c, 0xea,
+    0x82, 0xc5, 0x82, 0xb7, 0x81, 0x42,
+  ])));
+  const fixture = writeFixture("legacy-ja.txt", shiftJis);
+  try {
+    const result = await importSource({
+      sourcePath: fixture.sourcePath,
+      projectDirectory: projectDirectory(fixture.directory),
+      sourceLanguage: "ja",
+    });
+    const manifest = JSON.parse(readFileSync(result.manifestPath, "utf8")) as {
+      encoding?: unknown;
+      encodingDecision?: {
+        canonicalLabel?: unknown;
+        decisionSource?: unknown;
+        confidence?: unknown;
+        policyVersion?: unknown;
+      };
+    };
+    const ledger = SourceLedger.open(result.manifestPath);
+    assert.equal(ledger.sourceText, "日本語です。".repeat(4));
+    assert.equal(ledger.encoding, "shift_jis");
+    assert.equal(ledger.encodingDecision?.canonicalLabel, "shift_jis");
+    assert.equal(ledger.encodingDecision?.decisionSource, "heuristic");
+    assert.equal(ledger.sourceEncodingCompatibilityMode, false);
+    assert.equal(manifest.encoding, "shift_jis");
+    assert.equal(manifest.encodingDecision?.canonicalLabel, "shift_jis");
+    assert.equal(manifest.encodingDecision?.decisionSource, "heuristic");
+    assert.ok(Number(manifest.encodingDecision?.confidence) >= 0.85);
+    assert.equal(typeof manifest.encodingDecision?.policyVersion, "string");
+  } finally {
+    rmSync(fixture.directory, { recursive: true, force: true });
+  }
+});
+
+test("source importer accepts explicit EUC-KR and CP949 aliases without mojibake", async () => {
+  const bytes = Buffer.from([0xc7, 0xd1, 0xb1, 0xb9, 0xbe, 0xee]);
+  for (const explicitEncoding of ["euc-kr", "cp949"] as const) {
+    const fixture = writeFixture(`legacy-${explicitEncoding}.txt`, bytes);
+    try {
+      const result = await importSource({
+        sourcePath: fixture.sourcePath,
+        projectDirectory: projectDirectory(fixture.directory),
+        sourceLanguage: "ko",
+        explicitEncoding,
+      });
+      const ledger = SourceLedger.open(result.manifestPath);
+      const manifest = JSON.parse(readFileSync(result.manifestPath, "utf8")) as {
+        encodingDecision?: { canonicalLabel?: unknown; decisionSource?: unknown };
+      };
+      assert.equal(ledger.sourceText, "한국어");
+      assert.equal(ledger.sourceText.includes("\uFFFD"), false);
+      assert.equal(
+        manifest.encodingDecision?.canonicalLabel,
+        explicitEncoding === "cp949" ? "windows-949" : "euc-kr",
+      );
+      assert.equal(manifest.encodingDecision?.decisionSource, "user");
+    } finally {
+      rmSync(fixture.directory, { recursive: true, force: true });
+    }
+  }
+});
+
+test("source importer exposes only safe encoding alternatives for an ambiguous legacy file", async () => {
+  const bytes = Buffer.concat(Array.from({ length: 3 }, () =>
+    Buffer.from([0xc7, 0xd1, 0xb1, 0xb9, 0xbe, 0xee])));
+  const fixture = writeFixture("ambiguous-ko.txt", bytes);
+  const destination = projectDirectory(fixture.directory);
+  try {
+    await assert.rejects(
+      importSource({
+        sourcePath: fixture.sourcePath,
+        projectDirectory: destination,
+        sourceLanguage: "ko",
+      }),
+      (error: unknown) => {
+        assert.ok(error instanceof SourceImportError);
+        assert.equal(error.code, "SOURCE_ENCODING_AMBIGUOUS");
+        const alternatives = (error as SourceImportError & {
+          alternatives?: readonly { canonicalLabel?: unknown }[];
+        }).alternatives ?? [];
+        assert.deepEqual(
+          alternatives.map((item) => item.canonicalLabel).sort(),
+          ["euc-kr", "windows-949"],
+        );
+        assert.equal(JSON.stringify(error).includes("한국어"), false);
+        assert.equal(JSON.stringify(error).includes(fixture.sourcePath), false);
+        return true;
+      },
+    );
+    assert.equal(existsSync(destination), false);
+  } finally {
+    rmSync(fixture.directory, { recursive: true, force: true });
+  }
+});
+
 test("source importer refuses ambiguous non-BOM bytes instead of replacing them", async () => {
   const fixture = writeFixture("legacy.txt", Buffer.from([0x80, 0x81, 0x82]));
   const destination = projectDirectory(fixture.directory);
@@ -232,7 +330,7 @@ test("source importer refuses ambiguous non-BOM bytes instead of replacing them"
       sourcePath: fixture.sourcePath,
       projectDirectory: destination,
       sourceLanguage: "und",
-    }), "ENCODING_AMBIGUOUS");
+    }), "SOURCE_ENCODING_AMBIGUOUS");
     assert.equal(existsSync(destination), false);
   } finally {
     rmSync(fixture.directory, { recursive: true, force: true });

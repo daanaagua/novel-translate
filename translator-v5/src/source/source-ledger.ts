@@ -9,6 +9,12 @@ import {
 } from "../language/profiles.js";
 import type { SourceLanguageProfile } from "../language/types.js";
 import type {
+  CanonicalEncodingLabel,
+  EncodingAlternative,
+  EncodingDecisionSource,
+  SourceEncodingDecision,
+} from "./encoding-policy.js";
+import type {
   CanonicalSegment,
   ExcludedRawRange,
   ScalarSource,
@@ -127,8 +133,9 @@ function sourceVersionFor(
   canonicalSegments: readonly CanonicalSegment[],
   excludedRawRanges: readonly ExcludedRawRange[],
   languageProfile?: SourceLanguageProfile,
+  encodingDecision?: SourceEncodingDecision,
 ): string {
-  const identity = [
+  const identity: unknown[] = [
     ["schema_version", stringField(manifest, "schema_version")],
     ["raw_sha256", stringField(manifest, "raw_sha256")],
     ["canonical_sha256", stringField(manifest, "canonical_sha256")],
@@ -156,7 +163,133 @@ function sourceVersionFor(
       ["source_language_profile_version", languageProfile.version],
     );
   }
+  if (encodingDecision !== undefined) {
+    identity.push(["encoding_decision", [
+      ["canonical_label", encodingDecision.canonicalLabel],
+      ["decision_source", encodingDecision.decisionSource],
+      ["confidence", encodingDecision.confidence],
+      ["alternatives", encodingDecision.alternatives.map((alternative) => [
+        ["canonical_label", alternative.canonicalLabel],
+        ["confidence", alternative.confidence],
+        ["diagnostics", [...alternative.diagnostics]],
+      ])],
+      ["diagnostics", [...encodingDecision.diagnostics]],
+      ["policy_version", encodingDecision.policyVersion],
+    ]]);
+  }
   return sha256(JSON.stringify(identity));
+}
+
+const ENCODING_LABELS: ReadonlySet<CanonicalEncodingLabel> = new Set([
+  "utf-8",
+  "utf-16le",
+  "utf-16be",
+  "utf-32le",
+  "utf-32be",
+  "shift_jis",
+  "euc-jp",
+  "euc-kr",
+  "windows-949",
+]);
+
+const ENCODING_DECISION_SOURCES: ReadonlySet<EncodingDecisionSource> = new Set([
+  "bom",
+  "strict_utf8",
+  "heuristic",
+  "user",
+]);
+
+function confidenceField(
+  input: Record<string, unknown>,
+  name: string,
+  context = name,
+): number {
+  const value = input[name];
+  if (typeof value !== "number" || !Number.isFinite(value) || value < 0 || value > 1) {
+    throw new SourceIntegrityError(
+      "MANIFEST_INVALID",
+      `${context} must be a finite number between 0 and 1`,
+    );
+  }
+  return value;
+}
+
+function stringArray(value: unknown, context: string): readonly string[] {
+  if (!Array.isArray(value) || value.some((item) => typeof item !== "string")) {
+    throw new SourceIntegrityError("MANIFEST_INVALID", `${context} must be an array of strings`);
+  }
+  return Object.freeze([...value] as string[]);
+}
+
+function encodingLabel(value: unknown, context: string): CanonicalEncodingLabel {
+  if (typeof value !== "string" || !ENCODING_LABELS.has(value as CanonicalEncodingLabel)) {
+    throw new SourceIntegrityError(
+      "MANIFEST_INVALID",
+      `${context} must be a supported canonical encoding label`,
+    );
+  }
+  return value as CanonicalEncodingLabel;
+}
+
+function encodingDecisionForManifest(
+  manifest: Record<string, unknown>,
+  manifestEncoding: string,
+): { decision?: SourceEncodingDecision; compatibilityMode: boolean } {
+  if (manifest.encodingDecision === undefined) {
+    return { compatibilityMode: true };
+  }
+  const input = record(manifest.encodingDecision, "encodingDecision");
+  const canonicalLabel = encodingLabel(input.canonicalLabel, "encodingDecision.canonicalLabel");
+  if (canonicalLabel !== manifestEncoding) {
+    throw new SourceIntegrityError(
+      "MANIFEST_INVALID",
+      "encodingDecision.canonicalLabel must match encoding",
+    );
+  }
+  const decisionSource = input.decisionSource;
+  if (typeof decisionSource !== "string"
+    || !ENCODING_DECISION_SOURCES.has(decisionSource as EncodingDecisionSource)) {
+    throw new SourceIntegrityError(
+      "MANIFEST_INVALID",
+      "encodingDecision.decisionSource is unsupported",
+    );
+  }
+  if (!Array.isArray(input.alternatives)) {
+    throw new SourceIntegrityError(
+      "MANIFEST_INVALID",
+      "encodingDecision.alternatives must be an array",
+    );
+  }
+  const alternatives: EncodingAlternative[] = input.alternatives.map((value, index) => {
+    const alternative = record(value, `encodingDecision.alternatives[${index}]`);
+    return Object.freeze({
+      canonicalLabel: encodingLabel(
+        alternative.canonicalLabel,
+        `encodingDecision.alternatives[${index}].canonicalLabel`,
+      ),
+      confidence: confidenceField(
+        alternative,
+        "confidence",
+        `encodingDecision.alternatives[${index}].confidence`,
+      ),
+      diagnostics: stringArray(
+        alternative.diagnostics,
+        `encodingDecision.alternatives[${index}].diagnostics`,
+      ),
+    });
+  });
+  const policyVersion = stringField(input, "policyVersion");
+  return {
+    compatibilityMode: false,
+    decision: Object.freeze({
+      canonicalLabel,
+      decisionSource: decisionSource as EncodingDecisionSource,
+      confidence: confidenceField(input, "confidence", "encodingDecision.confidence"),
+      alternatives: Object.freeze(alternatives),
+      diagnostics: stringArray(input.diagnostics, "encodingDecision.diagnostics"),
+      policyVersion,
+    }),
+  };
 }
 
 function languageForManifest(manifest: Record<string, unknown>): {
@@ -318,6 +451,9 @@ export class SourceLedger implements ScalarSource {
   readonly canonicalPath: string;
   readonly sourceText: string;
   readonly sourceVersion: string;
+  readonly encoding: string;
+  readonly encodingDecision?: SourceEncodingDecision;
+  readonly sourceEncodingCompatibilityMode: boolean;
   readonly sourceLanguage: string;
   readonly sourceLanguageCompatibilityMode: boolean;
   readonly languageProfile: SourceLanguageProfile;
@@ -332,6 +468,9 @@ export class SourceLedger implements ScalarSource {
     canonicalPath: string;
     sourceText: string;
     sourceVersion: string;
+    encoding: string;
+    encodingDecision?: SourceEncodingDecision;
+    sourceEncodingCompatibilityMode: boolean;
     languageProfile: SourceLanguageProfile;
     sourceLanguageCompatibilityMode: boolean;
     canonicalSegments: CanonicalSegment[];
@@ -343,6 +482,9 @@ export class SourceLedger implements ScalarSource {
     this.canonicalPath = options.canonicalPath;
     this.sourceText = options.sourceText;
     this.sourceVersion = options.sourceVersion;
+    this.encoding = options.encoding;
+    this.encodingDecision = options.encodingDecision;
+    this.sourceEncodingCompatibilityMode = options.sourceEncodingCompatibilityMode;
     this.languageProfile = options.languageProfile;
     this.sourceLanguage = options.languageProfile.id;
     this.sourceLanguageCompatibilityMode = options.sourceLanguageCompatibilityMode;
@@ -435,11 +577,14 @@ export class SourceLedger implements ScalarSource {
       raw.length,
     );
     const language = languageForManifest(manifest);
+    const encoding = stringField(manifest, "encoding");
+    const encodingDecision = encodingDecisionForManifest(manifest, encoding);
     const sourceVersion = sourceVersionFor(
       manifest,
       canonicalSegments,
       excludedRawRanges,
       language.compatibilityMode ? undefined : language.profile,
+      encodingDecision.decision,
     );
 
     return new SourceLedger({
@@ -448,6 +593,9 @@ export class SourceLedger implements ScalarSource {
       canonicalPath,
       sourceText,
       sourceVersion,
+      encoding,
+      encodingDecision: encodingDecision.decision,
+      sourceEncodingCompatibilityMode: encodingDecision.compatibilityMode,
       languageProfile: language.profile,
       sourceLanguageCompatibilityMode: language.compatibilityMode,
       canonicalSegments,
