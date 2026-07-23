@@ -21,6 +21,8 @@
   "dependencies": {
     "@earendil-works/pi-agent-core": "0.80.10",
     "@earendil-works/pi-ai": "0.80.10",
+    "csv-parse": "7.0.1",
+    "exceljs": "4.4.0",
     "fast-xml-parser": "^5.10.1",
     "opencc-js": "1.4.1",
     "react": "19.2.8",

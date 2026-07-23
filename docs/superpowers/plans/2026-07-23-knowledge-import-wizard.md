@@ -75,7 +75,7 @@
 - 创建：`translator-v5/src/knowledge-import/input-policy.ts`
 - 测试：`translator-v5/test/knowledge-import-input-policy.test.ts`
 
-- [ ] **步骤 1：编写扩展名、大小和结构边界失败测试**
+- [x] **步骤 1：编写扩展名、大小和结构边界失败测试**
 
 ```ts
 test("accepts only the four knowledge import formats", () => {
@@ -102,7 +102,7 @@ test("rejects oversized, deeply nested and over-wide inputs before staging", () 
 });
 ```
 
-- [ ] **步骤 2：运行测试确认失败**
+- [x] **步骤 2：运行测试确认失败**
 
 运行：
 
@@ -112,7 +112,7 @@ node --test --import tsx test/knowledge-import-input-policy.test.ts
 
 预期：FAIL，模块不存在。
 
-- [ ] **步骤 3：安装固定依赖**
+- [x] **步骤 3：安装固定依赖**
 
 运行：
 
@@ -122,7 +122,7 @@ npm install csv-parse@7.0.1 exceljs@4.4.0
 
 确认 `package.json` 的 dependencies 精确记录两个版本，`npm audit --omit=dev` 不得出现 high/critical；若出现则停止实施并记录依赖风险，不使用 `--force` 绕过。
 
-- [ ] **步骤 4：定义有界输入策略**
+- [x] **步骤 4：定义有界输入策略**
 
 `input-policy.ts` 固定：
 
@@ -140,7 +140,7 @@ export const MAX_XLSX_ENTRY_RATIO = 100;
 
 只接受 `.json`、`.yaml`、`.yml`、`.csv`、`.xlsx`。路径必须来自 Electron 文件选择器产生的 pending import，不允许 renderer 传入。所有错误使用稳定码并带行/列/路径定位。
 
-- [ ] **步骤 5：定义跨解析器类型**
+- [x] **步骤 5：定义跨解析器类型**
 
 在 `types.ts` 定义：
 
@@ -353,7 +353,7 @@ export interface CancelImportOperationRequest {
 
 `ImportInspection` 不含绝对路径和完整文件内容。
 
-- [ ] **步骤 6：运行策略测试和类型检查**
+- [x] **步骤 6：运行策略测试和类型检查**
 
 运行：
 
@@ -364,7 +364,7 @@ npm run typecheck
 
 预期：PASS。
 
-- [ ] **步骤 7：Commit**
+- [x] **步骤 7：Commit**
 
 ```powershell
 git add translator-v5/package.json translator-v5/package-lock.json translator-v5/src/knowledge-import/types.ts translator-v5/src/knowledge-import/input-policy.ts translator-v5/test/knowledge-import-input-policy.test.ts
@@ -383,7 +383,7 @@ git commit -m "feat: define safe knowledge import inputs"
 - 测试：`translator-v5/test/fixtures/knowledge-import/terms.json`
 - 测试：`translator-v5/test/fixtures/knowledge-import/terms.yaml`
 
-- [ ] **步骤 1：编写四种结构和危险键失败测试**
+- [x] **步骤 1：编写四种结构和危险键失败测试**
 
 ```ts
 test("discovers root arrays, nested arrays and key-value glossaries", async () => {
@@ -405,7 +405,7 @@ test("requires the dedicated library flow for a template declaring global scope"
 });
 ```
 
-- [ ] **步骤 2：运行测试确认失败**
+- [x] **步骤 2：运行测试确认失败**
 
 运行：
 
@@ -415,7 +415,7 @@ node --test --import tsx test/knowledge-import-json-yaml.test.ts
 
 预期：FAIL，读取器不存在。
 
-- [ ] **步骤 3：实现有界解析和记录路径**
+- [x] **步骤 3：实现有界解析和记录路径**
 
 JSON 和 YAML 都先校验文件大小。JSON 使用 YAML 库的严格 JSON schema 解析，以保留重复键错误；YAML 使用 core schema：
 
@@ -439,7 +439,7 @@ parseDocument(text, {
 
 记录路径仅由读取器生成 opaque ID；renderer 选择 ID，不传自写 JSONPath。
 
-- [ ] **步骤 4：建立官方模板版本**
+- [x] **步骤 4：建立官方模板版本**
 
 模板根结构固定：
 
@@ -462,7 +462,7 @@ parseDocument(text, {
 
 YAML 使用同一字段。`official-template.ts` 只接受精确 schema 和已知 root keys，成功时返回直接映射；未知版本不猜测。导入向导的目标作用域只允许 `book/project`；文件声明 `global` 时返回 `GLOBAL_IMPORT_REQUIRES_LIBRARY_CONFIRMATION`，提示先导入当前书或项目，再通过核心计划任务 6 的全局库流程显式提升 term/style，避免普通导入绕过跨库审计。
 
-- [ ] **步骤 5：运行 JSON/YAML 与旧 glossary 回归**
+- [x] **步骤 5：运行 JSON/YAML 与旧 glossary 回归**
 
 运行：
 
@@ -472,7 +472,7 @@ node --test --import tsx test/knowledge-import-json-yaml.test.ts test/glossary-p
 
 预期：PASS；旧 glossary 解析行为不变。
 
-- [ ] **步骤 6：Commit**
+- [x] **步骤 6：Commit**
 
 ```powershell
 git add translator-v5/src/knowledge-import/json-yaml-reader.ts translator-v5/src/knowledge-import/official-template.ts translator-v5/config/knowledge-import-template.json translator-v5/config/knowledge-import-template.yaml translator-v5/test/knowledge-import-json-yaml.test.ts translator-v5/test/fixtures/knowledge-import/terms.json translator-v5/test/fixtures/knowledge-import/terms.yaml
@@ -491,7 +491,7 @@ git commit -m "feat: inspect JSON and YAML knowledge files"
 - 创建：`translator-v5/test/knowledge-import-csv-xlsx.test.ts`
 - 创建：`translator-v5/test/fixtures/knowledge-import/terms.csv`
 
-- [ ] **步骤 1：编写编码、标题行、多工作表和公式失败测试**
+- [x] **步骤 1：编写编码、标题行、多工作表和公式失败测试**
 
 ```ts
 test("streams UTF-8 BOM CSV and preserves source row numbers", async () => {
@@ -511,7 +511,7 @@ test("lists XLSX sheets and never evaluates formulas", async () => {
 });
 ```
 
-- [ ] **步骤 2：运行测试确认失败**
+- [x] **步骤 2：运行测试确认失败**
 
 运行：
 
@@ -521,7 +521,7 @@ node --test --import tsx test/knowledge-import-csv-xlsx.test.ts
 
 预期：FAIL，CSV/XLSX 读取器不存在。
 
-- [ ] **步骤 3：实现 CSV 流式读取**
+- [x] **步骤 3：实现 CSV 流式读取**
 
 使用 `createReadStream` 和 `csv-parse`：
 
@@ -537,7 +537,7 @@ parse({
 
 编码只自动接受严格 UTF-8/UTF-8 BOM。非 UTF-8 返回 `status="encoding_required"` 和限定候选 `utf-16le/utf-16be/shift_jis/euc-jp/euc-kr/windows-949`，经用户确认后用 `new TextDecoder(encoding, { fatal: true })` 从原始字节重新严格解码；不用系统区域设置静默猜测，也不以替换字符吞掉乱码。标题行默认第一行，用户可在前 20 行中选择。
 
-- [ ] **步骤 4：实现 XLSX 只读提取**
+- [x] **步骤 4：实现 XLSX 只读提取**
 
 读取前先用现有 `yauzl` 检查 ZIP entries，累计 entry 数、声明的 uncompressed bytes 和每个 entry 的压缩比，按任务 1 的三个上限拒绝 ZIP bomb；同时拒绝 `xl/vbaProject.bin`、`xl/externalLinks/`、`xl/embeddings/`、任何 `.rels` 外部 Target 和任何路径穿越 entry。随后使用 `ExcelJS.stream.xlsx.WorkbookReader`：inspect 首次流式遍历时只为每个工作表保留前 20 个候选标题行和最多 50 条样例；stage 重新打开文件，只流式规范化用户选中的工作表，不把整本 workbook 留在内存。读取内容仅包括：
 
@@ -555,7 +555,7 @@ export async function writeOfficialXlsxTemplate(outputPath: string): Promise<voi
 
 用该受测函数创建 `config/knowledge-import-template.xlsx`，内容与 JSON/YAML/CSV 官方模板相同；测试重新读取生成文件并断言字段和值。
 
-- [ ] **步骤 5：统一表格列名**
+- [x] **步骤 5：统一表格列名**
 
 空标题生成不可映射诊断；重复标题显示为 `name [2]` 的 UI 标签，但内部使用稳定 column index，不改写原值。单元格字符串执行 NFKC 和首尾空白清理，正文内部空白不折叠。
 
@@ -577,7 +577,7 @@ export function normalizeHeaders(values: readonly unknown[]): readonly ImportCol
 }
 ```
 
-- [ ] **步骤 6：运行解析和依赖安全测试**
+- [x] **步骤 6：运行解析和依赖安全测试**
 
 运行：
 
@@ -588,7 +588,7 @@ npm audit --omit=dev
 
 预期：测试 PASS，audit 无 high/critical。
 
-- [ ] **步骤 7：Commit**
+- [x] **步骤 7：Commit**
 
 ```powershell
 git add translator-v5/src/knowledge-import/csv-reader.ts translator-v5/src/knowledge-import/xlsx-reader.ts translator-v5/src/knowledge-import/official-template.ts translator-v5/config/knowledge-import-template.csv translator-v5/config/knowledge-import-template.xlsx translator-v5/test/knowledge-import-csv-xlsx.test.ts translator-v5/test/fixtures/knowledge-import/terms.csv
