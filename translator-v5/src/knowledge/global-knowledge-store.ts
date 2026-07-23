@@ -94,7 +94,9 @@ interface EventRow {
 }
 
 interface ListCursor {
-  readonly version: 1;
+  readonly version: 2;
+  readonly libraryGeneration: number;
+  readonly filtersHash: string;
   readonly normalizedSubject: string;
   readonly objectType: GlobalKnowledgeObjectType;
   readonly recordId: string;
@@ -178,6 +180,13 @@ function requirePositiveInteger(value: unknown, label: string): number {
   return value as number;
 }
 
+function requireNonnegativeInteger(value: unknown, label: string): number {
+  if (!Number.isSafeInteger(value) || (value as number) < 0) {
+    throw new TypeError(`${label} must be a nonnegative safe integer`);
+  }
+  return value as number;
+}
+
 function requirePageSize(value: unknown): number {
   const limit = requirePositiveInteger(value, "limit");
   if (limit > MAX_PAGE_SIZE) {
@@ -233,23 +242,49 @@ function encodeCursor(value: ListCursor | AuditCursor): string {
 
 function decodeListCursor(value: string): ListCursor {
   try {
+    if (!/^[A-Za-z0-9_-]+$/u.test(value)) {
+      throw new Error("GLOBAL_KNOWLEDGE_CURSOR_INVALID");
+    }
+    const text = Buffer.from(value, "base64url").toString("utf8");
+    if (Buffer.from(text, "utf8").toString("base64url") !== value) {
+      throw new Error("GLOBAL_KNOWLEDGE_CURSOR_INVALID");
+    }
     const raw = exactObject(
-      JSON.parse(Buffer.from(value, "base64url").toString("utf8")),
-      ["version", "normalizedSubject", "objectType", "recordId", "revision"],
+      JSON.parse(text),
+      [
+        "version",
+        "libraryGeneration",
+        "filtersHash",
+        "normalizedSubject",
+        "objectType",
+        "recordId",
+        "revision",
+      ],
       "GLOBAL_KNOWLEDGE_CURSOR_INVALID",
     );
-    if (raw.version !== 1
+    if (raw.version !== 2
+      || typeof raw.filtersHash !== "string"
+      || !/^[0-9a-f]{64}$/u.test(raw.filtersHash)
       || typeof raw.normalizedSubject !== "string"
       || raw.normalizedSubject.length === 0) {
       throw new Error("GLOBAL_KNOWLEDGE_CURSOR_INVALID");
     }
-    return {
-      version: 1,
+    const cursor: ListCursor = {
+      version: 2,
+      libraryGeneration: requireNonnegativeInteger(
+        raw.libraryGeneration,
+        "cursor library generation",
+      ),
+      filtersHash: raw.filtersHash,
       normalizedSubject: raw.normalizedSubject,
       objectType: requireObjectType(raw.objectType),
       recordId: requireRecordId(raw.recordId),
       revision: requirePositiveInteger(raw.revision, "cursor revision"),
     };
+    if (canonicalJson(cursor) !== text) {
+      throw new Error("GLOBAL_KNOWLEDGE_CURSOR_INVALID");
+    }
+    return cursor;
   } catch {
     throw new Error("GLOBAL_KNOWLEDGE_CURSOR_INVALID");
   }
@@ -305,6 +340,30 @@ function generatedRecordId(document: CatalogKnowledgeDocument): string {
     }))
     .digest("hex");
   return `gk_${digest}`;
+}
+
+function normalizedGlobalSearch(value: string | undefined): string | null {
+  const normalized = value?.normalize("NFKC").trim().toLocaleLowerCase("und");
+  return normalized === undefined || normalized.length === 0
+    ? null
+    : normalized;
+}
+
+function normalizedGlobalObjectTypes(
+  value: readonly GlobalKnowledgeObjectType[] | undefined,
+): readonly GlobalKnowledgeObjectType[] {
+  return Object.freeze(
+    [...new Set((value ?? []).map(requireObjectType))].sort(),
+  );
+}
+
+function globalListFiltersHash(
+  search: string | null,
+  objectTypes: readonly GlobalKnowledgeObjectType[],
+): string {
+  return createHash("sha256")
+    .update(canonicalJson({ search, objectTypes }))
+    .digest("hex");
 }
 
 function revisionIdFor(
@@ -402,6 +461,13 @@ export class GlobalKnowledgeStore {
     try {
       this.#database.exec("PRAGMA foreign_keys = ON");
       this.#database.exec("PRAGMA busy_timeout = 5000");
+      this.#database.function(
+        "folioloom_normalize_search",
+        { deterministic: true },
+        (value) => typeof value === "string"
+          ? value.normalize("NFKC").toLocaleLowerCase("und")
+          : null,
+      );
       this.#initializeSchema();
     } catch (error) {
       this.#database.close();
@@ -503,25 +569,35 @@ export class GlobalKnowledgeStore {
   list(request: GlobalKnowledgeListRequest): GlobalKnowledgePage {
     this.#requireOpen();
     const limit = requirePageSize(request.limit);
-    const search = request.search === undefined
-      ? undefined
-      : request.search.trim();
-    if (search !== undefined && scalarLength(search) > MAX_SEARCH_SCALARS) {
+    const search = normalizedGlobalSearch(request.search);
+    if (search !== null && scalarLength(search) > MAX_SEARCH_SCALARS) {
       throw new RangeError(`search exceeds ${MAX_SEARCH_SCALARS} Unicode scalars`);
     }
-    const objectTypes = request.objectTypes === undefined
-      ? []
-      : [...new Set(request.objectTypes.map(requireObjectType))];
+    const objectTypes = normalizedGlobalObjectTypes(request.objectTypes);
+    const filtersHash = globalListFiltersHash(search, objectTypes);
+    const libraryGeneration = one<{ generation: number }>(
+      this.#database.prepare(`
+        SELECT COALESCE(MAX(rowid), 0) AS generation
+        FROM global_knowledge_revisions
+      `),
+    )?.generation ?? 0;
     const cursor = request.cursor === undefined
       ? undefined
       : decodeListCursor(request.cursor);
+    if (cursor !== undefined
+      && (
+        cursor.filtersHash !== filtersHash
+        || cursor.libraryGeneration !== libraryGeneration
+      )) {
+      throw new Error("GLOBAL_KNOWLEDGE_CURSOR_INVALID");
+    }
 
     const clauses = ["active = 1"];
     const parameters: SQLInputValue[] = [];
-    if (search !== undefined && search.length > 0) {
+    if (search !== null) {
       clauses.push(
-        "(instr(lower(normalized_subject), lower(?)) > 0 "
-        + "OR instr(lower(document_json), lower(?)) > 0)",
+        "(instr(folioloom_normalize_search(normalized_subject), ?) > 0 "
+        + "OR instr(folioloom_normalize_search(document_json), ?) > 0)",
       );
       parameters.push(search, search);
     }
@@ -574,7 +650,9 @@ export class GlobalKnowledgeStore {
     return deepFreeze({
       items,
       nextCursor: encodeCursor({
-        version: 1,
+        version: 2,
+        libraryGeneration,
+        filtersHash,
         normalizedSubject: last.normalizedSubject,
         objectType: last.objectType,
         recordId: last.recordId,

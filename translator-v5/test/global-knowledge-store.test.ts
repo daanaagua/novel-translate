@@ -241,6 +241,65 @@ test("paginates active revisions with opaque cursors and literal search", () => 
   }
 });
 
+test("binds global list cursors to normalized filters and library generation", () => {
+  const item = fixture();
+  let store: GlobalKnowledgeStore | undefined;
+  try {
+    const currentStore = new GlobalKnowledgeStore(item.path);
+    store = currentStore;
+    currentStore.promote(term("Archon", "执政官"), { expectedRevision: null });
+    currentStore.promote(term("Archoness", "女执政官"), { expectedRevision: null });
+    currentStore.promote(style("arch-dialogue", "对话简洁"), {
+      expectedRevision: null,
+    });
+
+    const first = currentStore.list({
+      search: "  ARCH  ",
+      objectTypes: ["term", "term"],
+      limit: 1,
+    });
+    assert.ok(first.nextCursor);
+    assert.doesNotThrow(() => currentStore.list({
+      search: "arch",
+      objectTypes: ["term"],
+      cursor: first.nextCursor,
+      limit: 1,
+    }));
+    assert.throws(
+      () => currentStore.list({
+        search: "dialogue",
+        objectTypes: ["term"],
+        cursor: first.nextCursor,
+        limit: 1,
+      }),
+      /GLOBAL_KNOWLEDGE_CURSOR_INVALID/u,
+    );
+    assert.throws(
+      () => currentStore.list({
+        search: "arch",
+        objectTypes: ["style"],
+        cursor: first.nextCursor,
+        limit: 1,
+      }),
+      /GLOBAL_KNOWLEDGE_CURSOR_INVALID/u,
+    );
+
+    currentStore.promote(term("Archer", "弓手"), { expectedRevision: null });
+    assert.throws(
+      () => currentStore.list({
+        search: "arch",
+        objectTypes: ["term"],
+        cursor: first.nextCursor,
+        limit: 1,
+      }),
+      /GLOBAL_KNOWLEDGE_CURSOR_INVALID/u,
+    );
+  } finally {
+    store?.close();
+    rmSync(item.directory, { recursive: true, force: true });
+  }
+});
+
 test("strips project evidence and provenance before persistence", () => {
   const item = fixture();
   try {

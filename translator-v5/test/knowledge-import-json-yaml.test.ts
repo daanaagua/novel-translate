@@ -121,6 +121,7 @@ test("recognizes only the exact official template version and root keys", async 
       policy: "policy",
       forms: "forms",
       note: "note",
+      locked: "locked",
     },
   });
   assert.deepEqual(yamlInspection.officialTemplate, jsonInspection.officialTemplate);

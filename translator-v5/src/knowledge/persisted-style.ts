@@ -17,11 +17,14 @@ export const PERSISTED_STYLE_FIELDS = [
   "typography",
   "narratorVoice",
   "additionalInstruction",
+  "narrativeDistance",
+  "dialogueRegister",
 ] as const;
 
 type PersistedStyleField = typeof PERSISTED_STYLE_FIELDS[number];
 
 const FIELD_SET = new Set<string>(PERSISTED_STYLE_FIELDS);
+const STYLE_KINDS = new Set(["style_directive", "style_profile"]);
 const STANDARD_FIELD_LIMIT = 180;
 const ADDITIONAL_INSTRUCTION_LIMIT = 600;
 
@@ -80,7 +83,9 @@ export function persistedStyleFromKnowledge(
     EffectiveKnowledgeField<string>[]
   >();
   for (const revision of revisions) {
-    if (revision.kind !== "style_directive" || revision.status !== "active") {
+    // `style_profile` was emitted by older importers. Keep reading it so an
+    // upgraded project does not silently lose an already accepted style.
+    if (!STYLE_KINDS.has(revision.kind) || revision.status !== "active") {
       continue;
     }
     const payload = record(revision.payload);

@@ -11,6 +11,7 @@ const OFFICIAL_TERM_FIELDS = Object.freeze({
   policy: "policy",
   forms: "forms",
   note: "note",
+  locked: "locked",
 });
 
 export interface OfficialTemplate {
@@ -81,7 +82,7 @@ export function identifyOfficialTemplate(
 export async function writeOfficialXlsxTemplate(outputPath: string): Promise<void> {
   const workbook = new ExcelJS.Workbook();
   const worksheet = workbook.addWorksheet("Terms");
-  worksheet.addRow(["source", "target", "policy", "forms", "note"]);
-  worksheet.addRow(["Archon", "执政官", "preferred", "archon", "职位称呼"]);
+  worksheet.addRow(["source", "target", "policy", "forms", "note", "locked"]);
+  worksheet.addRow(["Archon", "执政官", "preferred", "archon", "职位称呼", false]);
   await workbook.xlsx.writeFile(outputPath);
 }

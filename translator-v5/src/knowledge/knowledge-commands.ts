@@ -32,6 +32,8 @@ export interface CatalogKnowledgeDocument {
   readonly status: KnowledgeStatus;
   readonly authority: KnowledgeAuthority;
   readonly evidence: readonly KnowledgeEvidence[];
+  /** Immutable upstream identity when a global revision is snapshotted locally. */
+  readonly globalRevisionId?: string;
 }
 
 export interface KnowledgeCatalogExpectation {
@@ -820,6 +822,7 @@ export function validateCatalogKnowledgeDocument(
       "status",
       "authority",
       "evidence",
+      "globalRevisionId",
     ]),
     "catalog knowledge document",
   );
@@ -835,6 +838,19 @@ export function validateCatalogKnowledgeDocument(
     throw new TypeError("catalog knowledge document alternatives must not be empty");
   }
   const objectType = raw.objectType as KnowledgeObjectType;
+  const authority = normalizeKnowledgeAuthority(raw.authority);
+  const globalRevisionId = raw.globalRevisionId === undefined
+    ? undefined
+    : requireNonemptyText(
+        raw.globalRevisionId,
+        "catalog globalRevisionId",
+        MAX_IDENTIFIER_SCALARS,
+      );
+  if (globalRevisionId !== undefined && authority.scope !== "global") {
+    throw new TypeError(
+      "catalog globalRevisionId is valid only for global snapshots",
+    );
+  }
   return {
     objectType,
     normalizedSubject: requireNonemptyText(
@@ -860,8 +876,9 @@ export function validateCatalogKnowledgeDocument(
       },
     ),
     status: raw.status as KnowledgeStatus,
-    authority: normalizeKnowledgeAuthority(raw.authority),
+    authority,
     evidence: normalizeEvidence(raw.evidence),
+    ...(globalRevisionId === undefined ? {} : { globalRevisionId }),
   };
 }
 
@@ -873,6 +890,7 @@ export function catalogDocumentFromRevision(
   if (revision.authority === undefined) {
     throw new TypeError("catalog revisions require knowledge authority");
   }
+  const globalRevisionId = revision.authority.provenance?.globalRevisionId;
   return {
     objectType,
     normalizedSubject: revision.normalizedSubject,
@@ -884,5 +902,6 @@ export function catalogDocumentFromRevision(
     status: revision.status,
     authority: normalizeKnowledgeAuthority(revision.authority),
     evidence: normalizeEvidence(evidence),
+    ...(globalRevisionId === undefined ? {} : { globalRevisionId }),
   };
 }

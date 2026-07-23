@@ -20,7 +20,7 @@ import {
   type TranslationBatchWindowResult,
 } from "../agents/translation-batch.js";
 import type { TranslationRequestInput } from "../agents/translation-request.js";
-import { entityLinkAsTerms, type EntityLink } from "../domain/entity-links.js";
+import type { EntityLink } from "../domain/entity-links.js";
 import type { StableTerm, V4Block } from "../domain/types.js";
 import {
   relevantGlossaryTerms,
@@ -39,6 +39,7 @@ import {
   mergeStyleState,
   persistedStyleFromKnowledge,
 } from "../knowledge/persisted-style.js";
+import { stableTermsFromKnowledge } from "../knowledge/stable-terms-from-knowledge.js";
 import { createKnowledgeSnapshot } from "../knowledge/snapshot.js";
 import { SourceLedger } from "../source/source-ledger.js";
 import type { LosslessBlock } from "../source/types.js";
@@ -209,13 +210,32 @@ function runtimeMetadata(metadata: unknown): unknown | undefined {
   return (metadata as Record<string, unknown>).translationRuntime;
 }
 
+function joinedStyleInstruction(
+  primary: string | undefined,
+  qualifierLabel: string,
+  qualifier: string | undefined,
+): string | undefined {
+  const normalizedQualifier = qualifier?.trim();
+  const values = [
+    normalizedQualifier === undefined || normalizedQualifier.length === 0
+      ? undefined
+      : `${qualifierLabel}：${normalizedQualifier}`,
+    primary?.trim(),
+  ].filter((value): value is string => value !== undefined && value.length > 0);
+  return values.length === 0 ? undefined : values.join("；");
+}
+
 function losslessStyleConstitution(style: StyleState | undefined): BookStyleConstitution {
   return createBookStyleConstitution({
     register: style?.register,
     sentencePolicy: style?.sentencePolicy,
     explicitation: style?.explicitation,
     imagery: style?.imagery,
-    dialogue: style?.dialogue,
+    dialogue: joinedStyleInstruction(
+      style?.dialogue,
+      "对话语域",
+      style?.dialogueRegister,
+    ),
     technicalProse: style?.technicalProse,
     typography: style?.typography ?? style?.dialogueQuotes,
     additionalInstruction: style?.additionalInstruction,
@@ -226,7 +246,11 @@ function losslessVoiceProfiles(style: StyleState | undefined): VoiceProfile[] {
   return [{
     voiceId: "narrator",
     scope: "main_narrator",
-    instruction: style?.narratorVoice ?? "保持作品主叙述者既定视角、距离和信息显隐",
+    instruction: joinedStyleInstruction(
+      style?.narratorVoice,
+      "叙事距离",
+      style?.narrativeDistance,
+    ) ?? "保持作品主叙述者既定视角、距离和信息显隐",
     confidence: 1,
   }];
 }
@@ -788,62 +812,6 @@ function windowSourceText(
 ): string {
   return window.blockIds.map((blockId) => blockById.get(blockId)?.sourceText ?? "")
     .join("\n\n");
-}
-
-function termsFromKnowledge(
-  revisions: readonly unknown[],
-): StableTerm[] {
-  const terms: StableTerm[] = [];
-  for (const raw of revisions) {
-    if (raw === null || typeof raw !== "object" || Array.isArray(raw)) {
-      continue;
-    }
-    const revision = raw as Partial<KnowledgeRevision>;
-    if (revision.status !== "active") {
-      continue;
-    }
-    if (revision.kind === "lexical_anchor"
-      && revision.payload !== null
-      && typeof revision.payload === "object"
-      && !Array.isArray(revision.payload)) {
-      const term = revision.payload as Partial<StableTerm>;
-      if (typeof term.sourceForm === "string"
-        && typeof term.canonicalSource === "string"
-        && typeof term.target === "string"
-        && typeof term.locked === "boolean") {
-        const stableTerm: StableTerm = {
-          conceptId: typeof term.conceptId === "string"
-            ? term.conceptId
-            : `user-${revision.normalizedSubject ?? term.canonicalSource}`,
-          lexemeId: typeof term.lexemeId === "string"
-            ? term.lexemeId
-            : `user-${revision.revisionId ?? revision.normalizedSubject ?? term.sourceForm}`,
-          sourceForm: term.sourceForm,
-          canonicalSource: term.canonicalSource,
-          target: term.target,
-          locked: term.locked,
-          ...(term.policy === undefined ? {} : { policy: term.policy }),
-          ...(term.note === undefined ? {} : { note: term.note }),
-          origin: term.origin ?? "knowledge",
-        };
-        const modelAuthored = revision.authority === undefined
-          || revision.authority.origin === "model";
-        terms.push(modelAuthored
-          ? softenModelAnchorTerm(stableTerm)
-          : stableTerm);
-      }
-    }
-    if (revision.kind === "entity_alias_link"
-      && revision.payload !== null
-      && typeof revision.payload === "object"
-      && !Array.isArray(revision.payload)) {
-      terms.push(...entityLinkAsTerms(revision.payload as EntityLink).map((term) => ({
-        ...term,
-        origin: term.origin ?? "knowledge",
-      })));
-    }
-  }
-  return terms;
 }
 
 function decidedAnchorFormsFromKnowledge(revisions: readonly unknown[]): string[] {
@@ -1728,7 +1696,7 @@ async function runLosslessBook(
           origin: term.origin ?? "legacy" as const,
         })),
         ...(options.glossary?.stableTerms ?? []),
-        ...termsFromKnowledge(snapshot.revisions),
+        ...stableTermsFromKnowledge(snapshot.revisions),
       ], context);
       const selectedSourceBlocks = sourceBlocksForWindows(selected, blockById);
       const selectedBlocks = selectedSourceBlocks.map(losslessAsV4);

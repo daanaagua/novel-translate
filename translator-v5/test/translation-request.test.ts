@@ -286,6 +286,122 @@ test("manual narrative memory is projected only when its source form is present"
   ).revisions.length, 0);
 });
 
+test("positioned narrative memory follows its block range instead of leaking by subject text", () => {
+  const profile = getSourceLanguageProfile("en");
+  const allBlocks = Array.from({ length: 6 }, (_, index) =>
+    block(`block-${index}`, index, index === 5
+      ? "Piaton stood outside the remembered interval."
+      : `Source paragraph ${index}.`));
+  const positionedMemory = {
+    revisionId: "r-positioned-memory",
+    revision: 1,
+    normalizedSubject: "Piaton",
+    kind: "narrative_memory",
+    payload: {
+      summary: "Piaton controls the shared body's heartbeat.",
+      startBlockId: "block-2",
+      endBlockId: "block-4",
+    },
+    alternatives: [],
+    status: "active" as const,
+    candidateIds: [],
+    sourceWindowIds: [],
+  };
+  const requestFor = (index: number): PhysicalRequestPlan => ({
+    requestId: `request-position-${index}`,
+    sourceTokens: 10,
+    windows: [{
+      windowId: `window-position-${index}`,
+      ordinal: index,
+      chapterId: "chapter-0",
+      chapterTitle: null,
+      blockIds: [`block-${index}`],
+      globalIndexes: [index],
+      sourceTokens: 10,
+      sourceChars: allBlocks[index]!.sourceText.length,
+      oversized: false,
+    }],
+  });
+
+  const inside = prepareTranslationRequest({
+    ...fixture(),
+    blocks: allBlocks,
+    request: requestFor(3),
+    stableTerms: [],
+    snapshot: { id: "snapshot-positioned", revisions: [positionedMemory] },
+    sourceLanguageProfile: profile,
+  });
+  const insideProjection = inside.sections.find(
+    (section) => section.kind === "memory",
+  )?.jsonPayload as {
+    revisions: readonly { revisionId: string; scope: string }[];
+  };
+  assert.deepEqual(insideProjection.revisions, [{
+    revisionId: "r-positioned-memory",
+    revision: 1,
+    normalizedSubject: "Piaton",
+    kind: "narrative_memory",
+    status: "active",
+    scope: "position_matched",
+    appliesToWindowIds: ["window-position-3"],
+    payload: positionedMemory.payload,
+    alternatives: [],
+  }]);
+
+  const outside = prepareTranslationRequest({
+    ...fixture(),
+    blocks: allBlocks,
+    request: requestFor(5),
+    stableTerms: [],
+    snapshot: { id: "snapshot-positioned", revisions: [positionedMemory] },
+    sourceLanguageProfile: profile,
+  });
+  const outsideProjection = outside.sections.find(
+    (section) => section.kind === "memory",
+  )?.jsonPayload as { revisions: readonly unknown[] };
+  assert.equal(outsideProjection.revisions.length, 0);
+  assert.doesNotMatch(outside.prompt, /controls the shared body's heartbeat/u);
+
+  const revalidationOutside = prepareTranslationRequest({
+    ...fixture(),
+    blocks: allBlocks,
+    request: requestFor(5),
+    stableTerms: [],
+    snapshot: {
+      id: "snapshot-positioned-revalidation",
+      revisions: [{ ...positionedMemory, status: "needs_revalidate" }],
+    },
+    sourceLanguageProfile: profile,
+  });
+  const revalidationProjection = revalidationOutside.sections.find(
+    (section) => section.kind === "memory",
+  )?.jsonPayload as { revisions: readonly unknown[] };
+  assert.equal(revalidationProjection.revisions.length, 0);
+
+  const mixedRequest: PhysicalRequestPlan = {
+    requestId: "request-position-mixed",
+    sourceTokens: 20,
+    windows: [requestFor(3).windows[0]!, requestFor(5).windows[0]!],
+  };
+  const mixed = prepareTranslationRequest({
+    ...fixture(),
+    blocks: allBlocks,
+    request: mixedRequest,
+    stableTerms: [],
+    snapshot: { id: "snapshot-positioned", revisions: [positionedMemory] },
+    sourceLanguageProfile: profile,
+  });
+  const mixedProjection = mixed.sections.find(
+    (section) => section.kind === "memory",
+  )?.jsonPayload as {
+    revisions: readonly { appliesToWindowIds?: readonly string[] }[];
+  };
+  assert.deepEqual(
+    mixedProjection.revisions[0]?.appliesToWindowIds,
+    ["window-position-3"],
+  );
+});
+
 test("user style cannot replace the fixed translation protocol", () => {
   const base = fixture();
   const normal = prepareTranslationRequest(base);

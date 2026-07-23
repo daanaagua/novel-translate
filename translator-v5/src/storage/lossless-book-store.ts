@@ -14,6 +14,29 @@ import type { CommitPromotion } from "../fullbook/commit-coordinator.js";
 import type { AdaptiveSchedulerSnapshot } from "../fullbook/adaptive-scheduler.js";
 import type { BookWindowPlan, BookWindowStatus } from "../fullbook/types.js";
 import {
+  classifyImport,
+  type ExistingImportKnowledge,
+  type ImportClassification,
+} from "../knowledge-import/conflict-classifier.js";
+import type {
+  PreparedImportRecord,
+} from "../knowledge-import/knowledge-import-service.js";
+import type {
+  CommittedImportReport,
+  DiscardStagedImportRequest,
+  ImportConflictDecision,
+  ImportCountSummary,
+  ImportDecisionRequest,
+  ImportPreviewRow,
+  ImportSelection,
+  KnowledgeImportFormat,
+  RolledBackImportReport,
+  StageImportRequest,
+  StagedImportPageRequest,
+  StagedImportReport,
+  StagedImportSummary,
+} from "../knowledge-import/types.js";
+import {
   getSourceLanguageProfile,
   supportedSourceLanguageIds,
 } from "../language/profiles.js";
@@ -32,6 +55,7 @@ import {
   requireMatchingKnowledgeReplay,
   validateCatalogKnowledgeDocument,
   validateCommitKnowledgeCommandsRequest,
+  validateKnowledgeCommand,
   validateKnowledgeEvidence,
   validateKnowledgePayload,
   type CatalogKnowledgeDocument,
@@ -47,6 +71,7 @@ import {
 import {
   compareAuthority,
   normalizeKnowledgeAuthority,
+  type JsonValue,
   type KnowledgeAuthority,
   type KnowledgeEvidence,
   type KnowledgeOrigin,
@@ -57,10 +82,13 @@ import {
   type KnowledgeSnapshot,
 } from "../knowledge/snapshot.js";
 import {
+  knowledgeRevisionMatchesSearch,
   type KnowledgeImpactView,
+  type KnowledgeRecordPageQuery,
   type KnowledgeQueryRecord,
   type KnowledgeQuerySource,
 } from "../knowledge/knowledge-query.js";
+import { matchKnowledgeImpacts } from "../knowledge/knowledge-impact-matcher.js";
 import { sourceFormsFromRevision } from "../knowledge/knowledge-source-forms.js";
 import { blockId } from "../source/block-builder.js";
 import { LEGACY_TOKEN_ESTIMATOR_VERSION } from "../source/token-estimator.js";
@@ -204,10 +232,42 @@ export type FaultCheckpoint =
   | "before_promote"
   | "before_commit"
   | "knowledge_command_before_commit"
+  | "knowledge_import_stage_before_commit"
+  | "knowledge_import_before_commit"
+  | "knowledge_import_rollback_before_commit"
   | "schema_v3_before_commit";
 
 export interface FaultInjector {
   checkpoint(name: FaultCheckpoint): void;
+}
+
+export interface PersistKnowledgeImportStageInput {
+  readonly runId: string;
+  readonly batchId: string;
+  readonly sourceHash: string;
+  readonly sourceName: string;
+  readonly sourceFormat: KnowledgeImportFormat;
+  readonly mappingJson: string;
+  readonly mappingHash: string;
+  readonly request: StageImportRequest;
+  readonly records: readonly PreparedImportRecord[];
+}
+
+export interface CommitStoredKnowledgeImportInput {
+  readonly runId: string;
+  readonly batchId: string;
+  readonly expectedGeneration: number;
+  readonly expectedSnapshotId: string;
+  readonly signal: AbortSignal;
+}
+
+export interface AttachGlobalKnowledgeSnapshotInput {
+  readonly requestId: string;
+  readonly runId: string;
+  readonly expectedGeneration: number;
+  readonly expectedSnapshotId: string;
+  readonly globalRevisionId: string;
+  readonly document: CatalogKnowledgeDocument;
 }
 
 export interface PersistedLosslessWindow extends BookWindowPlan {
@@ -459,6 +519,35 @@ interface KnowledgeStateRow {
   applied_project_generation: number;
 }
 
+interface StoredKnowledgeSummaryRow {
+  run_id: string;
+  record_id: string;
+  revision_id: string;
+  revision: number;
+  normalized_subject: string;
+  kind: string;
+  payload_json: string;
+  status: string;
+  active: number;
+  origin: string;
+  scope: string;
+  owned_fields_json: string;
+}
+
+interface StoredKnowledgeRevisionRow extends StoredKnowledgeSummaryRow {
+  evidence_json: string;
+  import_batch_id: string | null;
+}
+
+interface KnowledgePageRow extends StoredKnowledgeSummaryRow {
+  object_type: string;
+  catalog_object_type: string | null;
+  scope_revision: number | null;
+  scope_revision_scope: string | null;
+  provenance_catalog: string | null;
+  provenance_revision_id: string | null;
+}
+
 interface CatalogKnowledgeRow {
   source_version: string | null;
   record_id: string;
@@ -482,6 +571,39 @@ interface AppliedKnowledgeCommand {
   readonly revision: KnowledgeRevision;
   readonly bookChanged: boolean;
   readonly projectChanged: boolean;
+}
+
+interface KnowledgeImportBatchRow {
+  run_id: string;
+  batch_id: string;
+  source_hash: string;
+  source_name: string;
+  source_format: KnowledgeImportFormat;
+  mapping_json: string;
+  mapping_hash: string;
+  status: "staged" | "committed" | "rolled_back" | "discarded" | "failed";
+  report_json: string;
+  created_at: string;
+}
+
+interface KnowledgeImportRow {
+  run_id: string;
+  batch_id: string;
+  row_ordinal: number;
+  state: ImportPreviewRow["state"] | "committed";
+  normalized_json: string;
+  diagnostics_json: string;
+  decision_json: string | null;
+}
+
+interface StoredNormalizedImportRow {
+  readonly state: ImportPreviewRow["state"];
+  readonly prepared: PreparedImportRecord;
+  readonly classification: Pick<
+    ImportClassification,
+    "allowedDecisions" | "conflictSignature"
+  >;
+  readonly displayFields: Readonly<Record<string, JsonValue>>;
 }
 
 interface WindowRow {
@@ -607,44 +729,193 @@ function knowledgeObjectType(
   return "term";
 }
 
-function identifierCharacter(value: string | undefined): boolean {
-  return value !== undefined && /[\p{L}\p{N}]/u.test(value);
-}
-
-function normalizedSourceContainsForm(
-  source: string,
-  form: string,
-  profile: SourceLanguageProfile,
-): boolean {
-  let start = source.indexOf(form);
-  const cjk = profile.scripts.some((script) =>
-    script === "kana" || script === "hangul" || script === "han");
-  while (start >= 0) {
-    const before = source.at(start - 1);
-    const after = source.at(start + form.length);
-    if (cjk || (!identifierCharacter(before) && !identifierCharacter(after))) {
-      return true;
-    }
-    start = source.indexOf(form, start + form.length);
+function parsedKnowledgeRevision(value: unknown): KnowledgeRevision {
+  if (typeof value !== "string") {
+    throw new TypeError("stored knowledge revision JSON must be text");
   }
-  return false;
+  const parsed = JSON.parse(value) as unknown;
+  if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
+    throw new TypeError("stored knowledge revision JSON must be an object");
+  }
+  return parsed as KnowledgeRevision;
 }
 
-function sourceMatchesExplicitForms(
-  sourceText: string,
-  forms: readonly string[],
-  profile: SourceLanguageProfile,
-): boolean {
-  const normalizedSource = profile.normalizeSourceForm(sourceText);
-  const sourceTokens = new Set(profile.segment(sourceText)
-    .filter((token) => token.isWordLike)
-    .map((token) => token.normalized));
-  return forms.some((raw) => {
-    const form = profile.normalizeSourceForm(raw);
-    return scalarLength(form) >= 2
-      && (sourceTokens.has(form)
-        || normalizedSourceContainsForm(normalizedSource, form, profile));
+function sqliteKnowledgeObjectType(value: unknown): string {
+  return knowledgeObjectType(parsedKnowledgeRevision(value));
+}
+
+function sqliteKnowledgeMatches(
+  value: unknown,
+  objectType: unknown,
+  search: unknown,
+): number {
+  if (typeof objectType !== "string" || typeof search !== "string") {
+    return 0;
+  }
+  return knowledgeRevisionMatchesSearch(
+    parsedKnowledgeRevision(value),
+    objectType as KnowledgeObjectType,
+    search,
+  ) ? 1 : 0;
+}
+
+function importCursor(batchId: string, ordinal: number): string {
+  return Buffer.from(canonicalJson({
+    schema: "folioloom-knowledge-import-cursor-1",
+    batchId,
+    ordinal,
+  }), "utf8").toString("base64url");
+}
+
+function parseImportCursor(
+  cursor: string | undefined,
+  batchId: string,
+): number {
+  if (cursor === undefined) return -1;
+  try {
+    const raw = JSON.parse(
+      Buffer.from(cursor, "base64url").toString("utf8"),
+    ) as Record<string, unknown>;
+    if (raw.schema !== "folioloom-knowledge-import-cursor-1"
+      || raw.batchId !== batchId
+      || !Number.isSafeInteger(raw.ordinal)
+      || (raw.ordinal as number) < 0
+      || importCursor(batchId, raw.ordinal as number) !== cursor) {
+      throw new Error("cursor identity mismatch");
+    }
+    return raw.ordinal as number;
+  } catch (error) {
+    throw new Error("KNOWLEDGE_IMPORT_CURSOR_INVALID", { cause: error });
+  }
+}
+
+function emptyImportCounts(): ImportCountSummary {
+  return { ready: 0, merge: 0, conflict: 0, invalid: 0, skipped: 0 };
+}
+
+function parseImportDecision(value: string | null): ImportConflictDecision | undefined {
+  if (value === null) return undefined;
+  const raw = JSON.parse(value) as unknown;
+  if (raw === null || typeof raw !== "object" || Array.isArray(raw)) {
+    throw new Error("corrupt knowledge import decision");
+  }
+  const decision = raw as Record<string, unknown>;
+  if (decision.action === "keep_existing"
+    || decision.action === "use_imported"
+    || decision.action === "merge_as_alias"
+    || decision.action === "skip") {
+    if (Object.keys(decision).length !== 1) {
+      throw new Error("corrupt knowledge import decision");
+    }
+    return { action: decision.action };
+  }
+  if (decision.action === "create_separate"
+    && Object.keys(decision).length === 2
+    && typeof decision.normalizedSubject === "string"
+    && decision.normalizedSubject.trim().length > 0) {
+    return {
+      action: "create_separate",
+      normalizedSubject: decision.normalizedSubject.normalize("NFKC").trim(),
+    };
+  }
+  throw new Error("corrupt knowledge import decision");
+}
+
+function parseStoredImportRow(row: KnowledgeImportRow): StoredNormalizedImportRow {
+  const parsed = JSON.parse(row.normalized_json) as StoredNormalizedImportRow;
+  if (parsed === null || typeof parsed !== "object"
+    || parsed.prepared === undefined
+    || parsed.classification === undefined
+    || parsed.displayFields === undefined
+    || parsed.state === undefined) {
+    throw new Error(`corrupt knowledge import row ${row.batch_id}/${row.row_ordinal}`);
+  }
+  if (parsed.prepared.state === "normalized"
+    && parsed.prepared.record.ordinal !== row.row_ordinal) {
+    throw new Error(`corrupt knowledge import row ${row.batch_id}/${row.row_ordinal}`);
+  }
+  if (parsed.prepared.state === "invalid"
+    && parsed.prepared.ordinal !== row.row_ordinal) {
+    throw new Error(`corrupt knowledge import row ${row.batch_id}/${row.row_ordinal}`);
+  }
+  return parsed;
+}
+
+function importPreviewFromRow(row: KnowledgeImportRow): ImportPreviewRow {
+  const stored = parseStoredImportRow(row);
+  const decision = parseImportDecision(row.decision_json);
+  const effectiveState = decision?.action === "skip"
+    || decision?.action === "keep_existing"
+    ? "skipped"
+    : stored.state;
+  const diagnostics = JSON.parse(row.diagnostics_json) as ImportPreviewRow["diagnostics"];
+  if (!Array.isArray(diagnostics)) {
+    throw new Error(`corrupt knowledge import diagnostics ${row.batch_id}/${row.row_ordinal}`);
+  }
+  return Object.freeze({
+    ordinal: row.row_ordinal,
+    location: stored.prepared.state === "normalized"
+      ? stored.prepared.record.location
+      : stored.prepared.location,
+    state: effectiveState,
+    displayFields: Object.freeze({ ...stored.displayFields }),
+    diagnostics: Object.freeze([...diagnostics]),
+    allowedDecisions: Object.freeze([
+      ...stored.classification.allowedDecisions,
+    ]),
   });
+}
+
+function importCounts(rows: readonly KnowledgeImportRow[]): {
+  readonly counts: ImportCountSummary;
+  readonly unresolved: number;
+} {
+  const counts = emptyImportCounts();
+  const mutableCounts = counts as {
+    -readonly [Key in keyof ImportCountSummary]: number;
+  };
+  let unresolved = 0;
+  for (const row of rows) {
+    const stored = parseStoredImportRow(row);
+    const decision = parseImportDecision(row.decision_json);
+    const state = decision?.action === "skip"
+      || decision?.action === "keep_existing"
+      ? "skipped"
+      : stored.state;
+    mutableCounts[state] += 1;
+    if ((stored.state === "conflict" || stored.state === "invalid")
+      && decision === undefined) {
+      unresolved += 1;
+    }
+  }
+  return { counts, unresolved };
+}
+
+function importIdentityKey(normalizedSubject: string, kind: string): string {
+  return `${normalizedSubject.normalize("NFKC").trim().toLocaleLowerCase("und")}`
+    + `\0${kind.normalize("NFKC").trim().toLocaleLowerCase("und")}`;
+}
+
+function parseCommittedImportReport(value: string): CommittedImportReport {
+  const report = JSON.parse(value) as CommittedImportReport;
+  if (report === null || typeof report !== "object"
+    || typeof report.batchId !== "string"
+    || !Number.isSafeInteger(report.generation)
+    || typeof report.snapshotId !== "string") {
+    throw new Error("corrupt committed knowledge import report");
+  }
+  return Object.freeze({ ...report });
+}
+
+function parseRolledBackImportReport(value: string): RolledBackImportReport {
+  const report = JSON.parse(value) as RolledBackImportReport;
+  if (report === null || typeof report !== "object"
+    || typeof report.batchId !== "string"
+    || !Number.isSafeInteger(report.generation)
+    || typeof report.snapshotId !== "string") {
+    throw new Error("corrupt rolled-back knowledge import report");
+  }
+  return Object.freeze({ ...report });
 }
 
 function shortSourceExcerpt(
@@ -751,6 +1022,16 @@ export class LosslessBookStore {
     );
     try {
       this.#database.exec("PRAGMA foreign_keys=ON");
+      this.#database.function(
+        "folioloom_knowledge_object_type",
+        { deterministic: true },
+        sqliteKnowledgeObjectType,
+      );
+      this.#database.function(
+        "folioloom_knowledge_matches",
+        { deterministic: true },
+        sqliteKnowledgeMatches,
+      );
       const userVersion = one<{ user_version: number }>(
         this.#database.prepare("PRAGMA user_version"),
       )?.user_version ?? 0;
@@ -1972,6 +2253,8 @@ export class LosslessBookStore {
 
       const domain = new KnowledgeStore(this.knowledgeRevisions(runId));
       const desired = this.#catalogSeedRevisions(runId, run.source_version);
+      const desiredKeys = new Set(desired.map((revision) =>
+        knowledgeKey(revision.normalizedSubject, revision.kind)));
       for (const catalogRevision of desired) {
         const current = domain.latestRevision(
           catalogRevision.normalizedSubject,
@@ -2004,6 +2287,33 @@ export class LosslessBookStore {
           undefined,
         );
         this.#insertKnowledgeImpactsForRevision(run, appended);
+      }
+      for (const current of domain.projectableRevisions()) {
+        if (current.authority?.provenance === undefined
+          || desiredKeys.has(knowledgeKey(
+            current.normalizedSubject,
+            current.kind,
+          ))) {
+          continue;
+        }
+        const superseded = domain.appendRevision({
+          normalizedSubject: current.normalizedSubject,
+          kind: current.kind,
+          payload: current.payload,
+          alternatives: current.alternatives,
+          status: "superseded",
+          candidateIds: current.candidateIds,
+          sourceWindowIds: current.sourceWindowIds,
+          authority: current.authority,
+        });
+        this.#insertRunKnowledgeRevision(
+          runId,
+          superseded,
+          null,
+          this.#catalogEvidenceForRevision(superseded),
+          undefined,
+        );
+        this.#insertKnowledgeImpactsForRevision(run, superseded);
       }
 
       const parentSnapshot = this.latestKnowledgeSnapshot(runId);
@@ -2065,75 +2375,940 @@ export class LosslessBookStore {
   knowledgeQuerySource(runId: string): KnowledgeQuerySource {
     const run = this.#run(runId);
     const state = this.knowledgeState(runId);
-    const revisions = this.knowledgeRevisions(runId);
-    const historyByRecord = new Map<string, KnowledgeRevision[]>();
-    for (const revision of revisions) {
-      const recordId = knowledgeRecordId(
-        revision.normalizedSubject,
-        revision.kind,
+    const generation = this.#knowledgeQueryGeneration(run, state);
+    let legacyRecords: readonly KnowledgeQueryRecord[] | undefined;
+    const requireCurrentGeneration = (): void => {
+      const currentRun = this.#run(runId);
+      const current = this.#knowledgeQueryGeneration(
+        currentRun,
+        this.knowledgeState(runId),
       );
-      const history = historyByRecord.get(recordId) ?? [];
-      history.push(revision);
-      historyByRecord.set(recordId, history);
-    }
-    const activeRows = all<{
-      record_id: string;
-      revision_id: string;
-      evidence_json: string;
-    }>(this.#database.prepare(`
-      SELECT record_id, revision_id, evidence_json
-      FROM knowledge_records
-      WHERE run_id=? AND active=1
-      ORDER BY normalized_subject, kind, record_id
-    `), runId);
-    const revisionById = new Map(revisions.map((revision) => [
-      revision.revisionId,
-      revision,
-    ]));
-    const records = activeRows.map((row): KnowledgeQueryRecord => {
-      const revision = revisionById.get(row.revision_id);
-      if (revision === undefined
-        || row.record_id !== knowledgeRecordId(
-          revision.normalizedSubject,
-          revision.kind,
-        )) {
-        throw new Error(`corrupt active knowledge query row ${row.revision_id}`);
+      if (current !== generation) {
+        throw new Error("KNOWLEDGE_QUERY_SOURCE_STALE");
       }
-      const catalog = this.#catalogMetadataForRevision(run, revision);
-      return Object.freeze({
-        id: row.record_id,
-        objectType: catalog?.objectType ?? knowledgeObjectType(revision),
-        revision,
-        scopeRevision: catalog?.scopeRevision ?? null,
-        evidence: Object.freeze(this.#resolvedKnowledgeEvidence(
-          run,
-          revision,
-          JSON.parse(row.evidence_json) as unknown,
-        )),
-        history: Object.freeze([
-          ...(historyByRecord.get(row.record_id) ?? []),
-        ]),
-        impacts: Object.freeze(this.#knowledgeImpacts(
-          run,
-          revision,
-        )),
-      });
-    });
-    const stableRecords = Object.freeze(records);
-    const byId = new Map(stableRecords.map((record) => [record.id, record]));
-    const generation = hashText(canonicalJson({
-      schema: "folioloom-knowledge-query-generation-1",
-      runId,
-      sourceVersion: run.source_version,
-      generation: state.generation,
-      snapshotId: state.snapshotId,
-      bookGeneration: state.appliedBookGeneration,
-      projectGeneration: state.appliedProjectGeneration,
-    }));
+    };
     return Object.freeze({
       generation,
-      listKnowledgeRecords: () => stableRecords,
-      knowledgeRecord: (id: string) => byId.get(id),
+      listKnowledgeRecords: () => {
+        requireCurrentGeneration();
+        if (legacyRecords === undefined) {
+          const summaries: KnowledgeQueryRecord[] = [];
+          let after: KnowledgeRecordPageQuery["after"];
+          while (true) {
+            const page = this.#queryKnowledgeRecordsPage(run, {
+              search: null,
+              objectTypes: [],
+              statuses: [],
+              origins: [],
+              scopes: [],
+              ...(after === undefined ? {} : { after }),
+              limit: 201,
+            });
+            const visible = page.slice(0, 200);
+            for (const summary of visible) {
+              const detail = this.#knowledgeQueryRecord(run, summary.id);
+              if (detail !== undefined) summaries.push(detail);
+            }
+            if (page.length <= 200 || visible.length === 0) break;
+            const last = visible.at(-1)!;
+            after = {
+              normalizedSubject: last.revision.normalizedSubject,
+              kind: last.revision.kind,
+              id: last.id,
+            };
+          }
+          legacyRecords = Object.freeze(summaries);
+        }
+        return legacyRecords;
+      },
+      queryKnowledgeRecords: (query: KnowledgeRecordPageQuery) => {
+        requireCurrentGeneration();
+        return this.#queryKnowledgeRecordsPage(run, query);
+      },
+      knowledgeRecord: (id: string) => {
+        requireCurrentGeneration();
+        return this.#knowledgeQueryRecord(run, id);
+      },
+    });
+  }
+
+  stageKnowledgeImport(
+    input: PersistKnowledgeImportStageInput,
+  ): StagedImportReport {
+    if (this.#schemaVersion !== LOSSLESS_BOOK_SCHEMA_VERSION) {
+      throw new Error("schema v3 write upgrade required");
+    }
+    requireNonempty(input.runId, "runId");
+    requireNonempty(input.batchId, "batchId");
+    requireNonempty(input.sourceName, "sourceName");
+    if (input.sourceName.includes("/") || input.sourceName.includes("\\")) {
+      throw new Error("KNOWLEDGE_IMPORT_SOURCE_NAME_INVALID");
+    }
+    if (!/^[0-9a-f]{64}$/u.test(input.sourceHash)
+      || !/^[0-9a-f]{64}$/u.test(input.mappingHash)) {
+      throw new Error("KNOWLEDGE_IMPORT_IDENTITY_INVALID");
+    }
+    const parsedMapping = JSON.parse(input.mappingJson) as unknown;
+    if (canonicalJson(parsedMapping) !== input.mappingJson) {
+      throw new Error("KNOWLEDGE_IMPORT_MAPPING_NOT_CANONICAL");
+    }
+    return this.#transaction(() => {
+      const duplicateByBatch = this.#knowledgeImportBatch(
+        input.runId,
+        input.batchId,
+      );
+      const duplicateByIdentity = one<KnowledgeImportBatchRow>(
+        this.#database.prepare(`
+          SELECT * FROM knowledge_import_batches
+          WHERE run_id=? AND source_hash=? AND mapping_hash=?
+        `),
+        input.runId,
+        input.sourceHash,
+        input.mappingHash,
+      );
+      const existing = duplicateByBatch ?? duplicateByIdentity;
+      if (existing !== undefined) {
+        if (existing.source_hash !== input.sourceHash
+          || existing.source_format !== input.sourceFormat
+          || existing.mapping_hash !== input.mappingHash
+          || existing.mapping_json !== input.mappingJson) {
+          throw new Error("KNOWLEDGE_IMPORT_IDENTITY_CONFLICT");
+        }
+        return this.#stagedImportReport(input.runId, existing.batch_id, {
+          limit: 100,
+        });
+      }
+
+      const run = this.#run(input.runId);
+      const state = this.knowledgeState(input.runId);
+      if (state.generation !== input.request.expectedGeneration
+        || state.snapshotId !== input.request.expectedSnapshotId) {
+        throw new Error(
+          "KNOWLEDGE_GENERATION_CONFLICT: knowledge state changed; inspect again",
+        );
+      }
+      const active = new KnowledgeStore(this.knowledgeRevisions(input.runId))
+        .projectableRevisions();
+      const simulated = new Map<string, ExistingImportKnowledge>();
+      for (const revision of active) {
+        const key = importIdentityKey(
+          revision.normalizedSubject,
+          revision.kind,
+        );
+        const candidate: ExistingImportKnowledge = {
+          id: knowledgeRecordId(
+            revision.normalizedSubject,
+            revision.kind,
+          ),
+          objectType: knowledgeObjectType(revision),
+          normalizedSubject: revision.normalizedSubject,
+          kind: revision.kind,
+          payload: validateKnowledgePayload(
+            knowledgeObjectType(revision),
+            revision.payload,
+          ),
+        };
+        const previous = simulated.get(key);
+        if (previous !== undefined
+          && canonicalJson(previous) !== canonicalJson(candidate)) {
+          throw new Error(`KNOWLEDGE_AUTHORITY_CONFLICT: ${key}`);
+        }
+        simulated.set(key, candidate);
+      }
+
+      const stored: {
+        readonly ordinal: number;
+        readonly state: ImportPreviewRow["state"];
+        readonly normalizedJson: string;
+        readonly diagnosticsJson: string;
+      }[] = [];
+      const ordinals = new Set<number>();
+      for (const prepared of input.records) {
+        const ordinal = prepared.state === "normalized"
+          ? prepared.record.ordinal
+          : prepared.ordinal;
+        if (!Number.isSafeInteger(ordinal) || ordinal < 0
+          || ordinals.has(ordinal)) {
+          throw new Error("KNOWLEDGE_IMPORT_ROW_ORDINAL_INVALID");
+        }
+        ordinals.add(ordinal);
+        if (prepared.state === "invalid") {
+          const persisted: StoredNormalizedImportRow = {
+            state: "invalid",
+            prepared,
+            classification: {
+              allowedDecisions: Object.freeze(["skip"]),
+            },
+            displayFields: Object.freeze({}),
+          };
+          stored.push({
+            ordinal,
+            state: "invalid",
+            normalizedJson: canonicalJson(persisted),
+            diagnosticsJson: canonicalJson(prepared.diagnostics),
+          });
+          continue;
+        }
+        const record = prepared.record;
+        const key = importIdentityKey(
+          record.command.normalizedSubject,
+          record.command.kind,
+        );
+        const current = simulated.get(key);
+        const classification = classifyImport(current, record);
+        const persisted: StoredNormalizedImportRow = {
+          state: classification.state,
+          prepared,
+          classification: {
+            allowedDecisions: classification.allowedDecisions,
+            ...(classification.conflictSignature === undefined
+              ? {}
+              : { conflictSignature: classification.conflictSignature }),
+          },
+          displayFields: Object.freeze({ ...record.command.fieldPatch }),
+        };
+        stored.push({
+          ordinal,
+          state: classification.state,
+          normalizedJson: canonicalJson(persisted),
+          diagnosticsJson: canonicalJson(classification.diagnostics),
+        });
+        if (classification.state === "ready"
+          || classification.state === "merge") {
+          simulated.set(key, {
+            id: current?.id ?? knowledgeRecordId(
+              record.command.normalizedSubject,
+              record.command.kind,
+            ),
+            objectType: record.command.objectType,
+            normalizedSubject: record.command.normalizedSubject,
+            kind: record.command.kind,
+            payload: validateKnowledgePayload(
+              record.command.objectType,
+              applyKnowledgeFieldPatch(
+                current?.payload,
+                record.command.fieldPatch,
+              ),
+            ),
+          });
+        }
+      }
+      stored.sort((left, right) => left.ordinal - right.ordinal);
+      const insertBatch = this.#database.prepare(`
+        INSERT INTO knowledge_import_batches(
+          run_id, batch_id, source_hash, source_name, source_format,
+          mapping_json, mapping_hash, status, report_json
+        ) VALUES(?, ?, ?, ?, ?, ?, ?, 'staged', '{}')
+      `);
+      insertBatch.run(
+        input.runId,
+        input.batchId,
+        input.sourceHash,
+        input.sourceName,
+        input.sourceFormat,
+        input.mappingJson,
+        input.mappingHash,
+      );
+      const insertRow = this.#database.prepare(`
+        INSERT INTO knowledge_import_rows(
+          run_id, batch_id, row_ordinal, state, normalized_json,
+          diagnostics_json, decision_json
+        ) VALUES(?, ?, ?, ?, ?, ?, NULL)
+      `);
+      for (const row of stored) {
+        insertRow.run(
+          input.runId,
+          input.batchId,
+          row.ordinal,
+          row.state,
+          row.normalizedJson,
+          row.diagnosticsJson,
+        );
+      }
+      const rows = this.#knowledgeImportRows(input.runId, input.batchId);
+      const summary = importCounts(rows);
+      this.#database.prepare(`
+        UPDATE knowledge_import_batches SET report_json=?
+        WHERE run_id=? AND batch_id=? AND status='staged'
+      `).run(
+        canonicalJson({
+          batchId: input.batchId,
+          counts: summary.counts,
+          unresolved: summary.unresolved,
+        }),
+        input.runId,
+        input.batchId,
+      );
+      this.#appendEvent(input.runId, "knowledge_import_staged", {
+        batchId: input.batchId,
+        sourceHash: input.sourceHash,
+        mappingHash: input.mappingHash,
+        counts: summary.counts,
+        unresolved: summary.unresolved,
+      });
+      this.#faultInjector?.checkpoint("knowledge_import_stage_before_commit");
+      return this.#stagedImportReport(input.runId, input.batchId, {
+        limit: 100,
+      });
+    });
+  }
+
+  listStagedKnowledgeImports(
+    runId: string,
+  ): readonly StagedImportSummary[] {
+    this.#run(runId);
+    const batches = all<KnowledgeImportBatchRow>(this.#database.prepare(`
+      SELECT * FROM knowledge_import_batches
+      WHERE run_id=? AND status='staged'
+      ORDER BY created_at, batch_id
+    `), runId);
+    return Object.freeze(batches.map((batch) => {
+      const summary = importCounts(
+        this.#knowledgeImportRows(runId, batch.batch_id),
+      );
+      return Object.freeze({
+        batchId: batch.batch_id,
+        sourceName: batch.source_name,
+        sourceFormat: batch.source_format,
+        counts: summary.counts,
+        unresolved: summary.unresolved,
+        createdAt: batch.created_at,
+      });
+    }));
+  }
+
+  getStagedKnowledgeImport(
+    runId: string,
+    input: StagedImportPageRequest,
+  ): StagedImportReport {
+    return this.#stagedImportReport(runId, input.batchId, {
+      cursor: input.cursor,
+      limit: input.limit,
+    });
+  }
+
+  setKnowledgeImportDecisions(
+    runId: string,
+    input: ImportDecisionRequest,
+  ): StagedImportReport {
+    return this.#transaction(() => {
+      const batch = this.#requireKnowledgeImportBatch(runId, input.batchId);
+      if (batch.status !== "staged") {
+        throw new Error("KNOWLEDGE_IMPORT_BATCH_NOT_STAGED");
+      }
+      const seen = new Set<number>();
+      for (const item of input.decisions) {
+        if (!Number.isSafeInteger(item.rowOrdinal) || item.rowOrdinal < 0
+          || seen.has(item.rowOrdinal)) {
+          throw new Error("KNOWLEDGE_IMPORT_DECISION_ROW_INVALID");
+        }
+        seen.add(item.rowOrdinal);
+        const row = one<KnowledgeImportRow>(this.#database.prepare(`
+          SELECT * FROM knowledge_import_rows
+          WHERE run_id=? AND batch_id=? AND row_ordinal=?
+        `), runId, input.batchId, item.rowOrdinal);
+        if (row === undefined) {
+          throw new Error("KNOWLEDGE_IMPORT_DECISION_ROW_UNKNOWN");
+        }
+        const stored = parseStoredImportRow(row);
+        const decision = parseImportDecision(canonicalJson(item.decision));
+        if (decision === undefined
+          || !stored.classification.allowedDecisions.includes(decision.action)) {
+          throw new Error("KNOWLEDGE_IMPORT_DECISION_NOT_ALLOWED");
+        }
+        if (decision.action === "create_separate") {
+          if (stored.prepared.state !== "normalized"
+            || importIdentityKey(
+              decision.normalizedSubject,
+              stored.prepared.record.command.kind,
+            ) === importIdentityKey(
+              stored.prepared.record.command.normalizedSubject,
+              stored.prepared.record.command.kind,
+            )) {
+            throw new Error("KNOWLEDGE_IMPORT_SEPARATE_SUBJECT_INVALID");
+          }
+          const current = new KnowledgeStore(this.knowledgeRevisions(runId))
+            .activeKnowledge(
+              decision.normalizedSubject,
+              stored.prepared.record.command.kind,
+            );
+          if (current !== undefined) {
+            throw new Error("KNOWLEDGE_IMPORT_SEPARATE_SUBJECT_EXISTS");
+          }
+        }
+        this.#database.prepare(`
+          UPDATE knowledge_import_rows SET decision_json=?
+          WHERE run_id=? AND batch_id=? AND row_ordinal=?
+        `).run(
+          canonicalJson(decision),
+          runId,
+          input.batchId,
+          item.rowOrdinal,
+        );
+      }
+      const rows = this.#knowledgeImportRows(runId, input.batchId);
+      const summary = importCounts(rows);
+      this.#database.prepare(`
+        UPDATE knowledge_import_batches SET report_json=?
+        WHERE run_id=? AND batch_id=? AND status='staged'
+      `).run(
+        canonicalJson({
+          batchId: input.batchId,
+          counts: summary.counts,
+          unresolved: summary.unresolved,
+        }),
+        runId,
+        input.batchId,
+      );
+      return this.#stagedImportReport(runId, input.batchId, { limit: 100 });
+    });
+  }
+
+  discardStagedKnowledgeImport(
+    runId: string,
+    input: DiscardStagedImportRequest,
+  ): void {
+    this.#transaction(() => {
+      const batch = this.#requireKnowledgeImportBatch(runId, input.batchId);
+      if (batch.status !== "staged") {
+        throw new Error("KNOWLEDGE_IMPORT_BATCH_NOT_STAGED");
+      }
+      const rows = this.#knowledgeImportRows(runId, input.batchId);
+      const summary = importCounts(rows);
+      this.#database.prepare(`
+        UPDATE knowledge_import_batches
+        SET status='discarded', report_json=?
+        WHERE run_id=? AND batch_id=? AND status='staged'
+      `).run(
+        canonicalJson({
+          batchId: input.batchId,
+          counts: summary.counts,
+          unresolved: summary.unresolved,
+          discarded: rows.length,
+        }),
+        runId,
+        input.batchId,
+      );
+      this.#database.prepare(`
+        DELETE FROM knowledge_import_rows WHERE run_id=? AND batch_id=?
+      `).run(runId, input.batchId);
+      this.#appendEvent(runId, "knowledge_import_discarded", {
+        batchId: input.batchId,
+        rows: rows.length,
+      });
+    });
+  }
+
+  commitKnowledgeImport(
+    input: CommitStoredKnowledgeImportInput,
+  ): CommittedImportReport {
+    if (input.signal.aborted) {
+      throw new Error("KNOWLEDGE_IMPORT_CANCELLED");
+    }
+    return this.#transaction(() => {
+      const batch = this.#requireKnowledgeImportBatch(input.runId, input.batchId);
+      if (batch.status === "committed") {
+        return parseCommittedImportReport(batch.report_json);
+      }
+      if (batch.status !== "staged") {
+        throw new Error("KNOWLEDGE_IMPORT_BATCH_NOT_STAGED");
+      }
+      const run = this.#run(input.runId);
+      const state = this.knowledgeState(input.runId);
+      if (state.generation !== input.expectedGeneration
+        || state.snapshotId !== input.expectedSnapshotId) {
+        throw new Error(
+          "KNOWLEDGE_GENERATION_CONFLICT: knowledge state changed; reload before committing",
+        );
+      }
+      const currentBookGeneration = one<{ generation: number }>(
+        this.#database.prepare(`
+          SELECT generation FROM book_knowledge_state WHERE source_version=?
+        `),
+        run.source_version,
+      )?.generation;
+      const currentProjectGeneration = one<{ generation: number }>(
+        this.#database.prepare(`
+          SELECT generation FROM project_knowledge_state WHERE singleton=1
+        `),
+      )?.generation;
+      if (currentBookGeneration !== state.appliedBookGeneration
+        || currentProjectGeneration !== state.appliedProjectGeneration) {
+        throw new Error(
+          "KNOWLEDGE_SCOPE_GENERATION_CONFLICT: synchronize current knowledge first",
+        );
+      }
+      const busy = one<{ count: number }>(this.#database.prepare(`
+        SELECT COUNT(*) AS count FROM window_plans
+        WHERE run_id=? AND status IN ('running', 'staged')
+      `), input.runId)?.count ?? 0;
+      if (busy > 0) {
+        throw new Error(
+          "KNOWLEDGE_EDIT_BUSY: wait for the active translation window to finish",
+        );
+      }
+
+      const rows = this.#knowledgeImportRows(input.runId, input.batchId);
+      const summary = importCounts(rows);
+      if (summary.unresolved > 0) {
+        throw new Error("KNOWLEDGE_IMPORT_CONFLICTS_UNRESOLVED");
+      }
+      const domain = new KnowledgeStore(this.knowledgeRevisions(input.runId));
+      let bookChanged = false;
+      let projectChanged = false;
+      let added = 0;
+      let updated = 0;
+      let merged = 0;
+      let skipped = 0;
+      let invalid = 0;
+      let committed = 0;
+      const revisionIds: string[] = [];
+      const impactRevisions: KnowledgeRevision[] = [];
+      for (const row of rows) {
+        if (input.signal.aborted) {
+          throw new Error("KNOWLEDGE_IMPORT_CANCELLED");
+        }
+        const stored = parseStoredImportRow(row);
+        const decision = parseImportDecision(row.decision_json);
+        if (stored.state === "invalid") {
+          invalid += 1;
+          if (decision?.action !== "skip") {
+            throw new Error("KNOWLEDGE_IMPORT_INVALID_ROW_UNRESOLVED");
+          }
+          skipped += 1;
+          this.#database.prepare(`
+            UPDATE knowledge_import_rows SET state='skipped'
+            WHERE run_id=? AND batch_id=? AND row_ordinal=?
+          `).run(input.runId, input.batchId, row.row_ordinal);
+          continue;
+        }
+        if (stored.prepared.state !== "normalized") {
+          throw new Error("corrupt normalized knowledge import row");
+        }
+        if (decision?.action === "skip"
+          || decision?.action === "keep_existing") {
+          skipped += 1;
+          this.#database.prepare(`
+            UPDATE knowledge_import_rows SET state='skipped'
+            WHERE run_id=? AND batch_id=? AND row_ordinal=?
+          `).run(input.runId, input.batchId, row.row_ordinal);
+          continue;
+        }
+        let rawCommand: UpdateKnowledgeCommand = stored.prepared.record.command;
+        if (decision?.action === "create_separate") {
+          rawCommand = {
+            ...rawCommand,
+            normalizedSubject: decision.normalizedSubject,
+          };
+        } else if (decision?.action === "merge_as_alias") {
+          rawCommand = this.#importAliasMergeCommand(domain, rawCommand);
+        }
+        const current = domain.latestRevision(
+          rawCommand.normalizedSubject,
+          rawCommand.kind,
+        );
+        const catalog = this.#activeCatalogEntries(
+          run,
+          rawCommand.normalizedSubject,
+          rawCommand.kind,
+        ).find((entry) =>
+          entry.document.authority.scope === rawCommand.scope);
+        const command = validateKnowledgeCommand({
+          ...rawCommand,
+          expectedRevision: current?.revision ?? null,
+          expectedScopeRevision: catalog === undefined
+            ? null
+            : {
+                scope: catalog.document.authority.scope,
+                revision: catalog.row.revision,
+              },
+          origin: "import",
+          importBatchId: input.batchId,
+        });
+        if (command.type !== "upsert") {
+          throw new Error("knowledge import produced a non-upsert command");
+        }
+        const applied = this.#applyKnowledgeCommand(run, domain, command);
+        revisionIds.push(applied.revision.revisionId);
+        impactRevisions.push(applied.revision);
+        bookChanged ||= applied.bookChanged;
+        projectChanged ||= applied.projectChanged;
+        committed += 1;
+        if (decision?.action === "merge_as_alias"
+          || stored.state === "merge") {
+          merged += 1;
+        } else if (current === undefined) {
+          added += 1;
+        } else {
+          updated += 1;
+        }
+        this.#database.prepare(`
+          UPDATE knowledge_import_rows SET state='committed'
+          WHERE run_id=? AND batch_id=? AND row_ordinal=?
+        `).run(input.runId, input.batchId, row.row_ordinal);
+      }
+      this.#insertKnowledgeImpactsForRevisions(run, impactRevisions);
+
+      const parentSnapshot = this.latestKnowledgeSnapshot(input.runId);
+      const snapshot = createKnowledgeSnapshot(
+        input.runId,
+        domain.projectableRevisions(),
+        parentSnapshot.id,
+      );
+      this.#database.prepare(`
+        INSERT INTO knowledge_snapshots(
+          run_id, snapshot_id, parent_snapshot_id, producing_window_id,
+          content_hash, payload_json
+        ) VALUES(?, ?, ?, NULL, ?, ?)
+      `).run(
+        input.runId,
+        snapshot.id,
+        parentSnapshot.id,
+        snapshot.contentHash,
+        jsonText(snapshot, "knowledge import snapshot"),
+      );
+      let bookGeneration = state.appliedBookGeneration;
+      if (bookChanged) {
+        this.#database.prepare(`
+          UPDATE book_knowledge_state
+          SET generation=generation+1, updated_at=datetime('now')
+          WHERE source_version=?
+        `).run(run.source_version);
+        bookGeneration = one<{ generation: number }>(this.#database.prepare(`
+          SELECT generation FROM book_knowledge_state WHERE source_version=?
+        `), run.source_version)?.generation ?? -1;
+      }
+      let projectGeneration = state.appliedProjectGeneration;
+      if (projectChanged) {
+        this.#database.prepare(`
+          UPDATE project_knowledge_state
+          SET generation=generation+1, updated_at=datetime('now')
+          WHERE singleton=1
+        `).run();
+        projectGeneration = one<{ generation: number }>(this.#database.prepare(`
+          SELECT generation FROM project_knowledge_state WHERE singleton=1
+        `))?.generation ?? -1;
+      }
+      const generation = state.generation + 1;
+      const changed = this.#database.prepare(`
+        UPDATE knowledge_state
+        SET generation=?, applied_book_generation=?,
+            applied_project_generation=?, updated_at=datetime('now')
+        WHERE run_id=? AND generation=?
+      `).run(
+        generation,
+        bookGeneration,
+        projectGeneration,
+        input.runId,
+        state.generation,
+      );
+      if (Number(changed.changes) !== 1) {
+        throw new Error("KNOWLEDGE_GENERATION_CONFLICT");
+      }
+      const report: CommittedImportReport = Object.freeze({
+        batchId: input.batchId,
+        added,
+        updated,
+        merged,
+        skipped,
+        invalid,
+        committed,
+        generation,
+        snapshotId: snapshot.id,
+      });
+      this.#database.prepare(`
+        UPDATE knowledge_import_batches
+        SET status='committed', report_json=?
+        WHERE run_id=? AND batch_id=? AND status='staged'
+      `).run(canonicalJson(report), input.runId, input.batchId);
+      this.#appendEvent(input.runId, "knowledge_import_committed", {
+        ...report,
+        revisionIds,
+      });
+      this.#faultInjector?.checkpoint("knowledge_import_before_commit");
+      return report;
+    });
+  }
+
+  rollbackKnowledgeImport(
+    input: CommitStoredKnowledgeImportInput,
+  ): RolledBackImportReport {
+    if (input.signal.aborted) {
+      throw new Error("KNOWLEDGE_IMPORT_CANCELLED");
+    }
+    return this.#transaction(() => {
+      const batch = this.#requireKnowledgeImportBatch(input.runId, input.batchId);
+      if (batch.status === "rolled_back") {
+        return parseRolledBackImportReport(batch.report_json);
+      }
+      if (batch.status !== "committed") {
+        throw new Error("KNOWLEDGE_IMPORT_BATCH_NOT_COMMITTED");
+      }
+      const run = this.#run(input.runId);
+      const state = this.knowledgeState(input.runId);
+      if (state.generation !== input.expectedGeneration
+        || state.snapshotId !== input.expectedSnapshotId) {
+        throw new Error(
+          "KNOWLEDGE_GENERATION_CONFLICT: knowledge state changed; reload before rollback",
+        );
+      }
+      const currentBookGeneration = one<{ generation: number }>(
+        this.#database.prepare(`
+          SELECT generation FROM book_knowledge_state WHERE source_version=?
+        `),
+        run.source_version,
+      )?.generation;
+      const currentProjectGeneration = one<{ generation: number }>(
+        this.#database.prepare(`
+          SELECT generation FROM project_knowledge_state WHERE singleton=1
+        `),
+      )?.generation;
+      if (currentBookGeneration !== state.appliedBookGeneration
+        || currentProjectGeneration !== state.appliedProjectGeneration) {
+        throw new Error(
+          "KNOWLEDGE_SCOPE_GENERATION_CONFLICT: synchronize current knowledge first",
+        );
+      }
+      const busy = one<{ count: number }>(this.#database.prepare(`
+        SELECT COUNT(*) AS count FROM window_plans
+        WHERE run_id=? AND status IN ('running', 'staged')
+      `), input.runId)?.count ?? 0;
+      if (busy > 0) {
+        throw new Error(
+          "KNOWLEDGE_EDIT_BUSY: wait for the active translation window to finish",
+        );
+      }
+      const importedRows = all<{
+        revision_id: string;
+        payload_json: string;
+      }>(this.#database.prepare(`
+        SELECT revision_id, payload_json FROM knowledge_records
+        WHERE run_id=? AND import_batch_id=?
+        ORDER BY normalized_subject, kind, revision
+      `), input.runId, input.batchId);
+      const batchCatalogIds = new Set(importedRows.map((row) => {
+        const revision = JSON.parse(row.payload_json) as KnowledgeRevision;
+        return revision.authority?.provenance?.catalogRevisionId;
+      }).filter((item): item is string => typeof item === "string"));
+      const activeImported = importedRows.map((row) =>
+        JSON.parse(row.payload_json) as KnowledgeRevision).filter((revision) => {
+        const latest = one<{ active: number }>(this.#database.prepare(`
+          SELECT active FROM knowledge_records
+          WHERE run_id=? AND revision_id=?
+        `), input.runId, revision.revisionId);
+        return latest?.active === 1;
+      });
+      const domain = new KnowledgeStore(this.knowledgeRevisions(input.runId));
+      let bookChanged = false;
+      let projectChanged = false;
+      const impactRevisions: KnowledgeRevision[] = [];
+      for (const imported of activeImported) {
+        if (input.signal.aborted) {
+          throw new Error("KNOWLEDGE_IMPORT_CANCELLED");
+        }
+        const provenance = imported.authority?.provenance;
+        if (provenance === undefined) {
+          throw new Error("KNOWLEDGE_IMPORT_ROLLBACK_PROVENANCE_MISSING");
+        }
+        const catalogRow = provenance.catalog === "project"
+          ? one<CatalogKnowledgeRow>(this.#database.prepare(`
+              SELECT NULL AS source_version, record_id, revision, revision_id,
+                     object_type, normalized_subject, kind, document_json,
+                     origin, scope, active
+              FROM project_knowledge_revisions WHERE revision_id=?
+            `), provenance.catalogRevisionId)
+          : one<CatalogKnowledgeRow>(this.#database.prepare(`
+              SELECT source_version, record_id, revision, revision_id,
+                     object_type, normalized_subject, kind, document_json,
+                     origin, scope, active
+              FROM book_knowledge_revisions WHERE revision_id=?
+            `), provenance.catalogRevisionId);
+        if (catalogRow === undefined || catalogRow.active !== 1) {
+          throw new Error("KNOWLEDGE_IMPORT_ROLLBACK_CATALOG_CHANGED");
+        }
+        const catalog = this.#catalogEntryFromRow(catalogRow);
+        const previousRows = catalog.document.authority.scope === "project"
+          ? all<CatalogKnowledgeRow>(this.#database.prepare(`
+              SELECT NULL AS source_version, record_id, revision, revision_id,
+                     object_type, normalized_subject, kind, document_json,
+                     origin, scope, active
+              FROM project_knowledge_revisions
+              WHERE record_id=? AND revision<?
+              ORDER BY revision DESC
+            `), catalogRow.record_id, catalogRow.revision)
+          : all<CatalogKnowledgeRow>(this.#database.prepare(`
+              SELECT source_version, record_id, revision, revision_id,
+                     object_type, normalized_subject, kind, document_json,
+                     origin, scope, active
+              FROM book_knowledge_revisions
+              WHERE source_version=? AND record_id=? AND revision<?
+              ORDER BY revision DESC
+            `), run.source_version, catalogRow.record_id, catalogRow.revision);
+        const previous = previousRows
+          .filter((row) => !batchCatalogIds.has(row.revision_id))
+          .map((row) => this.#catalogEntryFromRow(row))
+          .find((entry) => PROJECTABLE_KNOWLEDGE_STATUSES.has(
+            entry.document.status,
+          ));
+        if (previous === undefined) {
+          this.#appendCatalogRevision(
+            run,
+            {
+              ...catalog.document,
+              status: "superseded",
+              authority: normalizeKnowledgeAuthority({
+                origin: "rollback",
+                scope: catalog.document.authority.scope,
+                ownedFields: catalog.document.authority.ownedFields,
+              }),
+            },
+            false,
+          );
+        } else {
+          this.#appendCatalogRevision(
+            run,
+            {
+              ...previous.document,
+              status: "active",
+              authority: normalizeKnowledgeAuthority({
+                origin: "rollback",
+                scope: previous.document.authority.scope,
+                ownedFields: previous.document.authority.ownedFields,
+              }),
+            },
+            true,
+          );
+        }
+        bookChanged ||= catalog.document.authority.scope !== "project";
+        projectChanged ||= catalog.document.authority.scope === "project";
+
+        const desired = this.#effectiveCatalogEntry(
+          run,
+          imported.normalizedSubject,
+          imported.kind,
+        );
+        if (desired === undefined) {
+          const superseded = domain.appendRevision({
+            normalizedSubject: imported.normalizedSubject,
+            kind: imported.kind,
+            payload: imported.payload,
+            alternatives: imported.alternatives,
+            status: "superseded",
+            candidateIds: imported.candidateIds,
+            sourceWindowIds: imported.sourceWindowIds,
+            authority: normalizeKnowledgeAuthority({
+              origin: "rollback",
+              scope: imported.authority?.scope ?? "book",
+              ownedFields: imported.authority?.ownedFields ?? [],
+            }),
+          });
+          this.#insertRunKnowledgeRevision(
+            input.runId,
+            superseded,
+            null,
+            [],
+            undefined,
+          );
+          impactRevisions.push(superseded);
+        } else {
+          const scope = desired.document.authority.scope;
+          const restored = domain.appendRevision({
+            normalizedSubject: desired.document.normalizedSubject,
+            kind: desired.document.kind,
+            payload: desired.document.payload,
+            alternatives: desired.document.alternatives,
+            status: desired.document.status,
+            candidateIds: imported.candidateIds,
+            sourceWindowIds: imported.sourceWindowIds,
+            authority: normalizeKnowledgeAuthority({
+              ...desired.document.authority,
+              provenance: {
+                catalog: scope === "project" ? "project" : "book",
+                catalogRevisionId: desired.row.revision_id,
+              },
+            }),
+          });
+          this.#insertRunKnowledgeRevision(
+            input.runId,
+            restored,
+            null,
+            desired.document.evidence,
+            undefined,
+          );
+          impactRevisions.push(restored);
+        }
+      }
+      this.#insertKnowledgeImpactsForRevisions(run, impactRevisions);
+      const parentSnapshot = this.latestKnowledgeSnapshot(input.runId);
+      const snapshot = createKnowledgeSnapshot(
+        input.runId,
+        domain.projectableRevisions(),
+        parentSnapshot.id,
+      );
+      this.#database.prepare(`
+        INSERT INTO knowledge_snapshots(
+          run_id, snapshot_id, parent_snapshot_id, producing_window_id,
+          content_hash, payload_json
+        ) VALUES(?, ?, ?, NULL, ?, ?)
+      `).run(
+        input.runId,
+        snapshot.id,
+        parentSnapshot.id,
+        snapshot.contentHash,
+        jsonText(snapshot, "knowledge import rollback snapshot"),
+      );
+      let bookGeneration = state.appliedBookGeneration;
+      if (bookChanged) {
+        this.#database.prepare(`
+          UPDATE book_knowledge_state
+          SET generation=generation+1, updated_at=datetime('now')
+          WHERE source_version=?
+        `).run(run.source_version);
+        bookGeneration = one<{ generation: number }>(this.#database.prepare(`
+          SELECT generation FROM book_knowledge_state WHERE source_version=?
+        `), run.source_version)?.generation ?? -1;
+      }
+      let projectGeneration = state.appliedProjectGeneration;
+      if (projectChanged) {
+        this.#database.prepare(`
+          UPDATE project_knowledge_state
+          SET generation=generation+1, updated_at=datetime('now')
+          WHERE singleton=1
+        `).run();
+        projectGeneration = one<{ generation: number }>(this.#database.prepare(`
+          SELECT generation FROM project_knowledge_state WHERE singleton=1
+        `))?.generation ?? -1;
+      }
+      const generation = state.generation + 1;
+      const changed = this.#database.prepare(`
+        UPDATE knowledge_state
+        SET generation=?, applied_book_generation=?,
+            applied_project_generation=?, updated_at=datetime('now')
+        WHERE run_id=? AND generation=?
+      `).run(
+        generation,
+        bookGeneration,
+        projectGeneration,
+        input.runId,
+        state.generation,
+      );
+      if (Number(changed.changes) !== 1) {
+        throw new Error("KNOWLEDGE_GENERATION_CONFLICT");
+      }
+      const report: RolledBackImportReport = Object.freeze({
+        batchId: input.batchId,
+        rolledBack: activeImported.length,
+        generation,
+        snapshotId: snapshot.id,
+      });
+      this.#database.prepare(`
+        UPDATE knowledge_import_batches
+        SET status='rolled_back', report_json=?
+        WHERE run_id=? AND batch_id=? AND status='committed'
+      `).run(canonicalJson(report), input.runId, input.batchId);
+      this.#appendEvent(input.runId, "knowledge_import_rolled_back", report);
+      this.#faultInjector?.checkpoint("knowledge_import_rollback_before_commit");
+      return report;
     });
   }
 
@@ -2282,6 +3457,228 @@ export class LosslessBookStore {
         result,
       };
       this.#appendEvent(request.runId, "knowledge_user_commit", event);
+      this.#faultInjector?.checkpoint("knowledge_command_before_commit");
+      return result;
+    });
+  }
+
+  attachGlobalKnowledgeSnapshot(
+    input: AttachGlobalKnowledgeSnapshotInput,
+  ): KnowledgeCommitResult {
+    if (this.#schemaVersion !== LOSSLESS_BOOK_SCHEMA_VERSION) {
+      throw new Error("schema v3 write upgrade required");
+    }
+    const requestId = requireNonempty(input.requestId, "requestId");
+    const runId = requireNonempty(input.runId, "runId");
+    const expectedSnapshotId = requireNonempty(
+      input.expectedSnapshotId,
+      "expectedSnapshotId",
+    );
+    if (!Number.isSafeInteger(input.expectedGeneration)
+      || input.expectedGeneration < 0) {
+      throw new TypeError("expectedGeneration must be a non-negative safe integer");
+    }
+    if (!/^[0-9a-f]{64}$/u.test(input.globalRevisionId)) {
+      throw new TypeError("globalRevisionId must be a revision hash");
+    }
+    const sourceDocument = validateCatalogKnowledgeDocument(input.document);
+    if ((sourceDocument.objectType !== "term"
+        && sourceDocument.objectType !== "style")
+      || sourceDocument.authority.scope !== "global") {
+      throw new Error("GLOBAL_SCOPE_FORBIDDEN");
+    }
+    if (sourceDocument.globalRevisionId !== undefined
+      && sourceDocument.globalRevisionId !== input.globalRevisionId) {
+      throw new Error("GLOBAL_KNOWLEDGE_REVISION_MISMATCH");
+    }
+    const document = validateCatalogKnowledgeDocument({
+      ...sourceDocument,
+      authority: {
+        origin: "import",
+        scope: "global",
+        ownedFields: sourceDocument.authority.ownedFields,
+      },
+      globalRevisionId: input.globalRevisionId,
+      evidence: [],
+    });
+    const requestHash = hashText(canonicalJson({
+      requestId,
+      runId,
+      expectedGeneration: input.expectedGeneration,
+      expectedSnapshotId,
+      globalRevisionId: input.globalRevisionId,
+      document,
+    }));
+
+    return this.#transaction(() => {
+      const replayRows = all<{ payload_json: string }>(this.#database.prepare(`
+        SELECT payload_json FROM events
+        WHERE run_id=? AND kind='knowledge_global_attached'
+          AND json_extract(payload_json, '$.requestId')=?
+        ORDER BY sequence
+      `), runId, requestId);
+      if (replayRows.length > 0) {
+        const payloads = replayRows.map((row) =>
+          JSON.parse(row.payload_json) as {
+            requestId: string;
+            requestHash: string;
+            result: KnowledgeCommitResult;
+          });
+        const first = payloads[0]!;
+        if (first.requestHash !== requestHash
+          || payloads.some((payload) =>
+            canonicalJson(payload) !== canonicalJson(first))) {
+          throw new Error("KNOWLEDGE_REQUEST_REUSE_CONFLICT");
+        }
+        return structuredClone(first.result);
+      }
+
+      const run = this.#run(runId);
+      const state = this.knowledgeState(runId);
+      const domain = new KnowledgeStore(this.knowledgeRevisions(runId));
+      const current = domain.latestRevision(
+        document.normalizedSubject,
+        document.kind,
+      );
+      if (current?.authority?.scope === "global"
+        && current.authority.provenance?.globalRevisionId
+          === input.globalRevisionId
+        && canonicalJson(current.payload) === canonicalJson(document.payload)) {
+        const result: KnowledgeCommitResult = {
+          requestId,
+          generation: state.generation,
+          snapshotId: state.snapshotId,
+          revisionIds: [current.revisionId],
+          bookGeneration: state.appliedBookGeneration,
+          projectGeneration: state.appliedProjectGeneration,
+        };
+        this.#appendEvent(runId, "knowledge_global_attached", {
+          requestId,
+          requestHash,
+          result,
+        });
+        return result;
+      }
+      if (current !== undefined) {
+        throw new Error(
+          "GLOBAL_KNOWLEDGE_SHADOWED: a stronger local value already exists",
+        );
+      }
+      if (state.generation !== input.expectedGeneration
+        || state.snapshotId !== expectedSnapshotId) {
+        throw new Error(
+          "KNOWLEDGE_GENERATION_CONFLICT: knowledge state changed; reload before saving",
+        );
+      }
+      const bookGeneration = one<{ generation: number }>(
+        this.#database.prepare(`
+          SELECT generation FROM book_knowledge_state WHERE source_version=?
+        `),
+        run.source_version,
+      )?.generation;
+      const projectGeneration = one<{ generation: number }>(
+        this.#database.prepare(`
+          SELECT generation FROM project_knowledge_state WHERE singleton=1
+        `),
+      )?.generation;
+      if (bookGeneration === undefined || projectGeneration === undefined
+        || bookGeneration !== state.appliedBookGeneration
+        || projectGeneration !== state.appliedProjectGeneration) {
+        throw new Error(
+          "KNOWLEDGE_SCOPE_GENERATION_CONFLICT: synchronize current knowledge before attaching",
+        );
+      }
+      const busy = one<{ count: number }>(this.#database.prepare(`
+        SELECT COUNT(*) AS count FROM window_plans
+        WHERE run_id=? AND status IN ('running', 'staged')
+      `), runId)?.count ?? 0;
+      if (busy > 0) {
+        throw new Error(
+          "KNOWLEDGE_EDIT_BUSY: wait for the active translation window to finish",
+        );
+      }
+
+      const catalog = this.#appendCatalogRevision(run, document, true, true);
+      const revision = domain.appendRevision({
+        normalizedSubject: document.normalizedSubject,
+        kind: document.kind,
+        payload: document.payload,
+        alternatives: document.alternatives,
+        status: document.status,
+        authority: normalizeKnowledgeAuthority({
+          ...document.authority,
+          provenance: {
+            catalog: "book",
+            catalogRevisionId: catalog.revision_id,
+            globalRevisionId: input.globalRevisionId,
+          },
+        }),
+      });
+      this.#insertRunKnowledgeRevision(
+        runId,
+        revision,
+        null,
+        document.evidence,
+        `global:${input.globalRevisionId}`,
+      );
+      this.#insertKnowledgeImpactsForRevision(run, revision);
+
+      const parentSnapshot = this.latestKnowledgeSnapshot(runId);
+      const snapshot = createKnowledgeSnapshot(
+        runId,
+        domain.projectableRevisions(),
+        parentSnapshot.id,
+      );
+      this.#database.prepare(`
+        INSERT INTO knowledge_snapshots(
+          run_id, snapshot_id, parent_snapshot_id, producing_window_id,
+          content_hash, payload_json
+        ) VALUES(?, ?, ?, NULL, ?, ?)
+      `).run(
+        runId,
+        snapshot.id,
+        parentSnapshot.id,
+        snapshot.contentHash,
+        jsonText(snapshot, "global knowledge attachment snapshot"),
+      );
+      const bookState = this.#database.prepare(`
+        UPDATE book_knowledge_state
+        SET generation=generation+1, updated_at=datetime('now')
+        WHERE source_version=? AND generation=?
+      `).run(run.source_version, bookGeneration);
+      if (Number(bookState.changes) !== 1) {
+        throw new Error("KNOWLEDGE_SCOPE_GENERATION_CONFLICT");
+      }
+      const nextBookGeneration = bookGeneration + 1;
+      const generation = state.generation + 1;
+      const updated = this.#database.prepare(`
+        UPDATE knowledge_state
+        SET generation=?, applied_book_generation=?,
+            applied_project_generation=?, updated_at=datetime('now')
+        WHERE run_id=? AND generation=?
+      `).run(
+        generation,
+        nextBookGeneration,
+        projectGeneration,
+        runId,
+        state.generation,
+      );
+      if (Number(updated.changes) !== 1) {
+        throw new Error("KNOWLEDGE_GENERATION_CONFLICT");
+      }
+      const result: KnowledgeCommitResult = {
+        requestId,
+        generation,
+        snapshotId: snapshot.id,
+        revisionIds: [revision.revisionId],
+        bookGeneration: nextBookGeneration,
+        projectGeneration,
+      };
+      this.#appendEvent(runId, "knowledge_global_attached", {
+        requestId,
+        requestHash,
+        result,
+      });
       this.#faultInjector?.checkpoint("knowledge_command_before_commit");
       return result;
     });
@@ -3255,6 +4652,69 @@ export class LosslessBookStore {
     return new Map(rows.map((row) => [row.block_id, row]));
   }
 
+  #knowledgeImportBatch(
+    runId: string,
+    batchId: string,
+  ): KnowledgeImportBatchRow | undefined {
+    return one<KnowledgeImportBatchRow>(this.#database.prepare(`
+      SELECT * FROM knowledge_import_batches WHERE run_id=? AND batch_id=?
+    `), runId, batchId);
+  }
+
+  #requireKnowledgeImportBatch(
+    runId: string,
+    batchId: string,
+  ): KnowledgeImportBatchRow {
+    this.#run(runId);
+    const batch = this.#knowledgeImportBatch(runId, batchId);
+    if (batch === undefined) {
+      throw new Error("KNOWLEDGE_IMPORT_BATCH_UNKNOWN");
+    }
+    return batch;
+  }
+
+  #knowledgeImportRows(
+    runId: string,
+    batchId: string,
+  ): KnowledgeImportRow[] {
+    return all<KnowledgeImportRow>(this.#database.prepare(`
+      SELECT * FROM knowledge_import_rows
+      WHERE run_id=? AND batch_id=?
+      ORDER BY row_ordinal
+    `), runId, batchId);
+  }
+
+  #stagedImportReport(
+    runId: string,
+    batchId: string,
+    page: { readonly cursor?: string; readonly limit: number },
+  ): StagedImportReport {
+    this.#requireKnowledgeImportBatch(runId, batchId);
+    if (!Number.isSafeInteger(page.limit) || page.limit < 1 || page.limit > 100) {
+      throw new Error("KNOWLEDGE_IMPORT_PAGE_LIMIT_INVALID");
+    }
+    const after = parseImportCursor(page.cursor, batchId);
+    const allRows = this.#knowledgeImportRows(runId, batchId);
+    const summary = importCounts(allRows);
+    const available = allRows.filter((row) => row.row_ordinal > after);
+    const pageRows = available.slice(0, page.limit);
+    const hasMore = available.length > pageRows.length;
+    return Object.freeze({
+      batchId,
+      counts: summary.counts,
+      unresolved: summary.unresolved,
+      rows: Object.freeze(pageRows.map(importPreviewFromRow)),
+      ...(hasMore && pageRows.length > 0
+        ? {
+            nextCursor: importCursor(
+              batchId,
+              pageRows.at(-1)!.row_ordinal,
+            ),
+          }
+        : {}),
+    });
+  }
+
   #knowledgeCommandReplay(
     runId: string,
     requestId: string,
@@ -3366,6 +4826,7 @@ export class LosslessBookStore {
           }),
         },
         false,
+        oldScope === "global",
       );
       bookChanged ||= oldScope !== "project";
       projectChanged ||= oldScope === "project";
@@ -3539,6 +5000,99 @@ export class LosslessBookStore {
     return entry;
   }
 
+  #importAliasMergeCommand(
+    domain: KnowledgeStore,
+    command: UpdateKnowledgeCommand,
+  ): UpdateKnowledgeCommand {
+    if (command.objectType === "alias") {
+      const alias = command.fieldPatch.alias;
+      const entityId = command.fieldPatch.entityId;
+      if (typeof alias !== "string" || typeof entityId !== "string") {
+        throw new Error("KNOWLEDGE_IMPORT_ALIAS_MERGE_INVALID");
+      }
+      return {
+        ...command,
+        normalizedSubject: `${alias} -> ${entityId}`,
+      };
+    }
+    if (command.objectType !== "term" && command.objectType !== "entity") {
+      throw new Error("KNOWLEDGE_IMPORT_ALIAS_MERGE_NOT_ALLOWED");
+    }
+    const current = domain.activeKnowledge(
+      command.normalizedSubject,
+      command.kind,
+    );
+    if (current === undefined
+      || current.payload === null
+      || typeof current.payload !== "object"
+      || Array.isArray(current.payload)) {
+      throw new Error("KNOWLEDGE_IMPORT_ALIAS_MERGE_TARGET_MISSING");
+    }
+    const currentPayload = current.payload as Record<string, unknown>;
+    const values: string[] = [];
+    const add = (value: unknown): void => {
+      if (typeof value === "string" && value.trim().length > 0) {
+        values.push(value.normalize("NFKC").trim());
+      } else if (Array.isArray(value)) {
+        for (const item of value) add(item);
+      }
+    };
+    const field = command.objectType === "term" ? "sourceForms" : "aliases";
+    if (command.objectType === "term") {
+      add(currentPayload.sourceForm);
+      add(currentPayload.canonicalSource);
+      add(currentPayload.sourceForms);
+      add(command.fieldPatch.sourceForm);
+      add(command.fieldPatch.canonicalSource);
+      add(command.fieldPatch.sourceForms);
+    } else {
+      add(currentPayload.canonicalName);
+      add(currentPayload.aliases);
+      add(command.fieldPatch.canonicalName);
+      add(command.fieldPatch.aliases);
+    }
+    const unique = [...new Set(values)].sort(compareText);
+    if (unique.length === 0) {
+      throw new Error("KNOWLEDGE_IMPORT_ALIAS_MERGE_EMPTY");
+    }
+    return {
+      ...command,
+      fieldPatch: { [field]: unique },
+      ownedFields: [`/${field}`],
+    };
+  }
+
+  #effectiveCatalogEntry(
+    run: RunRow,
+    normalizedSubject: string,
+    kind: string,
+  ): ActiveCatalogEntry | undefined {
+    let effective: ActiveCatalogEntry | undefined;
+    for (const entry of this.#activeCatalogEntries(
+      run,
+      normalizedSubject,
+      kind,
+    )) {
+      if (effective === undefined) {
+        effective = entry;
+        continue;
+      }
+      const comparison = compareAuthority(
+        entry.document.authority,
+        effective.document.authority,
+      );
+      if (comparison > 0) {
+        effective = entry;
+      } else if (comparison === 0
+        && canonicalJson(entry.document) !== canonicalJson(effective.document)) {
+        throw new Error(
+          `KNOWLEDGE_AUTHORITY_CONFLICT: ${normalizedSubject}/${kind}`,
+        );
+      }
+    }
+    return effective;
+  }
+
   #activeCatalogEntries(
     run: RunRow,
     normalizedSubject: string,
@@ -3605,10 +5159,12 @@ export class LosslessBookStore {
     run: RunRow,
     documentInput: CatalogKnowledgeDocument,
     active: boolean,
+    allowGlobalSnapshot = false,
   ): CatalogKnowledgeRow {
     const document = validateCatalogKnowledgeDocument(documentInput);
     const scope = document.authority.scope;
-    if (scope === "global") {
+    if (scope === "global"
+      && (!allowGlobalSnapshot || document.globalRevisionId === undefined)) {
       throw new Error(
         "global knowledge must be snapshotted through the global knowledge workflow",
       );
@@ -3744,8 +5300,18 @@ export class LosslessBookStore {
     run: RunRow,
     revision: KnowledgeRevision,
   ): void {
-    const forms = sourceFormsFromRevision(revision);
-    if (forms.length === 0) return;
+    this.#insertKnowledgeImpactsForRevisions(run, [revision]);
+  }
+
+  #insertKnowledgeImpactsForRevisions(
+    run: RunRow,
+    revisions: readonly KnowledgeRevision[],
+  ): void {
+    const revisionForms = revisions.map((revision) => ({
+      revisionId: revision.revisionId,
+      forms: sourceFormsFromRevision(revision),
+    })).filter((revision) => revision.forms.length > 0);
+    if (revisionForms.length === 0) return;
     const source = this.#source(run.source_version);
     const sourcePayload = JSON.parse(source.source_payload_json) as {
       sourceLanguage?: unknown;
@@ -3772,16 +5338,297 @@ export class LosslessBookStore {
         run_id, revision_id, source_version, block_id, reason
       ) VALUES(?, ?, ?, ?, 'explicit_source_form_match')
     `);
-    for (const block of blocks) {
-      if (sourceMatchesExplicitForms(block.source_text, forms, profile)) {
-        insert.run(
-          run.run_id,
-          revision.revisionId,
-          block.source_version,
-          block.block_id,
-        );
+    const matches = matchKnowledgeImpacts(
+      revisionForms,
+      blocks.map((block) => ({
+        sourceVersion: block.source_version,
+        blockId: block.block_id,
+        sourceText: block.source_text,
+      })),
+      profile,
+    );
+    for (const match of matches) {
+      insert.run(
+        run.run_id,
+        match.revisionId,
+        match.sourceVersion,
+        match.blockId,
+      );
+    }
+  }
+
+  #knowledgeQueryGeneration(
+    run: RunRow,
+    state: KnowledgeStateView,
+  ): string {
+    return hashText(canonicalJson({
+      schema: "folioloom-knowledge-query-generation-1",
+      runId: run.run_id,
+      sourceVersion: run.source_version,
+      generation: state.generation,
+      snapshotId: state.snapshotId,
+      bookGeneration: state.appliedBookGeneration,
+      projectGeneration: state.appliedProjectGeneration,
+    }));
+  }
+
+  #storedKnowledgeRevision(
+    runId: string,
+    row: StoredKnowledgeSummaryRow | StoredKnowledgeRevisionRow,
+  ): KnowledgeRevision {
+    const revision = parsedKnowledgeRevision(row.payload_json);
+    if (row.run_id !== runId
+      || row.record_id !== knowledgeRecordId(
+        row.normalized_subject,
+        row.kind,
+      )
+      || revision.revisionId !== row.revision_id
+      || revision.revision !== row.revision
+      || revision.normalizedSubject !== row.normalized_subject
+      || revision.kind !== row.kind
+      || revision.status !== row.status
+      || !Array.isArray(revision.alternatives)
+      || !Array.isArray(revision.candidateIds)
+      || !Array.isArray(revision.sourceWindowIds)) {
+      throw new Error(`corrupt knowledge revision row ${row.revision_id}`);
+    }
+    const {
+      revisionId: _revisionId,
+      ...revisionContent
+    } = revision;
+    if (hashText(canonicalJson(revisionContent)) !== revision.revisionId) {
+      throw new Error(`corrupt knowledge revision hash ${row.revision_id}`);
+    }
+    const authority = revision.authority === undefined
+      ? undefined
+      : normalizeKnowledgeAuthority(revision.authority);
+    const ownedFields = JSON.parse(row.owned_fields_json) as unknown;
+    if (row.origin !== (authority?.origin ?? "model")
+      || row.scope !== (authority?.scope ?? "book")
+      || canonicalJson(ownedFields) !== canonicalJson(
+        authority?.ownedFields ?? [],
+      )) {
+      throw new Error(`corrupt knowledge authority row ${row.revision_id}`);
+    }
+    if ("evidence_json" in row) {
+      const evidence = validateKnowledgeEvidence(
+        JSON.parse(row.evidence_json) as unknown,
+      );
+      if (authority?.provenance !== undefined
+        && canonicalJson(evidence) !== canonicalJson(
+          this.#catalogEvidenceForRevision(revision),
+        )) {
+        throw new Error(`corrupt knowledge evidence row ${row.revision_id}`);
       }
     }
+    return revision;
+  }
+
+  #queryKnowledgeRecordsPage(
+    run: RunRow,
+    query: KnowledgeRecordPageQuery,
+  ): readonly KnowledgeQueryRecord[] {
+    if (!Number.isSafeInteger(query.limit)
+      || query.limit < 1
+      || query.limit > 201) {
+      throw new RangeError("knowledge page source limit must be between 1 and 201");
+    }
+    const clauses = ["1 = 1"];
+    const parameters: (string | number)[] = [
+      run.source_version,
+      run.run_id,
+    ];
+    const appendSetFilter = (
+      column: string,
+      values: readonly string[],
+    ): void => {
+      if (values.length === 0) return;
+      clauses.push(`${column} IN (${values.map(() => "?").join(", ")})`);
+      parameters.push(...values);
+    };
+    appendSetFilter("object_type", query.objectTypes);
+    appendSetFilter("status", query.statuses);
+    appendSetFilter("origin", query.origins);
+    appendSetFilter("scope", query.scopes);
+    if (query.search !== null) {
+      clauses.push(
+        "folioloom_knowledge_matches(payload_json, object_type, ?) = 1",
+      );
+      parameters.push(query.search);
+    }
+    if (query.after !== undefined) {
+      clauses.push(
+        "(normalized_subject, kind, record_id) > (?, ?, ?)",
+      );
+      parameters.push(
+        query.after.normalizedSubject,
+        query.after.kind,
+        query.after.id,
+      );
+    }
+    parameters.push(query.limit);
+    const rows = all<KnowledgePageRow>(this.#database.prepare(`
+      WITH active_knowledge AS (
+        SELECT
+          records.run_id,
+          records.record_id,
+          records.revision_id,
+          records.revision,
+          records.normalized_subject,
+          records.kind,
+          records.payload_json,
+          records.status,
+          records.active,
+          records.origin,
+          records.scope,
+          records.owned_fields_json,
+          COALESCE(
+            project_catalog.object_type,
+            book_catalog.object_type,
+            folioloom_knowledge_object_type(records.payload_json)
+          ) AS object_type,
+          COALESCE(
+            project_catalog.object_type,
+            book_catalog.object_type
+          ) AS catalog_object_type,
+          COALESCE(
+            project_catalog.revision,
+            book_catalog.revision
+          ) AS scope_revision,
+          COALESCE(
+            project_catalog.scope,
+            book_catalog.scope
+          ) AS scope_revision_scope,
+          json_extract(
+            records.payload_json,
+            '$.authority.provenance.catalog'
+          ) AS provenance_catalog,
+          json_extract(
+            records.payload_json,
+            '$.authority.provenance.catalogRevisionId'
+          ) AS provenance_revision_id
+        FROM knowledge_records AS records
+        LEFT JOIN project_knowledge_revisions AS project_catalog
+          ON json_extract(
+            records.payload_json,
+            '$.authority.provenance.catalog'
+          ) = 'project'
+         AND project_catalog.revision_id = json_extract(
+           records.payload_json,
+           '$.authority.provenance.catalogRevisionId'
+         )
+        LEFT JOIN book_knowledge_revisions AS book_catalog
+          ON json_extract(
+            records.payload_json,
+            '$.authority.provenance.catalog'
+          ) = 'book'
+         AND book_catalog.source_version = ?
+         AND book_catalog.revision_id = json_extract(
+           records.payload_json,
+           '$.authority.provenance.catalogRevisionId'
+         )
+        WHERE records.run_id = ? AND records.active = 1
+      )
+      SELECT *
+      FROM active_knowledge
+      WHERE ${clauses.join(" AND ")}
+      ORDER BY normalized_subject, kind, record_id
+      LIMIT ?
+    `), ...parameters).map((row) => {
+      const revision = this.#storedKnowledgeRevision(run.run_id, row);
+      const objectType = row.object_type as KnowledgeObjectType;
+      if (![
+        "term",
+        "entity",
+        "alias",
+        "relation",
+        "memory",
+        "style",
+      ].includes(objectType)) {
+        throw new Error(`corrupt knowledge object type ${row.object_type}`);
+      }
+      const provenance = revision.authority?.provenance;
+      if (provenance === undefined) {
+        if (row.catalog_object_type !== null
+          || row.scope_revision !== null
+          || row.scope_revision_scope !== null
+          || row.provenance_catalog !== null
+          || row.provenance_revision_id !== null) {
+          throw new Error(`corrupt knowledge catalog metadata ${row.revision_id}`);
+        }
+      } else if (
+        row.catalog_object_type === null
+        || row.scope_revision === null
+        || row.scope_revision_scope === null
+        || row.provenance_catalog !== provenance.catalog
+        || row.provenance_revision_id !== provenance.catalogRevisionId
+      ) {
+        throw new Error(
+          `corrupt knowledge catalog provenance ${provenance.catalogRevisionId}`,
+        );
+      }
+      return Object.freeze({
+        id: row.record_id,
+        objectType,
+        revision,
+        scopeRevision: row.scope_revision === null
+          ? null
+          : {
+            scope: row.scope_revision_scope as KnowledgeScope,
+            revision: row.scope_revision,
+          },
+        evidence: Object.freeze([]),
+        history: Object.freeze([]),
+        impacts: Object.freeze([]),
+      });
+    });
+    return Object.freeze(rows);
+  }
+
+  #knowledgeQueryRecord(
+    run: RunRow,
+    recordId: string,
+  ): KnowledgeQueryRecord | undefined {
+    const rows = all<StoredKnowledgeRevisionRow>(this.#database.prepare(`
+      SELECT run_id, record_id, revision_id, revision, normalized_subject, kind,
+             payload_json, status, active, origin, scope, owned_fields_json,
+             evidence_json, import_batch_id
+      FROM knowledge_records
+      WHERE run_id=? AND record_id=?
+      ORDER BY revision
+    `), run.run_id, recordId);
+    if (rows.length === 0) return undefined;
+    const activeRows = rows.filter((row) => row.active === 1);
+    if (activeRows.length === 0) return undefined;
+    if (activeRows.length !== 1) {
+      throw new Error(`corrupt active knowledge query row ${recordId}`);
+    }
+    const history = new KnowledgeStore(
+      rows.map((row) => this.#storedKnowledgeRevision(run.run_id, row)),
+    ).listRevisions();
+    const activeRow = activeRows[0]!;
+    const revision = history.find(
+      (candidate) => candidate.revisionId === activeRow.revision_id,
+    );
+    if (revision === undefined
+      || history.at(-1)?.revisionId !== revision.revisionId
+      || !PROJECTABLE_KNOWLEDGE_STATUSES.has(revision.status)) {
+      throw new Error(`corrupt active knowledge query row ${recordId}`);
+    }
+    const catalog = this.#catalogMetadataForRevision(run, revision);
+    return Object.freeze({
+      id: recordId,
+      objectType: catalog?.objectType ?? knowledgeObjectType(revision),
+      revision,
+      scopeRevision: catalog?.scopeRevision ?? null,
+      evidence: Object.freeze(this.#resolvedKnowledgeEvidence(
+        run,
+        revision,
+        JSON.parse(activeRow.evidence_json) as unknown,
+      )),
+      history: Object.freeze([...history]),
+      impacts: Object.freeze(this.#knowledgeImpacts(run, revision)),
+    });
   }
 
   #catalogMetadataForRevision(
@@ -4022,6 +5869,9 @@ export class LosslessBookStore {
         provenance: {
           catalog: catalogScope === "project" ? "project" : "book",
           catalogRevisionId: entry.row.revision_id,
+          ...(entry.document.globalRevisionId === undefined
+            ? {}
+            : { globalRevisionId: entry.document.globalRevisionId }),
         },
       });
       domain.appendRevision({

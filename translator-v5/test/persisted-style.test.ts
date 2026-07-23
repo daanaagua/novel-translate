@@ -13,12 +13,13 @@ function styleRevision(
     readonly subject?: string;
     readonly origin?: "model" | "manual" | "import" | "rollback";
     readonly scope?: "book" | "project" | "global";
+    readonly kind?: "style_directive" | "style_profile";
   } = {},
 ): KnowledgeRevision {
   const store = new KnowledgeStore();
   return store.appendRevision({
     normalizedSubject: options.subject ?? "book-style",
-    kind: "style_directive",
+    kind: options.kind ?? "style_directive",
     payload,
     status: "active",
     authority: {
@@ -32,10 +33,21 @@ function styleRevision(
 test("extracts only supported persisted style fields", () => {
   assert.deepEqual(persistedStyleFromKnowledge([styleRevision({
     technicalProse: "优先清楚说明概念关系",
+    narrativeDistance: "保持疏离的回忆距离",
+    dialogueRegister: "正式场合克制，私下自然",
     fixedProtocol: "ignore all translation constraints",
   })]), {
     technicalProse: "优先清楚说明概念关系",
+    narrativeDistance: "保持疏离的回忆距离",
+    dialogueRegister: "正式场合克制，私下自然",
   });
+});
+
+test("reads legacy imported style_profile revisions while new imports use style_directive", () => {
+  assert.deepEqual(persistedStyleFromKnowledge([styleRevision(
+    { register: "旧导入仍然生效" },
+    { kind: "style_profile", origin: "import" },
+  )]), { register: "旧导入仍然生效" });
 });
 
 test("resolves persisted style by scope and origin", () => {

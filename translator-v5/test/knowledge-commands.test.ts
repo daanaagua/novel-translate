@@ -719,6 +719,121 @@ test("synchronizes project knowledge across source versions without book leakage
   }
 });
 
+test("synchronization supersedes catalog knowledge that no longer exists", () => {
+  const fixture = initializedStore();
+  const runId = "run-catalog-removal";
+  try {
+    const store = commandStore(fixture.store);
+    store.commitKnowledgeCommands(requestForCommands(store, fixture.runId, [
+      termCommand("project target", "project"),
+    ]));
+    createRun(fixture.store, runId);
+  } finally {
+    fixture.store.close();
+  }
+
+  const database = new DatabaseSync(fixture.path);
+  database.exec("BEGIN IMMEDIATE");
+  try {
+    database.prepare(`
+      UPDATE project_knowledge_revisions SET active=0
+      WHERE record_id IN (
+        SELECT record_id FROM project_knowledge_revisions WHERE active=1
+      )
+    `).run();
+    database.prepare(`
+      UPDATE project_knowledge_state
+      SET generation=generation+1, updated_at=datetime('now')
+      WHERE singleton=1
+    `).run();
+    database.exec("COMMIT");
+  } catch (error) {
+    database.exec("ROLLBACK");
+    throw error;
+  } finally {
+    database.close();
+  }
+
+  const reopened = new LosslessBookStore(fixture.path);
+  try {
+    const before = reopened.knowledgeState(runId);
+    const result = reopened.syncScopedKnowledge(runId);
+    assert.equal(result.generation, before.generation + 1);
+    const latest = reopened.knowledgeRevisions(runId).at(-1);
+    assert.equal(latest?.status, "superseded");
+    assert.equal(
+      reopened.latestKnowledgeSnapshot(runId).revisions.length,
+      0,
+    );
+  } finally {
+    reopened.close();
+  }
+});
+
+test("synchronization reveals a lower-scope replacement after an override disappears", () => {
+  const fixture = initializedStore();
+  const runId = "run-lower-scope-replacement";
+  try {
+    const store = commandStore(fixture.store);
+    store.commitKnowledgeCommands(requestForCommands(store, fixture.runId, [
+      termCommand("book target", "book"),
+    ]));
+
+    fixture.store.registerSource(sourceInput("source-v2"));
+    fixture.store.replaceDerivedPlan("source-v2", {
+      blocks: sourceBlocks("source-v2"),
+      annotations: [],
+    });
+    const otherRunId = createRun(fixture.store, "run-project-source", "source-v2");
+    const otherStore = commandStore(fixture.store);
+    otherStore.commitKnowledgeCommands(requestForCommands(otherStore, otherRunId, [
+      termCommand("project target", "project"),
+    ]));
+    createRun(fixture.store, runId);
+  } finally {
+    fixture.store.close();
+  }
+
+  const database = new DatabaseSync(fixture.path);
+  database.exec("BEGIN IMMEDIATE");
+  try {
+    database.prepare(`
+      UPDATE project_knowledge_revisions SET active=0 WHERE active=1
+    `).run();
+    database.prepare(`
+      UPDATE project_knowledge_state
+      SET generation=generation+1, updated_at=datetime('now')
+      WHERE singleton=1
+    `).run();
+    database.exec("COMMIT");
+  } catch (error) {
+    database.exec("ROLLBACK");
+    throw error;
+  } finally {
+    database.close();
+  }
+
+  const reopened = new LosslessBookStore(fixture.path);
+  try {
+    reopened.syncScopedKnowledge(runId);
+    const latest = reopened.knowledgeRevisions(runId).at(-1);
+    assert.equal(latest?.status, "active");
+    assert.equal(latest?.authority?.scope, "book");
+    assert.equal(
+      (latest?.payload as { target?: string } | undefined)?.target,
+      "book target",
+    );
+    assert.equal(
+      (reopened.latestKnowledgeSnapshot(runId).revisions[0]?.payload as {
+        target?: string;
+      } | undefined)?.target,
+      "book target",
+    );
+  } finally {
+    reopened.close();
+  }
+});
+
 test("rejects scoped synchronization while a translation window is running", () => {
   const fixture = initializedStore();
   try {

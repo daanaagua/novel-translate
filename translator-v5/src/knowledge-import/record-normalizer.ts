@@ -119,11 +119,11 @@ const NORMALIZED_FIELDS: Readonly<Record<
 
 const KIND_BY_OBJECT_TYPE: Readonly<Record<KnowledgeObjectType, string>> = {
   term: "lexical_anchor",
-  entity: "entity",
+  entity: "entity_identity",
   alias: "entity_alias_link",
   relation: "entity_relation",
   memory: "narrative_memory",
-  style: "style_profile",
+  style: "style_directive",
 };
 
 export interface NormalizeImportRecordInput {
@@ -283,6 +283,43 @@ function subjectFor(
   return subject;
 }
 
+function completeTermPolicy(
+  fieldPatch: Record<string, JsonValue>,
+  location: string,
+): void {
+  const explicitPolicy = fieldPatch.policy;
+  const explicitLocked = fieldPatch.locked;
+  if (explicitPolicy === undefined && explicitLocked === undefined) {
+    fieldPatch.policy = "preferred";
+    fieldPatch.locked = false;
+    return;
+  }
+  if (explicitPolicy === undefined && typeof explicitLocked === "boolean") {
+    fieldPatch.policy = explicitLocked ? "locked" : "preferred";
+    return;
+  }
+  if (typeof explicitPolicy === "string" && explicitLocked === undefined) {
+    fieldPatch.locked = explicitPolicy === "locked";
+    return;
+  }
+  if (explicitLocked === true && explicitPolicy !== "locked") {
+    fail(
+      "KNOWLEDGE_IMPORT_TERM_POLICY_CONFLICT",
+      "term.locked=true requires policy=locked",
+      location,
+      "locked",
+    );
+  }
+  if (explicitPolicy === "locked" && explicitLocked !== true) {
+    fail(
+      "KNOWLEDGE_IMPORT_TERM_POLICY_CONFLICT",
+      "term.policy=locked requires locked=true",
+      location,
+      "policy",
+    );
+  }
+}
+
 export function normalizeImportRecord(
   input: NormalizeImportRecordInput,
 ): NormalizedImportRecord {
@@ -368,6 +405,9 @@ export function normalizeImportRecord(
         field,
       );
     }
+  }
+  if (input.selection.objectType === "term") {
+    completeTermPolicy(fieldPatch, input.record.location);
   }
   if (Object.keys(fieldPatch).length === 0) {
     fail(

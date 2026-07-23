@@ -1,4 +1,5 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
+import { createReadStream } from "node:fs";
 import { readFile, stat } from "node:fs/promises";
 import { basename, isAbsolute } from "node:path";
 
@@ -79,6 +80,7 @@ export type PreparedImportRecord =
 
 export interface StageBatchInput {
   readonly batchId: string;
+  readonly sourceHash: string;
   readonly sourceName: string;
   readonly sourceFormat: PendingKnowledgeImport["format"];
   readonly request: StageImportRequest;
@@ -88,6 +90,28 @@ export interface StageBatchInput {
    * transaction. Throwing or aborting must leave neither a batch nor rows.
    */
   readonly records: AsyncIterable<PreparedImportRecord>;
+}
+
+async function sourceFileHash(
+  path: string,
+  signal: AbortSignal,
+): Promise<string> {
+  const hash = createHash("sha256");
+  const stream = createReadStream(path);
+  try {
+    for await (const chunk of stream) {
+      if (signal.aborted) {
+        stream.destroy();
+        throw cancelled();
+      }
+      hash.update(chunk as Buffer);
+    }
+  } catch (error) {
+    stream.destroy();
+    throw error;
+  }
+  if (signal.aborted) throw cancelled();
+  return hash.digest("hex");
 }
 
 /**
@@ -114,6 +138,13 @@ interface PendingEntry {
   readonly absolutePath: string;
   readonly expiresAt: number;
   context?: InspectionContext;
+  inspectedSourceHash?: string;
+}
+
+interface SourceFileStamp {
+  readonly size: number;
+  readonly mtimeMs: number;
+  readonly ctimeMs: number;
 }
 
 type InspectionContext =
@@ -152,6 +183,27 @@ function cancelled(): KnowledgeImportServiceError {
     "KNOWLEDGE_IMPORT_CANCELLED",
     "the operation was cancelled",
   );
+}
+
+async function sourceFileStamp(path: string): Promise<SourceFileStamp> {
+  const details = await stat(path);
+  if (!details.isFile()) {
+    fail("KNOWLEDGE_IMPORT_NOT_FILE", "pending import is not a regular file");
+  }
+  return Object.freeze({
+    size: details.size,
+    mtimeMs: details.mtimeMs,
+    ctimeMs: details.ctimeMs,
+  });
+}
+
+function sameSourceFileStamp(
+  left: SourceFileStamp,
+  right: SourceFileStamp,
+): boolean {
+  return left.size === right.size
+    && left.mtimeMs === right.mtimeMs
+    && left.ctimeMs === right.ctimeMs;
 }
 
 function frozenInspection(
@@ -354,15 +406,40 @@ export class KnowledgeImportService {
     );
   }
 
+  async #inspectWithIdentity(
+    entry: PendingEntry,
+    signal: AbortSignal,
+    inspect: () => Promise<ImportInspectionResult>,
+  ): Promise<ImportInspectionResult> {
+    entry.context = undefined;
+    entry.inspectedSourceHash = undefined;
+    const before = await sourceFileStamp(entry.absolutePath);
+    const result = await inspect();
+    if (result.status !== "ready") return result;
+    const sourceHash = await sourceFileHash(entry.absolutePath, signal);
+    const after = await sourceFileStamp(entry.absolutePath);
+    if (!sameSourceFileStamp(before, after)) {
+      entry.context = undefined;
+      fail(
+        "KNOWLEDGE_IMPORT_SOURCE_CHANGED",
+        "the source file changed while it was being inspected; inspect it again",
+      );
+    }
+    entry.inspectedSourceHash = sourceHash;
+    return result;
+  }
+
   inspect(input: InspectImportRequest): Promise<ImportInspectionResult> {
     return this.#withOperation(input.operationId, async (signal) => {
       const entry = this.#entry(input.pendingImportId);
       if (signal.aborted) throw cancelled();
-      if (entry.pending.format === "json" || entry.pending.format === "yaml") {
-        return this.#inspectStructured(entry);
-      }
-      if (entry.pending.format === "csv") return this.#inspectCsv(entry);
-      return this.#inspectXlsx(entry);
+      return this.#inspectWithIdentity(entry, signal, async () => {
+        if (entry.pending.format === "json" || entry.pending.format === "yaml") {
+          return this.#inspectStructured(entry);
+        }
+        if (entry.pending.format === "csv") return this.#inspectCsv(entry);
+        return this.#inspectXlsx(entry);
+      });
     });
   }
 
@@ -378,7 +455,11 @@ export class KnowledgeImportService {
         );
       }
       if (signal.aborted) throw cancelled();
-      return this.#inspectCsv(entry, input.encoding);
+      return this.#inspectWithIdentity(
+        entry,
+        signal,
+        () => this.#inspectCsv(entry, input.encoding),
+      );
     });
   }
 
@@ -517,6 +598,7 @@ export class KnowledgeImportService {
     input: StageImportRequest,
     batchId: string,
     signal: AbortSignal,
+    expectedStamp: SourceFileStamp,
   ): AsyncGenerator<PreparedImportRecord> {
     let seen = 0;
     for await (const source of this.#recordSources(entry, input.selection)) {
@@ -543,6 +625,13 @@ export class KnowledgeImportService {
       }
       if (seen % 256 === 0 && signal.aborted) throw cancelled();
     }
+    const finalStamp = await sourceFileStamp(entry.absolutePath);
+    if (!sameSourceFileStamp(expectedStamp, finalStamp)) {
+      fail(
+        "KNOWLEDGE_IMPORT_SOURCE_CHANGED",
+        "the source file changed while it was being staged; inspect it again",
+      );
+    }
   }
 
   stage(input: StageImportRequest): Promise<StagedImportReport> {
@@ -550,13 +639,37 @@ export class KnowledgeImportService {
       const entry = this.#entry(input.pendingImportId);
       const storage = this.#requireStorage();
       const batchId = this.#createId();
+      if (entry.context === undefined
+        || entry.inspectedSourceHash === undefined) {
+        fail(
+          "KNOWLEDGE_IMPORT_INSPECTION_REQUIRED",
+          "inspect the pending file before staging it",
+        );
+      }
+      const beforeHash = await sourceFileStamp(entry.absolutePath);
+      const sourceHash = await sourceFileHash(entry.absolutePath, signal);
+      const afterHash = await sourceFileStamp(entry.absolutePath);
+      if (!sameSourceFileStamp(beforeHash, afterHash)
+        || sourceHash !== entry.inspectedSourceHash) {
+        fail(
+          "KNOWLEDGE_IMPORT_SOURCE_CHANGED",
+          "the source file changed after inspection; inspect it again",
+        );
+      }
       return storage.stageBatch({
         batchId,
+        sourceHash,
         sourceName: entry.pending.fileName,
         sourceFormat: entry.pending.format,
         request: input,
         signal,
-        records: this.#preparedRecords(entry, input, batchId, signal),
+        records: this.#preparedRecords(
+          entry,
+          input,
+          batchId,
+          signal,
+          afterHash,
+        ),
       });
     });
   }

@@ -8,6 +8,7 @@ import test from "node:test";
 import type { BookWindowPlan } from "../src/fullbook/types.js";
 import {
   KnowledgeQueryService,
+  type KnowledgeRecordPageQuery,
   type KnowledgeQueryRecord,
   type KnowledgeQuerySource,
 } from "../src/knowledge/knowledge-query.js";
@@ -75,6 +76,43 @@ class FixtureSource implements KnowledgeQuerySource {
 
   listKnowledgeRecords(): readonly KnowledgeQueryRecord[] {
     return this.records;
+  }
+
+  knowledgeRecord(id: string): KnowledgeQueryRecord | undefined {
+    return this.records.find((item) => item.id === id);
+  }
+}
+
+class PagedFixtureSource implements KnowledgeQuerySource {
+  legacyListCalls = 0;
+  readonly requests: KnowledgeRecordPageQuery[] = [];
+
+  constructor(
+    readonly generation: string,
+    readonly records: readonly KnowledgeQueryRecord[],
+  ) {}
+
+  listKnowledgeRecords(): readonly KnowledgeQueryRecord[] {
+    this.legacyListCalls += 1;
+    throw new Error("legacy full materialization must not be used");
+  }
+
+  queryKnowledgeRecords(
+    request: KnowledgeRecordPageQuery,
+  ): readonly KnowledgeQueryRecord[] {
+    this.requests.push(request);
+    const after = request.after;
+    return this.records
+      .filter((item) => after === undefined
+        || item.revision.normalizedSubject > after.normalizedSubject
+        || (
+          item.revision.normalizedSubject === after.normalizedSubject
+          && (
+            item.revision.kind > after.kind
+            || (item.revision.kind === after.kind && item.id > after.id)
+          )
+        ))
+      .slice(0, request.limit);
   }
 
   knowledgeRecord(id: string): KnowledgeQueryRecord | undefined {
@@ -285,6 +323,74 @@ test("uses an opaque stable cursor without duplicates after equal labels", () =>
   assert.match(first.nextCursor ?? "", /^[A-Za-z0-9_-]+$/u);
 });
 
+test("uses SQLite-compatible UTF-8 ordering for supplementary-plane cursors", () => {
+  const source = new FixtureSource("generation-1", [
+    record("record-supplementary", "\u{10000}"),
+    record("record-private-use", "\uE000"),
+  ]);
+  const service = new KnowledgeQueryService(source);
+
+  const first = service.list({ limit: 1 });
+  const second = service.list({
+    limit: 1,
+    cursor: first.nextCursor ?? undefined,
+  });
+
+  assert.deepEqual(
+    [...first.items, ...second.items].map((item) => item.normalizedSubject),
+    ["\uE000", "\u{10000}"],
+  );
+});
+
+test("pushes normalized filters and seek pagination into a paged query source", () => {
+  const source = new PagedFixtureSource("generation-1", [
+    record("record-1", "archon"),
+    record("record-2", "archon"),
+    record("record-3", "archpriest"),
+  ]);
+  const service = new KnowledgeQueryService(source);
+
+  const first = service.list({
+    search: "  ARCH  ",
+    objectTypes: ["term", "term"],
+    statuses: ["active"],
+    origins: ["manual"],
+    scopes: ["book"],
+    limit: 2,
+  });
+  assert.deepEqual(first.items.map((item) => item.id), [
+    "record-1",
+    "record-2",
+  ]);
+  assert.ok(first.nextCursor);
+  assert.equal(source.legacyListCalls, 0);
+  assert.deepEqual(source.requests[0], {
+    search: "arch",
+    objectTypes: ["term"],
+    statuses: ["active"],
+    origins: ["manual"],
+    scopes: ["book"],
+    limit: 3,
+  });
+
+  const second = service.list({
+    search: "arch",
+    objectTypes: ["term"],
+    statuses: ["active"],
+    origins: ["manual"],
+    scopes: ["book"],
+    cursor: first.nextCursor ?? undefined,
+    limit: 2,
+  });
+  assert.deepEqual(second.items.map((item) => item.id), ["record-3"]);
+  assert.deepEqual(source.requests[1]?.after, {
+    normalizedSubject: "archon",
+    kind: "term_sense",
+    id: "record-2",
+  });
+  assert.equal(source.legacyListCalls, 0);
+});
+
 test("binds cursors to normalized filters and source generation", () => {
   const records = [
     record("record-a", "archon"),
@@ -425,6 +531,7 @@ test("adapts a run into a stable query generation with catalog history and exact
     }])]);
 
     const source = fixture.store.knowledgeQuerySource(fixture.runId);
+    assert.equal(typeof source.queryKnowledgeRecords, "function");
     const service = new KnowledgeQueryService(source);
     const page = service.list({ limit: 20 });
     assert.equal(page.items.length, 1);
@@ -456,11 +563,72 @@ test("adapts a run into a stable query generation with catalog history and exact
       expectedRevision: null,
       expectedScopeRevision: null,
     }]);
-    assert.equal(source.listKnowledgeRecords().length, 1);
+    assert.throws(
+      () => source.listKnowledgeRecords(),
+      /KNOWLEDGE_QUERY_SOURCE_STALE/u,
+    );
     assert.notEqual(
       source.generation,
       fixture.store.knowledgeQuerySource(fixture.runId).generation,
     );
+  } finally {
+    fixture.store.close();
+  }
+});
+
+test("pushes store search, filters, and seek cursors into SQLite", () => {
+  const fixture = storeQueryFixture(["The Archon met the Autarch."]);
+  try {
+    commitKnowledge(fixture, [
+      termCommand("archon", "Archon"),
+      termCommand("autarch", "Autarch"),
+      {
+        type: "upsert",
+        objectType: "memory",
+        normalizedSubject: "memory:archon-audience",
+        kind: "narrative_memory",
+        expectedRevision: null,
+        expectedScopeRevision: null,
+        fieldPatch: {
+          summary: "The audience happened before dawn.",
+        },
+        ownedFields: ["/summary"],
+        scope: "book",
+        evidence: [],
+        origin: "manual",
+      },
+    ]);
+    const service = new KnowledgeQueryService(
+      fixture.store.knowledgeQuerySource(fixture.runId),
+    );
+    const first = service.list({
+      search: " ARCH ",
+      objectTypes: ["term"],
+      statuses: ["active"],
+      origins: ["manual"],
+      scopes: ["book"],
+      limit: 1,
+    });
+    assert.deepEqual(
+      first.items.map((item) => item.normalizedSubject),
+      ["archon"],
+    );
+    assert.ok(first.nextCursor);
+
+    const second = service.list({
+      search: "arch",
+      objectTypes: ["term"],
+      statuses: ["active"],
+      origins: ["manual"],
+      scopes: ["book"],
+      cursor: first.nextCursor ?? undefined,
+      limit: 1,
+    });
+    assert.deepEqual(
+      second.items.map((item) => item.normalizedSubject),
+      ["autarch"],
+    );
+    assert.equal(second.nextCursor, null);
   } finally {
     fixture.store.close();
   }
@@ -549,8 +717,12 @@ test("rejects source evidence whose quote does not exactly match its certified r
       canonicalEnd: block!.canonicalStart + 10,
       quote: "Autarch",
     }])]);
+    const service = new KnowledgeQueryService(
+      fixture.store.knowledgeQuerySource(fixture.runId),
+    );
+    const item = service.list({ limit: 20 }).items[0]!;
     assert.throws(
-      () => fixture.store.knowledgeQuerySource(fixture.runId),
+      () => service.detail(item.id),
       /KNOWLEDGE_EVIDENCE_POSITION_MISMATCH/u,
     );
   } finally {

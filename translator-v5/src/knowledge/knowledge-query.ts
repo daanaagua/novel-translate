@@ -16,7 +16,7 @@ import {
 } from "./knowledge-store.js";
 import { sourceFormsFromRevision } from "./knowledge-source-forms.js";
 
-const CURSOR_SCHEMA = "folioloom-knowledge-cursor-1";
+const CURSOR_SCHEMA = "folioloom-knowledge-cursor-2";
 const DEFAULT_MAX_LIMIT = 200;
 
 const OBJECT_TYPES = new Set<KnowledgeObjectType>([
@@ -100,6 +100,27 @@ export interface KnowledgeListPage {
   readonly nextCursor: string | null;
 }
 
+export interface KnowledgeQuerySortKey {
+  readonly normalizedSubject: string;
+  readonly kind: string;
+  readonly id: string;
+}
+
+/**
+ * Store-facing, already-normalized list request. Implementations must apply
+ * every filter and return rows in strict `(normalizedSubject, kind, id)` order.
+ * `limit` includes the one look-ahead row requested by the service.
+ */
+export interface KnowledgeRecordPageQuery {
+  readonly search: string | null;
+  readonly objectTypes: readonly KnowledgeObjectType[];
+  readonly statuses: readonly KnowledgeStatus[];
+  readonly origins: readonly KnowledgeOrigin[];
+  readonly scopes: readonly KnowledgeScope[];
+  readonly after?: KnowledgeQuerySortKey;
+  readonly limit: number;
+}
+
 /**
  * The database adapter deliberately exposes no SQL or paths. A store only
  * needs to provide a generation token, active records, and one lazy detail
@@ -108,6 +129,9 @@ export interface KnowledgeListPage {
 export interface KnowledgeQuerySource {
   readonly generation: string;
   listKnowledgeRecords(): readonly KnowledgeQueryRecord[];
+  queryKnowledgeRecords?(
+    query: KnowledgeRecordPageQuery,
+  ): readonly KnowledgeQueryRecord[];
   knowledgeRecord(id: string): KnowledgeQueryRecord | undefined;
 }
 
@@ -119,17 +143,11 @@ interface NormalizedFilters {
   readonly scopes: readonly KnowledgeScope[];
 }
 
-interface SortKey {
-  readonly normalizedSubject: string;
-  readonly kind: string;
-  readonly id: string;
-}
-
 interface KnowledgeCursor {
   readonly schema: typeof CURSOR_SCHEMA;
   readonly generation: string;
   readonly filtersHash: string;
-  readonly after: SortKey;
+  readonly after: KnowledgeQuerySortKey;
 }
 
 function invalidCursor(): never {
@@ -137,16 +155,22 @@ function invalidCursor(): never {
 }
 
 function compareText(left: string, right: string): number {
-  return left < right ? -1 : left > right ? 1 : 0;
+  return Buffer.compare(
+    Buffer.from(left, "utf8"),
+    Buffer.from(right, "utf8"),
+  );
 }
 
-function compareSortKey(left: SortKey, right: SortKey): number {
+function compareSortKey(
+  left: KnowledgeQuerySortKey,
+  right: KnowledgeQuerySortKey,
+): number {
   return compareText(left.normalizedSubject, right.normalizedSubject)
     || compareText(left.kind, right.kind)
     || compareText(left.id, right.id);
 }
 
-function sortKey(record: KnowledgeQueryRecord): SortKey {
+function sortKey(record: KnowledgeQueryRecord): KnowledgeQuerySortKey {
   return {
     normalizedSubject: record.revision.normalizedSubject,
     kind: record.revision.kind,
@@ -287,6 +311,32 @@ function listItem(recordValue: KnowledgeQueryRecord): KnowledgeListItem {
   };
 }
 
+export function knowledgeRevisionMatchesSearch(
+  revision: KnowledgeRevision,
+  objectType: KnowledgeObjectType,
+  normalizedSearch: string,
+): boolean {
+  const payload = payloadRecord(revision.payload);
+  const display = [
+    payload?.canonicalName,
+    payload?.sourceForm,
+    payload?.canonicalSource,
+    sourceFormsFromRevision(revision)[0],
+    revision.normalizedSubject,
+  ].find(
+    (value): value is string =>
+      typeof value === "string" && value.trim().length > 0,
+  )?.trim() ?? revision.normalizedSubject;
+  const searchable = [
+    revision.normalizedSubject,
+    display,
+    revision.kind,
+    objectType,
+    ...sourceFormsFromRevision(revision),
+  ].map((value) => value.normalize("NFKC").toLocaleLowerCase("und"));
+  return searchable.some((value) => value.includes(normalizedSearch));
+}
+
 function includes<T>(filter: readonly T[], value: T): boolean {
   return filter.length === 0 || filter.includes(value);
 }
@@ -303,14 +353,11 @@ function matches(
     return false;
   }
   if (filters.search === null) return true;
-  const searchable = [
-    item.normalizedSubject,
-    item.displayName,
-    item.kind,
+  return knowledgeRevisionMatchesSearch(
+    recordValue.revision,
     item.objectType,
-    ...sourceFormsFromRevision(recordValue.revision),
-  ].map((value) => value.normalize("NFKC").toLocaleLowerCase("und"));
-  return searchable.some((value) => value.includes(filters.search as string));
+    filters.search,
+  );
 }
 
 function requireLimit(value: number): number {
@@ -332,7 +379,7 @@ export class KnowledgeQueryService {
     const limit = requireLimit(query.limit);
     const filters = normalizeFilters(query);
     const hash = filtersHash(filters);
-    let after: SortKey | undefined;
+    let after: KnowledgeQuerySortKey | undefined;
     if (query.cursor !== undefined) {
       const cursor = decodeCursor(query.cursor);
       if (cursor.generation !== this.source.generation
@@ -341,10 +388,33 @@ export class KnowledgeQueryService {
       }
       after = cursor.after;
     }
-    const matched = this.source.listKnowledgeRecords()
-      .filter((item) => matches(item, filters))
-      .sort((left, right) => compareSortKey(sortKey(left), sortKey(right)))
-      .filter((item) => after === undefined || compareSortKey(sortKey(item), after) > 0);
+    const matched = this.source.queryKnowledgeRecords === undefined
+      ? this.source.listKnowledgeRecords()
+        .filter((item) => matches(item, filters))
+        .sort((left, right) => compareSortKey(sortKey(left), sortKey(right)))
+        .filter((item) =>
+          after === undefined || compareSortKey(sortKey(item), after) > 0)
+      : this.source.queryKnowledgeRecords({
+        search: filters.search,
+        objectTypes: filters.objectTypes,
+        statuses: filters.statuses,
+        origins: filters.origins,
+        scopes: filters.scopes,
+        ...(after === undefined ? {} : { after }),
+        limit: limit + 1,
+      });
+    if (matched.length > limit + 1) {
+      throw new Error("KNOWLEDGE_QUERY_SOURCE_INVALID");
+    }
+    let previous = after;
+    for (const item of matched) {
+      const current = sortKey(item);
+      if (!matches(item, filters)
+        || (previous !== undefined && compareSortKey(current, previous) <= 0)) {
+        throw new Error("KNOWLEDGE_QUERY_SOURCE_INVALID");
+      }
+      previous = current;
+    }
     const page = matched.slice(0, limit);
     const nextCursor = matched.length > limit && page.length > 0
       ? encodeCursor({

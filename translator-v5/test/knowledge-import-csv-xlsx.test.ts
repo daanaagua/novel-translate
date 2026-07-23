@@ -205,5 +205,6 @@ test("writes an official XLSX template that the streaming reader can read back",
     "column:2": "preferred",
     "column:3": "archon",
     "column:4": "职位称呼",
+    "column:5": false,
   });
 });

@@ -24,11 +24,11 @@ function incoming(
 ): NormalizedImportRecord {
   const kind = {
     term: "lexical_anchor",
-    entity: "entity",
+    entity: "entity_identity",
     alias: "entity_alias_link",
     relation: "entity_relation",
     memory: "narrative_memory",
-    style: "style_profile",
+    style: "style_directive",
   }[objectType];
   return {
     ordinal: 1,

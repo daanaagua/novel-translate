@@ -118,10 +118,14 @@ test("uses explicit confirmed mappings and normalizes a term command", () => {
     target: "执政官",
     sourceForms: ["archon", "Archon"],
     note: "formal title, not a personal name",
+    policy: "preferred",
+    locked: false,
   });
   assert.deepEqual(normalized.command.ownedFields, [
     "/canonicalSource",
+    "/locked",
     "/note",
+    "/policy",
     "/sourceForm",
     "/sourceForms",
     "/target",
@@ -196,6 +200,14 @@ test("normalizes all six object types through command validation", () => {
       requiredPatch: "register",
     },
   ];
+  const expectedKinds: Readonly<Record<KnowledgeObjectType, string>> = {
+    term: "lexical_anchor",
+    entity: "entity_identity",
+    alias: "entity_alias_link",
+    relation: "entity_relation",
+    memory: "narrative_memory",
+    style: "style_directive",
+  };
 
   for (const [index, item] of cases.entries()) {
     const normalized = normalizeImportRecord({
@@ -205,8 +217,56 @@ test("normalizes all six object types through command validation", () => {
       importBatchId: "batch-six-types",
     });
     assert.equal(normalized.command.objectType, item.objectType);
+    assert.equal(normalized.command.kind, expectedKinds[item.objectType]);
     assert.equal(Object.hasOwn(normalized.command.fieldPatch, item.requiredPatch), true);
   }
+});
+
+test("term imports use preferred semantics by default and preserve explicit lock policy", () => {
+  const preferred = normalizeImportRecord({
+    record: record({ source: "Archon", target: "执政官" }),
+    selection: selection("term"),
+    fields: {
+      source: mapping("source", "source"),
+      target: mapping("target", "target"),
+    },
+    importBatchId: "batch-preferred",
+  });
+  assert.equal(preferred.command.fieldPatch.policy, "preferred");
+  assert.equal(preferred.command.fieldPatch.locked, false);
+
+  const locked = normalizeImportRecord({
+    record: record({ source: "Archon", target: "阁下", policy: "locked" }),
+    selection: selection("term"),
+    fields: {
+      source: mapping("source", "source"),
+      target: mapping("target", "target"),
+      policy: mapping("policy", "policy"),
+    },
+    importBatchId: "batch-locked",
+  });
+  assert.equal(locked.command.fieldPatch.policy, "locked");
+  assert.equal(locked.command.fieldPatch.locked, true);
+
+  assert.throws(
+    () => normalizeImportRecord({
+      record: record({
+        source: "Archon",
+        target: "执政官",
+        policy: "contextual",
+        locked: true,
+      }),
+      selection: selection("term"),
+      fields: {
+        source: mapping("source", "source"),
+        target: mapping("target", "target"),
+        policy: mapping("policy", "policy"),
+        locked: mapping("locked", "locked"),
+      },
+      importBatchId: "batch-conflicting-policy",
+    }),
+    /term\.locked=true requires policy=locked/u,
+  );
 });
 
 test("does not split arrays without an explicit separator", () => {

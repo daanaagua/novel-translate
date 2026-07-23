@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -15,6 +15,12 @@ import {
 } from "../src/fullbook/book-runner.js";
 import type { BookWindowPlan } from "../src/fullbook/types.js";
 import { planBookWindows } from "../src/fullbook/window-planner.js";
+import {
+  LosslessKnowledgeImportStorageAdapter,
+} from "../src/knowledge-import/lossless-knowledge-import-storage.js";
+import type {
+  PreparedImportRecord,
+} from "../src/knowledge-import/knowledge-import-service.js";
 import { createKnowledgeSnapshot } from "../src/knowledge/snapshot.js";
 import { auditLosslessBookStore } from "../src/report.js";
 import { blockId, buildLosslessBlocks } from "../src/source/block-builder.js";
@@ -219,6 +225,103 @@ test("unknown and duplicate block IDs cannot stage", () => {
     assert.equal(fixture.store.auditState("run-a").translations.length, 0);
   } finally {
     fixture.store.close();
+  }
+});
+
+test("an injected import stage fault leaves no persistent batch or row", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "v5-import-stage-fault-"));
+  const path = join(directory, "book.db");
+  const fixture = initializeStore(path, {
+    checkpoint(name) {
+      if (name === "knowledge_import_stage_before_commit") {
+        throw new Error("injected knowledge_import_stage_before_commit");
+      }
+    },
+  });
+  const batchId = randomUUID();
+  const prepared: PreparedImportRecord = {
+    state: "normalized",
+    record: {
+      ordinal: 0,
+      location: "row 1",
+      canonicalHash: sha256("import-row"),
+      diagnostics: [],
+      command: {
+        type: "upsert",
+        objectType: "term",
+        normalizedSubject: "Archon",
+        kind: "lexical_anchor",
+        expectedRevision: null,
+        expectedScopeRevision: null,
+        fieldPatch: {
+          sourceForm: "Archon",
+          canonicalSource: "Archon",
+          target: "Magistrate",
+        },
+        ownedFields: ["/sourceForm", "/canonicalSource", "/target"],
+        scope: "book",
+        evidence: [],
+        origin: "import",
+        importBatchId: batchId,
+      },
+    },
+  };
+  try {
+    const adapter = new LosslessKnowledgeImportStorageAdapter(
+      fixture.store,
+      "run-a",
+    );
+    await assert.rejects(
+      () => adapter.stageBatch({
+        batchId,
+        sourceHash: sha256("terms.json source"),
+        sourceName: "terms.json",
+        sourceFormat: "json",
+        request: {
+          pendingImportId: randomUUID(),
+          operationId: randomUUID(),
+          expectedGeneration: 0,
+          expectedSnapshotId: fixture.snapshotId,
+          selection: {
+            objectType: "term",
+            scope: "book",
+            recordPathId: "records",
+          },
+          fields: {
+            source: {
+              targetField: "source",
+              sourceColumn: "source",
+              confidence: "high",
+              confirmed: true,
+            },
+            target: {
+              targetField: "target",
+              sourceColumn: "target",
+              confidence: "high",
+              confirmed: true,
+            },
+          },
+        },
+        signal: new AbortController().signal,
+        records: {
+          async *[Symbol.asyncIterator]() {
+            yield prepared;
+          },
+        },
+      }),
+      /injected knowledge_import_stage_before_commit/u,
+    );
+    assert.equal((await adapter.listStaged()).length, 0);
+  } finally {
+    fixture.store.close();
+  }
+
+  const reopened = new LosslessBookStore(path);
+  try {
+    const adapter = new LosslessKnowledgeImportStorageAdapter(reopened, "run-a");
+    assert.equal((await adapter.listStaged()).length, 0);
+  } finally {
+    reopened.close();
   }
 });
 

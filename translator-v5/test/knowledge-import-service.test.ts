@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import test from "node:test";
 
 import {
@@ -11,11 +11,24 @@ import {
   type PreparedImportRecord,
   type StageBatchInput,
 } from "../src/knowledge-import/knowledge-import-service.js";
+import {
+  LosslessKnowledgeImportStorageAdapter,
+} from "../src/knowledge-import/lossless-knowledge-import-storage.js";
 import type {
+  CommittedImportReport,
   ImportFieldMapping,
   ImportSelection,
+  RolledBackImportReport,
   StagedImportReport,
 } from "../src/knowledge-import/types.js";
+import { createKnowledgeSnapshot } from "../src/knowledge/snapshot.js";
+import { blockId } from "../src/source/block-builder.js";
+import {
+  LosslessBookStore,
+  type CertifiedSourceInput,
+  type FaultCheckpoint,
+  type FaultInjector,
+} from "../src/storage/lossless-book-store.js";
 
 function termSelection(recordPathId?: string): ImportSelection {
   return {
@@ -32,6 +45,133 @@ function mapField(targetField: string, sourceColumn: string): ImportFieldMapping
     confidence: "high",
     confirmed: true,
   };
+}
+
+function sha256(value: string): string {
+  return createHash("sha256").update(value, "utf8").digest("hex");
+}
+
+function importSource(): CertifiedSourceInput {
+  return {
+    sourceVersion: "source-import",
+    rawSha256: sha256("source"),
+    canonicalSha256: sha256("source"),
+    canonicalChars: 6,
+    coordinateUnit: "unicode_scalar",
+    sourceFormat: "txt",
+    encoding: "utf-8",
+    extractor: "test",
+    ranges: [{
+      rangeId: "range-import",
+      canonicalStart: 0,
+      canonicalEnd: 6,
+      originKind: "text",
+      originRef: "source.txt",
+      transformation: "identity",
+    }],
+  };
+}
+
+function importFixture(
+  directory: string,
+  injector?: FaultInjector,
+): {
+  readonly runId: string;
+  readonly store: LosslessBookStore;
+  readonly service: KnowledgeImportService;
+} {
+  const runId = "run-import";
+  const store = new LosslessBookStore(join(directory, "book.db"), injector);
+  store.registerSource(importSource());
+  store.replaceDerivedPlan("source-import", {
+    blocks: [{
+      id: blockId("source-import", 0, 6, "source"),
+      sourceVersion: "source-import",
+      canonicalStart: 0,
+      canonicalEnd: 6,
+      sourceText: "source",
+      sourceHash: sha256("source"),
+      globalIndex: 0,
+      tokenCount: 1,
+      structureId: null,
+      structureTitle: null,
+    }],
+    annotations: [],
+  });
+  const snapshot = createKnowledgeSnapshot(runId, []);
+  store.createTranslationRun({
+    runId,
+    sourceVersion: "source-import",
+    protocolVersion: "test",
+    modelId: "test",
+    initialSnapshotId: snapshot.id,
+    initialSnapshot: snapshot,
+  });
+  return {
+    runId,
+    store,
+    service: new KnowledgeImportService({
+      storage: new LosslessKnowledgeImportStorageAdapter(store, runId),
+    }),
+  };
+}
+
+async function stageTerms(
+  service: KnowledgeImportService,
+  path: string,
+): Promise<StagedImportReport> {
+  const pending = service.registerPending(path);
+  const inspection = await service.inspect({
+    pendingImportId: pending.pendingImportId,
+    operationId: randomUUID(),
+  });
+  assert.equal(inspection.status, "ready");
+  if (inspection.status !== "ready") assert.fail("expected ready import");
+  const recordPathId = inspection.inspection.recordPaths[0]?.id;
+  assert.ok(recordPathId);
+  return service.stage({
+    pendingImportId: pending.pendingImportId,
+    operationId: randomUUID(),
+    expectedGeneration: 0,
+    expectedSnapshotId: createKnowledgeSnapshot("run-import", []).id,
+    selection: termSelection(recordPathId),
+    fields: {
+      source: mapField("source", "source"),
+      target: mapField("target", "target"),
+    },
+  });
+}
+
+function currentImportState(
+  fixture: ReturnType<typeof importFixture>,
+): { generation: number; snapshotId: string } {
+  return fixture.store.knowledgeState(fixture.runId);
+}
+
+function commitBatch(
+  fixture: ReturnType<typeof importFixture>,
+  batchId: string,
+): Promise<CommittedImportReport> {
+  const state = currentImportState(fixture);
+  return fixture.service.commit({
+    batchId,
+    operationId: randomUUID(),
+    expectedGeneration: state.generation,
+    expectedSnapshotId: state.snapshotId,
+  });
+}
+
+function rollbackBatch(
+  fixture: ReturnType<typeof importFixture>,
+  batchId: string,
+): Promise<RolledBackImportReport> {
+  const state = currentImportState(fixture);
+  return fixture.service.rollback({
+    batchId,
+    operationId: randomUUID(),
+    expectedGeneration: state.generation,
+    expectedSnapshotId: state.snapshotId,
+  });
 }
 
 async function withTempDirectory(
@@ -246,3 +386,518 @@ test("prepares normalized records for an atomic adapter without disclosing the s
     }).includes(directory), false);
   });
 });
+
+test("persists staged rows, pages them and discards them without changing knowledge", async () => {
+  await withTempDirectory(async (directory) => {
+    const path = join(directory, "terms.json");
+    await writeFile(path, JSON.stringify([
+      { source: "Archon", target: "Magistrate" },
+      { source: "Autarch", target: "Sovereign" },
+    ]), "utf8");
+    const fixture = importFixture(directory);
+    try {
+      const before = currentImportState(fixture);
+      const staged = await stageTerms(fixture.service, path);
+      assert.deepEqual(staged.counts, {
+        ready: 2,
+        merge: 0,
+        conflict: 0,
+        invalid: 0,
+        skipped: 0,
+      });
+      assert.equal(staged.unresolved, 0);
+      assert.equal((await fixture.service.listStaged()).length, 1);
+      const firstPage = await fixture.service.getStaged({
+        batchId: staged.batchId,
+        limit: 1,
+      });
+      assert.equal(firstPage.rows.length, 1);
+      assert.ok(firstPage.nextCursor);
+      const secondPage = await fixture.service.getStaged({
+        batchId: staged.batchId,
+        cursor: firstPage.nextCursor,
+        limit: 1,
+      });
+      assert.equal(secondPage.rows.length, 1);
+
+      await fixture.service.discardStaged({ batchId: staged.batchId });
+      assert.equal((await fixture.service.listStaged()).length, 0);
+      assert.deepEqual(currentImportState(fixture), before);
+      const discarded = await fixture.service.getStaged({
+        batchId: staged.batchId,
+        limit: 100,
+      });
+      assert.equal(discarded.rows.length, 0);
+    } finally {
+      fixture.store.close();
+    }
+  });
+});
+
+test("requires explicit decisions for conflicts and invalid rows before commit", async () => {
+  await withTempDirectory(async (directory) => {
+    const fixture = importFixture(directory);
+    try {
+      const state = fixture.store.knowledgeState(fixture.runId);
+      fixture.store.commitKnowledgeCommands({
+        requestId: randomUUID(),
+        runId: fixture.runId,
+        expectedGeneration: state.generation,
+        expectedSnapshotId: state.snapshotId,
+        commands: [{
+          type: "upsert",
+          objectType: "term",
+          normalizedSubject: "Archon",
+          kind: "lexical_anchor",
+          expectedRevision: null,
+          expectedScopeRevision: null,
+          fieldPatch: {
+            sourceForm: "Archon",
+            canonicalSource: "Archon",
+            target: "Existing",
+          },
+          ownedFields: ["/sourceForm", "/canonicalSource", "/target"],
+          scope: "book",
+          evidence: [],
+          origin: "manual",
+        }],
+      });
+      const conflictPath = join(directory, "conflict.json");
+      await writeFile(conflictPath, JSON.stringify([
+        { source: "Archon", target: "Imported" },
+      ]), "utf8");
+      const pending = fixture.service.registerPending(conflictPath);
+      const inspected = await fixture.service.inspect({
+        pendingImportId: pending.pendingImportId,
+        operationId: randomUUID(),
+      });
+      assert.equal(inspected.status, "ready");
+      if (inspected.status !== "ready") assert.fail("expected ready import");
+      const recordPathId = inspected.inspection.recordPaths[0]?.id;
+      assert.ok(recordPathId);
+      const current = currentImportState(fixture);
+      const staged = await fixture.service.stage({
+        pendingImportId: pending.pendingImportId,
+        operationId: randomUUID(),
+        expectedGeneration: current.generation,
+        expectedSnapshotId: current.snapshotId,
+        selection: termSelection(recordPathId),
+        fields: {
+          source: mapField("source", "source"),
+          target: mapField("target", "target"),
+        },
+      });
+      assert.equal(staged.counts.conflict, 1);
+      assert.equal(staged.unresolved, 1);
+      await assert.rejects(
+        () => commitBatch(fixture, staged.batchId),
+        /KNOWLEDGE_IMPORT_CONFLICTS_UNRESOLVED/u,
+      );
+      const rowOrdinal = staged.rows[0]?.ordinal;
+      assert.notEqual(rowOrdinal, undefined);
+      const decided = await fixture.service.setDecisions({
+        batchId: staged.batchId,
+        decisions: [{
+          rowOrdinal: rowOrdinal as number,
+          decision: { action: "use_imported" },
+        }],
+      });
+      assert.equal(decided.unresolved, 0);
+      const committed = await commitBatch(fixture, staged.batchId);
+      assert.equal(committed.updated, 1);
+      assert.equal(committed.committed, 1);
+      assert.equal(
+        (fixture.store.knowledgeRevisions(fixture.runId).at(-1)?.payload as {
+          target?: string;
+        }).target,
+        "Imported",
+      );
+
+      const invalidPath = join(directory, "invalid.json");
+      await writeFile(invalidPath, JSON.stringify([
+        { source: "NoTarget", target: null },
+      ]), "utf8");
+      const invalid = await (async () => {
+        const invalidPending = fixture.service.registerPending(invalidPath);
+        const invalidInspection = await fixture.service.inspect({
+          pendingImportId: invalidPending.pendingImportId,
+          operationId: randomUUID(),
+        });
+        assert.equal(invalidInspection.status, "ready");
+        if (invalidInspection.status !== "ready") assert.fail("expected ready");
+        const invalidPathId = invalidInspection.inspection.recordPaths[0]?.id;
+        assert.ok(invalidPathId);
+        const stateAfterCommit = currentImportState(fixture);
+        return fixture.service.stage({
+          pendingImportId: invalidPending.pendingImportId,
+          operationId: randomUUID(),
+          expectedGeneration: stateAfterCommit.generation,
+          expectedSnapshotId: stateAfterCommit.snapshotId,
+          selection: termSelection(invalidPathId),
+          fields: {
+            source: mapField("source", "source"),
+            target: mapField("target", "target"),
+          },
+        });
+      })();
+      assert.equal(invalid.counts.invalid, 1);
+      await assert.rejects(
+        () => commitBatch(fixture, invalid.batchId),
+        /KNOWLEDGE_IMPORT_CONFLICTS_UNRESOLVED/u,
+      );
+      await fixture.service.setDecisions({
+        batchId: invalid.batchId,
+        decisions: [{
+          rowOrdinal: invalid.rows[0]!.ordinal,
+          decision: { action: "skip" },
+        }],
+      });
+      const skipped = await commitBatch(fixture, invalid.batchId);
+      assert.equal(skipped.invalid, 1);
+      assert.equal(skipped.skipped, 1);
+      assert.equal(skipped.committed, 0);
+    } finally {
+      fixture.store.close();
+    }
+  });
+});
+
+test("stages and commits the same import idempotently", async () => {
+  await withTempDirectory(async (directory) => {
+    const path = join(directory, "terms.json");
+    await writeFile(path, JSON.stringify([
+      { source: "Archon", target: "Magistrate" },
+    ]), "utf8");
+    const fixture = importFixture(directory);
+    try {
+      const firstStage = await stageTerms(fixture.service, path);
+      const duplicateStage = await stageTerms(fixture.service, path);
+      assert.equal(duplicateStage.batchId, firstStage.batchId);
+      const firstCommit = await commitBatch(fixture, firstStage.batchId);
+      const revisionCount = fixture.store.knowledgeRevisions(fixture.runId).length;
+      const replay = await fixture.service.commit({
+        batchId: firstStage.batchId,
+        operationId: randomUUID(),
+        expectedGeneration: 0,
+        expectedSnapshotId: createKnowledgeSnapshot(fixture.runId, []).id,
+      });
+      assert.deepEqual(replay, firstCommit);
+      assert.equal(
+        fixture.store.knowledgeRevisions(fixture.runId).length,
+        revisionCount,
+      );
+    } finally {
+      fixture.store.close();
+    }
+  });
+});
+
+test("uses the complete source file hash even when changed columns are unmapped", async () => {
+  await withTempDirectory(async (directory) => {
+    const path = join(directory, "terms.json");
+    await writeFile(path, JSON.stringify([
+      { source: "Archon", target: "Magistrate", privateNote: "first" },
+    ]), "utf8");
+    const fixture = importFixture(directory);
+    try {
+      const first = await stageTerms(fixture.service, path);
+      await writeFile(path, JSON.stringify([
+        { source: "Archon", target: "Magistrate", privateNote: "second" },
+      ]), "utf8");
+      const second = await stageTerms(fixture.service, path);
+      assert.notEqual(second.batchId, first.batchId);
+      assert.equal((await fixture.service.listStaged()).length, 2);
+    } finally {
+      fixture.store.close();
+    }
+  });
+});
+
+test("rejects a source file that changes after inspection", async () => {
+  await withTempDirectory(async (directory) => {
+    const path = join(directory, "terms.json");
+    await writeFile(path, JSON.stringify([
+      { source: "Archon", target: "Magistrate" },
+    ]), "utf8");
+    const fixture = importFixture(directory);
+    try {
+      const pending = fixture.service.registerPending(path);
+      const inspection = await fixture.service.inspect({
+        pendingImportId: pending.pendingImportId,
+        operationId: randomUUID(),
+      });
+      assert.equal(inspection.status, "ready");
+      if (inspection.status !== "ready") assert.fail("expected ready import");
+      const recordPathId = inspection.inspection.recordPaths[0]?.id;
+      assert.ok(recordPathId);
+      await writeFile(path, JSON.stringify([
+        { source: "Archon", target: "Changed after inspection" },
+      ]), "utf8");
+
+      await assert.rejects(
+        () => fixture.service.stage({
+          pendingImportId: pending.pendingImportId,
+          operationId: randomUUID(),
+          expectedGeneration: 0,
+          expectedSnapshotId: createKnowledgeSnapshot(
+            fixture.runId,
+            [],
+          ).id,
+          selection: termSelection(recordPathId),
+          fields: {
+            source: mapField("source", "source"),
+            target: mapField("target", "target"),
+          },
+        }),
+        /KNOWLEDGE_IMPORT_SOURCE_CHANGED/u,
+      );
+      assert.equal((await fixture.service.listStaged()).length, 0);
+    } finally {
+      fixture.store.close();
+    }
+  });
+});
+
+test("rolls back additions and updates as one idempotent batch", async () => {
+  await withTempDirectory(async (directory) => {
+    const additionPath = join(directory, "addition.json");
+    await writeFile(additionPath, JSON.stringify([
+      { source: "Archon", target: "Magistrate" },
+    ]), "utf8");
+    const fixture = importFixture(directory);
+    try {
+      const addition = await stageTerms(fixture.service, additionPath);
+      await commitBatch(fixture, addition.batchId);
+      const first = await rollbackBatch(fixture, addition.batchId);
+      const historyCount = fixture.store.knowledgeRevisions(fixture.runId).length;
+      assert.equal(
+        fixture.store.knowledgeRevisions(fixture.runId).at(-1)?.status,
+        "superseded",
+      );
+      assert.equal(
+        fixture.store.latestKnowledgeSnapshot(fixture.runId).revisions.length,
+        0,
+      );
+      const replay = await fixture.service.rollback({
+        batchId: addition.batchId,
+        operationId: randomUUID(),
+        expectedGeneration: 0,
+        expectedSnapshotId: "stale",
+      });
+      assert.deepEqual(replay, first);
+      assert.equal(
+        fixture.store.knowledgeRevisions(fixture.runId).length,
+        historyCount,
+      );
+    } finally {
+      fixture.store.close();
+    }
+  });
+});
+
+test("rollback restores the pre-import catalog value after an imported update", async () => {
+  await withTempDirectory(async (directory) => {
+    const fixture = importFixture(directory);
+    try {
+      const state = currentImportState(fixture);
+      fixture.store.commitKnowledgeCommands({
+        requestId: randomUUID(),
+        runId: fixture.runId,
+        expectedGeneration: state.generation,
+        expectedSnapshotId: state.snapshotId,
+        commands: [{
+          type: "upsert",
+          objectType: "term",
+          normalizedSubject: "Archon",
+          kind: "lexical_anchor",
+          expectedRevision: null,
+          expectedScopeRevision: null,
+          fieldPatch: {
+            sourceForm: "Archon",
+            canonicalSource: "Archon",
+            target: "Original",
+          },
+          ownedFields: ["/sourceForm", "/canonicalSource", "/target"],
+          scope: "book",
+          evidence: [],
+          origin: "manual",
+        }],
+      });
+      const path = join(directory, "update.json");
+      await writeFile(path, JSON.stringify([
+        { source: "Archon", target: "Imported" },
+      ]), "utf8");
+      const pending = fixture.service.registerPending(path);
+      const inspected = await fixture.service.inspect({
+        pendingImportId: pending.pendingImportId,
+        operationId: randomUUID(),
+      });
+      assert.equal(inspected.status, "ready");
+      if (inspected.status !== "ready") assert.fail("expected ready");
+      const recordPathId = inspected.inspection.recordPaths[0]?.id;
+      assert.ok(recordPathId);
+      const beforeStage = currentImportState(fixture);
+      let staged = await fixture.service.stage({
+        pendingImportId: pending.pendingImportId,
+        operationId: randomUUID(),
+        expectedGeneration: beforeStage.generation,
+        expectedSnapshotId: beforeStage.snapshotId,
+        selection: termSelection(recordPathId),
+        fields: {
+          source: mapField("source", "source"),
+          target: mapField("target", "target"),
+        },
+      });
+      staged = await fixture.service.setDecisions({
+        batchId: staged.batchId,
+        decisions: [{
+          rowOrdinal: staged.rows[0]!.ordinal,
+          decision: { action: "use_imported" },
+        }],
+      });
+      assert.equal(staged.unresolved, 0);
+      await commitBatch(fixture, staged.batchId);
+      assert.equal(
+        (fixture.store.knowledgeRevisions(fixture.runId).at(-1)?.payload as {
+          target?: string;
+        }).target,
+        "Imported",
+      );
+
+      await rollbackBatch(fixture, staged.batchId);
+      const restored = fixture.store.knowledgeRevisions(fixture.runId).at(-1);
+      assert.equal(restored?.status, "active");
+      assert.equal(restored?.authority?.origin, "rollback");
+      assert.equal(
+        (restored?.payload as { target?: string } | undefined)?.target,
+        "Original",
+      );
+    } finally {
+      fixture.store.close();
+    }
+  });
+});
+
+test("rollback rejects a stale book or project catalog generation", async () => {
+  await withTempDirectory(async (directory) => {
+    const path = join(directory, "terms.json");
+    await writeFile(path, JSON.stringify([
+      { source: "Archon", target: "Magistrate" },
+    ]), "utf8");
+    const fixture = importFixture(directory);
+    try {
+      const staged = await stageTerms(fixture.service, path);
+      await commitBatch(fixture, staged.batchId);
+
+      const secondRunId = "run-import-second";
+      const secondSnapshot = createKnowledgeSnapshot(secondRunId, []);
+      fixture.store.createTranslationRun({
+        runId: secondRunId,
+        sourceVersion: "source-import",
+        protocolVersion: "test",
+        modelId: "test",
+        initialSnapshotId: secondSnapshot.id,
+        initialSnapshot: secondSnapshot,
+      });
+      const secondState = fixture.store.knowledgeState(secondRunId);
+      fixture.store.commitKnowledgeCommands({
+        requestId: randomUUID(),
+        runId: secondRunId,
+        expectedGeneration: secondState.generation,
+        expectedSnapshotId: secondState.snapshotId,
+        commands: [{
+          type: "upsert",
+          objectType: "term",
+          normalizedSubject: "Autarch",
+          kind: "lexical_anchor",
+          expectedRevision: null,
+          expectedScopeRevision: null,
+          fieldPatch: {
+            sourceForm: "Autarch",
+            canonicalSource: "Autarch",
+            target: "Sovereign",
+          },
+          ownedFields: ["/sourceForm", "/canonicalSource", "/target"],
+          scope: "project",
+          evidence: [],
+          origin: "manual",
+        }],
+      });
+
+      await assert.rejects(
+        () => rollbackBatch(fixture, staged.batchId),
+        /KNOWLEDGE_SCOPE_GENERATION_CONFLICT/u,
+      );
+      assert.equal(
+        fixture.store.knowledgeRevisions(fixture.runId).at(-1)?.status,
+        "active",
+      );
+    } finally {
+      fixture.store.close();
+    }
+  });
+});
+
+for (const checkpoint of [
+  "knowledge_import_stage_before_commit",
+  "knowledge_import_before_commit",
+  "knowledge_import_rollback_before_commit",
+] as const satisfies readonly FaultCheckpoint[]) {
+  test(`keeps the whole import atomic after injected ${checkpoint}`, async () => {
+    await withTempDirectory(async (directory) => {
+      let armed = checkpoint === "knowledge_import_stage_before_commit";
+      let injected = false;
+      const fixture = importFixture(directory, {
+        checkpoint(name) {
+          if (armed && !injected && name === checkpoint) {
+            injected = true;
+            throw new Error(`injected ${name}`);
+          }
+        },
+      });
+      const path = join(directory, "terms.json");
+      await writeFile(path, JSON.stringify([
+        { source: "Archon", target: "Magistrate" },
+      ]), "utf8");
+      try {
+        if (checkpoint === "knowledge_import_stage_before_commit") {
+          await assert.rejects(
+            () => stageTerms(fixture.service, path),
+            /injected knowledge_import_stage_before_commit/u,
+          );
+          assert.equal((await fixture.service.listStaged()).length, 0);
+          assert.equal(fixture.store.knowledgeRevisions(fixture.runId).length, 0);
+          return;
+        }
+        const staged = await stageTerms(fixture.service, path);
+        if (checkpoint === "knowledge_import_before_commit") {
+          armed = true;
+          const before = currentImportState(fixture);
+          await assert.rejects(
+            () => commitBatch(fixture, staged.batchId),
+            /injected knowledge_import_before_commit/u,
+          );
+          assert.deepEqual(currentImportState(fixture), before);
+          assert.equal(fixture.store.knowledgeRevisions(fixture.runId).length, 0);
+          assert.equal((await fixture.service.listStaged()).length, 1);
+          return;
+        }
+        await commitBatch(fixture, staged.batchId);
+        armed = true;
+        const before = currentImportState(fixture);
+        const history = fixture.store.knowledgeRevisions(fixture.runId);
+        await assert.rejects(
+          () => rollbackBatch(fixture, staged.batchId),
+          /injected knowledge_import_rollback_before_commit/u,
+        );
+        assert.deepEqual(currentImportState(fixture), before);
+        assert.deepEqual(
+          fixture.store.knowledgeRevisions(fixture.runId),
+          history,
+        );
+      } finally {
+        fixture.store.close();
+      }
+    });
+  });
+}

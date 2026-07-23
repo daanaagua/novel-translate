@@ -1836,7 +1836,12 @@ test("lossless resume merges persisted style over caller style for the next wave
     "style",
     "book-style",
     "style_directive",
-    { technicalProse: "先交代概念关系，再保持术语精确" },
+    {
+      technicalProse: "先交代概念关系，再保持术语精确",
+      dialogue: "对白".repeat(90),
+      narrativeDistance: "保持疏离的回忆距离",
+      dialogueRegister: "正式场合克制，私下自然",
+    },
   );
 
   const resumedProvider = fauxProvider();
@@ -1854,6 +1859,8 @@ test("lossless resume merges persisted style over caller style for the next wave
 
   assert.equal(resumed.status.completedWindows, resumed.status.totalWindows);
   assert.match(resumedPrompt, /先交代概念关系，再保持术语精确/u);
+  assert.match(resumedPrompt, /保持疏离的回忆距离/u);
+  assert.match(resumedPrompt, /正式场合克制，私下自然/u);
   assert.doesNotMatch(resumedPrompt, /调用方原始要求/u);
 });
 

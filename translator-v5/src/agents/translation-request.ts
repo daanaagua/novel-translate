@@ -227,6 +227,10 @@ export function prepareTranslationRequest(
   const profile = input.sourceLanguageProfile ?? getSourceLanguageProfile("en");
   const responseProtocol = input.responseProtocol ?? "typed_tool";
   const windows = windowsForPrompt(input);
+  const blockPositionById = new Map(input.blocks.map((block) => [
+    block.id,
+    { blockId: block.id, globalIndex: block.globalIndex },
+  ]));
   const framedProtocol = responseProtocol === "framed_text"
     ? createFramedTranslationProtocol({
       requestId: input.request.requestId,
@@ -244,6 +248,20 @@ export function prepareTranslationRequest(
     input.snapshot.revisions,
     windows.flatMap((window) => window.blocks.map((block) => block.sourceText)),
     profile,
+    {
+      corpusBlocks: [...blockPositionById.values()],
+      currentBlocks: windows.flatMap((window) => window.blocks.map((promptBlock) => {
+        const block = blockPositionById.get(promptBlock.blockId);
+        if (block === undefined) {
+          throw new Error(`physical request references unknown block: ${promptBlock.blockId}`);
+        }
+        return {
+          blockId: block.blockId,
+          globalIndex: block.globalIndex,
+          windowId: window.windowId,
+        };
+      })),
+    },
   );
   const termsPayload = {
     stableTerms: input.stableTerms,
