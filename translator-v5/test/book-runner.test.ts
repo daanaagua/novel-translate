@@ -1641,6 +1641,151 @@ test("lossless runner resumes the same isolated run and promotes the remaining o
   assert.deepEqual(resumed.windows.map((window) => window.status), ["completed", "completed"]);
 });
 
+function commitManualKnowledge(
+  storePath: string,
+  objectType: "term" | "style",
+  normalizedSubject: string,
+  kind: string,
+  fieldPatch: Record<string, string | boolean>,
+): void {
+  const store = new LosslessBookStore(storePath);
+  try {
+    const state = store.knowledgeState("run-lossless");
+    store.commitKnowledgeCommands({
+      requestId: `manual-${objectType}-${normalizedSubject}`,
+      runId: "run-lossless",
+      expectedGeneration: state.generation,
+      expectedSnapshotId: state.snapshotId,
+      commands: [{
+        type: "upsert",
+        objectType,
+        normalizedSubject,
+        kind,
+        expectedRevision: null,
+        expectedScopeRevision: null,
+        fieldPatch,
+        ownedFields: Object.keys(fieldPatch).map((field) => `/${field}`),
+        scope: "book",
+        evidence: [],
+        origin: "manual",
+      }],
+    });
+  } finally {
+    store.close();
+  }
+}
+
+test("lossless resume preserves a manually locked knowledge term in stable terms", async () => {
+  const fixture = losslessFixture("EDGEWOOD\n\nBOOK ONE\n\narchon greeted the steward.");
+  fixture.faux.setResponses([losslessBatchResponse]);
+  await runBook({ ...fixture.options, maxWindows: 1 } as never);
+  commitManualKnowledge(
+    fixture.options.storePath,
+    "term",
+    "archon",
+    "lexical_anchor",
+    {
+      sourceForm: "Archon",
+      canonicalSource: "Archon",
+      target: "阁下",
+      locked: true,
+      policy: "locked",
+      note: "人物面前的直接呼告",
+    },
+  );
+  commitManualKnowledge(
+    fixture.options.storePath,
+    "term",
+    "steward",
+    "lexical_anchor",
+    {
+      sourceForm: "steward",
+      canonicalSource: "steward",
+      target: "总管",
+      locked: false,
+      policy: "preferred",
+      note: "叙述中的默认职业称谓",
+    },
+  );
+
+  const resumedProvider = fauxProvider();
+  let resumedPrompt = "";
+  resumedProvider.setResponses([(context) => {
+    resumedPrompt = userText(context);
+    return losslessBatchResponse(context);
+  }]);
+  const resumed = await runBook({
+    ...fixture.options,
+    model: resumedProvider.getModel(),
+    streamFn: resumedProvider.provider.streamSimple.bind(resumedProvider.provider),
+  } as never);
+
+  assert.equal(resumed.status.completedWindows, resumed.status.totalWindows);
+  const termMatch = /STABLE TERMS\n\n(\[[\s\S]*?\])\n\nUNRESOLVED ENTITY LINKS/u.exec(resumedPrompt);
+  assert.ok(termMatch?.[1]);
+  const terms = JSON.parse(termMatch[1]) as Array<{
+    conceptId: string;
+    lexemeId: string;
+    sourceForm: string;
+    canonicalSource: string;
+    target: string;
+    policy?: string;
+    locked: boolean;
+    note?: string;
+    origin?: string;
+  }>;
+  const term = terms.find((candidate) => candidate.sourceForm === "Archon");
+  assert.ok(term);
+  assert.equal(term.conceptId, "user-archon");
+  assert.match(term.lexemeId, /^user-/u);
+  assert.equal(term.canonicalSource, "Archon");
+  assert.equal(term.target, "阁下");
+  assert.equal(term.locked, true);
+  assert.equal(term.policy, "locked");
+  assert.equal(term.note, "人物面前的直接呼告");
+  assert.equal(term.origin, "knowledge");
+  const preferred = terms.find((candidate) => candidate.sourceForm === "steward");
+  assert.ok(preferred);
+  assert.equal(preferred.target, "总管");
+  assert.equal(preferred.locked, false);
+  assert.equal(preferred.policy, "preferred");
+  assert.equal(preferred.note, "叙述中的默认职业称谓");
+});
+
+test("lossless resume merges persisted style over caller style for the next wave", async () => {
+  const fixture = losslessFixture("EDGEWOOD\n\nBOOK ONE\n\nthe orbit was narrow.");
+  fixture.faux.setResponses([losslessBatchResponse]);
+  await runBook({
+    ...fixture.options,
+    maxWindows: 1,
+    styleState: { technicalProse: "调用方原始要求" },
+  } as never);
+  commitManualKnowledge(
+    fixture.options.storePath,
+    "style",
+    "book-style",
+    "style_directive",
+    { technicalProse: "先交代概念关系，再保持术语精确" },
+  );
+
+  const resumedProvider = fauxProvider();
+  let resumedPrompt = "";
+  resumedProvider.setResponses([(context) => {
+    resumedPrompt = userText(context);
+    return losslessBatchResponse(context);
+  }]);
+  const resumed = await runBook({
+    ...fixture.options,
+    model: resumedProvider.getModel(),
+    streamFn: resumedProvider.provider.streamSimple.bind(resumedProvider.provider),
+    styleState: { technicalProse: "调用方原始要求" },
+  } as never);
+
+  assert.equal(resumed.status.completedWindows, resumed.status.totalWindows);
+  assert.match(resumedPrompt, /先交代概念关系，再保持术语精确/u);
+  assert.doesNotMatch(resumedPrompt, /调用方原始要求/u);
+});
+
 test("lossless resume uses bounded structured style evidence instead of a raw prior tail", async () => {
   const fixture = losslessFixture("EDGEWOOD\n\nBOOK ONE");
   const longTranslation = "克制样例。";

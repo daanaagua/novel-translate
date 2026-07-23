@@ -33,7 +33,12 @@ import {
   canonicalJson,
   KnowledgeStore,
   type KnowledgeCandidate,
+  type KnowledgeRevision,
 } from "../knowledge/knowledge-store.js";
+import {
+  mergeStyleState,
+  persistedStyleFromKnowledge,
+} from "../knowledge/persisted-style.js";
 import { createKnowledgeSnapshot } from "../knowledge/snapshot.js";
 import { SourceLedger } from "../source/source-ledger.js";
 import type { LosslessBlock } from "../source/types.js";
@@ -793,7 +798,7 @@ function termsFromKnowledge(
     if (raw === null || typeof raw !== "object" || Array.isArray(raw)) {
       continue;
     }
-    const revision = raw as { kind?: unknown; payload?: unknown; status?: unknown };
+    const revision = raw as Partial<KnowledgeRevision>;
     if (revision.status !== "active") {
       continue;
     }
@@ -802,16 +807,30 @@ function termsFromKnowledge(
       && typeof revision.payload === "object"
       && !Array.isArray(revision.payload)) {
       const term = revision.payload as Partial<StableTerm>;
-      if (typeof term.conceptId === "string"
-        && typeof term.lexemeId === "string"
-        && typeof term.sourceForm === "string"
+      if (typeof term.sourceForm === "string"
         && typeof term.canonicalSource === "string"
         && typeof term.target === "string"
         && typeof term.locked === "boolean") {
-        terms.push(softenModelAnchorTerm({
-          ...(term as StableTerm),
+        const stableTerm: StableTerm = {
+          conceptId: typeof term.conceptId === "string"
+            ? term.conceptId
+            : `user-${revision.normalizedSubject ?? term.canonicalSource}`,
+          lexemeId: typeof term.lexemeId === "string"
+            ? term.lexemeId
+            : `user-${revision.revisionId ?? revision.normalizedSubject ?? term.sourceForm}`,
+          sourceForm: term.sourceForm,
+          canonicalSource: term.canonicalSource,
+          target: term.target,
+          locked: term.locked,
+          ...(term.policy === undefined ? {} : { policy: term.policy }),
+          ...(term.note === undefined ? {} : { note: term.note }),
           origin: term.origin ?? "knowledge",
-        }));
+        };
+        const modelAuthored = revision.authority === undefined
+          || revision.authority.origin === "model";
+        terms.push(modelAuthored
+          ? softenModelAnchorTerm(stableTerm)
+          : stableTerm);
       }
     }
     if (revision.kind === "entity_alias_link"
@@ -1647,8 +1666,6 @@ async function runLosslessBook(
       ...(schedulerSnapshot === undefined ? {} : { snapshot: schedulerSnapshot }),
     });
     const blockById = new Map(context.losslessBlocks.map((block) => [block.id, block]));
-    const styleConstitution = losslessStyleConstitution(options.styleState);
-    const voiceProfiles = losslessVoiceProfiles(options.styleState);
     let fastWaveHorizonMultiplier = runtimeSet.mode === "fast" ? 2 : 1;
 
     while (processedWindows < maxWindows) {
@@ -1682,6 +1699,12 @@ async function runLosslessBook(
       }
 
       const snapshot = store.latestKnowledgeSnapshot(runId);
+      const requestStyle = mergeStyleState(
+        options.styleState,
+        persistedStyleFromKnowledge(snapshot.revisions),
+      );
+      const styleConstitution = losslessStyleConstitution(requestStyle);
+      const voiceProfiles = losslessVoiceProfiles(requestStyle);
       const priorStyleObservations = store.styleObservations(runId);
       const effectiveStyleByWindow = Object.fromEntries(selected.map((window) => [
         window.windowId,
@@ -1935,7 +1958,7 @@ async function runLosslessBook(
             options.glossary,
           ),
           snapshot,
-          styleState: options.styleState,
+          styleState: requestStyle,
           sourceLanguageProfile: context.languageProfile,
           entityLinkWarnings,
           effectiveStyleByWindow: Object.fromEntries(request.windows.map((window) => [
