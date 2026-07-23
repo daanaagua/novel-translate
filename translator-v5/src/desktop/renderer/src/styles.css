@@ -526,6 +526,12 @@ h2 {
 
 .field input::placeholder { color: #667487; }
 
+.field input.has-saved-credential::placeholder {
+  color: var(--ink);
+  opacity: 1;
+  letter-spacing: 0.18em;
+}
+
 .model-row {
   display: grid;
   grid-template-columns: minmax(0, 1fr) auto;

@@ -30,6 +30,8 @@ interface ProviderSetupProps {
   onDraftValidityChange?(matchesActive: boolean): void;
 }
 
+const SAVED_CREDENTIAL_MASK = "••••••••••••";
+
 function firstModel(provider: DesktopOnboardingProvider | undefined): string {
   return provider?.fallbackModelIds[0] ?? "";
 }
@@ -232,6 +234,7 @@ export function ProviderSetup({
   }
 
   const configured = selectedProvider !== undefined && selectedProvider.credentialStatus !== "missing";
+  const credentialAvailable = selectedProvider?.credentialStatus === "available";
   const canTest = selectedProvider !== undefined && modelId !== "" && !formLocked;
 
   return (
@@ -291,7 +294,8 @@ export function ProviderSetup({
               aria-label="API Key"
               autoComplete="off"
               value={apiKey}
-              placeholder={selectedProvider.keyPlaceholder}
+              className={credentialAvailable ? "has-saved-credential" : undefined}
+              placeholder={credentialAvailable ? SAVED_CREDENTIAL_MASK : selectedProvider.keyPlaceholder}
               onChange={(event) => {
                 setApiKey(event.target.value);
                 setConnectionFeedback(undefined);

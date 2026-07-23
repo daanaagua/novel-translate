@@ -523,6 +523,8 @@ describe("FolioLoom desktop onboarding", () => {
     expect(kimi.getAttribute("aria-pressed")).toBe("true");
     expect((screen.getByLabelText("模型") as HTMLSelectElement).value).toBe("moonshot-v1-8k");
     expect(screen.getByRole("button", { name: "high" }).getAttribute("aria-pressed")).toBe("true");
+    expect((screen.getByLabelText("API Key") as HTMLInputElement).value).toBe("");
+    expect((screen.getByLabelText("API Key") as HTMLInputElement).placeholder).toBe("••••••••••••");
   });
 
   it("locks trial when the visible model draft no longer matches the tested model", async () => {
@@ -539,9 +541,15 @@ describe("FolioLoom desktop onboarding", () => {
     expect(screen.getByText(/重新测试连接后才能试译/u)).toBeTruthy();
   });
 
-  it("clears the API Key and shows confirmation only after a ready connection", async () => {
+  it("replaces the API Key with a persistent mask only after a ready connection", async () => {
     const user = userEvent.setup();
-    const testModel = vi.fn().mockResolvedValue(ok(testResult()));
+    const configuredReady: DesktopOnboardingState = {
+      ...readyOnboarding,
+      providers: providers.map((provider) => provider.id === "deepseek"
+        ? { ...provider, credentialStatus: "available", credentialPersistence: "encrypted" }
+        : provider),
+    };
+    const testModel = vi.fn().mockResolvedValue(ok(testResult(configuredReady)));
     render(<App api={createApi({
       getOnboardingState: vi.fn().mockResolvedValue(ok(sourceOnlyOnboarding)),
       testModel,
@@ -556,6 +564,7 @@ describe("FolioLoom desktop onboarding", () => {
       apiKey: "sk-temporary-key",
     })));
     await waitFor(() => expect((apiKey as HTMLInputElement).value).toBe(""));
+    expect((apiKey as HTMLInputElement).placeholder).toBe("••••••••••••");
     expect(screen.getByRole("status").textContent).toContain("连接成功，API Key 已安全保存。");
   });
 
@@ -745,11 +754,13 @@ describe("FolioLoom desktop onboarding", () => {
     await user.type(await screen.findByLabelText("API Key"), "sk-forget-after-ready");
     await user.click(screen.getByRole("button", { name: "测试连接" }));
     expect(await screen.findByText("连接成功，API Key 已安全保存。")).toBeTruthy();
+    expect((screen.getByLabelText("API Key") as HTMLInputElement).placeholder).toBe("••••••••••••");
 
     await user.click(screen.getByRole("button", { name: "忘记此密钥" }));
     await waitFor(() => expect(forgetCredential).toHaveBeenCalledWith("deepseek"));
 
     expect(screen.queryByText("连接成功，API Key 已安全保存。")).toBeNull();
+    expect((screen.getByLabelText("API Key") as HTMLInputElement).placeholder).toBe("DeepSeek API Key");
     expect((screen.getByRole("button", { name: "开始试译" }) as HTMLButtonElement).disabled).toBe(true);
     expect(screen.queryByText("当前已选择 deepseek-reasoner")).toBeNull();
   });
