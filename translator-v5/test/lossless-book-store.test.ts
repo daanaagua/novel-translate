@@ -204,7 +204,7 @@ function validStage(
   };
 }
 
-test("schema v2 enables foreign keys and WAL and creates every audit table", () => {
+test("schema v3 enables foreign keys and WAL and creates every audit table", () => {
   const path = fixturePath();
   const store = new LosslessBookStore(path);
   assert.deepEqual(store.databaseSettings(), { foreignKeys: true, journalMode: "wal" });
@@ -218,7 +218,10 @@ test("schema v2 enables foreign keys and WAL and creates every audit table", () 
     "source_versions", "source_ranges", "structure_annotations", "logical_blocks",
     "translation_runs", "window_plans", "window_membership", "translations",
     "knowledge_candidates", "knowledge_records", "knowledge_snapshots", "migration_candidates",
-    "recovery_runs", "events", "lossless_schema_meta",
+    "recovery_runs", "events", "lossless_schema_meta", "knowledge_state",
+    "book_knowledge_state", "book_knowledge_revisions", "project_knowledge_state",
+    "project_knowledge_revisions", "knowledge_block_impacts", "knowledge_import_batches",
+    "knowledge_import_rows",
   ]) {
     assert.ok(names.includes(name), `missing table ${name}`);
   }
@@ -300,7 +303,7 @@ test("read-only store rejects mutations", () => {
   readOnly.close();
 });
 
-test("schema v2 refuses to migrate a legacy BookStore database in place", () => {
+test("schema v3 refuses to migrate a legacy BookStore database in place", () => {
   const path = fixturePath();
   const legacy = new BookStore(path);
   legacy.close();
@@ -315,7 +318,7 @@ test("schema v2 refuses to migrate a legacy BookStore database in place", () => 
   database.close();
 });
 
-test("schema v2 rejects unknown and partial databases without changing journal, tables, or version", () => {
+test("schema v3 rejects unknown and partial databases without changing journal, tables, or version", () => {
   for (const [kind, initializeDatabase] of [
     ["unknown", (database: DatabaseSync) => {
       database.exec("PRAGMA journal_mode=DELETE; PRAGMA user_version=99; CREATE TABLE unrelated(value TEXT)");
@@ -594,6 +597,11 @@ test("conflicting staged candidates persist as two domain revisions while raw ca
   assert.deepEqual(
     store.latestKnowledgeSnapshot(runId).revisions,
     [history[1]],
+  );
+  assert.equal(
+    store.knowledgeState(runId).generation,
+    2,
+    "each promoted model knowledge change advances the workbench generation",
   );
   store.close();
 

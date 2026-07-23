@@ -1,5 +1,11 @@
 import { createHash } from "node:crypto";
 
+import {
+  mergeCandidateWithAuthority,
+  normalizeKnowledgeAuthority,
+  type KnowledgeAuthority,
+} from "./knowledge-authority.js";
+
 export type KnowledgeStatus =
   | "candidate"
   | "provisional"
@@ -57,6 +63,7 @@ export interface KnowledgeRevision {
   readonly status: KnowledgeStatus;
   readonly candidateIds: readonly string[];
   readonly sourceWindowIds: readonly string[];
+  readonly authority?: KnowledgeAuthority;
 }
 
 type KnowledgeRevisionContent = Omit<KnowledgeRevision, "revisionId">;
@@ -69,6 +76,7 @@ export interface AppendKnowledgeRevision {
   readonly status: KnowledgeStatus;
   readonly candidateIds?: readonly string[];
   readonly sourceWindowIds?: readonly string[];
+  readonly authority?: KnowledgeAuthority;
 }
 
 type CanonicalJson =
@@ -202,7 +210,7 @@ function normalizeRevisionContent(input: unknown): KnowledgeRevisionContent {
   if (!Array.isArray(raw.alternatives) || raw.alternatives.length === 0) {
     throw new TypeError("knowledge alternatives must be a nonempty array");
   }
-  return {
+  const content: KnowledgeRevisionContent = {
     revision: raw.revision as number,
     normalizedSubject: requireIdentifier(raw.normalizedSubject, "normalizedSubject"),
     kind: requireIdentifier(raw.kind, "kind"),
@@ -212,6 +220,13 @@ function normalizeRevisionContent(input: unknown): KnowledgeRevisionContent {
     candidateIds: requireStringArray(raw.candidateIds, "candidateIds"),
     sourceWindowIds: requireStringArray(raw.sourceWindowIds, "sourceWindowIds"),
   };
+  if (raw.authority !== undefined) {
+    return {
+      ...content,
+      authority: normalizeKnowledgeAuthority(raw.authority),
+    };
+  }
+  return content;
 }
 
 function revisionFromContent(input: unknown): KnowledgeRevision {
@@ -311,7 +326,7 @@ export class KnowledgeStore {
     const key = keyOf(normalizedSubject, kind);
     const previous = this.#latestByKey.get(key);
     const revision = (previous?.revision ?? 0) + 1;
-    const appended = revisionFromContent({
+    const content: KnowledgeRevisionContent = {
       revision,
       normalizedSubject,
       kind,
@@ -320,7 +335,10 @@ export class KnowledgeStore {
       status: input.status,
       candidateIds: input.candidateIds ?? [],
       sourceWindowIds: input.sourceWindowIds ?? [],
-    });
+    };
+    const appended = revisionFromContent(input.authority === undefined
+      ? content
+      : { ...content, authority: input.authority });
     if (previous !== undefined && !transitionAllowed(previous.status, appended.status)) {
       throw new Error(
         `knowledge transition is not allowed: ${previous.status} -> ${appended.status}`,
@@ -371,10 +389,17 @@ export class KnowledgeStore {
         compareText(canonicalJson(left.payload), canonicalJson(right.payload))
         || compareText(left.recordId, right.recordId));
       const current = this.latestRevision(group.normalizedSubject, group.kind);
-      const alternatives = sortedAlternatives([
-        ...(current?.alternatives ?? []),
-        ...group.candidates.map((candidate) => candidate.payload),
-      ]);
+      const alternatives = current?.authority === undefined
+        ? sortedAlternatives([
+          ...(current?.alternatives ?? []),
+          ...group.candidates.map((candidate) => candidate.payload),
+        ])
+        : sortedAlternatives(group.candidates.map((candidate) =>
+          mergeCandidateWithAuthority(
+            current.payload,
+            candidate.payload,
+            current.authority,
+          )));
       const status: KnowledgeStatus = alternatives.length === 1
         ? singletonCandidateStatus(group.kind, alternatives[0])
         : "needs_revalidate";
@@ -391,6 +416,7 @@ export class KnowledgeStore {
           ...group.candidates.map((candidate) => candidate.recordId),
         ],
         sourceWindowIds: [...(current?.sourceWindowIds ?? []), sourceWindowId],
+        authority: current?.authority,
       }));
     }
     return Object.freeze(appended);

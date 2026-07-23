@@ -1,5 +1,24 @@
 # FolioLoom 当前任务状态
 
+## 2026-07-23 当前 Goal：知识工作台与多格式导入
+
+- **状态：** 执行中
+- **分支：** `feat/folioloom-desktop`
+- **规格：** `docs/superpowers/specs/2026-07-23-knowledge-workbench-and-import-design.md`
+- **计划 A：** `docs/superpowers/plans/2026-07-23-knowledge-workbench-core.md`
+- **计划 B：** `docs/superpowers/plans/2026-07-23-knowledge-import-wizard.md`
+- **当前阶段：** 核心 Task 1–3 已通过风险审查并修复全部 3 个 P1/1 个 P2；正在接线分页查询、翻译投影与 catalog 同步。
+- **验收门槛：** 核心测试、桌面测试、两套 typecheck、production build 全部通过；Electron GUI 实际打开并完成工作台/导入主路径 smoke。
+- **本轮进度：**
+  - schema v3 新建、v2 原子迁移、故障回滚和只读 v2 兼容：定向测试 29/29 通过。
+  - 字段级 authority、旧 revision 哈希兼容和人工字段保护：定向测试 17/17 通过。
+  - 原子知识命令、幂等 request、乐观锁、撤销、book/project catalog seed、模型 promotion generation：核心联合测试 58/58 通过；扩展命令测试 10/10 通过。
+  - Task 1–3 风险审查发现并已修复：陈旧 run 虚报 catalog generation、人工快照破坏 lineage、六类字段缺少语义校验、authority/catalog 元数据未互证。
+  - 修复后全套核心测试 542 通过、1 项 Windows 符号链接环境跳过；TypeScript 全量检查通过。
+  - 导入 Task 1–3 已完成严格 JSON/YAML/CSV/XLSX 读取、安全边界、显式编码协商与官方模板；定向测试 15/15 通过，等待后续字段映射与 staging 接线。
+
+---
+
 ## 目标
 
 - 修复 DeepSeek V4 Flash/high 连接测试误报，并统一连接探针与正式运行时策略。

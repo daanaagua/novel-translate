@@ -22,6 +22,33 @@ import {
   type KnowledgeStatus,
 } from "../knowledge/knowledge-store.js";
 import {
+  applyKnowledgeFieldPatch,
+  catalogDocumentFromRevision,
+  knowledgeCommandRequestHash,
+  requireMatchingKnowledgeReplay,
+  validateCatalogKnowledgeDocument,
+  validateCommitKnowledgeCommandsRequest,
+  validateKnowledgeEvidence,
+  validateKnowledgePayload,
+  type CatalogKnowledgeDocument,
+  type CommitKnowledgeCommandsRequest,
+  type KnowledgeCommand,
+  type KnowledgeCommandEventPayload,
+  type KnowledgeCommitResult,
+  type KnowledgeObjectType,
+  type KnowledgeStateView,
+  type RollbackKnowledgeCommand,
+  type UpdateKnowledgeCommand,
+} from "../knowledge/knowledge-commands.js";
+import {
+  compareAuthority,
+  normalizeKnowledgeAuthority,
+  type KnowledgeAuthority,
+  type KnowledgeEvidence,
+  type KnowledgeOrigin,
+  type KnowledgeScope,
+} from "../knowledge/knowledge-authority.js";
+import {
   createKnowledgeSnapshot,
   type KnowledgeSnapshot,
 } from "../knowledge/snapshot.js";
@@ -32,12 +59,20 @@ import { scalarLength } from "../source/types.js";
 import { parseStyleObservation } from "../style/style-observation.js";
 import type { LocalStyleObservation } from "../style/types.js";
 import {
+  LOSSLESS_BOOK_SCHEMA_FINGERPRINT as LOSSLESS_BOOK_SCHEMA_V2_FINGERPRINT,
+  LOSSLESS_BOOK_SCHEMA_MARKER as LOSSLESS_BOOK_SCHEMA_V2_MARKER,
+  LOSSLESS_BOOK_SCHEMA_TABLES as LOSSLESS_BOOK_SCHEMA_V2_TABLES,
+  LOSSLESS_BOOK_SCHEMA_VERSION as LOSSLESS_BOOK_SCHEMA_V2_VERSION,
+} from "./book-schema-v2.js";
+import {
   LOSSLESS_BOOK_SCHEMA_FINGERPRINT,
   LOSSLESS_BOOK_SCHEMA_MARKER,
   LOSSLESS_BOOK_SCHEMA_TABLES,
-  LOSSLESS_BOOK_SCHEMA_V2,
+  LOSSLESS_BOOK_SCHEMA_V3,
+  LOSSLESS_BOOK_SCHEMA_V3_EXTENSION,
+  LOSSLESS_BOOK_SCHEMA_V3_KNOWLEDGE_RECORDS,
   LOSSLESS_BOOK_SCHEMA_VERSION,
-} from "./book-schema-v2.js";
+} from "./book-schema-v3.js";
 
 export interface CertifiedSourceRange {
   rangeId: string;
@@ -149,7 +184,9 @@ export type FaultCheckpoint =
   | "after_stage"
   | "before_translation_insert"
   | "before_promote"
-  | "before_commit";
+  | "before_commit"
+  | "knowledge_command_before_commit"
+  | "schema_v3_before_commit";
 
 export interface FaultInjector {
   checkpoint(name: FaultCheckpoint): void;
@@ -248,7 +285,7 @@ export interface LosslessAuditKnowledgeRevision {
   status: string;
   active: boolean;
   payload: unknown;
-  producingWindowId: string;
+  producingWindowId: string | null;
 }
 
 export interface LosslessAuditSnapshot {
@@ -397,6 +434,37 @@ interface RunRow {
   status: string;
 }
 
+interface KnowledgeStateRow {
+  generation: number;
+  applied_book_generation: number;
+  applied_project_generation: number;
+}
+
+interface CatalogKnowledgeRow {
+  source_version: string | null;
+  record_id: string;
+  revision: number;
+  revision_id: string;
+  object_type: string;
+  normalized_subject: string;
+  kind: string;
+  document_json: string;
+  origin: string;
+  scope: string;
+  active: number;
+}
+
+interface ActiveCatalogEntry {
+  readonly row: CatalogKnowledgeRow;
+  readonly document: CatalogKnowledgeDocument;
+}
+
+interface AppliedKnowledgeCommand {
+  readonly revision: KnowledgeRevision;
+  readonly bookChanged: boolean;
+  readonly projectChanged: boolean;
+}
+
 interface WindowRow {
   run_id: string;
   window_id: string;
@@ -478,6 +546,14 @@ function knowledgeRecordId(normalizedSubject: string, kind: string): string {
   return hashText(`${normalizedSubject}\0${kind}`);
 }
 
+function compareText(left: string, right: string): number {
+  return left < right ? -1 : left > right ? 1 : 0;
+}
+
+function knowledgeKey(normalizedSubject: string, kind: string): string {
+  return `${normalizedSubject}\0${kind}`;
+}
+
 const PROJECTABLE_KNOWLEDGE_STATUSES = new Set<KnowledgeStatus>([
   "provisional",
   "active",
@@ -552,6 +628,7 @@ export class LosslessBookStore {
   readonly #database: DatabaseSync;
   readonly #faultInjector: FaultInjector | undefined;
   readonly #temporarySnapshotDirectory: string | undefined;
+  readonly #schemaVersion: number;
 
   constructor(
     path: string,
@@ -584,8 +661,18 @@ export class LosslessBookStore {
           throw new Error("lossless book store does not exist");
         }
         this.#initializeSchema();
+        this.#schemaVersion = LOSSLESS_BOOK_SCHEMA_VERSION;
+      } else if (userVersion === LOSSLESS_BOOK_SCHEMA_V2_VERSION) {
+        this.#verifyV2Schema(tables);
+        if (mode === "read-write") {
+          this.#migrateV2ToV3();
+          this.#schemaVersion = LOSSLESS_BOOK_SCHEMA_VERSION;
+        } else {
+          this.#schemaVersion = LOSSLESS_BOOK_SCHEMA_V2_VERSION;
+        }
       } else {
-        this.#verifyExistingSchema(userVersion, tables);
+        this.#verifyV3Schema(userVersion, tables);
+        this.#schemaVersion = LOSSLESS_BOOK_SCHEMA_VERSION;
       }
       if (mode === "read-write") {
         this.#database.exec("PRAGMA journal_mode=WAL");
@@ -692,6 +779,10 @@ export class LosslessBookStore {
           range.rawEnd ?? null,
         );
       }
+      this.#database.prepare(`
+        INSERT INTO book_knowledge_state(source_version, generation)
+        VALUES(?, 0)
+      `).run(normalized.sourceVersion);
       this.#appendEvent(null, "source_registered", {
         sourceVersion: normalized.sourceVersion,
         fingerprint,
@@ -776,20 +867,21 @@ export class LosslessBookStore {
     }
     const protocolVersion = requireNonempty(meta.protocolVersion, "protocolVersion");
     const modelId = requireNonempty(meta.modelId, "modelId");
-    const snapshotId = requireNonempty(meta.initialSnapshotId, "initialSnapshotId");
+    const requestedSnapshotId = requireNonempty(
+      meta.initialSnapshotId,
+      "initialSnapshotId",
+    );
     const metadata = jsonText(meta.metadata ?? {}, "translation run metadata");
     const initialSnapshot = meta.initialSnapshot;
     if (initialSnapshot !== undefined) {
       if (initialSnapshot.runId !== runId) {
         throw new Error(`initial snapshot ${initialSnapshot.id} belongs to another run`);
       }
-      if (initialSnapshot.id !== snapshotId
+      if (initialSnapshot.id !== requestedSnapshotId
         || initialSnapshot.id !== initialSnapshot.contentHash) {
         throw new Error("initial snapshot identity mismatch");
       }
     }
-    const snapshotPayload = jsonText(initialSnapshot ?? [], "initial knowledge snapshot");
-    const snapshotHash = initialSnapshot?.contentHash ?? hashText(snapshotPayload);
     const existing = one<RunRow>(
       this.#database.prepare("SELECT * FROM translation_runs WHERE run_id=?"),
       runId,
@@ -801,17 +893,64 @@ export class LosslessBookStore {
         || existing.metadata_json !== metadata) {
         throw new Error(`translation run ${runId} metadata mismatch`);
       }
-      const snapshot = one<{ snapshot_id: string }>(this.#database.prepare(`
-        SELECT snapshot_id FROM knowledge_snapshots
+      const snapshot = one<{ snapshot_id: string; payload_json: string }>(
+        this.#database.prepare(`
+        SELECT snapshot_id, payload_json FROM knowledge_snapshots
         WHERE run_id=? ORDER BY rowid LIMIT 1
-      `), runId);
-      if (snapshot?.snapshot_id !== snapshotId) {
+      `),
+        runId,
+      );
+      const requestedIsCanonicalEmpty = initialSnapshot !== undefined
+        && initialSnapshot.revisions.length === 0
+        && initialSnapshot.parentSnapshotId === null
+        && initialSnapshot.id === createKnowledgeSnapshot(runId, []).id;
+      const persistedWasCatalogSeeded = snapshot !== undefined
+        && (() => {
+          const parsed = JSON.parse(snapshot.payload_json) as unknown;
+          return parsed !== null
+            && typeof parsed === "object"
+            && !Array.isArray(parsed)
+            && Array.isArray((parsed as { revisions?: unknown }).revisions)
+            && ((parsed as { revisions: unknown[] }).revisions.length > 0);
+        })();
+      if (snapshot === undefined
+        || (snapshot.snapshot_id !== requestedSnapshotId
+          && !(requestedIsCanonicalEmpty && persistedWasCatalogSeeded))) {
         throw new Error(`translation run ${runId} initial snapshot mismatch`);
       }
+      this.#verifyRunKnowledgeState(runId, sourceVersion);
       return runId;
     }
 
     this.#transaction(() => {
+      const bookGeneration = one<{ generation: number }>(this.#database.prepare(`
+        SELECT generation FROM book_knowledge_state WHERE source_version=?
+      `), sourceVersion)?.generation;
+      const projectGeneration = one<{ generation: number }>(this.#database.prepare(`
+        SELECT generation FROM project_knowledge_state WHERE singleton=1
+      `))?.generation;
+      if (bookGeneration === undefined || projectGeneration === undefined) {
+        throw new Error("schema v3 knowledge generation state is incomplete");
+      }
+      const seededRevisions = this.#catalogSeedRevisions(runId, sourceVersion);
+      if (seededRevisions.length > 0
+        && initialSnapshot !== undefined
+        && (initialSnapshot.revisions.length !== 0
+          || initialSnapshot.parentSnapshotId !== null
+          || initialSnapshot.id !== createKnowledgeSnapshot(runId, []).id)) {
+        throw new Error(
+          "initial knowledge snapshot conflicts with current book/project knowledge",
+        );
+      }
+      const effectiveSnapshot = seededRevisions.length === 0
+        ? initialSnapshot
+        : createKnowledgeSnapshot(runId, seededRevisions);
+      const effectiveSnapshotId = effectiveSnapshot?.id ?? requestedSnapshotId;
+      const snapshotPayload = jsonText(
+        effectiveSnapshot ?? [],
+        "initial knowledge snapshot",
+      );
+      const snapshotHash = effectiveSnapshot?.contentHash ?? hashText(snapshotPayload);
       this.#database.prepare(`
         INSERT INTO translation_runs(
           run_id, source_version, protocol_version, model_id, metadata_json
@@ -821,9 +960,28 @@ export class LosslessBookStore {
         INSERT INTO knowledge_snapshots(
           run_id, snapshot_id, content_hash, payload_json
         ) VALUES(?, ?, ?, ?)
-      `).run(runId, snapshotId, snapshotHash, snapshotPayload);
+      `).run(runId, effectiveSnapshotId, snapshotHash, snapshotPayload);
+      for (const revision of seededRevisions) {
+        this.#insertRunKnowledgeRevision(
+          runId,
+          revision,
+          null,
+          this.#catalogEvidenceForRevision(revision),
+          undefined,
+        );
+      }
+      this.#database.prepare(`
+        INSERT INTO knowledge_state(
+          run_id, generation, applied_book_generation, applied_project_generation
+        ) VALUES(?, 0, ?, ?)
+      `).run(runId, bookGeneration, projectGeneration);
       this.#appendEvent(runId, "translation_run_created", {
-        runId, sourceVersion, protocolVersion, modelId, snapshotId,
+        runId,
+        sourceVersion,
+        protocolVersion,
+        modelId,
+        snapshotId: effectiveSnapshotId,
+        seededKnowledgeRevisions: seededRevisions.length,
       });
     });
     return runId;
@@ -1371,30 +1529,26 @@ export class LosslessBookStore {
         throw new Error(`failed to promote complete window ${runId}/${windowId}`);
       }
 
-      const insertKnowledgeRevision = this.#database.prepare(`
-        INSERT INTO knowledge_records(
-          run_id, record_id, revision_id, revision, normalized_subject, kind,
-          payload_json, status, active, producing_window_id
-        ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-      `);
       for (const revision of appendedRevisions) {
         const recordId = knowledgeRecordId(revision.normalizedSubject, revision.kind);
-        this.#database.prepare(`
-          UPDATE knowledge_records SET active=0
-          WHERE run_id=? AND record_id=? AND active=1
-        `).run(runId, recordId);
-        insertKnowledgeRevision.run(
+        const evidence = this.#activeRunKnowledgeEvidence(runId, recordId);
+        this.#insertRunKnowledgeRevision(
           runId,
-          recordId,
-          revision.revisionId,
-          revision.revision,
-          revision.normalizedSubject,
-          revision.kind,
-          canonicalJson(revision),
-          revision.status,
-          PROJECTABLE_KNOWLEDGE_STATUSES.has(revision.status) ? 1 : 0,
+          revision,
           windowId,
+          evidence,
+          undefined,
         );
+      }
+      if (appendedRevisions.length > 0) {
+        const updatedKnowledgeState = this.#database.prepare(`
+          UPDATE knowledge_state
+          SET generation=generation+1, updated_at=datetime('now')
+          WHERE run_id=?
+        `).run(runId);
+        if (Number(updatedKnowledgeState.changes) !== 1) {
+          throw new Error(`translation run ${runId} knowledge state mismatch`);
+        }
       }
       const promotedCandidates = this.#database.prepare(`
         UPDATE knowledge_candidates SET stage_state='promoted'
@@ -1634,6 +1788,188 @@ export class LosslessBookStore {
     return this.allWindows(runId).filter((window) => window.status === "pending");
   }
 
+  knowledgeState(runId: string): KnowledgeStateView {
+    if (this.#schemaVersion !== LOSSLESS_BOOK_SCHEMA_VERSION) {
+      throw new Error("schema v3 write upgrade required");
+    }
+    this.#run(runId);
+    const state = one<KnowledgeStateRow>(this.#database.prepare(`
+      SELECT generation, applied_book_generation, applied_project_generation
+      FROM knowledge_state WHERE run_id=?
+    `), runId);
+    if (state === undefined) {
+      throw new Error("schema v3 write upgrade required");
+    }
+    const snapshot = one<{ snapshot_id: string }>(this.#database.prepare(`
+      SELECT snapshot_id FROM knowledge_snapshots
+      WHERE run_id=? ORDER BY rowid DESC LIMIT 1
+    `), runId);
+    if (snapshot === undefined) {
+      throw new Error(`translation run ${runId} has no knowledge snapshot`);
+    }
+    return {
+      generation: requireSafeInteger(state.generation, "knowledge generation"),
+      snapshotId: snapshot.snapshot_id,
+      appliedBookGeneration: requireSafeInteger(
+        state.applied_book_generation,
+        "applied book generation",
+      ),
+      appliedProjectGeneration: requireSafeInteger(
+        state.applied_project_generation,
+        "applied project generation",
+      ),
+    };
+  }
+
+  commitKnowledgeCommands(
+    input: CommitKnowledgeCommandsRequest | unknown,
+  ): KnowledgeCommitResult {
+    if (this.#schemaVersion !== LOSSLESS_BOOK_SCHEMA_VERSION) {
+      throw new Error("schema v3 write upgrade required");
+    }
+    const request = validateCommitKnowledgeCommandsRequest(input);
+    const requestHash = knowledgeCommandRequestHash(request);
+    return this.#transaction(() => {
+      const replay = this.#knowledgeCommandReplay(
+        request.runId,
+        request.requestId,
+        requestHash,
+      );
+      if (replay !== undefined) {
+        return replay;
+      }
+      const run = this.#run(request.runId);
+      const state = this.knowledgeState(request.runId);
+      if (state.generation !== request.expectedGeneration
+        || state.snapshotId !== request.expectedSnapshotId) {
+        throw new Error(
+          "KNOWLEDGE_GENERATION_CONFLICT: knowledge state changed; reload before saving",
+        );
+      }
+      const currentBookGeneration = one<{ generation: number }>(
+        this.#database.prepare(`
+          SELECT generation FROM book_knowledge_state WHERE source_version=?
+        `),
+        run.source_version,
+      )?.generation;
+      const currentProjectGeneration = one<{ generation: number }>(
+        this.#database.prepare(`
+          SELECT generation FROM project_knowledge_state WHERE singleton=1
+        `),
+      )?.generation;
+      if (currentBookGeneration === undefined
+        || currentProjectGeneration === undefined) {
+        throw new Error("schema v3 knowledge generation state is incomplete");
+      }
+      if (currentBookGeneration !== state.appliedBookGeneration
+        || currentProjectGeneration !== state.appliedProjectGeneration) {
+        throw new Error(
+          "KNOWLEDGE_SCOPE_GENERATION_CONFLICT: synchronize current book/project knowledge before saving",
+        );
+      }
+      const busy = one<{ count: number }>(this.#database.prepare(`
+        SELECT COUNT(*) AS count FROM window_plans
+        WHERE run_id=? AND status IN ('running', 'staged')
+      `), request.runId)?.count ?? 0;
+      if (busy > 0) {
+        throw new Error(
+          "KNOWLEDGE_EDIT_BUSY: wait for the active translation window to finish",
+        );
+      }
+
+      const domain = new KnowledgeStore(this.knowledgeRevisions(request.runId));
+      const revisionIds: string[] = [];
+      let bookChanged = false;
+      let projectChanged = false;
+      for (const command of request.commands) {
+        const result = this.#applyKnowledgeCommand(run, domain, command);
+        revisionIds.push(result.revision.revisionId);
+        bookChanged ||= result.bookChanged;
+        projectChanged ||= result.projectChanged;
+      }
+
+      const parentSnapshot = this.latestKnowledgeSnapshot(request.runId);
+      const snapshot = createKnowledgeSnapshot(
+        request.runId,
+        domain.projectableRevisions(),
+        parentSnapshot.id,
+      );
+      this.#database.prepare(`
+        INSERT INTO knowledge_snapshots(
+          run_id, snapshot_id, parent_snapshot_id, producing_window_id,
+          content_hash, payload_json
+        ) VALUES(?, ?, ?, NULL, ?, ?)
+      `).run(
+        request.runId,
+        snapshot.id,
+        parentSnapshot.id,
+        snapshot.contentHash,
+        jsonText(snapshot, "knowledge command snapshot"),
+      );
+
+      let bookGeneration = state.appliedBookGeneration;
+      if (bookChanged) {
+        const updated = this.#database.prepare(`
+          UPDATE book_knowledge_state
+          SET generation=generation+1, updated_at=datetime('now')
+          WHERE source_version=?
+        `).run(run.source_version);
+        if (Number(updated.changes) !== 1) {
+          throw new Error("book knowledge generation state is incomplete");
+        }
+        bookGeneration = one<{ generation: number }>(this.#database.prepare(`
+          SELECT generation FROM book_knowledge_state WHERE source_version=?
+        `), run.source_version)?.generation ?? -1;
+      }
+      let projectGeneration = state.appliedProjectGeneration;
+      if (projectChanged) {
+        const updated = this.#database.prepare(`
+          UPDATE project_knowledge_state
+          SET generation=generation+1, updated_at=datetime('now')
+          WHERE singleton=1
+        `).run();
+        if (Number(updated.changes) !== 1) {
+          throw new Error("project knowledge generation state is incomplete");
+        }
+        projectGeneration = one<{ generation: number }>(this.#database.prepare(`
+          SELECT generation FROM project_knowledge_state WHERE singleton=1
+        `))?.generation ?? -1;
+      }
+      const generation = state.generation + 1;
+      const updatedState = this.#database.prepare(`
+        UPDATE knowledge_state
+        SET generation=?, applied_book_generation=?,
+            applied_project_generation=?, updated_at=datetime('now')
+        WHERE run_id=? AND generation=?
+      `).run(
+        generation,
+        bookGeneration,
+        projectGeneration,
+        request.runId,
+        state.generation,
+      );
+      if (Number(updatedState.changes) !== 1) {
+        throw new Error("KNOWLEDGE_GENERATION_CONFLICT: knowledge state changed");
+      }
+      const result: KnowledgeCommitResult = {
+        requestId: request.requestId,
+        generation,
+        snapshotId: snapshot.id,
+        revisionIds,
+        bookGeneration,
+        projectGeneration,
+      };
+      const event: KnowledgeCommandEventPayload = {
+        requestId: request.requestId,
+        requestHash,
+        result,
+      };
+      this.#appendEvent(request.runId, "knowledge_user_commit", event);
+      this.#faultInjector?.checkpoint("knowledge_command_before_commit");
+      return result;
+    });
+  }
+
   latestKnowledgeSnapshot(runId: string): KnowledgeSnapshot {
     this.#run(runId);
     const row = one<{ snapshot_id: string; payload_json: string }>(
@@ -1731,9 +2067,15 @@ export class LosslessBookStore {
       payload_json: string;
       status: string;
       active: number;
+      origin: string;
+      scope: string;
+      owned_fields_json: string;
+      evidence_json: string;
+      import_batch_id: string | null;
     }>(this.#database.prepare(`
       SELECT run_id, record_id, revision_id, revision, normalized_subject, kind,
-             payload_json, status, active
+             payload_json, status, active, origin, scope, owned_fields_json,
+             evidence_json, import_batch_id
       FROM knowledge_records
       WHERE run_id=?
       ORDER BY normalized_subject, kind, revision
@@ -1748,6 +2090,26 @@ export class LosslessBookStore {
         || parsed.kind !== row.kind
         || parsed.status !== row.status) {
         throw new Error(`corrupt knowledge revision row ${row.revision_id}`);
+      }
+      const authority = parsed.authority === undefined
+        ? undefined
+        : normalizeKnowledgeAuthority(parsed.authority);
+      const ownedFields = JSON.parse(row.owned_fields_json) as unknown;
+      const evidence = validateKnowledgeEvidence(
+        JSON.parse(row.evidence_json) as unknown,
+      );
+      if (row.origin !== (authority?.origin ?? "model")
+        || row.scope !== (authority?.scope ?? "book")
+        || canonicalJson(ownedFields) !== canonicalJson(
+          authority?.ownedFields ?? [],
+        )) {
+        throw new Error(`corrupt knowledge authority row ${row.revision_id}`);
+      }
+      if (authority?.provenance !== undefined
+        && canonicalJson(evidence) !== canonicalJson(
+          this.#catalogEvidenceForRevision(parsed),
+        )) {
+        throw new Error(`corrupt knowledge evidence row ${row.revision_id}`);
       }
       return parsed;
     });
@@ -1972,7 +2334,7 @@ export class LosslessBookStore {
       status: string;
       active: number;
       payload_json: string;
-      producing_window_id: string;
+      producing_window_id: string | null;
     }>(this.#database.prepare(`
       SELECT run_id, record_id, revision_id, revision, normalized_subject, kind,
              status, active, payload_json, producing_window_id
@@ -2067,7 +2429,10 @@ export class LosslessBookStore {
   #initializeSchema(): void {
     this.#database.exec("BEGIN IMMEDIATE");
     try {
-      this.#database.exec(LOSSLESS_BOOK_SCHEMA_V2);
+      this.#database.exec(LOSSLESS_BOOK_SCHEMA_V3);
+      this.#database.prepare(`
+        INSERT INTO project_knowledge_state(singleton, generation) VALUES(1, 0)
+      `).run();
       const insertMarker = this.#database.prepare(`
         INSERT INTO lossless_schema_meta(key, value) VALUES(?, ?)
       `);
@@ -2081,19 +2446,18 @@ export class LosslessBookStore {
     }
   }
 
-  #verifyExistingSchema(userVersion: number, tables: readonly string[]): void {
+  #verifyNoLegacySchema(tables: readonly string[]): void {
     const legacyNames = new Set(["book_meta", "book_blocks", "windows"]);
     if (tables.some((table) => legacyNames.has(table))) {
       throw new Error(
-        "legacy BookStore schema requires a new database for schema v2; in-place migration is forbidden",
+        "legacy BookStore schema requires a new database for schema v3; in-place migration is forbidden",
       );
     }
-    if (userVersion !== LOSSLESS_BOOK_SCHEMA_VERSION) {
-      throw new Error(
-        `unsupported schema user_version ${userVersion}; expected ${LOSSLESS_BOOK_SCHEMA_VERSION}`,
-      );
-    }
-    const expected = [...LOSSLESS_BOOK_SCHEMA_TABLES];
+  }
+
+  #verifyV2Schema(tables: readonly string[]): void {
+    this.#verifyNoLegacySchema(tables);
+    const expected = [...LOSSLESS_BOOK_SCHEMA_V2_TABLES];
     if (tables.length !== expected.length
       || tables.some((table, index) => table !== expected[index])) {
       throw new Error("schema v2 table set is incomplete or contains unknown tables");
@@ -2104,9 +2468,108 @@ export class LosslessBookStore {
         WHERE key IN ('marker', 'fingerprint')
       `),
     ).map((row) => [row.key, row.value]));
+    if (markers.get("marker") !== LOSSLESS_BOOK_SCHEMA_V2_MARKER
+      || markers.get("fingerprint") !== LOSSLESS_BOOK_SCHEMA_V2_FINGERPRINT) {
+      throw new Error("schema v2 marker or fingerprint mismatch");
+    }
+  }
+
+  #verifyV3Schema(userVersion: number, tables: readonly string[]): void {
+    this.#verifyNoLegacySchema(tables);
+    if (userVersion !== LOSSLESS_BOOK_SCHEMA_VERSION) {
+      throw new Error(
+        `unsupported schema user_version ${userVersion}; expected ${LOSSLESS_BOOK_SCHEMA_VERSION}`,
+      );
+    }
+    const expected = [...LOSSLESS_BOOK_SCHEMA_TABLES];
+    if (tables.length !== expected.length
+      || tables.some((table, index) => table !== expected[index])) {
+      throw new Error("schema v3 table set is incomplete or contains unknown tables");
+    }
+    const markers = new Map(all<{ key: string; value: string }>(
+      this.#database.prepare(`
+        SELECT key, value FROM lossless_schema_meta
+        WHERE key IN ('marker', 'fingerprint')
+      `),
+    ).map((row) => [row.key, row.value]));
     if (markers.get("marker") !== LOSSLESS_BOOK_SCHEMA_MARKER
       || markers.get("fingerprint") !== LOSSLESS_BOOK_SCHEMA_FINGERPRINT) {
-      throw new Error("schema v2 marker or fingerprint mismatch");
+      throw new Error("schema v3 marker or fingerprint mismatch");
+    }
+  }
+
+  #migrateV2ToV3(): void {
+    this.#database.exec("BEGIN IMMEDIATE");
+    try {
+      this.#database.exec("ALTER TABLE knowledge_records RENAME TO knowledge_records_v2");
+      this.#database.exec(LOSSLESS_BOOK_SCHEMA_V3_KNOWLEDGE_RECORDS);
+      this.#database.exec(`
+        INSERT INTO knowledge_records(
+          run_id, record_id, revision_id, revision, normalized_subject,
+          kind, payload_json, status, active, producing_window_id,
+          origin, scope, owned_fields_json, evidence_json, import_batch_id,
+          created_at
+        )
+        SELECT
+          run_id, record_id, revision_id, revision, normalized_subject,
+          kind, payload_json, status, active, producing_window_id,
+          'model', 'book', '[]', '[]', NULL, created_at
+        FROM knowledge_records_v2;
+        DROP TABLE knowledge_records_v2;
+      `);
+      this.#database.exec(LOSSLESS_BOOK_SCHEMA_V3_EXTENSION);
+      this.#database.exec(`
+        INSERT INTO book_knowledge_state(source_version, generation)
+        SELECT source_version, 0 FROM source_versions;
+        INSERT INTO project_knowledge_state(singleton, generation) VALUES(1, 0);
+        INSERT INTO knowledge_state(
+          run_id, generation, applied_book_generation, applied_project_generation
+        )
+        SELECT run_id, 0, 0, 0 FROM translation_runs;
+      `);
+      const updateMarker = this.#database.prepare(`
+        UPDATE lossless_schema_meta SET value=? WHERE key=?
+      `);
+      updateMarker.run(LOSSLESS_BOOK_SCHEMA_MARKER, "marker");
+      updateMarker.run(LOSSLESS_BOOK_SCHEMA_FINGERPRINT, "fingerprint");
+      this.#database.exec(`PRAGMA user_version=${LOSSLESS_BOOK_SCHEMA_VERSION}`);
+      this.#faultInjector?.checkpoint("schema_v3_before_commit");
+      this.#database.exec("COMMIT");
+    } catch (error) {
+      this.#database.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
+  #verifyRunKnowledgeState(runId: string, sourceVersion: string): void {
+    const state = one<{
+      generation: number;
+      applied_book_generation: number;
+      applied_project_generation: number;
+    }>(this.#database.prepare(`
+      SELECT generation, applied_book_generation, applied_project_generation
+      FROM knowledge_state WHERE run_id=?
+    `), runId);
+    const bookGeneration = one<{ generation: number }>(this.#database.prepare(`
+      SELECT generation FROM book_knowledge_state WHERE source_version=?
+    `), sourceVersion)?.generation;
+    const projectGeneration = one<{ generation: number }>(this.#database.prepare(`
+      SELECT generation FROM project_knowledge_state WHERE singleton=1
+    `))?.generation;
+    const generations = state === undefined
+      ? []
+      : [
+          state.generation,
+          state.applied_book_generation,
+          state.applied_project_generation,
+        ];
+    if (state === undefined
+      || bookGeneration === undefined
+      || projectGeneration === undefined
+      || generations.some((generation) => !Number.isSafeInteger(generation) || generation < 0)
+      || state.applied_book_generation > bookGeneration
+      || state.applied_project_generation > projectGeneration) {
+      throw new Error(`translation run ${runId} knowledge state mismatch`);
     }
   }
 
@@ -2473,6 +2936,601 @@ export class LosslessBookStore {
       WHERE m.run_id=? AND m.window_id=? ORDER BY m.position
     `), runId, windowId);
     return new Map(rows.map((row) => [row.block_id, row]));
+  }
+
+  #knowledgeCommandReplay(
+    runId: string,
+    requestId: string,
+    requestHash: string,
+  ): KnowledgeCommitResult | undefined {
+    const rows = all<{ payload_json: string }>(this.#database.prepare(`
+      SELECT payload_json FROM events
+      WHERE run_id=? AND kind='knowledge_user_commit'
+        AND json_extract(payload_json, '$.requestId')=?
+      ORDER BY sequence
+    `), runId, requestId);
+    if (rows.length === 0) {
+      return undefined;
+    }
+    const parsed = rows.map((row) =>
+      JSON.parse(row.payload_json) as KnowledgeCommandEventPayload);
+    const first = parsed[0] as KnowledgeCommandEventPayload;
+    const result = requireMatchingKnowledgeReplay(first, requestHash);
+    for (const item of parsed.slice(1)) {
+      if (canonicalJson(item) !== canonicalJson(first)) {
+        throw new Error(
+          `corrupt duplicate knowledge command replay for ${requestId}`,
+        );
+      }
+    }
+    return result;
+  }
+
+  #applyKnowledgeCommand(
+    run: RunRow,
+    domain: KnowledgeStore,
+    command: KnowledgeCommand,
+  ): AppliedKnowledgeCommand {
+    return command.type === "upsert"
+      ? this.#applyUpsertKnowledgeCommand(run, domain, command)
+      : this.#applyRollbackKnowledgeCommand(run, domain, command);
+  }
+
+  #applyUpsertKnowledgeCommand(
+    run: RunRow,
+    domain: KnowledgeStore,
+    command: UpdateKnowledgeCommand,
+  ): AppliedKnowledgeCommand {
+    const current = domain.latestRevision(
+      command.normalizedSubject,
+      command.kind,
+    );
+    const currentRevision = current?.revision ?? null;
+    if (currentRevision !== command.expectedRevision) {
+      throw new Error(
+        "KNOWLEDGE_REVISION_CONFLICT: the knowledge object changed; reload before saving",
+      );
+    }
+    const expectedCatalog = this.#expectedCatalogEntry(
+      run,
+      command.normalizedSubject,
+      command.kind,
+      command.expectedScopeRevision,
+    );
+    if (expectedCatalog !== undefined
+      && expectedCatalog.document.objectType !== command.objectType) {
+      throw new Error("KNOWLEDGE_OBJECT_TYPE_CONFLICT");
+    }
+
+    const payload = validateKnowledgePayload(
+      command.objectType,
+      applyKnowledgeFieldPatch(current?.payload, command.fieldPatch),
+    );
+    const priorAuthority = current?.authority === undefined
+      ? undefined
+      : normalizeKnowledgeAuthority(current.authority);
+    let authority: KnowledgeAuthority = normalizeKnowledgeAuthority({
+      origin: command.origin,
+      scope: command.scope,
+      ownedFields: command.ownedFields,
+    });
+    if (priorAuthority !== undefined && priorAuthority.scope === command.scope) {
+      const ownedFields = [...new Set([
+        ...priorAuthority.ownedFields,
+        ...authority.ownedFields,
+      ])].sort(compareText);
+      const origin = compareAuthority(priorAuthority, authority) > 0
+        ? priorAuthority.origin
+        : authority.origin;
+      authority = normalizeKnowledgeAuthority({
+        origin,
+        scope: command.scope,
+        ownedFields,
+      });
+    }
+    const evidence = command.evidence.length > 0
+      ? command.evidence
+      : (expectedCatalog?.document.evidence ?? []);
+    const scopeChanged = expectedCatalog !== undefined
+      && expectedCatalog.document.authority.scope !== command.scope;
+    let bookChanged = command.scope !== "project";
+    let projectChanged = command.scope === "project";
+    if (scopeChanged) {
+      const oldScope = expectedCatalog.document.authority.scope;
+      this.#appendCatalogRevision(
+        run,
+        {
+          ...expectedCatalog.document,
+          status: "superseded",
+          authority: normalizeKnowledgeAuthority({
+            origin: command.origin,
+            scope: oldScope,
+            ownedFields: expectedCatalog.document.authority.ownedFields,
+          }),
+        },
+        false,
+      );
+      bookChanged ||= oldScope !== "project";
+      projectChanged ||= oldScope === "project";
+    }
+    const catalog = this.#appendCatalogRevision(
+      run,
+      {
+        objectType: command.objectType,
+        normalizedSubject: command.normalizedSubject,
+        kind: command.kind,
+        payload,
+        alternatives: [payload],
+        status: "active",
+        authority,
+        evidence,
+      },
+      true,
+    );
+    const runAuthority = normalizeKnowledgeAuthority({
+      ...authority,
+      provenance: {
+        catalog: command.scope === "project" ? "project" : "book",
+        catalogRevisionId: catalog.revision_id,
+      },
+    });
+    const revision = domain.appendRevision({
+      normalizedSubject: command.normalizedSubject,
+      kind: command.kind,
+      payload,
+      alternatives: [payload],
+      status: "active",
+      candidateIds: current?.candidateIds ?? [],
+      sourceWindowIds: current?.sourceWindowIds ?? [],
+      authority: runAuthority,
+    });
+    this.#insertRunKnowledgeRevision(
+      run.run_id,
+      revision,
+      null,
+      evidence,
+      command.importBatchId,
+    );
+    return { revision, bookChanged, projectChanged };
+  }
+
+  #applyRollbackKnowledgeCommand(
+    run: RunRow,
+    domain: KnowledgeStore,
+    command: RollbackKnowledgeCommand,
+  ): AppliedKnowledgeCommand {
+    const current = domain.latestRevision(
+      command.normalizedSubject,
+      command.kind,
+    );
+    if (current?.revision !== command.expectedRevision) {
+      throw new Error(
+        "KNOWLEDGE_REVISION_CONFLICT: the knowledge object changed; reload before restoring",
+      );
+    }
+    const expectedCatalog = this.#expectedCatalogEntry(
+      run,
+      command.normalizedSubject,
+      command.kind,
+      command.expectedScopeRevision,
+    );
+    if (expectedCatalog === undefined) {
+      throw new Error("KNOWLEDGE_CATALOG_REVISION_CONFLICT");
+    }
+    const target = domain.listRevisions().find((revision) =>
+      revision.normalizedSubject === command.normalizedSubject
+      && revision.kind === command.kind
+      && revision.revision === command.targetRevision);
+    if (target === undefined) {
+      throw new Error(
+        `KNOWLEDGE_ROLLBACK_TARGET_MISSING: revision ${command.targetRevision}`,
+      );
+    }
+    const scope = expectedCatalog.document.authority.scope;
+    const ownedFields = target.authority?.ownedFields
+      ?? expectedCatalog.document.authority.ownedFields;
+    const authority = normalizeKnowledgeAuthority({
+      origin: "rollback",
+      scope,
+      ownedFields,
+    });
+    const payload = validateKnowledgePayload(
+      expectedCatalog.document.objectType,
+      structuredClone(target.payload),
+    );
+    const catalog = this.#appendCatalogRevision(
+      run,
+      {
+        objectType: expectedCatalog.document.objectType,
+        normalizedSubject: command.normalizedSubject,
+        kind: command.kind,
+        payload,
+        alternatives: [payload],
+        status: "active",
+        authority,
+        evidence: expectedCatalog.document.evidence,
+      },
+      true,
+    );
+    const runAuthority = normalizeKnowledgeAuthority({
+      ...authority,
+      provenance: {
+        catalog: scope === "project" ? "project" : "book",
+        catalogRevisionId: catalog.revision_id,
+      },
+    });
+    const revision = domain.appendRevision({
+      normalizedSubject: command.normalizedSubject,
+      kind: command.kind,
+      payload,
+      alternatives: [payload],
+      status: "active",
+      candidateIds: target.candidateIds,
+      sourceWindowIds: target.sourceWindowIds,
+      authority: runAuthority,
+    });
+    this.#insertRunKnowledgeRevision(
+      run.run_id,
+      revision,
+      null,
+      expectedCatalog.document.evidence,
+      undefined,
+    );
+    return {
+      revision,
+      bookChanged: scope !== "project",
+      projectChanged: scope === "project",
+    };
+  }
+
+  #expectedCatalogEntry(
+    run: RunRow,
+    normalizedSubject: string,
+    kind: string,
+    expectation: {
+      readonly scope: KnowledgeScope;
+      readonly revision: number;
+    } | null,
+  ): ActiveCatalogEntry | undefined {
+    const entries = this.#activeCatalogEntries(run, normalizedSubject, kind);
+    if (expectation === null) {
+      if (entries.length > 0) {
+        throw new Error(
+          "KNOWLEDGE_CATALOG_REVISION_CONFLICT: catalog entry already exists",
+        );
+      }
+      return undefined;
+    }
+    const entry = entries.find(
+      (candidate) => candidate.document.authority.scope === expectation.scope,
+    );
+    if (entry === undefined || entry.row.revision !== expectation.revision) {
+      throw new Error(
+        "KNOWLEDGE_CATALOG_REVISION_CONFLICT: catalog entry changed; reload before saving",
+      );
+    }
+    if (entries.some((candidate) =>
+      candidate !== entry
+      && compareAuthority(
+        candidate.document.authority,
+        entry.document.authority,
+      ) >= 0)) {
+      throw new Error(
+        "KNOWLEDGE_CATALOG_REVISION_CONFLICT: a stronger catalog override exists",
+      );
+    }
+    return entry;
+  }
+
+  #activeCatalogEntries(
+    run: RunRow,
+    normalizedSubject: string,
+    kind: string,
+  ): ActiveCatalogEntry[] {
+    const recordId = knowledgeRecordId(normalizedSubject, kind);
+    const rows = [
+      ...all<CatalogKnowledgeRow>(this.#database.prepare(`
+        SELECT source_version, record_id, revision, revision_id, object_type,
+               normalized_subject, kind, document_json, origin, scope, active
+        FROM book_knowledge_revisions
+        WHERE source_version=? AND record_id=? AND active=1
+      `), run.source_version, recordId),
+      ...all<CatalogKnowledgeRow>(this.#database.prepare(`
+        SELECT NULL AS source_version, record_id, revision, revision_id, object_type,
+               normalized_subject, kind, document_json, origin, scope, active
+        FROM project_knowledge_revisions
+        WHERE record_id=? AND active=1
+      `), recordId),
+    ];
+    return rows.map((row) =>
+      this.#catalogEntryFromRow(row, normalizedSubject, kind));
+  }
+
+  #catalogEntryFromRow(
+    row: CatalogKnowledgeRow,
+    normalizedSubject = row.normalized_subject,
+    kind = row.kind,
+  ): ActiveCatalogEntry {
+    const document = validateCatalogKnowledgeDocument(
+      JSON.parse(row.document_json) as unknown,
+    );
+    if (row.record_id !== knowledgeRecordId(normalizedSubject, kind)
+      || row.normalized_subject !== normalizedSubject
+      || row.kind !== kind
+      || row.object_type !== document.objectType
+      || row.normalized_subject !== document.normalizedSubject
+      || row.kind !== document.kind
+      || row.origin !== document.authority.origin
+      || row.scope !== document.authority.scope
+      || (row.active !== 0 && row.active !== 1)
+      || !Number.isSafeInteger(row.revision)
+      || row.revision < 1
+      || (row.scope === "project"
+        ? row.source_version !== null
+        : typeof row.source_version !== "string"
+          || row.source_version.length === 0)) {
+      throw new Error(`corrupt catalog knowledge revision ${row.revision_id}`);
+    }
+    const expectedRevisionId = hashText(canonicalJson({
+      catalogVersion: 1,
+      sourceVersion: row.scope === "project" ? null : row.source_version,
+      recordId: row.record_id,
+      revision: row.revision,
+      document,
+    }));
+    if (row.revision_id !== expectedRevisionId) {
+      throw new Error(`corrupt catalog knowledge revision ${row.revision_id}`);
+    }
+    return { row, document };
+  }
+
+  #appendCatalogRevision(
+    run: RunRow,
+    documentInput: CatalogKnowledgeDocument,
+    active: boolean,
+  ): CatalogKnowledgeRow {
+    const document = validateCatalogKnowledgeDocument(documentInput);
+    const scope = document.authority.scope;
+    if (scope === "global") {
+      throw new Error(
+        "global knowledge must be snapshotted through the global knowledge workflow",
+      );
+    }
+    if (document.authority.origin === "model") {
+      throw new Error("model knowledge cannot be written to a user catalog");
+    }
+    const recordId = knowledgeRecordId(
+      document.normalizedSubject,
+      document.kind,
+    );
+    const isProject = scope === "project";
+    const revision = isProject
+      ? (one<{ revision: number }>(this.#database.prepare(`
+          SELECT MAX(revision) AS revision FROM project_knowledge_revisions
+          WHERE record_id=?
+        `), recordId)?.revision ?? 0) + 1
+      : (one<{ revision: number }>(this.#database.prepare(`
+          SELECT MAX(revision) AS revision FROM book_knowledge_revisions
+          WHERE source_version=? AND record_id=?
+        `), run.source_version, recordId)?.revision ?? 0) + 1;
+    const revisionId = hashText(canonicalJson({
+      catalogVersion: 1,
+      sourceVersion: isProject ? null : run.source_version,
+      recordId,
+      revision,
+      document,
+    }));
+    if (isProject) {
+      this.#database.prepare(`
+        UPDATE project_knowledge_revisions SET active=0
+        WHERE record_id=? AND active=1
+      `).run(recordId);
+      this.#database.prepare(`
+        INSERT INTO project_knowledge_revisions(
+          record_id, revision, revision_id, object_type, normalized_subject,
+          kind, document_json, origin, scope, active
+        ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, 'project', ?)
+      `).run(
+        recordId,
+        revision,
+        revisionId,
+        document.objectType,
+        document.normalizedSubject,
+        document.kind,
+        canonicalJson(document),
+        document.authority.origin,
+        active ? 1 : 0,
+      );
+    } else {
+      this.#database.prepare(`
+        UPDATE book_knowledge_revisions SET active=0
+        WHERE source_version=? AND record_id=? AND active=1
+      `).run(run.source_version, recordId);
+      this.#database.prepare(`
+        INSERT INTO book_knowledge_revisions(
+          source_version, record_id, revision, revision_id, object_type,
+          normalized_subject, kind, document_json, origin, scope, active
+        ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `).run(
+        run.source_version,
+        recordId,
+        revision,
+        revisionId,
+        document.objectType,
+        document.normalizedSubject,
+        document.kind,
+        canonicalJson(document),
+        document.authority.origin,
+        scope,
+        active ? 1 : 0,
+      );
+    }
+    return {
+      source_version: isProject ? null : run.source_version,
+      record_id: recordId,
+      revision,
+      revision_id: revisionId,
+      object_type: document.objectType,
+      normalized_subject: document.normalizedSubject,
+      kind: document.kind,
+      document_json: canonicalJson(document),
+      origin: document.authority.origin,
+      scope,
+      active: active ? 1 : 0,
+    };
+  }
+
+  #insertRunKnowledgeRevision(
+    runId: string,
+    revision: KnowledgeRevision,
+    producingWindowId: string | null,
+    evidence: readonly KnowledgeEvidence[],
+    importBatchId: string | undefined,
+  ): void {
+    const recordId = knowledgeRecordId(
+      revision.normalizedSubject,
+      revision.kind,
+    );
+    const authority = revision.authority === undefined
+      ? undefined
+      : normalizeKnowledgeAuthority(revision.authority);
+    this.#database.prepare(`
+      UPDATE knowledge_records SET active=0
+      WHERE run_id=? AND record_id=? AND active=1
+    `).run(runId, recordId);
+    this.#database.prepare(`
+      INSERT INTO knowledge_records(
+        run_id, record_id, revision_id, revision, normalized_subject, kind,
+        payload_json, status, active, producing_window_id, origin, scope,
+        owned_fields_json, evidence_json, import_batch_id
+      ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      runId,
+      recordId,
+      revision.revisionId,
+      revision.revision,
+      revision.normalizedSubject,
+      revision.kind,
+      canonicalJson(revision),
+      revision.status,
+      PROJECTABLE_KNOWLEDGE_STATUSES.has(revision.status) ? 1 : 0,
+      producingWindowId,
+      authority?.origin ?? "model",
+      authority?.scope ?? "book",
+      canonicalJson(authority?.ownedFields ?? []),
+      canonicalJson(evidence),
+      importBatchId ?? null,
+    );
+  }
+
+  #activeRunKnowledgeEvidence(
+    runId: string,
+    recordId: string,
+  ): readonly KnowledgeEvidence[] {
+    const row = one<{ evidence_json: string }>(this.#database.prepare(`
+      SELECT evidence_json FROM knowledge_records
+      WHERE run_id=? AND record_id=? AND active=1
+    `), runId, recordId);
+    if (row === undefined) {
+      return [];
+    }
+    const parsed = JSON.parse(row.evidence_json) as unknown;
+    if (!Array.isArray(parsed)) {
+      throw new Error(`corrupt evidence JSON for ${recordId}`);
+    }
+    return parsed as KnowledgeEvidence[];
+  }
+
+  #catalogSeedRevisions(
+    runId: string,
+    sourceVersion: string,
+  ): readonly KnowledgeRevision[] {
+    const rows = [
+      ...all<CatalogKnowledgeRow>(this.#database.prepare(`
+        SELECT NULL AS source_version, record_id, revision, revision_id, object_type,
+               normalized_subject, kind, document_json, origin, scope, active
+        FROM project_knowledge_revisions WHERE active=1
+      `)),
+      ...all<CatalogKnowledgeRow>(this.#database.prepare(`
+        SELECT source_version, record_id, revision, revision_id, object_type,
+               normalized_subject, kind, document_json, origin, scope, active
+        FROM book_knowledge_revisions
+        WHERE source_version=? AND active=1
+      `), sourceVersion),
+    ];
+    const effective = new Map<string, ActiveCatalogEntry>();
+    for (const row of rows) {
+      const entry = this.#catalogEntryFromRow(row);
+      const key = knowledgeKey(
+        entry.document.normalizedSubject,
+        entry.document.kind,
+      );
+      const previous = effective.get(key);
+      if (previous === undefined) {
+        effective.set(key, entry);
+        continue;
+      }
+      const comparison = compareAuthority(
+        entry.document.authority,
+        previous.document.authority,
+      );
+      if (comparison > 0) {
+        effective.set(key, entry);
+      } else if (comparison === 0
+        && canonicalJson(entry.document) !== canonicalJson(previous.document)) {
+        throw new Error(
+          `KNOWLEDGE_AUTHORITY_CONFLICT: catalog seed differs for ${key}`,
+        );
+      }
+    }
+    const domain = new KnowledgeStore();
+    for (const entry of [...effective.values()].sort((left, right) =>
+      compareText(left.document.normalizedSubject, right.document.normalizedSubject)
+      || compareText(left.document.kind, right.document.kind))) {
+      const catalogScope = entry.document.authority.scope;
+      const authority = normalizeKnowledgeAuthority({
+        ...entry.document.authority,
+        provenance: {
+          catalog: catalogScope === "project" ? "project" : "book",
+          catalogRevisionId: entry.row.revision_id,
+        },
+      });
+      domain.appendRevision({
+        normalizedSubject: entry.document.normalizedSubject,
+        kind: entry.document.kind,
+        payload: entry.document.payload,
+        alternatives: entry.document.alternatives,
+        status: entry.document.status,
+        authority,
+      });
+    }
+    return domain.listRevisions();
+  }
+
+  #catalogEvidenceForRevision(
+    revision: KnowledgeRevision,
+  ): readonly KnowledgeEvidence[] {
+    const provenance = revision.authority?.provenance;
+    if (provenance === undefined) {
+      return [];
+    }
+    const row = provenance.catalog === "project"
+      ? one<CatalogKnowledgeRow>(this.#database.prepare(`
+          SELECT NULL AS source_version, record_id, revision, revision_id, object_type,
+                 normalized_subject, kind, document_json, origin, scope, active
+          FROM project_knowledge_revisions WHERE revision_id=?
+        `), provenance.catalogRevisionId)
+      : one<CatalogKnowledgeRow>(this.#database.prepare(`
+          SELECT source_version, record_id, revision, revision_id, object_type,
+                 normalized_subject, kind, document_json, origin, scope, active
+          FROM book_knowledge_revisions WHERE revision_id=?
+        `), provenance.catalogRevisionId);
+    if (row === undefined) {
+      throw new Error(
+        `catalog provenance ${provenance.catalogRevisionId} is missing`,
+      );
+    }
+    return this.#catalogEntryFromRow(row).document.evidence;
   }
 
   #appendEvent(runId: string | null, kind: string, payload: unknown): void {

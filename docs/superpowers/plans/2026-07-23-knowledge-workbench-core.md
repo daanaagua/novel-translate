@@ -74,7 +74,7 @@
 - 测试：`translator-v5/test/book-schema-v3.test.ts`
 - 测试：`translator-v5/test/lossless-book-store.test.ts`
 
-- [ ] **步骤 1：编写新建与迁移失败测试**
+- [x] **步骤 1：编写新建与迁移失败测试**
 
 在 `book-schema-v3.test.ts` 建立真实临时数据库，覆盖新建、v2 迁移和中途故障回滚：
 
@@ -119,7 +119,7 @@ test("rolls back the complete v2 to v3 migration after a fault", () => {
 
 同时把 `lossless-book-store.test.ts` 中“schema v2”新建期望改为 schema v3，但保留“未知/部分数据库不得擅自改动”和只读快照行为。
 
-- [ ] **步骤 2：运行测试确认失败**
+- [x] **步骤 2：运行测试确认失败**
 
 运行：
 
@@ -129,7 +129,7 @@ node --test --import tsx --test-name-pattern="schema v3|v2 store as v3|schema v2
 
 预期：FAIL，提示 `book-schema-v3.ts` 不存在或 `user_version` 仍为 2。
 
-- [ ] **步骤 3：定义 schema v3**
+- [x] **步骤 3：定义 schema v3**
 
 在 `book-schema-v3.ts` 复用 v2 建表串并追加以下严格表：
 
@@ -273,7 +273,7 @@ evidence_json TEXT NOT NULL DEFAULT '[]' CHECK(json_valid(evidence_json)),
 import_batch_id TEXT
 ```
 
-- [ ] **步骤 4：实现严格迁移与兼容打开**
+- [x] **步骤 4：实现严格迁移与兼容打开**
 
 在 `LosslessBookStore` 构造阶段：
 
@@ -297,7 +297,7 @@ this.#faultInjector?.checkpoint("schema_v3_before_commit");
 
 同时修改 `createTranslationRun`，在创建运行和初始 snapshot 的同一事务中插入 `knowledge_state(run_id, generation=0, applied_book_generation=currentBookGeneration, applied_project_generation=currentProjectGeneration)`；重复创建运行时校验该行存在且两个 applied generation 均合法。任务 3 将补上实际 book/project seed 内容。
 
-- [ ] **步骤 5：运行迁移与完整存储测试**
+- [x] **步骤 5：运行迁移与完整存储测试**
 
 运行：
 
@@ -307,7 +307,7 @@ node --test --import tsx test/book-schema-v3.test.ts test/lossless-book-store.te
 
 预期：PASS；故障注入后的数据库仍为完整 v2，正常迁移后知识 revision ID 和快照 ID 不变。
 
-- [ ] **步骤 6：Commit**
+- [x] **步骤 6：Commit**
 
 ```powershell
 git add translator-v5/src/storage/book-schema-v2.ts translator-v5/src/storage/book-schema-v3.ts translator-v5/src/storage/lossless-book-store.ts translator-v5/test/book-schema-v3.test.ts translator-v5/test/lossless-book-store.test.ts
@@ -323,7 +323,7 @@ git commit -m "feat: add user knowledge schema v3"
 - 测试：`translator-v5/test/knowledge-authority.test.ts`
 - 测试：`translator-v5/test/knowledge-snapshot.test.ts`
 
-- [ ] **步骤 1：编写兼容与字段合并失败测试**
+- [x] **步骤 1：编写兼容与字段合并失败测试**
 
 ```ts
 test("keeps legacy revision hashes when authority is absent", () => {
@@ -392,7 +392,7 @@ test("resolves authority by scope and origin and exposes same-rank conflicts", (
 });
 ```
 
-- [ ] **步骤 2：运行测试确认失败**
+- [x] **步骤 2：运行测试确认失败**
 
 运行：
 
@@ -402,7 +402,7 @@ node --test --import tsx test/knowledge-authority.test.ts test/knowledge-snapsho
 
 预期：FAIL，`KnowledgeRevision` 尚无 `authority`，候选会把人工值变为冲突。
 
-- [ ] **步骤 3：实现 authority 类型和 JSON Pointer 合并**
+- [x] **步骤 3：实现 authority 类型和 JSON Pointer 合并**
 
 在 `knowledge-authority.ts` 定义：
 
@@ -450,7 +450,7 @@ export function compareAuthority(
 
 `compareAuthority` 固定按 `book > project > global`，同作用域按 `manual/rollback > import > model`。同级不同值必须返回显式冲突，不能用 revision 时间或数组顺序决胜。
 
-- [ ] **步骤 4：扩展修订但保持旧哈希兼容**
+- [x] **步骤 4：扩展修订但保持旧哈希兼容**
 
 给 `KnowledgeRevision` 和 `AppendKnowledgeRevision` 只增加可选 authority：
 
@@ -460,7 +460,7 @@ readonly authority?: KnowledgeAuthority;
 
 `normalizeRevisionContent` 只有在输入确实含有 authority 时才写入 canonical content，旧修订不得被补默认值。证据保存在 `knowledge_records.evidence_json`，不进入反复复制的 snapshot payload。`reconcileCandidates` 使用 `mergeCandidateWithAuthority` 后再去重 alternatives；若所有差异均落在被保护字段上，保持 `active`，否则才进入 `needs_revalidate`。
 
-- [ ] **步骤 5：验证旧快照和新权威修订**
+- [x] **步骤 5：验证旧快照和新权威修订**
 
 运行：
 
@@ -470,7 +470,7 @@ node --test --import tsx test/knowledge-authority.test.ts test/knowledge-snapsho
 
 预期：PASS；旧 fixture 哈希不变，新 revision/snapshot 对相同输入保持确定性。
 
-- [ ] **步骤 6：Commit**
+- [x] **步骤 6：Commit**
 
 ```powershell
 git add translator-v5/src/knowledge/knowledge-authority.ts translator-v5/src/knowledge/knowledge-store.ts translator-v5/test/knowledge-authority.test.ts translator-v5/test/knowledge-snapshot.test.ts
@@ -486,7 +486,7 @@ git commit -m "feat: preserve user-owned knowledge fields"
 - 测试：`translator-v5/test/knowledge-commands.test.ts`
 - 测试：`translator-v5/test/fault-injection.test.ts`
 
-- [ ] **步骤 1：编写保存、竞争和故障失败测试**
+- [x] **步骤 1：编写保存、竞争和故障失败测试**
 
 ```ts
 test("commits one user revision, snapshot, generation and event atomically", () => {
@@ -550,7 +550,7 @@ test("seeds a different source version only from project-scoped knowledge", () =
 });
 ```
 
-- [ ] **步骤 2：运行测试确认失败**
+- [x] **步骤 2：运行测试确认失败**
 
 运行：
 
@@ -560,7 +560,7 @@ node --test --import tsx test/knowledge-commands.test.ts test/fault-injection.te
 
 预期：FAIL，存储层尚无 `knowledgeState` 和 `commitKnowledgeCommands`。
 
-- [ ] **步骤 3：定义命令和结果**
+- [x] **步骤 3：定义命令和结果**
 
 在 `knowledge-commands.ts` 定义无路径、无 SQL 的领域命令：
 
@@ -611,7 +611,7 @@ export interface RollbackKnowledgeCommand {
 
 同时定义 `validateKnowledgeCommand`，为六种对象给出允许字段、必填字段和长度上限。未知字段必须报错，不能静默丢弃。`expectedScopeRevision.scope` 表示编辑前条目所在作用域；因此改变 `book/project` 作用域时仍能对旧 catalog 做乐观锁。`global` 条目不能在普通命令中就地改写：界面必须让用户选择“复制为本书覆盖”或进入任务 6 的全局库流程。
 
-- [ ] **步骤 4：实现单事务命令提交**
+- [x] **步骤 4：实现单事务命令提交**
 
 `LosslessBookStore.commitKnowledgeCommands` 在一个现有 `#transaction` 中：
 
@@ -649,7 +649,7 @@ commitKnowledgeCommands(input: CommitKnowledgeCommandsRequest): KnowledgeCommitR
 
 现有 `promoteStagedWindow` 在确实追加模型 knowledge revisions 时也把 run generation 增加 1；只有翻译文本变化而知识不变时 generation 保持不变。这样工作台能发现后台扫描产生的新知识。
 
-- [ ] **步骤 5：增加空批次与幂等约束**
+- [x] **步骤 5：增加空批次与幂等约束**
 
 空 commands 必须报 `commands must not be empty`。同一 `requestId` 的成功命令重试应返回原结果：把 requestId 和结果记录在事件中，并在事务开始时查询；同一 requestId 携带不同 canonical payload 时返回 `KNOWLEDGE_REQUEST_REUSE_CONFLICT`。
 
@@ -673,7 +673,7 @@ function requireMatchingReplay(
 }
 ```
 
-- [ ] **步骤 6：运行命令和全套故障测试**
+- [x] **步骤 6：运行命令和全套故障测试**
 
 运行：
 
@@ -683,7 +683,7 @@ node --test --import tsx test/knowledge-commands.test.ts test/fault-injection.te
 
 预期：PASS，无故障点留下半条 revision 或孤立 snapshot。
 
-- [ ] **步骤 7：Commit**
+- [x] **步骤 7：Commit**
 
 ```powershell
 git add translator-v5/src/knowledge/knowledge-commands.ts translator-v5/src/storage/lossless-book-store.ts translator-v5/test/knowledge-commands.test.ts translator-v5/test/fault-injection.test.ts

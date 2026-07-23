@@ -280,6 +280,74 @@ export function auditLosslessBookStore(
   let projectedKnowledge: KnowledgeStore | undefined;
   const consumedKnowledgeRows = new Set<number>();
   let previousSnapshotId: string | null = null;
+  const appendSnapshotKnowledge = (
+    payloadRevisions: readonly KnowledgeRevision[],
+    producingWindowId: string | null,
+  ): KnowledgeStore => {
+    const target = new KnowledgeStore(payloadRevisions);
+    const previous = projectedKnowledge ?? new KnowledgeStore();
+    const selected: Array<{
+      readonly index: number;
+      readonly revision: KnowledgeRevision;
+    }> = [];
+    if (producingWindowId !== null) {
+      for (let index = 0; index < state.knowledgeRevisions.length; index += 1) {
+        const row = state.knowledgeRevisions[index]!;
+        if (!consumedKnowledgeRows.has(index)
+          && row.producingWindowId === producingWindowId) {
+          selected.push({
+            index,
+            revision: row.payload as KnowledgeRevision,
+          });
+        }
+      }
+    } else {
+      for (const targetRevision of target.listRevisions()) {
+        const previousRevision = previous.latestRevision(
+          targetRevision.normalizedSubject,
+          targetRevision.kind,
+        )?.revision ?? 0;
+        if (targetRevision.revision <= previousRevision) {
+          continue;
+        }
+        for (let index = 0; index < state.knowledgeRevisions.length; index += 1) {
+          const row = state.knowledgeRevisions[index]!;
+          if (!consumedKnowledgeRows.has(index)
+            && row.producingWindowId === null
+            && row.normalizedSubject === targetRevision.normalizedSubject
+            && row.kind === targetRevision.kind
+            && row.revision > previousRevision
+            && row.revision <= targetRevision.revision) {
+            selected.push({
+              index,
+              revision: row.payload as KnowledgeRevision,
+            });
+          }
+        }
+      }
+    }
+    const next = new KnowledgeStore([
+      ...previous.listRevisions(),
+      ...selected.map((item) => item.revision),
+    ]);
+    const expected = createKnowledgeSnapshot(
+      state.runId,
+      next.projectableRevisions(),
+      previousSnapshotId,
+    );
+    const actual = createKnowledgeSnapshot(
+      state.runId,
+      target.projectableRevisions(),
+      previousSnapshotId,
+    );
+    if (canonicalJson(expected) !== canonicalJson(actual)) {
+      throw new Error("snapshot projection differs from persisted domain history");
+    }
+    for (const item of selected) {
+      consumedKnowledgeRows.add(item.index);
+    }
+    return next;
+  };
   for (let snapshotIndex = 0; snapshotIndex < state.snapshots.length; snapshotIndex += 1) {
     const snapshot = state.snapshots[snapshotIndex]!;
     const payload = snapshot.payload as Partial<KnowledgeSnapshot> | null;
@@ -310,31 +378,18 @@ export function auditLosslessBookStore(
         if (snapshot.producingWindowId !== null) {
           throw new Error("initial snapshot must not have a producing window");
         }
-        projectedKnowledge = new KnowledgeStore(payload.revisions);
+        projectedKnowledge = appendSnapshotKnowledge(
+          payload.revisions,
+          snapshot.producingWindowId,
+        );
       } else {
-        if (projectedKnowledge === undefined || snapshot.producingWindowId === null) {
+        if (projectedKnowledge === undefined) {
           throw new Error("derived snapshot is missing its knowledge predecessor");
         }
-        const appended: KnowledgeRevision[] = [];
-        for (let index = 0; index < state.knowledgeRevisions.length; index += 1) {
-          const revision = state.knowledgeRevisions[index]!;
-          if (revision.producingWindowId === snapshot.producingWindowId) {
-            appended.push(revision.payload as KnowledgeRevision);
-            consumedKnowledgeRows.add(index);
-          }
-        }
-        projectedKnowledge = new KnowledgeStore([
-          ...projectedKnowledge.listRevisions(),
-          ...appended,
-        ]);
-        const expected = createKnowledgeSnapshot(
-          state.runId,
-          projectedKnowledge.projectableRevisions(),
-          snapshot.parentSnapshotId,
+        projectedKnowledge = appendSnapshotKnowledge(
+          payload.revisions,
+          snapshot.producingWindowId,
         );
-        if (canonicalJson(expected) !== canonicalJson(payload)) {
-          throw new Error("snapshot projection differs from persisted domain history");
-        }
       }
     } catch {
       incidents.push("KNOWLEDGE_HISTORY_INVALID");

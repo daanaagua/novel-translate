@@ -188,6 +188,46 @@ test("snapshots are deeply immutable and hash canonical content", () => {
   }, TypeError);
 });
 
+test("authority-bearing revisions and snapshots are deterministic", () => {
+  function completed(ownedFields: readonly string[]) {
+    const store = new KnowledgeStore();
+    store.appendRevision({
+      normalizedSubject: "archon",
+      kind: "term_sense",
+      payload: { target: "阁下", note: "manual" },
+      status: "active",
+      authority: {
+        origin: "manual",
+        scope: "book",
+        ownedFields,
+      },
+    });
+    store.reconcileCandidates([candidate(
+      "candidate-1",
+      "archon",
+      { note: "model", target: "执政官" },
+      "term_sense",
+    )], "window-1");
+    return {
+      revisions: store.listRevisions(),
+      snapshot: createKnowledgeSnapshot("run-authority", store.projectableRevisions()),
+    };
+  }
+
+  const left = completed(["/target", "/note", "/target"]);
+  const right = completed(["/note", "/target"]);
+  assert.deepEqual(left, right);
+  assert.equal(left.revisions[1]?.status, "active");
+  assert.deepEqual(left.revisions[1]?.payload, {
+    note: "manual",
+    target: "阁下",
+  });
+  assert.deepEqual(
+    new KnowledgeStore(left.revisions).listRevisions(),
+    left.revisions,
+  );
+});
+
 test("snapshots project only the latest translator-visible revision per active key", () => {
   const store = new KnowledgeStore();
   store.appendRevision({

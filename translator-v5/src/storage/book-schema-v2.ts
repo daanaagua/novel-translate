@@ -20,6 +20,26 @@ export const LOSSLESS_BOOK_SCHEMA_TABLES = [
   "window_plans",
 ] as const;
 
+export const LOSSLESS_BOOK_SCHEMA_V2_KNOWLEDGE_RECORDS = `  CREATE TABLE knowledge_records(
+    run_id TEXT NOT NULL,
+    record_id TEXT NOT NULL CHECK(length(trim(record_id)) > 0),
+    revision_id TEXT NOT NULL CHECK(length(trim(revision_id)) > 0),
+    revision INTEGER NOT NULL CHECK(revision >= 1),
+    normalized_subject TEXT NOT NULL CHECK(length(trim(normalized_subject)) > 0),
+    kind TEXT NOT NULL CHECK(length(trim(kind)) > 0),
+    payload_json TEXT NOT NULL CHECK(json_valid(payload_json)),
+    status TEXT NOT NULL
+      CHECK(status IN ('candidate', 'provisional', 'active', 'needs_revalidate', 'contextual', 'superseded')),
+    active INTEGER NOT NULL DEFAULT 0 CHECK(active IN (0, 1)),
+    producing_window_id TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    PRIMARY KEY(run_id, record_id, revision),
+    UNIQUE(run_id, revision_id),
+    FOREIGN KEY(run_id, producing_window_id)
+      REFERENCES window_plans(run_id, window_id) ON DELETE RESTRICT
+  ) STRICT;
+`;
+
 /**
  * Schema v2 is intentionally separate from the legacy BookStore schema.
  * Every mutable translation artifact is namespaced by a translation run.
@@ -203,26 +223,7 @@ export const LOSSLESS_BOOK_SCHEMA_V2 = `
       REFERENCES knowledge_snapshots(run_id, snapshot_id) ON DELETE RESTRICT
   ) STRICT;
 
-  CREATE TABLE knowledge_records(
-    run_id TEXT NOT NULL,
-    record_id TEXT NOT NULL CHECK(length(trim(record_id)) > 0),
-    revision_id TEXT NOT NULL CHECK(length(trim(revision_id)) > 0),
-    revision INTEGER NOT NULL CHECK(revision >= 1),
-    normalized_subject TEXT NOT NULL CHECK(length(trim(normalized_subject)) > 0),
-    kind TEXT NOT NULL CHECK(length(trim(kind)) > 0),
-    payload_json TEXT NOT NULL CHECK(json_valid(payload_json)),
-    status TEXT NOT NULL
-      CHECK(status IN ('candidate', 'provisional', 'active', 'needs_revalidate', 'contextual', 'superseded')),
-    active INTEGER NOT NULL DEFAULT 0 CHECK(active IN (0, 1)),
-    producing_window_id TEXT NOT NULL,
-    created_at TEXT NOT NULL DEFAULT (datetime('now')),
-    PRIMARY KEY(run_id, record_id, revision),
-    UNIQUE(run_id, revision_id),
-    FOREIGN KEY(run_id, producing_window_id)
-      REFERENCES window_plans(run_id, window_id) ON DELETE RESTRICT
-  ) STRICT;
-
-  CREATE TABLE migration_candidates(
+${LOSSLESS_BOOK_SCHEMA_V2_KNOWLEDGE_RECORDS}\n  CREATE TABLE migration_candidates(
     candidate_id TEXT PRIMARY KEY CHECK(length(trim(candidate_id)) > 0),
     run_id TEXT REFERENCES translation_runs(run_id) ON DELETE RESTRICT,
     source_version TEXT NOT NULL REFERENCES source_versions(source_version) ON DELETE RESTRICT,
