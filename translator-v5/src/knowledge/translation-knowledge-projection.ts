@@ -4,6 +4,7 @@ import {
   canonicalJson,
   type KnowledgeStatus,
 } from "./knowledge-store.js";
+import { sourceFormsFromRevision } from "./knowledge-source-forms.js";
 import type { SourceLanguageProfile } from "../language/types.js";
 
 /**
@@ -167,45 +168,8 @@ function parseRevision(value: unknown): ParsedRevision | undefined {
   };
 }
 
-function appendString(value: unknown, target: Set<string>): void {
-  const string = nonemptyString(value);
-  if (string !== undefined) target.add(string);
-}
-
-function appendStringArray(value: unknown, target: Set<string>): void {
-  if (!Array.isArray(value)) return;
-  for (const item of value) appendString(item, target);
-}
-
-/**
- * Only fields that denote literal source forms are inspected.  Fact prose is
- * intentionally never searched: it could spuriously turn unrelated memories
- * into prompt context.
- */
-function formsFromPayload(value: unknown): string[] {
-  const forms = new Set<string>();
-  const appendKnownFields = (candidate: unknown): void => {
-    const raw = record(candidate);
-    if (raw === undefined) return;
-    appendStringArray(raw.subjectForms, forms);
-    appendStringArray(raw.sourceForms, forms);
-    appendStringArray(raw.normalizedForms, forms);
-    appendString(raw.sourceForm, forms);
-    appendString(raw.canonicalSource, forms);
-  };
-  appendKnownFields(value);
-  const raw = record(value);
-  if (raw !== undefined && Array.isArray(raw.alternatives)) {
-    for (const alternative of raw.alternatives) appendKnownFields(alternative);
-  }
-  return [...forms].sort(compareText);
-}
-
 function formsForRevision(revision: ParsedRevision): string[] {
-  const forms = new Set(formsFromPayload(revision.payload));
-  for (const alternative of revision.alternatives) {
-    for (const form of formsFromPayload(alternative)) forms.add(form);
-  }
+  const forms = new Set(sourceFormsFromRevision(revision));
   // Ordinary durable memory candidates normalize their first subject form into
   // normalizedSubject.  Entity-link keys use an internal prefix, so payload
   // forms above remain the matching route for those records.

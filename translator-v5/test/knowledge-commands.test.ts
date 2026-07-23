@@ -35,6 +35,13 @@ interface KnowledgeCommitResult {
 interface KnowledgeCommandCapableStore {
   knowledgeState(runId: string): KnowledgeStateView;
   commitKnowledgeCommands(input: unknown): KnowledgeCommitResult;
+  syncScopedKnowledge(runId: string): {
+    readonly changed: boolean;
+    readonly generation: number;
+    readonly snapshotId: string;
+    readonly appliedBookGeneration: number;
+    readonly appliedProjectGeneration: number;
+  };
 }
 
 function commandStore(store: LosslessBookStore): KnowledgeCommandCapableStore {
@@ -626,6 +633,148 @@ test("detects catalog content drift from its content-addressed revision id", () 
       () => createRun(reopened, "run-catalog-tamper"),
       /corrupt catalog knowledge revision/u,
     );
+  } finally {
+    reopened.close();
+  }
+});
+
+test("synchronizes book and project catalog changes into one stale-run snapshot", () => {
+  const fixture = initializedStore();
+  try {
+    const staleRun = createRun(fixture.store, "run-stale-sync");
+    const current = commandStore(fixture.store);
+    current.commitKnowledgeCommands(
+      commitRequest(current, fixture.runId, "阁下"),
+    );
+    current.commitKnowledgeCommands(requestForCommands(current, fixture.runId, [
+      termCommand("皮亚顿", "project", {
+        normalizedSubject: "piaton",
+        sourceForm: "Piaton",
+      }),
+    ]));
+
+    const stale = commandStore(fixture.store);
+    const before = stale.knowledgeState(staleRun);
+    const synced = stale.syncScopedKnowledge(staleRun);
+    const after = stale.knowledgeState(staleRun);
+    assert.equal(synced.changed, true);
+    assert.equal(after.generation, before.generation + 1);
+    assert.equal(after.appliedBookGeneration, 1);
+    assert.equal(after.appliedProjectGeneration, 1);
+    assert.deepEqual(
+      fixture.store.latestKnowledgeSnapshot(staleRun).revisions
+        .map((revision) => revision.normalizedSubject),
+      ["archon", "piaton"],
+    );
+
+    const noOp = stale.syncScopedKnowledge(staleRun);
+    assert.equal(noOp.changed, false);
+    assert.deepEqual(stale.knowledgeState(staleRun), after);
+  } finally {
+    fixture.store.close();
+  }
+});
+
+test("synchronizes project knowledge across source versions without book leakage", () => {
+  const fixture = initializedStore();
+  try {
+    fixture.store.registerSource(sourceInput("source-v2"));
+    fixture.store.replaceDerivedPlan("source-v2", {
+      blocks: sourceBlocks("source-v2"),
+      annotations: [],
+    });
+    const otherSourceRun = createRun(
+      fixture.store,
+      "run-other-source-sync",
+      "source-v2",
+    );
+    const current = commandStore(fixture.store);
+    current.commitKnowledgeCommands(requestForCommands(current, fixture.runId, [
+      termCommand("执政官", "project"),
+    ]));
+    current.commitKnowledgeCommands(requestForCommands(current, fixture.runId, [
+      termCommand("皮亚顿", "book", {
+        normalizedSubject: "piaton",
+        sourceForm: "Piaton",
+      }),
+    ]));
+
+    const other = commandStore(fixture.store);
+    other.syncScopedKnowledge(otherSourceRun);
+    assert.deepEqual(
+      fixture.store.latestKnowledgeSnapshot(otherSourceRun).revisions
+        .map((revision) => revision.normalizedSubject),
+      ["archon"],
+    );
+    assert.equal(
+      other.knowledgeState(otherSourceRun).appliedBookGeneration,
+      0,
+    );
+    assert.equal(
+      other.knowledgeState(otherSourceRun).appliedProjectGeneration,
+      1,
+    );
+  } finally {
+    fixture.store.close();
+  }
+});
+
+test("rejects scoped synchronization while a translation window is running", () => {
+  const fixture = initializedStore();
+  try {
+    const staleRun = createRun(fixture.store, "run-busy-sync");
+    fixture.store.initializeWindowPlan(staleRun, windowPlan());
+    const current = commandStore(fixture.store);
+    current.commitKnowledgeCommands(
+      commitRequest(current, fixture.runId, "阁下"),
+    );
+    fixture.store.claimWindow(staleRun, "window-0");
+    const stale = commandStore(fixture.store);
+    const before = stale.knowledgeState(staleRun);
+    assert.throws(
+      () => stale.syncScopedKnowledge(staleRun),
+      /KNOWLEDGE_EDIT_BUSY/u,
+    );
+    assert.deepEqual(stale.knowledgeState(staleRun), before);
+    assert.deepEqual(
+      fixture.store.latestKnowledgeSnapshot(staleRun).revisions,
+      [],
+    );
+  } finally {
+    fixture.store.close();
+  }
+});
+
+test("rolls back scoped synchronization atomically on commit failure", () => {
+  const fixture = initializedStore();
+  const staleRun = createRun(fixture.store, "run-fault-sync");
+  const current = commandStore(fixture.store);
+  current.commitKnowledgeCommands(
+    commitRequest(current, fixture.runId, "阁下"),
+  );
+  const before = commandStore(fixture.store).knowledgeState(staleRun);
+  fixture.store.close();
+
+  const failing = new LosslessBookStore(fixture.path, {
+    checkpoint(name) {
+      if (name === "before_commit") {
+        throw new Error("injected before_commit");
+      }
+    },
+  });
+  try {
+    assert.throws(
+      () => commandStore(failing).syncScopedKnowledge(staleRun),
+      /injected before_commit/u,
+    );
+  } finally {
+    failing.close();
+  }
+
+  const reopened = new LosslessBookStore(fixture.path);
+  try {
+    assert.deepEqual(commandStore(reopened).knowledgeState(staleRun), before);
+    assert.deepEqual(reopened.latestKnowledgeSnapshot(staleRun).revisions, []);
   } finally {
     reopened.close();
   }

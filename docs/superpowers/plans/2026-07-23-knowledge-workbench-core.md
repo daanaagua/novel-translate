@@ -700,7 +700,7 @@ git commit -m "feat: add atomic knowledge commands"
 - 修改：`translator-v5/src/knowledge/translation-knowledge-projection.ts`
 - 测试：`translator-v5/test/knowledge-query.test.ts`
 
-- [ ] **步骤 1：编写分页稳定性和影响失败测试**
+- [x] **步骤 1：编写分页稳定性和影响失败测试**
 
 ```ts
 test("uses an opaque stable cursor without duplicates after equal labels", () => {
@@ -719,7 +719,7 @@ test("returns exact evidence and flags only translated matching blocks", () => {
 });
 ```
 
-- [ ] **步骤 2：运行测试确认失败**
+- [x] **步骤 2：运行测试确认失败**
 
 运行：
 
@@ -729,7 +729,7 @@ node --test --import tsx test/knowledge-query.test.ts
 
 预期：FAIL，查询适配器和影响表写入尚不存在。
 
-- [ ] **步骤 3：抽取统一源形式**
+- [x] **步骤 3：抽取统一源形式**
 
 把 `translation-knowledge-projection.ts` 中私有的源形式提取逻辑迁到职责单一的 `knowledge-source-forms.ts`：
 
@@ -739,7 +739,7 @@ export function sourceFormsFromRevision(revision: KnowledgeRevision): readonly s
 
 只读取明确表示原文形式的字段（`sourceForm`、`sourceForms`、`canonicalSource`、`subjectForms`、`normalizedForms`），不得搜索事实散文。
 
-- [ ] **步骤 4：实现语义对象和游标**
+- [x] **步骤 4：实现语义对象和游标**
 
 定义：
 
@@ -770,7 +770,7 @@ export interface KnowledgeListItem {
 
 排序键固定为 `normalized_subject, kind, record_id`；游标是带 schema 字段的 base64url canonical JSON，非法、过期或不匹配筛选哈希的游标报 `KNOWLEDGE_CURSOR_INVALID`。
 
-- [ ] **步骤 5：在命令事务内写影响**
+- [x] **步骤 5：在命令事务内写影响**
 
 每条新 revision 取明确源形式，使用当前语言画像归一化后与 `logical_blocks.source_text` 做保守匹配；只对已有 active translation 的块写 `knowledge_block_impacts`。没有明确源形式的关系/记忆不制造全书影响。
 
@@ -802,7 +802,7 @@ for (const block of store.activeTranslatedBlocks(runId)) {
 - 原文块位置与短摘录；
 - pending/acknowledged/retranslated impacts。
 
-- [ ] **步骤 6：运行查询和投影回归**
+- [x] **步骤 6：运行查询和投影回归**
 
 运行：
 
@@ -812,7 +812,7 @@ node --test --import tsx test/knowledge-query.test.ts test/translation-request.t
 
 预期：PASS；分页结果稳定，投影字节预算不变，全文事实不会被误当成匹配关键词。
 
-- [ ] **步骤 7：Commit**
+- [x] **步骤 7：Commit**
 
 ```powershell
 git add translator-v5/src/knowledge/knowledge-source-forms.ts translator-v5/src/knowledge/knowledge-query.ts translator-v5/src/storage/lossless-book-store.ts translator-v5/src/knowledge/translation-knowledge-projection.ts translator-v5/test/knowledge-query.test.ts
@@ -831,7 +831,7 @@ git commit -m "feat: query knowledge with evidence and impacts"
 - 测试：`translator-v5/test/translation-request.test.ts`
 - 测试：`translator-v5/test/structured-style.test.ts`
 
-- [ ] **步骤 1：编写术语、记忆和风格生效失败测试**
+- [x] **步骤 1：编写术语、记忆和风格生效失败测试**
 
 ```ts
 test("uses a manually locked term in the next pending window", async () => {
@@ -882,7 +882,7 @@ test("syncs project knowledge into a stale run from another source version", asy
 });
 ```
 
-- [ ] **步骤 2：运行测试确认失败**
+- [x] **步骤 2：运行测试确认失败**
 
 运行：
 
@@ -892,7 +892,7 @@ node --test --import tsx test/book-runner.test.ts test/translation-request.test.
 
 预期：FAIL，人工 `term_sense` 和 `style_directive` 尚未进入 runner。
 
-- [ ] **步骤 3：统一人工术语表示**
+- [x] **步骤 3：统一人工术语表示**
 
 人工术语保存为 `kind="lexical_anchor"`，payload 完整满足 `StableTerm`：
 
@@ -912,7 +912,7 @@ node --test --import tsx test/book-runner.test.ts test/translation-request.test.
 
 修改 `termsFromKnowledge`：人工 authority 的 locked/preferred 值不经过 `softenModelAnchorTerm`，只有模型来源仍按现有降权逻辑处理。
 
-- [ ] **步骤 4：持久化风格只覆盖允许字段**
+- [x] **步骤 4：持久化风格只覆盖允许字段**
 
 `persisted-style.ts` 只读取 active `kind="style_directive"`，允许字段与 `style-profile.ts` 的九个字段一致。按 `book > project > global`、`manual > import > model` 合并；同级冲突抛出 `PERSISTED_STYLE_CONFLICT`，不凭写入时间猜测。
 
@@ -927,7 +927,7 @@ const requestStyle = mergeStyleState(options.styleState, persistedStyle);
 
 在恢复/启动运行并进入第一波前调用 `store.syncScopedKnowledge(runId)`。该方法仅在没有 running/staged 窗口的安全边界执行；它分别比较当前 source version 的 book generation 和 singleton project generation 与 run 中的两个 applied generation，把较新的 active catalog 文档按任务 2 的权威规则合并并重基为该 run 的下一 revision。一次同步无论涉及一个还是两个 catalog，都只创建一个新 snapshot、只增加一次 run generation，并原子更新两个 applied generation；二者均相等时严格 no-op，不能每波制造重复 revision。
 
-- [ ] **步骤 5：验证模型候选不会覆盖人工值**
+- [x] **步骤 5：验证模型候选不会覆盖人工值**
 
 增加恢复运行测试：人工 revision 后出现冲突模型候选，完成窗口后最新 payload 的 owned target 仍为人工值；候选原始行仍在 `knowledge_candidates` 可审计。
 
@@ -941,7 +941,7 @@ test("keeps owned fields after a conflicting model candidate is promoted", async
 });
 ```
 
-- [ ] **步骤 6：运行翻译核心回归**
+- [x] **步骤 6：运行翻译核心回归**
 
 运行：
 
@@ -951,7 +951,7 @@ node --test --import tsx test/book-runner.test.ts test/translation-request.test.
 
 预期：PASS；人工术语进入 stable terms，叙事记忆按位置开放，风格不改变工具协议。
 
-- [ ] **步骤 7：Commit**
+- [x] **步骤 7：Commit**
 
 ```powershell
 git add translator-v5/src/knowledge/persisted-style.ts translator-v5/src/knowledge/knowledge-store.ts translator-v5/src/fullbook/book-runner.ts translator-v5/src/agents/translation-request.ts translator-v5/test/book-runner.test.ts translator-v5/test/translation-request.test.ts translator-v5/test/structured-style.test.ts

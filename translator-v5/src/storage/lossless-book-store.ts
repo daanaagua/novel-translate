@@ -13,7 +13,11 @@ import { DatabaseSync, type StatementSync } from "node:sqlite";
 import type { CommitPromotion } from "../fullbook/commit-coordinator.js";
 import type { AdaptiveSchedulerSnapshot } from "../fullbook/adaptive-scheduler.js";
 import type { BookWindowPlan, BookWindowStatus } from "../fullbook/types.js";
-import { supportedSourceLanguageIds } from "../language/profiles.js";
+import {
+  getSourceLanguageProfile,
+  supportedSourceLanguageIds,
+} from "../language/profiles.js";
+import type { SourceLanguageProfile } from "../language/types.js";
 import {
   canonicalJson,
   KnowledgeStore,
@@ -52,6 +56,12 @@ import {
   createKnowledgeSnapshot,
   type KnowledgeSnapshot,
 } from "../knowledge/snapshot.js";
+import {
+  type KnowledgeImpactView,
+  type KnowledgeQueryRecord,
+  type KnowledgeQuerySource,
+} from "../knowledge/knowledge-query.js";
+import { sourceFormsFromRevision } from "../knowledge/knowledge-source-forms.js";
 import { blockId } from "../source/block-builder.js";
 import { LEGACY_TOKEN_ESTIMATOR_VERSION } from "../source/token-estimator.js";
 import type { LosslessBlock, StructureAnnotation } from "../source/types.js";
@@ -127,6 +137,14 @@ export interface LosslessBookStatusSummary {
   humanRequiredWindows: number;
   failedWindows: number;
   modelCalls: number;
+}
+
+export interface ScopedKnowledgeSyncResult {
+  readonly changed: boolean;
+  readonly generation: number;
+  readonly snapshotId: string;
+  readonly appliedBookGeneration: number;
+  readonly appliedProjectGeneration: number;
 }
 
 export interface StoredTranslationRun {
@@ -423,6 +441,7 @@ interface SourceVersionRow {
   canonical_chars: number;
   source_fingerprint: string;
   plan_fingerprint: string | null;
+  source_payload_json: string;
 }
 
 interface RunRow {
@@ -560,6 +579,90 @@ const PROJECTABLE_KNOWLEDGE_STATUSES = new Set<KnowledgeStatus>([
   "needs_revalidate",
   "contextual",
 ]);
+
+function knowledgeObjectType(
+  revision: KnowledgeRevision,
+): KnowledgeObjectType {
+  const payload = revision.payload !== null
+    && typeof revision.payload === "object"
+    && !Array.isArray(revision.payload)
+    ? revision.payload as Record<string, unknown>
+    : {};
+  if ("sourceForm" in payload || "canonicalSource" in payload || "target" in payload) {
+    return "term";
+  }
+  if ("alias" in payload && "entityId" in payload) return "alias";
+  if ("fromEntityId" in payload || "relationType" in payload) return "relation";
+  if ("canonicalName" in payload || "targetName" in payload || "entityType" in payload) {
+    return "entity";
+  }
+  if ("summary" in payload || "timeline" in payload || "startBlockId" in payload) {
+    return "memory";
+  }
+  if (revision.kind.includes("style")) return "style";
+  if (revision.kind.includes("alias")) return "alias";
+  if (revision.kind.includes("relation")) return "relation";
+  if (revision.kind.includes("entity")) return "entity";
+  if (revision.kind.includes("memory") || revision.kind === "fact") return "memory";
+  return "term";
+}
+
+function identifierCharacter(value: string | undefined): boolean {
+  return value !== undefined && /[\p{L}\p{N}]/u.test(value);
+}
+
+function normalizedSourceContainsForm(
+  source: string,
+  form: string,
+  profile: SourceLanguageProfile,
+): boolean {
+  let start = source.indexOf(form);
+  const cjk = profile.scripts.some((script) =>
+    script === "kana" || script === "hangul" || script === "han");
+  while (start >= 0) {
+    const before = source.at(start - 1);
+    const after = source.at(start + form.length);
+    if (cjk || (!identifierCharacter(before) && !identifierCharacter(after))) {
+      return true;
+    }
+    start = source.indexOf(form, start + form.length);
+  }
+  return false;
+}
+
+function sourceMatchesExplicitForms(
+  sourceText: string,
+  forms: readonly string[],
+  profile: SourceLanguageProfile,
+): boolean {
+  const normalizedSource = profile.normalizeSourceForm(sourceText);
+  const sourceTokens = new Set(profile.segment(sourceText)
+    .filter((token) => token.isWordLike)
+    .map((token) => token.normalized));
+  return forms.some((raw) => {
+    const form = profile.normalizeSourceForm(raw);
+    return scalarLength(form) >= 2
+      && (sourceTokens.has(form)
+        || normalizedSourceContainsForm(normalizedSource, form, profile));
+  });
+}
+
+function shortSourceExcerpt(
+  sourceText: string,
+  forms: readonly string[],
+  profile: SourceLanguageProfile,
+): string {
+  const scalars = [...sourceText];
+  if (scalars.length <= 160) return sourceText;
+  const lowerSource = sourceText.normalize("NFKC").toLocaleLowerCase(profile.locale);
+  const rawIndex = forms
+    .map((form) =>
+      lowerSource.indexOf(form.normalize("NFKC").toLocaleLowerCase(profile.locale)))
+    .find((index) => index >= 0) ?? 0;
+  const scalarIndex = [...sourceText.slice(0, rawIndex)].length;
+  const start = Math.max(0, scalarIndex - 60);
+  return scalars.slice(start, Math.min(scalars.length, start + 160)).join("");
+}
 
 function stringArrayFromJson(value: string, label: string): string[] {
   const parsed = JSON.parse(value) as unknown;
@@ -1821,6 +1924,219 @@ export class LosslessBookStore {
     };
   }
 
+  syncScopedKnowledge(runId: string): ScopedKnowledgeSyncResult {
+    if (this.#schemaVersion !== LOSSLESS_BOOK_SCHEMA_VERSION) {
+      throw new Error("schema v3 write upgrade required");
+    }
+    return this.#transaction(() => {
+      const run = this.#run(runId);
+      const state = this.knowledgeState(runId);
+      const bookGeneration = one<{ generation: number }>(
+        this.#database.prepare(`
+          SELECT generation FROM book_knowledge_state WHERE source_version=?
+        `),
+        run.source_version,
+      )?.generation;
+      const projectGeneration = one<{ generation: number }>(
+        this.#database.prepare(`
+          SELECT generation FROM project_knowledge_state WHERE singleton=1
+        `),
+      )?.generation;
+      if (bookGeneration === undefined || projectGeneration === undefined) {
+        throw new Error("schema v3 knowledge generation state is incomplete");
+      }
+      if (state.appliedBookGeneration > bookGeneration
+        || state.appliedProjectGeneration > projectGeneration) {
+        throw new Error(`translation run ${runId} knowledge state mismatch`);
+      }
+      if (state.appliedBookGeneration === bookGeneration
+        && state.appliedProjectGeneration === projectGeneration) {
+        return {
+          changed: false,
+          generation: state.generation,
+          snapshotId: state.snapshotId,
+          appliedBookGeneration: state.appliedBookGeneration,
+          appliedProjectGeneration: state.appliedProjectGeneration,
+        };
+      }
+
+      const busy = one<{ count: number }>(this.#database.prepare(`
+        SELECT COUNT(*) AS count FROM window_plans
+        WHERE run_id=? AND status IN ('running', 'staged')
+      `), runId)?.count ?? 0;
+      if (busy > 0) {
+        throw new Error(
+          "KNOWLEDGE_EDIT_BUSY: wait for the active translation window to finish",
+        );
+      }
+
+      const domain = new KnowledgeStore(this.knowledgeRevisions(runId));
+      const desired = this.#catalogSeedRevisions(runId, run.source_version);
+      for (const catalogRevision of desired) {
+        const current = domain.latestRevision(
+          catalogRevision.normalizedSubject,
+          catalogRevision.kind,
+        );
+        const desiredProvenance = catalogRevision.authority?.provenance;
+        const currentProvenance = current?.authority?.provenance;
+        if (desiredProvenance !== undefined
+          && currentProvenance?.catalog === desiredProvenance.catalog
+          && currentProvenance.catalogRevisionId
+            === desiredProvenance.catalogRevisionId) {
+          continue;
+        }
+        const appended = domain.appendRevision({
+          normalizedSubject: catalogRevision.normalizedSubject,
+          kind: catalogRevision.kind,
+          payload: catalogRevision.payload,
+          alternatives: catalogRevision.alternatives,
+          status: catalogRevision.status,
+          candidateIds: current?.candidateIds ?? catalogRevision.candidateIds,
+          sourceWindowIds:
+            current?.sourceWindowIds ?? catalogRevision.sourceWindowIds,
+          authority: catalogRevision.authority,
+        });
+        this.#insertRunKnowledgeRevision(
+          runId,
+          appended,
+          null,
+          this.#catalogEvidenceForRevision(appended),
+          undefined,
+        );
+        this.#insertKnowledgeImpactsForRevision(run, appended);
+      }
+
+      const parentSnapshot = this.latestKnowledgeSnapshot(runId);
+      const snapshot = createKnowledgeSnapshot(
+        runId,
+        domain.projectableRevisions(),
+        parentSnapshot.id,
+      );
+      this.#database.prepare(`
+        INSERT INTO knowledge_snapshots(
+          run_id, snapshot_id, parent_snapshot_id, producing_window_id,
+          content_hash, payload_json
+        ) VALUES(?, ?, ?, NULL, ?, ?)
+      `).run(
+        runId,
+        snapshot.id,
+        parentSnapshot.id,
+        snapshot.contentHash,
+        jsonText(snapshot, "scoped knowledge synchronization snapshot"),
+      );
+
+      const generation = state.generation + 1;
+      const updated = this.#database.prepare(`
+        UPDATE knowledge_state
+        SET generation=?, applied_book_generation=?,
+            applied_project_generation=?, updated_at=datetime('now')
+        WHERE run_id=? AND generation=? AND applied_book_generation=?
+          AND applied_project_generation=?
+      `).run(
+        generation,
+        bookGeneration,
+        projectGeneration,
+        runId,
+        state.generation,
+        state.appliedBookGeneration,
+        state.appliedProjectGeneration,
+      );
+      if (Number(updated.changes) !== 1) {
+        throw new Error("KNOWLEDGE_GENERATION_CONFLICT: knowledge state changed");
+      }
+      this.#appendEvent(runId, "knowledge_scope_synchronized", {
+        generation,
+        snapshotId: snapshot.id,
+        previousBookGeneration: state.appliedBookGeneration,
+        previousProjectGeneration: state.appliedProjectGeneration,
+        bookGeneration,
+        projectGeneration,
+      });
+      return {
+        changed: true,
+        generation,
+        snapshotId: snapshot.id,
+        appliedBookGeneration: bookGeneration,
+        appliedProjectGeneration: projectGeneration,
+      };
+    });
+  }
+
+  knowledgeQuerySource(runId: string): KnowledgeQuerySource {
+    const run = this.#run(runId);
+    const state = this.knowledgeState(runId);
+    const revisions = this.knowledgeRevisions(runId);
+    const historyByRecord = new Map<string, KnowledgeRevision[]>();
+    for (const revision of revisions) {
+      const recordId = knowledgeRecordId(
+        revision.normalizedSubject,
+        revision.kind,
+      );
+      const history = historyByRecord.get(recordId) ?? [];
+      history.push(revision);
+      historyByRecord.set(recordId, history);
+    }
+    const activeRows = all<{
+      record_id: string;
+      revision_id: string;
+      evidence_json: string;
+    }>(this.#database.prepare(`
+      SELECT record_id, revision_id, evidence_json
+      FROM knowledge_records
+      WHERE run_id=? AND active=1
+      ORDER BY normalized_subject, kind, record_id
+    `), runId);
+    const revisionById = new Map(revisions.map((revision) => [
+      revision.revisionId,
+      revision,
+    ]));
+    const records = activeRows.map((row): KnowledgeQueryRecord => {
+      const revision = revisionById.get(row.revision_id);
+      if (revision === undefined
+        || row.record_id !== knowledgeRecordId(
+          revision.normalizedSubject,
+          revision.kind,
+        )) {
+        throw new Error(`corrupt active knowledge query row ${row.revision_id}`);
+      }
+      const catalog = this.#catalogMetadataForRevision(run, revision);
+      return Object.freeze({
+        id: row.record_id,
+        objectType: catalog?.objectType ?? knowledgeObjectType(revision),
+        revision,
+        scopeRevision: catalog?.scopeRevision ?? null,
+        evidence: Object.freeze(this.#resolvedKnowledgeEvidence(
+          run,
+          revision,
+          JSON.parse(row.evidence_json) as unknown,
+        )),
+        history: Object.freeze([
+          ...(historyByRecord.get(row.record_id) ?? []),
+        ]),
+        impacts: Object.freeze(this.#knowledgeImpacts(
+          run,
+          revision,
+        )),
+      });
+    });
+    const stableRecords = Object.freeze(records);
+    const byId = new Map(stableRecords.map((record) => [record.id, record]));
+    const generation = hashText(canonicalJson({
+      schema: "folioloom-knowledge-query-generation-1",
+      runId,
+      sourceVersion: run.source_version,
+      generation: state.generation,
+      snapshotId: state.snapshotId,
+      bookGeneration: state.appliedBookGeneration,
+      projectGeneration: state.appliedProjectGeneration,
+    }));
+    return Object.freeze({
+      generation,
+      listKnowledgeRecords: () => stableRecords,
+      knowledgeRecord: (id: string) => byId.get(id),
+    });
+  }
+
   commitKnowledgeCommands(
     input: CommitKnowledgeCommandsRequest | unknown,
   ): KnowledgeCommitResult {
@@ -1884,6 +2200,7 @@ export class LosslessBookStore {
       for (const command of request.commands) {
         const result = this.#applyKnowledgeCommand(run, domain, command);
         revisionIds.push(result.revision.revisionId);
+        this.#insertKnowledgeImpactsForRevision(run, result.revision);
         bookChanged ||= result.bookChanged;
         projectChanged ||= result.projectChanged;
       }
@@ -3421,6 +3738,218 @@ export class LosslessBookStore {
       canonicalJson(evidence),
       importBatchId ?? null,
     );
+  }
+
+  #insertKnowledgeImpactsForRevision(
+    run: RunRow,
+    revision: KnowledgeRevision,
+  ): void {
+    const forms = sourceFormsFromRevision(revision);
+    if (forms.length === 0) return;
+    const source = this.#source(run.source_version);
+    const sourcePayload = JSON.parse(source.source_payload_json) as {
+      sourceLanguage?: unknown;
+    };
+    const profile = getSourceLanguageProfile(
+      typeof sourcePayload.sourceLanguage === "string"
+        ? sourcePayload.sourceLanguage
+        : undefined,
+    );
+    const blocks = all<{
+      source_version: string;
+      block_id: string;
+      source_text: string;
+    }>(this.#database.prepare(`
+      SELECT DISTINCT b.source_version, b.block_id, b.source_text
+      FROM translations AS t
+      JOIN logical_blocks AS b
+        ON b.source_version=t.source_version AND b.block_id=t.block_id
+      WHERE t.run_id=? AND t.active=1 AND b.source_version=?
+      ORDER BY b.global_index, b.block_id
+    `), run.run_id, run.source_version);
+    const insert = this.#database.prepare(`
+      INSERT OR IGNORE INTO knowledge_block_impacts(
+        run_id, revision_id, source_version, block_id, reason
+      ) VALUES(?, ?, ?, ?, 'explicit_source_form_match')
+    `);
+    for (const block of blocks) {
+      if (sourceMatchesExplicitForms(block.source_text, forms, profile)) {
+        insert.run(
+          run.run_id,
+          revision.revisionId,
+          block.source_version,
+          block.block_id,
+        );
+      }
+    }
+  }
+
+  #catalogMetadataForRevision(
+    run: RunRow,
+    revision: KnowledgeRevision,
+  ): {
+    readonly objectType: KnowledgeObjectType;
+    readonly scopeRevision: {
+      readonly scope: KnowledgeScope;
+      readonly revision: number;
+    };
+  } | undefined {
+    const provenance = revision.authority?.provenance;
+    if (provenance === undefined) return undefined;
+    const row = provenance.catalog === "project"
+      ? one<CatalogKnowledgeRow>(this.#database.prepare(`
+          SELECT NULL AS source_version, record_id, revision, revision_id,
+                 object_type, normalized_subject, kind, document_json,
+                 origin, scope, active
+          FROM project_knowledge_revisions WHERE revision_id=?
+        `), provenance.catalogRevisionId)
+      : one<CatalogKnowledgeRow>(this.#database.prepare(`
+          SELECT source_version, record_id, revision, revision_id,
+                 object_type, normalized_subject, kind, document_json,
+                 origin, scope, active
+          FROM book_knowledge_revisions
+          WHERE source_version=? AND revision_id=?
+        `), run.source_version, provenance.catalogRevisionId);
+    if (row === undefined) {
+      throw new Error(
+        `corrupt knowledge catalog provenance ${provenance.catalogRevisionId}`,
+      );
+    }
+    const entry = this.#catalogEntryFromRow(
+      row,
+      revision.normalizedSubject,
+      revision.kind,
+    );
+    return {
+      objectType: entry.document.objectType,
+      scopeRevision: {
+        scope: entry.document.authority.scope,
+        revision: row.revision,
+      },
+    };
+  }
+
+  #resolvedKnowledgeEvidence(
+    run: RunRow,
+    revision: KnowledgeRevision,
+    rawEvidence: unknown,
+  ): KnowledgeEvidence[] {
+    const evidence = [...validateKnowledgeEvidence(rawEvidence)];
+    const seenWindows = new Set(evidence
+      .filter((item) => item.kind === "source_window")
+      .map((item) => item.sourceWindowId));
+    for (const sourceWindowId of revision.sourceWindowIds) {
+      if (!seenWindows.has(sourceWindowId)) {
+        evidence.push({ kind: "source_window", sourceWindowId });
+        seenWindows.add(sourceWindowId);
+      }
+    }
+    return evidence.map((item): KnowledgeEvidence => {
+      if (item.kind === "user_note") return item;
+      if (item.kind === "source_window") {
+        const present = one<{ present: number }>(this.#database.prepare(`
+          SELECT 1 AS present FROM window_plans
+          WHERE run_id=? AND window_id=? AND source_version=?
+        `), run.run_id, item.sourceWindowId, run.source_version);
+        if (present === undefined) {
+          throw new Error("KNOWLEDGE_EVIDENCE_POSITION_MISMATCH");
+        }
+        return item;
+      }
+      const block = one<{
+        canonical_start: number;
+        canonical_end: number;
+        source_text: string;
+      }>(this.#database.prepare(`
+        SELECT canonical_start, canonical_end, source_text
+        FROM logical_blocks WHERE source_version=? AND block_id=?
+      `), run.source_version, item.blockId);
+      if (block === undefined) {
+        throw new Error("KNOWLEDGE_EVIDENCE_POSITION_MISMATCH");
+      }
+      const scalars = [...block.source_text];
+      let start = item.canonicalStart;
+      let end = item.canonicalEnd;
+      if ((start === undefined) !== (end === undefined)) {
+        throw new Error("KNOWLEDGE_EVIDENCE_POSITION_MISMATCH");
+      }
+      if (start === undefined && end === undefined && item.quote !== undefined) {
+        const index = block.source_text.indexOf(item.quote);
+        if (index < 0) {
+          throw new Error("KNOWLEDGE_EVIDENCE_POSITION_MISMATCH");
+        }
+        start = block.canonical_start
+          + [...block.source_text.slice(0, index)].length;
+        end = start + scalarLength(item.quote);
+      }
+      if (start === undefined || end === undefined) {
+        start = block.canonical_start;
+        end = Math.min(block.canonical_end, start + 160);
+      }
+      if (start < block.canonical_start
+        || end < start
+        || end > block.canonical_end) {
+        throw new Error("KNOWLEDGE_EVIDENCE_POSITION_MISMATCH");
+      }
+      const relativeStart = start - block.canonical_start;
+      const relativeEnd = end - block.canonical_start;
+      const exact = scalars.slice(relativeStart, relativeEnd).join("");
+      if (item.quote !== undefined && item.quote !== exact) {
+        throw new Error("KNOWLEDGE_EVIDENCE_POSITION_MISMATCH");
+      }
+      if (scalarLength(exact) > 160) {
+        end = start + 160;
+      }
+      return {
+        kind: "source_block",
+        blockId: item.blockId,
+        canonicalStart: start,
+        canonicalEnd: end,
+        quote: scalars.slice(
+          relativeStart,
+          relativeStart + (end - start),
+        ).join(""),
+      };
+    });
+  }
+
+  #knowledgeImpacts(
+    run: RunRow,
+    revision: KnowledgeRevision,
+  ): KnowledgeImpactView[] {
+    const forms = sourceFormsFromRevision(revision);
+    const source = this.#source(run.source_version);
+    const sourcePayload = JSON.parse(source.source_payload_json) as {
+      sourceLanguage?: unknown;
+    };
+    const profile = getSourceLanguageProfile(
+      typeof sourcePayload.sourceLanguage === "string"
+        ? sourcePayload.sourceLanguage
+        : undefined,
+    );
+    return all<{
+      block_id: string;
+      global_index: number;
+      source_version: string;
+      status: "pending" | "acknowledged" | "retranslated";
+      reason: string;
+      source_text: string;
+    }>(this.#database.prepare(`
+      SELECT i.block_id, b.global_index, i.source_version, i.status,
+             i.reason, b.source_text
+      FROM knowledge_block_impacts AS i
+      JOIN logical_blocks AS b
+        ON b.source_version=i.source_version AND b.block_id=i.block_id
+      WHERE i.run_id=? AND i.revision_id=? AND i.source_version=?
+      ORDER BY b.global_index, i.block_id
+    `), run.run_id, revision.revisionId, run.source_version).map((row) => ({
+      blockId: row.block_id,
+      globalIndex: row.global_index,
+      sourceVersion: row.source_version,
+      status: row.status,
+      reason: row.reason,
+      sourceExcerpt: shortSourceExcerpt(row.source_text, forms, profile),
+    }));
   }
 
   #activeRunKnowledgeEvidence(
