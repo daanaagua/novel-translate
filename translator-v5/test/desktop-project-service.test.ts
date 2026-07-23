@@ -254,7 +254,7 @@ test("snapshot validates a discovered database suffix after resolving a file lin
     assert.equal(result.ok, false);
     if (!result.ok) {
       assert.equal(result.error.code, "DESKTOP_INPUT_INVALID");
-      assert.match(result.error.message, /storePath must identify a \\.db file/);
+      assert.match(result.error.message, /storePath must identify a \.db file/);
     }
   } finally {
     rmSync(fixture.directory, { recursive: true, force: true });
