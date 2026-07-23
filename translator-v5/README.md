@@ -15,7 +15,7 @@ npm.cmd install
 
 ## 本地桌面工作台
 
-桌面端仍是开发预览，不是已经发布的安装包。普通用户不需要理解内部清单或数据库，按三步操作即可：
+桌面端已经随 FolioLoom v1.1.0 提供 Windows x64 便携包。普通用户不需要理解内部清单或数据库，按三步操作即可：
 
 1. 选择 TXT、EPUB、DOCX 或 Markdown 书稿；
 2. 选择 DeepSeek、Kimi、阿里云百炼、火山方舟、OpenAI、硅基流动或自定义兼容服务，填写 API Key、模型与 provider 原始 effort 值；
@@ -26,6 +26,10 @@ Set-Location translator-v5
 npm.cmd install
 npm.cmd run desktop:dev
 ```
+
+不需要开发环境的用户可以从
+[GitHub Releases](https://github.com/daanaagua/novel-translate/releases/latest)
+下载 `FolioLoom-portable-win-x64.zip`，完整解压后运行根目录的 `FolioLoom.exe`。
 
 连接检查会验证真实流式响应、工具调用和多轮连续性；只有 `ready` 状态可以开始试译。`limited` 和 `failed` 会显示可执行原因，不会被包装成成功。试译只运行一个串行窗口，不会暗中启动全书翻译。
 

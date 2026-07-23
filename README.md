@@ -4,9 +4,9 @@
 
 FolioLoom 是一个面向长篇小说的开源 AI 翻译引擎。它把原文完整性、叙事记忆、实体别名、术语连续性、局部风格和失败恢复作为同一条可审计流水线处理，目标是让复杂小说在分块、并行和长时间运行后仍保持可追溯的一致性。
 
-当前版本为 **FolioLoom v1.0.0**。正式内核位于 [`translator-v5/`](translator-v5/)，以 TypeScript 编写；仓库根目录的 Python 代码主要承担 TXT、Markdown、DOCX、EPUB 输入适配，并保留 V1–V4 的研究历史。
+当前版本为 **FolioLoom v1.1.0**。正式内核位于 [`translator-v5/`](translator-v5/)，以 TypeScript 编写；仓库根目录的 Python 代码主要承担 TXT、Markdown、DOCX、EPUB 输入适配，并保留 V1–V4 的研究历史。
 
-## V1.0 能做什么
+## V1.1 能做什么
 
 - 为原始文本建立带哈希和位置映射的无损账本；
 - 按逻辑窗口串行或有限并行翻译，并在中断后恢复；
@@ -14,14 +14,17 @@ FolioLoom 是一个面向长篇小说的开源 AI 翻译引擎。它把原文完
 - 在每个并行波次冻结术语锚点，减少兄弟窗口的译名漂移；
 - 组合书级风格约束、人物声音、语体权重和衰减的局部状态；
 - 对漏译、异常残留和结构错误执行确定性校验与一次局部修复；
-- 从 SQLite 状态库导出中文 TXT、双语 TXT 和审计报告。
+- 从 SQLite 状态库导出中文 TXT、双语 TXT 和审计报告；
+- 通过 Electron 桌面端完成书稿导入、模型连接、试译、术语与叙事记忆维护；
+- 导入 JSON、YAML、CSV 或 XLSX 术语数据，并在写入前处理字段映射和冲突；
+- 针对英语、日语和韩语提供编码识别、token 估算及长篇调度策略。
 
 ## 当前限制
 
-- 提供本地开发用 Electron 桌面工作台，但尚未发布可下载的 Windows 安装包或 portable ZIP；
-- V4 的本地裁决页和旧 Streamlit 页面仍保留，但不是 V1.0 主入口；
+- 当前发布 Windows x64 单文件便携版和目录便携 ZIP，尚未提供代码签名；
+- V4 的本地裁决页和旧 Streamlit 页面仍保留，但不是 V1.1 主入口；
 - 已完成离线回归和真实模型的一窗口、三窗口门禁，尚未发布最新版架构的全书质量基准；
-- 桌面端当前只接通书稿导入、模型兼容性检查和单片段试译；全书翻译、审阅、术语编辑与导出仍使用命令行；
+- 桌面端已接通书稿导入、模型兼容性检查、单片段试译和知识工作台；全书开始、暂停、恢复、批量审阅与导出仍使用命令行；
 - 桌面端内置 DeepSeek、Kimi、阿里云百炼、火山方舟、OpenAI、硅基流动及自定义 OpenAI-compatible 接口入口；各模型仍须通过真实兼容性检查。
 
 ## 安装
@@ -29,8 +32,8 @@ FolioLoom 是一个面向长篇小说的开源 AI 翻译引擎。它把原文完
 要求：Windows、Python 3.11+、Node.js 24+。
 
 ```powershell
-git clone https://github.com/daanaagua/FolioLoom.git
-Set-Location FolioLoom
+git clone https://github.com/daanaagua/novel-translate.git
+Set-Location novel-translate
 
 python -m venv .venv
 .\.venv\Scripts\python.exe -m pip install -r requirements.txt
@@ -40,7 +43,7 @@ npm.cmd ci
 Set-Location ..
 ```
 
-复制示例配置。V1.0 可以把真实 API Key 写入不会被 Git 跟踪的 `config/config.yaml`，也可以在运行命令中使用 `--opencode-auth` 从本机 OpenCode 的认证文件读取：
+复制示例配置。V1.1 可以把真实 API Key 写入不会被 Git 跟踪的 `config/config.yaml`，也可以在运行命令中使用 `--opencode-auth` 从本机 OpenCode 的认证文件读取：
 
 ```powershell
 Copy-Item config\config.example.yaml config\config.yaml

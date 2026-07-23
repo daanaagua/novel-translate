@@ -56,3 +56,6 @@ translator-v5/out/
 translator-v5/release/
 translator-v5/.local/
 用于测试的模型.txt
+
+# Local copyrighted source text
+/Book of the New Sun.docx
