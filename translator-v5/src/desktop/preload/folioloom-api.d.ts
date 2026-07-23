@@ -3,6 +3,17 @@ import type {
   DesktopConfirmSourceEncodingRequest,
   DesktopDiscoverModelsRequest,
   DesktopDoctorReport,
+  DesktopAttachGlobalKnowledgeRequest,
+  DesktopGlobalKnowledgeListRequest,
+  DesktopGlobalKnowledgePage,
+  DesktopKnowledgeDetail,
+  DesktopKnowledgeDiagnostics,
+  DesktopKnowledgeListRequest,
+  DesktopKnowledgeMutationRequest,
+  DesktopKnowledgeMutationResult,
+  DesktopKnowledgePage,
+  DesktopPromoteKnowledgeRequest,
+  DesktopSuggestKnowledgeImportRequest,
   DesktopModelOption,
   DesktopOnboardingState,
   DesktopProjectSnapshot,
@@ -12,6 +23,22 @@ import type {
   DesktopTestModelResult,
   DesktopTrialProgress,
   DesktopTrialResult,
+  CancelImportOperationRequest,
+  CommitImportRequest,
+  CommittedImportReport,
+  ConfirmImportEncodingRequest,
+  DiscardStagedImportRequest,
+  ImportDecisionRequest,
+  ImportInspectionResult,
+  InspectImportRequest,
+  MappingSuggestion,
+  PendingKnowledgeImport,
+  RollbackImportRequest,
+  RolledBackImportReport,
+  StageImportRequest,
+  StagedImportPageRequest,
+  StagedImportReport,
+  StagedImportSummary,
 } from "../contracts.js";
 
 export interface FolioLoomDesktopApi {
@@ -26,6 +53,26 @@ export interface FolioLoomDesktopApi {
   startTrial(request: DesktopStartTrialRequest): Promise<DesktopResult<DesktopTrialResult>>;
   cancelTrial(): Promise<DesktopResult<void>>;
   onTrialProgress(listener: (progress: DesktopTrialProgress) => void): () => void;
+  listKnowledge(request: DesktopKnowledgeListRequest): Promise<DesktopResult<DesktopKnowledgePage>>;
+  getKnowledgeDetail(objectId: string): Promise<DesktopResult<DesktopKnowledgeDetail>>;
+  mutateKnowledge(request: DesktopKnowledgeMutationRequest): Promise<DesktopResult<DesktopKnowledgeMutationResult>>;
+  promoteKnowledgeToGlobal(request: DesktopPromoteKnowledgeRequest): Promise<DesktopResult<DesktopKnowledgeMutationResult>>;
+  listGlobalKnowledge(request: DesktopGlobalKnowledgeListRequest): Promise<DesktopResult<DesktopGlobalKnowledgePage>>;
+  attachGlobalKnowledge(request: DesktopAttachGlobalKnowledgeRequest): Promise<DesktopResult<DesktopKnowledgeMutationResult>>;
+  getKnowledgeDiagnostics(): Promise<DesktopResult<DesktopKnowledgeDiagnostics>>;
+  chooseKnowledgeImport(): Promise<DesktopResult<PendingKnowledgeImport>>;
+  inspectKnowledgeImport(request: InspectImportRequest): Promise<DesktopResult<ImportInspectionResult>>;
+  confirmKnowledgeImportEncoding(request: ConfirmImportEncodingRequest): Promise<DesktopResult<ImportInspectionResult>>;
+  listStagedKnowledgeImports(): Promise<DesktopResult<readonly StagedImportSummary[]>>;
+  getStagedKnowledgeImport(request: StagedImportPageRequest): Promise<DesktopResult<StagedImportReport>>;
+  suggestKnowledgeImport(request: DesktopSuggestKnowledgeImportRequest): Promise<DesktopResult<MappingSuggestion>>;
+  stageKnowledgeImport(request: StageImportRequest): Promise<DesktopResult<StagedImportReport>>;
+  decideKnowledgeImport(request: ImportDecisionRequest): Promise<DesktopResult<StagedImportReport>>;
+  commitKnowledgeImport(request: CommitImportRequest): Promise<DesktopResult<CommittedImportReport>>;
+  rollbackKnowledgeImport(request: RollbackImportRequest): Promise<DesktopResult<RolledBackImportReport>>;
+  cancelKnowledgeImportOperation(request: CancelImportOperationRequest): Promise<DesktopResult<void>>;
+  cancelPendingKnowledgeImport(pendingImportId: string): Promise<DesktopResult<void>>;
+  discardStagedKnowledgeImport(request: DiscardStagedImportRequest): Promise<DesktopResult<void>>;
   chooseProject(): Promise<DesktopResult<DesktopProjectSnapshot>>;
   chooseStore(): Promise<DesktopResult<DesktopProjectSnapshot>>;
   refreshProject(): Promise<DesktopResult<DesktopProjectSnapshot>>;

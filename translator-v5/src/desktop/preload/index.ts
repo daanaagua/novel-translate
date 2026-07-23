@@ -41,6 +41,55 @@ const desktopApi: FolioLoomDesktopApi = {
     ipcRenderer.on(DESKTOP_TRIAL_PROGRESS_CHANNEL, forward);
     return () => ipcRenderer.removeListener(DESKTOP_TRIAL_PROGRESS_CHANNEL, forward);
   },
+  listKnowledge: (request) => ipcRenderer.invoke("folioloom:knowledge-list", request),
+  getKnowledgeDetail: (objectId) => ipcRenderer.invoke("folioloom:knowledge-detail", objectId),
+  mutateKnowledge: (request) => ipcRenderer.invoke("folioloom:knowledge-mutate", request),
+  promoteKnowledgeToGlobal: (request) =>
+    ipcRenderer.invoke("folioloom:knowledge-promote-global", request),
+  listGlobalKnowledge: (request) =>
+    ipcRenderer.invoke("folioloom:knowledge-global-list", request),
+  attachGlobalKnowledge: (request) =>
+    ipcRenderer.invoke("folioloom:knowledge-global-attach", request),
+  getKnowledgeDiagnostics: () =>
+    ipcRenderer.invoke("folioloom:knowledge-diagnostics"),
+  chooseKnowledgeImport: () =>
+    ipcRenderer.invoke("folioloom:knowledge-import-choose"),
+  inspectKnowledgeImport: (request) =>
+    ipcRenderer.invoke("folioloom:knowledge-import-inspect", request),
+  confirmKnowledgeImportEncoding: (request) =>
+    ipcRenderer.invoke(
+      "folioloom:knowledge-import-confirm-encoding",
+      request,
+    ),
+  listStagedKnowledgeImports: () =>
+    ipcRenderer.invoke("folioloom:knowledge-import-list-staged"),
+  getStagedKnowledgeImport: (request) =>
+    ipcRenderer.invoke("folioloom:knowledge-import-get-staged", request),
+  suggestKnowledgeImport: (request) =>
+    ipcRenderer.invoke("folioloom:knowledge-import-suggest", request),
+  stageKnowledgeImport: (request) =>
+    ipcRenderer.invoke("folioloom:knowledge-import-stage", request),
+  decideKnowledgeImport: (request) =>
+    ipcRenderer.invoke("folioloom:knowledge-import-decide", request),
+  commitKnowledgeImport: (request) =>
+    ipcRenderer.invoke("folioloom:knowledge-import-commit", request),
+  rollbackKnowledgeImport: (request) =>
+    ipcRenderer.invoke("folioloom:knowledge-import-rollback", request),
+  cancelKnowledgeImportOperation: (request) =>
+    ipcRenderer.invoke(
+      "folioloom:knowledge-import-cancel-operation",
+      request,
+    ),
+  cancelPendingKnowledgeImport: (pendingImportId) =>
+    ipcRenderer.invoke(
+      "folioloom:knowledge-import-cancel-pending",
+      pendingImportId,
+    ),
+  discardStagedKnowledgeImport: (request) =>
+    ipcRenderer.invoke(
+      "folioloom:knowledge-import-discard-staged",
+      request,
+    ),
   chooseProject: () => ipcRenderer.invoke("folioloom:choose-project"),
   chooseStore: () => ipcRenderer.invoke("folioloom:choose-store"),
   refreshProject: () => ipcRenderer.invoke("folioloom:refresh-project"),

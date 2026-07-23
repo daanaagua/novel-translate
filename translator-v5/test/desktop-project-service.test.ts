@@ -339,6 +339,31 @@ test("snapshot requires an explicit selection for multiple matching runs", () =>
   }
 });
 
+test("resolves one trusted knowledge target without returning it through snapshot", () => {
+  const fixture = createFixture({ runIds: ["run-a"] });
+  try {
+    const service = new DesktopProjectService();
+    const target = service.resolveKnowledgeTarget({
+      manifestPath: fixture.manifestPath,
+      storePath: fixture.storePath,
+    });
+    assert.equal(target.ok, true);
+    if (target.ok) {
+      assert.equal(target.value.storePath, fixture.storePath);
+      assert.equal(target.value.runId, "run-a");
+      assert.equal(typeof target.value.sourceVersion, "string");
+      assert.equal(target.value.sourceLanguage, "en");
+    }
+    const snapshot = service.snapshot({
+      manifestPath: fixture.manifestPath,
+      storePath: fixture.storePath,
+    });
+    assert.equal(JSON.stringify(snapshot).includes(fixture.storePath), false);
+  } finally {
+    rmSync(fixture.directory, { recursive: true, force: true });
+  }
+});
+
 test("snapshot marks stores with only foreign source runs invalid", () => {
   const fixture = createFixture({ foreignRun: true });
   try {

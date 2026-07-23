@@ -200,3 +200,42 @@ export interface DesktopTrialResult {
   sourceText: string;
   translationText: string;
 }
+
+export type {
+  DesktopAttachGlobalKnowledgeRequest,
+  DesktopGlobalKnowledgeListRequest,
+  DesktopGlobalKnowledgePage,
+  DesktopKnowledgeDetail,
+  DesktopKnowledgeDiagnostics,
+  DesktopKnowledgeEvidence,
+  DesktopKnowledgeListRequest,
+  DesktopKnowledgeMutationRequest,
+  DesktopKnowledgeMutationResult,
+  DesktopKnowledgePage,
+  DesktopKnowledgeScopeRevision,
+  DesktopPromoteKnowledgeRequest,
+  DesktopSuggestKnowledgeImportRequest,
+} from "./knowledge-contracts.js";
+export type {
+  CancelImportOperationRequest,
+  CommitImportRequest,
+  CommittedImportReport,
+  ConfirmImportEncodingRequest,
+  DiscardStagedImportRequest,
+  ImportFieldMapping,
+  ImportConflictDecision,
+  ImportDecisionRequest,
+  ImportInspection,
+  ImportInspectionResult,
+  ImportPreviewRow,
+  ImportSelection,
+  InspectImportRequest,
+  MappingSuggestion,
+  PendingKnowledgeImport,
+  RollbackImportRequest,
+  RolledBackImportReport,
+  StageImportRequest,
+  StagedImportPageRequest,
+  StagedImportReport,
+  StagedImportSummary,
+} from "./knowledge-contracts.js";

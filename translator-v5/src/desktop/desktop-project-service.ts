@@ -179,6 +179,27 @@ function sourceVersionMismatchError(sourceVersion: string): DesktopError {
   };
 }
 
+function safeKnowledgeTargetError(error: DesktopError): DesktopError {
+  const messages: Readonly<Record<string, string>> = {
+    DESKTOP_INPUT_INVALID: "The current project configuration is invalid",
+    KNOWLEDGE_RUN_NOT_FOUND: "The current project has no translation run for this source",
+    KNOWLEDGE_RUN_SELECTION_REQUIRED:
+      "Select one translation run before opening the knowledge workbench",
+    KNOWLEDGE_STORE_INVALID:
+      "The current translation state database is not valid for this source",
+    KNOWLEDGE_STORE_NOT_FOUND:
+      "The current project has no translation state database",
+    SOURCE_VERSION_MISMATCH:
+      "The translation state database belongs to a different source version",
+  };
+  return {
+    code: error.code,
+    message: messages[error.code] ?? "The knowledge workbench could not open this project",
+    retryable: error.retryable,
+    ...(error.nextAction === undefined ? {} : { nextAction: error.nextAction }),
+  };
+}
+
 function projectDoctorReport(
   report: BookDoctorReport,
   glossaryPath: string | undefined,
@@ -283,6 +304,62 @@ export class DesktopProjectService {
       }
     } catch (error) {
       return fail(toDesktopError(error));
+    }
+  }
+
+  resolveKnowledgeTarget(request: DesktopProjectRequest): DesktopResult<{
+    storePath: string;
+    runId: string;
+    sourceVersion: string;
+    sourceLanguage: string;
+  }> {
+    try {
+      const manifestPath = requireManifestPath(request.manifestPath);
+      const storePath = request.storePath === undefined
+        ? discoverStorePath(manifestPath)
+        : requireStorePath(request.storePath);
+      if (storePath === undefined) {
+        throw new DesktopInputError(
+          "KNOWLEDGE_STORE_NOT_FOUND",
+          "The current project has no translation state database",
+        );
+      }
+      const snapshot = this.snapshot({
+        ...request,
+        manifestPath,
+        storePath,
+      });
+      if (!snapshot.ok) {
+        return fail(safeKnowledgeTargetError(snapshot.error));
+      }
+      if (snapshot.value.store.state === "invalid") {
+        return fail(safeKnowledgeTargetError(snapshot.value.store.error ?? {
+          code: "KNOWLEDGE_STORE_INVALID",
+          message: "The current translation state database is not valid for this source",
+          retryable: false,
+        }));
+      }
+      if (snapshot.value.runSelection === "required") {
+        throw new DesktopInputError(
+          "KNOWLEDGE_RUN_SELECTION_REQUIRED",
+          "Select one translation run before opening the knowledge workbench",
+        );
+      }
+      if (snapshot.value.runSelection !== "selected"
+        || snapshot.value.selectedRunId === undefined) {
+        throw new DesktopInputError(
+          "KNOWLEDGE_RUN_NOT_FOUND",
+          "The current project has no translation run for this source",
+        );
+      }
+      return ok({
+        storePath,
+        runId: snapshot.value.selectedRunId,
+        sourceVersion: snapshot.value.sourceVersion,
+        sourceLanguage: snapshot.value.sourceLanguage,
+      });
+    } catch (error) {
+      return fail(safeKnowledgeTargetError(toDesktopError(error)));
     }
   }
 

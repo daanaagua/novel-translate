@@ -10,6 +10,8 @@ import {
   type DesktopTrialProgress,
 } from "../contracts.js";
 import { DesktopCredentialStore } from "../desktop-credential-store.js";
+import { DesktopKnowledgeImportStorage } from "../desktop-knowledge-import-storage.js";
+import { DesktopKnowledgeService } from "../desktop-knowledge-service.js";
 import { DesktopModelService } from "../desktop-model-service.js";
 import { DesktopPreferences } from "../desktop-preferences.js";
 import { DesktopProjectService } from "../desktop-project-service.js";
@@ -18,6 +20,8 @@ import { DesktopTrialService, type DesktopTrialRuntime } from "../desktop-trial-
 import { createProviderRuntime } from "../../providers/runtime.js";
 import { providerRegistry } from "../../providers/registry.js";
 import type { ModelProfile } from "../../providers/types.js";
+import { GlobalKnowledgeStore } from "../../knowledge/global-knowledge-store.js";
+import { KnowledgeImportService } from "../../knowledge-import/knowledge-import-service.js";
 import { registerDesktopIpc } from "./ipc.js";
 import { createDesktopProviderRegistryAdapter } from "./provider-model-adapter.js";
 import {
@@ -32,6 +36,7 @@ const currentDirectory = dirname(fileURLToPath(import.meta.url));
 const trustedRendererUrls = new Map<number, string>();
 const desktopChrome = desktopWindowChrome();
 let trialServiceForShutdown: DesktopTrialService | undefined;
+let globalKnowledgeStoreForShutdown: GlobalKnowledgeStore | undefined;
 let quitAfterTrialSettles = false;
 let quitSettlementStarted = false;
 
@@ -136,6 +141,21 @@ void app.whenReady().then(() => {
   });
   trialServiceForShutdown = trialService;
   let currentRequest = loadRecentRequest(preferences);
+  const globalKnowledgeStore = new GlobalKnowledgeStore(
+    join(app.getPath("userData"), "global-knowledge.db"),
+  );
+  globalKnowledgeStoreForShutdown = globalKnowledgeStore;
+  const knowledgeService = new DesktopKnowledgeService(
+    projectService,
+    globalKnowledgeStore,
+    () => currentRequest,
+  );
+  const knowledgeImportService = new KnowledgeImportService({
+    storage: new DesktopKnowledgeImportStorage(
+      projectService,
+      () => currentRequest,
+    ),
+  });
 
   registerDesktopIpc({
     ipcMain: {
@@ -152,6 +172,8 @@ void app.whenReady().then(() => {
     sourceService,
     modelService,
     trialService,
+    knowledgeService,
+    knowledgeImportService,
     isTrustedEvent(event) {
       return isTrustedDesktopIpcEvent(event, trustedRendererUrls);
     },
@@ -177,6 +199,11 @@ app.on("window-all-closed", () => {
   if (process.platform !== "darwin") {
     app.quit();
   }
+});
+
+app.on("will-quit", () => {
+  globalKnowledgeStoreForShutdown?.close();
+  globalKnowledgeStoreForShutdown = undefined;
 });
 
 app.on("before-quit", (event) => {

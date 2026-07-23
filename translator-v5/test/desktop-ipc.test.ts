@@ -7,6 +7,11 @@ import test from "node:test";
 import type {
   DesktopChooseSourceResult,
   DesktopDoctorReport,
+  DesktopKnowledgeDiagnostics,
+  DesktopKnowledgeMutationRequest,
+  DesktopKnowledgePage,
+  PendingKnowledgeImport,
+  StagedImportReport,
   DesktopProjectRequest,
   DesktopProjectSnapshot,
   DesktopResult,
@@ -82,6 +87,7 @@ interface IpcFixtureOptions {
   existingReadyModel?: boolean;
   testStatus?: "ready" | "limited" | "failed";
   sourceEncodingRequired?: boolean;
+  pickedKnowledgeImport?: boolean;
 }
 
 interface IpcFixture {
@@ -103,6 +109,14 @@ interface IpcFixture {
     starts: readonly { manifestPath: string; mode: DesktopTrialMode }[];
     cancellations: number;
   };
+  knowledgeCalls: {
+    lists: readonly unknown[];
+    mutations: readonly unknown[];
+  };
+  knowledgeImportCalls: {
+    registered: readonly string[];
+    staged: readonly unknown[];
+  };
   dialogFilters: ReadonlyArray<{ name: string; extensions: string[] }>;
   currentRequest: DesktopProjectRequest | undefined;
 }
@@ -114,6 +128,7 @@ function registerFixtureHandlers(options: IpcFixtureOptions = {}): IpcFixture {
   const sourcePath = join(directory, "chapter.epub");
   const invalidSourcePath = join(directory, "chapter.exe");
   const textPath = join(directory, "not-a-store.txt");
+  const knowledgeImportPath = join(directory, "terms.xlsx");
   const activeRunIds = options.activeRunIds ?? [];
   const handlers = new Map<string, DesktopIpcHandler>();
   const sourceImports: string[] = [];
@@ -122,6 +137,10 @@ function registerFixtureHandlers(options: IpcFixtureOptions = {}): IpcFixture {
   const tests: unknown[] = [];
   const forgotten: unknown[] = [];
   const trialStarts: Array<{ manifestPath: string; mode: DesktopTrialMode }> = [];
+  const knowledgeLists: unknown[] = [];
+  const knowledgeMutations: unknown[] = [];
+  const registeredKnowledgeImports: string[] = [];
+  const stagedKnowledgeImports: unknown[] = [];
   let trialCancellations = 0;
   const dialogFilters: Array<{ name: string; extensions: string[] }> = [];
   const trustedEvent = {
@@ -183,7 +202,11 @@ function registerFixtureHandlers(options: IpcFixtureOptions = {}): IpcFixture {
           extensions: [...filter.extensions],
         })));
         const extension = dialogOptions.filters[0]?.extensions[0];
-        const selected = extension === "txt"
+        const selected = dialogOptions.filters[0]?.extensions.includes("xlsx")
+          ? options.pickedKnowledgeImport
+            ? knowledgeImportPath
+            : undefined
+          : extension === "txt"
           ? options.pickedSource === "source"
             ? sourcePath
             : options.pickedSource === "invalid"
@@ -274,6 +297,94 @@ function registerFixtureHandlers(options: IpcFixtureOptions = {}): IpcFixture {
         trialCancellations += 1;
       },
     },
+    knowledgeService: {
+      list(request) {
+        knowledgeLists.push(request);
+        return ok({
+          generation: 0,
+          snapshotId: "snapshot-0",
+          items: [],
+        } satisfies DesktopKnowledgePage);
+      },
+      detail() {
+        return fail("KNOWLEDGE_NOT_FOUND", "not found");
+      },
+      mutate(request: DesktopKnowledgeMutationRequest) {
+        knowledgeMutations.push(request);
+        return fail("KNOWLEDGE_NOT_FOUND", "not found");
+      },
+      promoteGlobal() {
+        return fail("KNOWLEDGE_NOT_FOUND", "not found");
+      },
+      listGlobal() {
+        return ok({ items: [] });
+      },
+      attachGlobal() {
+        return fail("GLOBAL_KNOWLEDGE_REVISION_NOT_FOUND", "not found");
+      },
+      diagnostics() {
+        return ok({
+          schemaVersion: 3,
+          knowledgeGeneration: 0,
+          countsByType: {},
+          countsByStatus: {},
+          pendingImpacts: 0,
+          latestMigration: "lossless-book-schema-v3",
+        } satisfies DesktopKnowledgeDiagnostics);
+      },
+    },
+    knowledgeImportService: {
+      registerPending(path) {
+        registeredKnowledgeImports.push(path);
+        return {
+          pendingImportId: "a22f46e4-539b-45e1-84a7-9c58a69eb92d",
+          fileName: "terms.xlsx",
+          format: "xlsx",
+        } satisfies PendingKnowledgeImport;
+      },
+      async inspect() {
+        throw new Error("not used");
+      },
+      async confirmEncoding() {
+        throw new Error("not used");
+      },
+      async suggestMapping() {
+        throw new Error("not used");
+      },
+      async stage(request) {
+        stagedKnowledgeImports.push(request);
+        return {
+          batchId: "833c5f65-3ae0-4128-b2db-3f900d33f2ee",
+          counts: {
+            ready: 0,
+            merge: 0,
+            conflict: 0,
+            invalid: 0,
+            skipped: 0,
+          },
+          unresolved: 0,
+          rows: [],
+        } satisfies StagedImportReport;
+      },
+      async listStaged() {
+        return [];
+      },
+      async getStaged() {
+        throw new Error("not used");
+      },
+      async setDecisions() {
+        throw new Error("not used");
+      },
+      async discardStaged() {},
+      async commit() {
+        throw new Error("not used");
+      },
+      async rollback() {
+        throw new Error("not used");
+      },
+      cancelOperation() {},
+      cancelPendingImport() {},
+    },
     isTrustedEvent(event) {
       return event === trustedEvent;
     },
@@ -307,6 +418,15 @@ function registerFixtureHandlers(options: IpcFixtureOptions = {}): IpcFixture {
     get trialCalls() {
       return { starts: trialStarts, cancellations: trialCancellations };
     },
+    get knowledgeCalls() {
+      return { lists: knowledgeLists, mutations: knowledgeMutations };
+    },
+    get knowledgeImportCalls() {
+      return {
+        registered: registeredKnowledgeImports,
+        staged: stagedKnowledgeImports,
+      };
+    },
     get dialogFilters() {
       return dialogFilters;
     },
@@ -335,6 +455,26 @@ test("IPC only registers the desktop allowlist", () => {
       "folioloom:discover-models",
       "folioloom:doctor",
       "folioloom:forget-credential",
+      "folioloom:knowledge-list",
+      "folioloom:knowledge-detail",
+      "folioloom:knowledge-mutate",
+      "folioloom:knowledge-promote-global",
+      "folioloom:knowledge-global-list",
+      "folioloom:knowledge-global-attach",
+      "folioloom:knowledge-diagnostics",
+      "folioloom:knowledge-import-choose",
+      "folioloom:knowledge-import-inspect",
+      "folioloom:knowledge-import-confirm-encoding",
+      "folioloom:knowledge-import-list-staged",
+      "folioloom:knowledge-import-get-staged",
+      "folioloom:knowledge-import-suggest",
+      "folioloom:knowledge-import-stage",
+      "folioloom:knowledge-import-decide",
+      "folioloom:knowledge-import-commit",
+      "folioloom:knowledge-import-rollback",
+      "folioloom:knowledge-import-cancel-operation",
+      "folioloom:knowledge-import-cancel-pending",
+      "folioloom:knowledge-import-discard-staged",
       "folioloom:onboarding-state",
       "folioloom:refresh-project",
       "folioloom:select-run",
@@ -342,6 +482,91 @@ test("IPC only registers the desktop allowlist", () => {
       "folioloom:start-trial",
       "folioloom:cancel-trial",
     ].sort());
+  } finally {
+    rmSync(fixture.directory, { recursive: true, force: true });
+  }
+});
+
+test("knowledge import IPC owns file paths and rejects renderer path injection", async () => {
+  const fixture = registerFixtureHandlers({ pickedKnowledgeImport: true });
+  try {
+    const chosen = await handler(
+      fixture,
+      "folioloom:knowledge-import-choose",
+    )(fixture.trustedEvent) as DesktopResult<PendingKnowledgeImport>;
+    assert.deepEqual(chosen, ok({
+      pendingImportId: "a22f46e4-539b-45e1-84a7-9c58a69eb92d",
+      fileName: "terms.xlsx",
+      format: "xlsx",
+    }));
+    assert.equal(fixture.knowledgeImportCalls.registered.length, 1);
+    assert.doesNotMatch(JSON.stringify(chosen), /[A-Z]:\\|knowledgeImportPath/u);
+
+    const injected = await handler(
+      fixture,
+      "folioloom:knowledge-import-stage",
+    )(fixture.trustedEvent, {
+      pendingImportId: "a22f46e4-539b-45e1-84a7-9c58a69eb92d",
+      operationId: "65e535fb-69e7-40af-b531-c5840741ee81",
+      expectedGeneration: 0,
+      expectedSnapshotId:
+        "0000000000000000000000000000000000000000000000000000000000000000",
+      selection: {
+        sheetId: "sheet-1",
+        headerRow: 1,
+        objectType: "term",
+        scope: "book",
+      },
+      fields: {},
+      path: "C:\\outside\\secrets.xlsx",
+    }) as DesktopResult<unknown>;
+    assert.equal(injected.ok, false);
+    if (!injected.ok) assert.equal(injected.error.code, "DESKTOP_INPUT_INVALID");
+    assert.equal(fixture.knowledgeImportCalls.staged.length, 0);
+  } finally {
+    rmSync(fixture.directory, { recursive: true, force: true });
+  }
+});
+
+test("knowledge IPC accepts only narrow renderer-safe payloads", async () => {
+  const fixture = registerFixtureHandlers();
+  try {
+    const listed = await handler(fixture, "folioloom:knowledge-list")(
+      fixture.trustedEvent,
+      { search: "Archon", objectTypes: ["term"], limit: 50 },
+    ) as DesktopResult<DesktopKnowledgePage>;
+    assert.equal(listed.ok, true);
+    assert.deepEqual(fixture.knowledgeCalls.lists, [{
+      search: "Archon",
+      objectTypes: ["term"],
+      limit: 50,
+    }]);
+
+    const injected = await handler(fixture, "folioloom:knowledge-mutate")(
+      fixture.trustedEvent,
+      {
+        requestId: "39e28df1-cde0-4a46-89ef-af5d13777639",
+        expectedGeneration: 0,
+        expectedSnapshotId: "snapshot-0",
+        command: {
+          type: "upsert",
+          objectType: "term",
+          normalizedSubject: "archon",
+          kind: "lexical_anchor",
+          expectedRevision: null,
+          expectedScopeRevision: null,
+          fieldPatch: { sourceForm: "Archon", target: "阁下" },
+          ownedFields: ["/target"],
+          scope: "book",
+          evidence: [],
+          origin: "manual",
+        },
+        storePath: "C:\\outside\\book.db",
+      },
+    ) as DesktopResult<unknown>;
+    assert.equal(injected.ok, false);
+    if (!injected.ok) assert.equal(injected.error.code, "DESKTOP_INPUT_INVALID");
+    assert.equal(fixture.knowledgeCalls.mutations.length, 0);
   } finally {
     rmSync(fixture.directory, { recursive: true, force: true });
   }
