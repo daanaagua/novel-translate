@@ -557,6 +557,43 @@ describe("FolioLoom desktop onboarding", () => {
     expect(await screen.findByText("上次连接模型时网络超时。")).toBeTruthy();
   });
 
+  it("shows a persisted failed probe after restart when it belongs to the active model", async () => {
+    const restarted: DesktopOnboardingState = {
+      ...readyOnboarding,
+      latestProbe: {
+        status: "failed",
+        providerId: "deepseek",
+        modelId: "deepseek-reasoner",
+        message: "matching active-model probe failed",
+        retryable: true,
+      },
+    };
+    render(<App api={createApi({
+      getOnboardingState: vi.fn().mockResolvedValue(ok(restarted)),
+    })} />);
+
+    expect(await screen.findByText("matching active-model probe failed")).toBeTruthy();
+  });
+
+  it("does not attribute another model's failed probe to the active model after restart", async () => {
+    const restarted: DesktopOnboardingState = {
+      ...readyOnboarding,
+      latestProbe: {
+        status: "failed",
+        providerId: "kimi",
+        modelId: "moonshot-v1-8k",
+        message: "different model probe failed",
+        retryable: true,
+      },
+    };
+    render(<App api={createApi({
+      getOnboardingState: vi.fn().mockResolvedValue(ok(restarted)),
+    })} />);
+
+    await screen.findByLabelText("API Key");
+    expect(screen.queryByText("different model probe failed")).toBeNull();
+  });
+
   it("keeps the API Key and reports an IPC connection error beside the button", async () => {
     const user = userEvent.setup();
     render(<App api={createApi({
@@ -575,7 +612,7 @@ describe("FolioLoom desktop onboarding", () => {
     await user.type(apiKey, "sk-keep-after-ipc-error");
     await user.click(screen.getByRole("button", { name: "测试连接" }));
 
-    expect(await screen.findByText("连接测试失败：连接服务超时，请稍后重试。")).toBeTruthy();
+    expect(await screen.findByText("连接服务超时，请稍后重试。")).toBeTruthy();
     expect((apiKey as HTMLInputElement).value).toBe("sk-keep-after-ipc-error");
   });
 

@@ -74,6 +74,8 @@ export interface DesktopTestModelRequest extends DesktopModelPreference {
 
 export interface DesktopProbeSummary extends DesktopProbePreference {
   checkedAt: string;
+  providerId: ProviderId;
+  modelId: string;
 }
 
 export interface DesktopModelTestResult {
@@ -134,9 +136,12 @@ function probeSummary(
   report: DesktopCapabilityReport,
   credential: string,
   checkedAt: string,
+  profile: DesktopModelPreference,
 ): DesktopProbeSummary {
   return {
     status: report.status,
+    providerId: profile.providerId,
+    modelId: profile.modelId,
     ...(report.code === undefined ? {} : { code: report.code }),
     message: redactSecret(report.message, credential),
     retryable: report.retryable,
@@ -144,9 +149,11 @@ function probeSummary(
   };
 }
 
-function failedProbeSummary(checkedAt: string): DesktopProbeSummary {
+function failedProbeSummary(checkedAt: string, profile: DesktopModelPreference): DesktopProbeSummary {
   return {
     status: "failed",
+    providerId: profile.providerId,
+    modelId: profile.modelId,
     code: "PROBE_FAILED",
     message: "模型连通性测试失败，请检查设置后重试。",
     retryable: true,
@@ -227,9 +234,9 @@ export class DesktopModelService {
     const checkedAt = this.#now();
     let report: DesktopProbeSummary;
     try {
-      report = probeSummary(await this.#providers.probe(profile, credential), credential, checkedAt);
+      report = probeSummary(await this.#providers.probe(profile, credential), credential, checkedAt, profile);
     } catch {
-      report = failedProbeSummary(checkedAt);
+      report = failedProbeSummary(checkedAt, profile);
     }
 
     const state = this.#preferences.loadState();

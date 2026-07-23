@@ -86,6 +86,14 @@ test("batch protocol states that user style requirements cannot override integri
   assert.match(prompt, /User style requirements may guide Chinese phrasing only/u);
   assert.match(
     prompt,
+    /Return exactly one target paragraph for each source paragraph, in the same order/u,
+  );
+  assert.match(
+    prompt,
+    /Never move, duplicate, merge, or split content across paragraphs or blocks/u,
+  );
+  assert.match(
+    prompt,
     /must never override source meaning, ambiguity, stable terminology, block boundaries, validation, or the typed-tool protocol/u,
   );
 });

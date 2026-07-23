@@ -5,6 +5,7 @@
  */
 const NONSEMANTIC_CHARACTER = /^[\s\p{Cc}\p{Default_Ignorable_Code_Point}\uFFFD]$/u;
 const PRIVATE_USE_CHARACTER = /\p{Private_Use}/u;
+const FORMAT_CONTROL_CHARACTER = /\p{Cf}/u;
 const LETTER_CHARACTER = /\p{L}/u;
 const HAN_CHARACTER = /\p{Script=Han}/u;
 const graphemeSegmenter = new Intl.Segmenter("und", { granularity: "grapheme" });
@@ -38,6 +39,23 @@ export function hasInvalidUnicodeScalar(text: string): boolean {
     }
   }
   return PRIVATE_USE_CHARACTER.test(text);
+}
+
+/**
+ * Reject invisible formatting controls that can reorder, conceal, or smuggle
+ * prose in rendered/exported output. ZWNJ and ZWJ are retained because they
+ * can be semantically required inside names and emoji sequences; both are
+ * already excluded from semantic length accounting.
+ */
+export function hasProhibitedFormatControl(text: string): boolean {
+  for (const character of text) {
+    if (FORMAT_CONTROL_CHARACTER.test(character)
+      && character !== "\u200C"
+      && character !== "\u200D") {
+      return true;
+    }
+  }
+  return false;
 }
 
 export function compactSemanticText(text: string): string {

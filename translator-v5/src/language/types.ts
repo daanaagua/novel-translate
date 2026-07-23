@@ -47,9 +47,13 @@ export interface AnchorCandidateInput {
 export interface ProfileAnchorCandidate {
   sourceForm: string;
   normalizedSource: string;
+  sourceAuthoredTarget?: string;
+  likelyProperName?: boolean;
   contexts: string[];
   corpusFrequency: number;
   currentWaveOccurrences: number;
+  documentFrequency: number;
+  morphologyDiversity: number;
   score: number;
 }
 
@@ -77,6 +81,8 @@ export interface SourceLanguageProfile {
   collectScriptStats(text: string): ScriptStats;
   segment(text: string): SourceToken[];
   normalizeSourceForm(text: string): string;
+  normalizeAnchorSourceForm(text: string): string;
+  hasExplicitEntityNamingCue(text: string): boolean;
   collectAnchorCandidates(input: AnchorCandidateInput): ProfileAnchorCandidate[];
   detectSourceResidue(
     translation: string,

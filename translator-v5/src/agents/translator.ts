@@ -12,7 +12,10 @@ import {
   targetLanguageLabel,
 } from "../language/target.js";
 import type { SourceLanguageProfile } from "../language/types.js";
-import { normalizeChineseQuoteTexts } from "../style/chinese-quote-normalization.js";
+import {
+  normalizeChineseQuoteTexts,
+  normalizeChineseQuoteTextsAgainstSource,
+} from "../style/chinese-quote-normalization.js";
 import { simplifyChineseTranslation } from "../style/chinese-script-normalization.js";
 import {
   normalizeTranslatedSceneSeparators,
@@ -121,18 +124,29 @@ export function normalizeCandidateTypography(
   preservedTargetForms: readonly string[] = [],
   sourceTextByBlockId: ReadonlyMap<string, string> = new Map(),
 ): TranslationCandidate {
-  const normalized = normalizeChineseQuoteTexts(candidate.translations.map((item) =>
+  const targetTexts = candidate.translations.map((item) =>
     normalizeTranslatedSceneSeparators(
       item.text,
       sourceTextByBlockId.get(item.blockId),
-    )));
+    ));
+  const sourceTexts = candidate.translations.map((item) =>
+    sourceTextByBlockId.get(item.blockId));
+  const normalizedTexts = sourceTexts.every((text): text is string => text !== undefined)
+    ? normalizeChineseQuoteTextsAgainstSource(targetTexts, sourceTexts).texts
+    : targetTexts.map((targetText, index) => {
+      const sourceText = sourceTexts[index];
+      return sourceText === undefined
+        ? normalizeChineseQuoteTexts([targetText]).texts[0] ?? targetText
+        : normalizeChineseQuoteTextsAgainstSource([targetText], [sourceText]).texts[0]
+          ?? targetText;
+    });
   return {
     ...candidate,
     notes: [...candidate.notes],
     translations: candidate.translations.map((translation, index) => ({
       ...translation,
       text: simplifyChineseTranslation(
-        normalized.texts[index] ?? translation.text,
+        normalizedTexts[index] ?? translation.text,
         preservedTargetForms,
       ),
     })),
@@ -227,6 +241,9 @@ export class Translator {
         `The source language is ${sourceLanguageProfile.displayName} (${sourceLanguageProfile.id}); the target language is ${targetLanguageLabel()}.`,
         SIMPLIFIED_CHINESE_SCRIPT_REQUIREMENT,
         "Preserve meaning, ambiguity, paragraph structure, voice, and all block boundaries.",
+        "Return exactly one target paragraph for each source paragraph, in the same order.",
+        "Never move, duplicate, merge, or split content across paragraphs or blocks.",
+        "For supplied terms, locked=true must be reproduced exactly; policy=preferred is a default rendering, not a literal-in-every-context constraint.",
         "Use translator-global facts only to disambiguate wording; do not add facts unavailable to the narrator.",
         "Do not leave ordinary source-language prose words untranslated unless the stable terminology explicitly preserves them.",
         "If and only if a concrete ambiguity can change the Chinese wording, call request_translation_evidence with one to three literal source-language forms copied from the target island.",
@@ -251,7 +268,7 @@ export class Translator {
       [...term.target.matchAll(/[A-Za-z][A-Za-z'-]+/gu)].map((match) => match[0]),
     );
     const requiredTerms = terms
-      .filter((term) => term.locked && term.conceptId.startsWith("run-anchor-"))
+      .filter((term) => term.locked)
       .map((term) => ({ sourceForm: term.sourceForm, target: term.target }));
     let candidate = input.collector.translations().slice(before).at(-1);
     const preservedTargetForms = terms.filter((term) => term.locked).map((term) => term.target);

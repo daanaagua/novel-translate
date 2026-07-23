@@ -6,7 +6,10 @@ import type { BudgetLedger } from "../kernel/budget.js";
 import type { LosslessBlock } from "../source/types.js";
 import { normalizeTranslatedSceneSeparators } from "../source/layout-separators.js";
 import { hasSemanticText } from "../text/semantic-text.js";
-import { normalizeChineseQuoteTexts } from "../style/chinese-quote-normalization.js";
+import {
+  normalizeChineseQuoteTexts,
+  normalizeChineseQuoteTextsAgainstSource,
+} from "../style/chinese-quote-normalization.js";
 import { simplifyChineseTranslation } from "../style/chinese-script-normalization.js";
 import type { StyleObservationSubmission } from "../style/types.js";
 import type {
@@ -274,23 +277,27 @@ function normalizeWindowTypography(
   preservedTargetForms: readonly string[],
   sourceTextByBlockId: ReadonlyMap<string, string>,
 ): TranslationBatchWindowResult[] {
-  let state = { openDoubleQuoteDepth: 0 };
   return windows.map((window) => {
-    const normalized = normalizeChineseQuoteTexts(
-      window.translations.map((translation) =>
-        normalizeTranslatedSceneSeparators(
-          translation.text,
-          sourceTextByBlockId.get(translation.blockId),
-        )),
-      state,
-    );
-    state = normalized.state;
+    const targetTexts = window.translations.map((translation) =>
+      normalizeTranslatedSceneSeparators(
+        translation.text,
+        sourceTextByBlockId.get(translation.blockId),
+      ));
+    const sourceTexts = window.translations.map((translation) =>
+      sourceTextByBlockId.get(translation.blockId));
+    const normalizedTexts = targetTexts.map((targetText, index) => {
+      const sourceText = sourceTexts[index];
+      return sourceText === undefined
+        ? normalizeChineseQuoteTexts([targetText]).texts[0] ?? targetText
+        : normalizeChineseQuoteTextsAgainstSource([targetText], [sourceText]).texts[0]
+          ?? targetText;
+    });
     return {
       ...window,
       translations: window.translations.map((translation, index) => ({
         ...translation,
         text: simplifyChineseTranslation(
-          normalized.texts[index] ?? translation.text,
+          normalizedTexts[index] ?? translation.text,
           preservedTargetForms,
         ),
       })),

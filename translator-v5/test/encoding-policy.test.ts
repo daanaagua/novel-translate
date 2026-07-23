@@ -46,6 +46,97 @@ test("BOM and strict UTF-8 decisions are deterministic and traceable", () => {
   assert.equal(bom.decision.decisionSource, "bom");
 });
 
+test("BOM-less UTF-16 text is recognized instead of being accepted as NUL-padded UTF-8", () => {
+  for (const encoding of ["utf-16le", "utf-16be"] as const) {
+    const source = "The quick brown fox jumps over the lazy dog.\n".repeat(4);
+    const littleEndian = Buffer.from(source, "utf16le");
+    const bytes = encoding === "utf-16le"
+      ? littleEndian
+      : Buffer.from(littleEndian).swap16();
+    const result = decodeSourceBytes(bytes, { languageHint: "en" });
+    assert.equal(result.text, source);
+    assert.equal(result.decision.canonicalLabel, encoding);
+    assert.equal(result.decision.decisionSource, "heuristic");
+    assert.equal(result.text.includes("\u0000"), false);
+  }
+});
+
+test("BOM-less UTF-16 Japanese and Korean prose survives endian detection without mojibake", () => {
+  const fixtures = [
+    { languageHint: "ja", source: "日本語の小説です。\n".repeat(8) },
+    { languageHint: "ko", source: "한국어 장편소설입니다.\n".repeat(8) },
+  ] as const;
+  for (const fixture of fixtures) {
+    for (const encoding of ["utf-16le", "utf-16be"] as const) {
+      const littleEndian = Buffer.from(fixture.source, "utf16le");
+      const bytes = encoding === "utf-16le"
+        ? littleEndian
+        : Buffer.from(littleEndian).swap16();
+      const result = decodeSourceBytes(bytes, { languageHint: fixture.languageHint });
+      assert.equal(result.text, fixture.source);
+      assert.equal(result.decision.canonicalLabel, encoding);
+      assert.equal(result.text.includes("\uFFFD"), false);
+      assert.equal(result.text.includes("\u0000"), false);
+    }
+  }
+});
+
+test("single-line BOM-less UTF-16 CJK is offered for explicit confirmation", () => {
+  const fixtures = [
+    { languageHint: "ja", source: "日本語の文章です。".repeat(30) },
+    { languageHint: "ko", source: "한국어로이어지는긴문장입니다".repeat(30) },
+  ] as const;
+  for (const fixture of fixtures) {
+    for (const encoding of ["utf-16le", "utf-16be"] as const) {
+      const littleEndian = Buffer.from(fixture.source, "utf16le");
+      const bytes = encoding === "utf-16le"
+        ? littleEndian
+        : Buffer.from(littleEndian).swap16();
+      assert.throws(
+        () => decodeSourceBytes(bytes, { languageHint: fixture.languageHint }),
+        (error: unknown) => error instanceof EncodingPolicyError
+          && error.code === "SOURCE_ENCODING_AMBIGUOUS"
+          && error.alternatives.some((alternative) => alternative.canonicalLabel === encoding),
+      );
+      assert.equal(
+        decodeSourceBytes(bytes, { explicitEncoding: encoding }).text,
+        fixture.source,
+      );
+    }
+  }
+});
+
+test("private-use and tiny halfwidth-kana decodes are never auto-accepted as Japanese", () => {
+  for (const bytes of [
+    Buffer.from("f7eac1", "hex"),
+    Buffer.from([0xb1, 0xb2, 0xb3]),
+  ]) {
+    assert.throws(
+      () => decodeSourceBytes(bytes, { languageHint: "ja" }),
+      (error: unknown) => error instanceof EncodingPolicyError
+        && (error.code === "SOURCE_ENCODING_UNSUPPORTED"
+          || error.code === "SOURCE_ENCODING_AMBIGUOUS"),
+    );
+  }
+});
+
+test("strict UTF-8 and BOM paths never admit embedded NUL or unsafe controls", () => {
+  const unsafe = Buffer.from("alpha\u0000omega", "utf8");
+  assert.throws(
+    () => decodeSourceBytes(unsafe),
+    (error: unknown) => error instanceof EncodingPolicyError
+      && error.code === "SOURCE_ENCODING_UNSUPPORTED",
+  );
+  assert.throws(
+    () => decodeSourceBytes(Buffer.concat([
+      Buffer.from([0xef, 0xbb, 0xbf]),
+      unsafe,
+    ])),
+    (error: unknown) => error instanceof EncodingPolicyError
+      && error.code === "SOURCE_ENCODING_UNSUPPORTED",
+  );
+});
+
 test("explicit legacy encodings decode strictly without replacement characters", () => {
   const fixtures = [
     { bytes: SHIFT_JIS_JAPANESE, encoding: "windows-31j", text: "日本語です。", canonical: "shift_jis" },

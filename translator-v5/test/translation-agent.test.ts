@@ -124,6 +124,43 @@ test("translation agent receives minimal context and may retrieve evidence", asy
   assert.equal(outcome.humanRequired, false);
 });
 
+test("translator validates every locked glossary or legacy term", async () => {
+  const target = chapterBlock(0, "The Archon entered the chamber.");
+  const island = splitIntoChapterIslands([target])[0];
+  assert.ok(island);
+  const faux = fauxProvider();
+  faux.setResponses([fauxAssistantMessage(fauxToolCall("finalize_translation", {
+    translations: [{ blockId: target.id, text: "那位统治者走进了房间。" }],
+    notes: [],
+  }), { stopReason: "toolUse" })]);
+
+  const outcome = await new Translator(new PiRuntime()).translateIsland({
+    island,
+    model: faux.getModel(),
+    streamFn: faux.provider.streamSimple.bind(faux.provider),
+    budget: new BudgetLedger({ repairTurns: 0 }),
+    collector: new CandidateCollector(),
+    stableTerms: [{
+      conceptId: "glossary-archon",
+      lexemeId: "glossary-archon-lexeme",
+      sourceForm: "Archon",
+      canonicalSource: "Archon",
+      target: "执政官",
+      locked: true,
+      policy: "locked",
+      origin: "glossary",
+    }],
+    snapshot: { ...snapshot(), questions: [], translatorFacts: [], evidence: [] },
+    styleState: { register: "literary" },
+    previousActiveTail: "",
+  });
+
+  assert.equal(outcome.validation.valid, false);
+  assert.ok(outcome.validation.failures.some((failure) =>
+    failure.code === "stable_term_mismatch"));
+  assert.equal(outcome.humanRequired, true);
+});
+
 test("on-demand evidence lookup is literal-form bounded and position safe", async () => {
   const target = chapterBlock(0, "Rakesh changed her version of the scape.");
   const future = chapterBlock(1, "The scape was a shared[[]]virtual sensory scene.");
@@ -381,6 +418,60 @@ test("target normalization never guesses that bracket content is a scene marker"
   );
 });
 
+test("source layout checks do not reinterpret unrelated target brackets", () => {
+  const source = chapterBlock(0, "x");
+  const validation = new TranslationValidator().validate([source], {
+    translations: [{ blockId: source.id, text: "[[]]" }],
+    notes: [],
+    repaired: false,
+  });
+
+  assert.ok(!validation.failures.some((failure) =>
+    failure.code === "source_layout_token_leak"));
+  assert.ok(!validation.failures.some((failure) =>
+    failure.code === "paragraph_count_incompatible"));
+});
+
+test("source layout tokens cannot migrate into a neighboring translated block", () => {
+  const first = chapterBlock(0, "Ordinary prose without a layout token.");
+  const second = chapterBlock(1, "Scene one.[[]]Scene two.");
+  const validation = new TranslationValidator().validate([first, second], {
+    translations: [
+      { blockId: first.id, text: "第一段译文意外带出了[[]]提取记号。" },
+      { blockId: second.id, text: "第二段译文保留为普通段落边界。" },
+    ],
+    notes: [],
+    repaired: false,
+  });
+
+  assert.ok(validation.failures.some((failure) =>
+    failure.code === "source_layout_token_leak" && failure.blockId === first.id));
+});
+
+test("short formulas and symbolic identifiers may remain unchanged", () => {
+  const source = chapterBlock(0, "F=ma");
+  const validation = new TranslationValidator().validate([source], {
+    translations: [{ blockId: source.id, text: "F=ma" }],
+    notes: [],
+    repaired: false,
+  });
+
+  assert.ok(!validation.failures.some((failure) =>
+    failure.code === "target_script_mismatch"));
+});
+
+test("source layout tokens do not inflate semantic completeness length", () => {
+  const source = chapterBlock(0, `${"[[]]".repeat(100)}y`);
+  const validation = new TranslationValidator().validate([source], {
+    translations: [{ blockId: source.id, text: "乙" }],
+    notes: [],
+    repaired: false,
+  });
+
+  assert.ok(!validation.failures.some((failure) =>
+    failure.code === "abnormal_block_shortening"));
+});
+
 test("validator preserves exact isolated source identifiers without allowing copied prose", () => {
   const block = chapterBlock(0, "eGod\n\nThe sailors looked up.");
   const preserved = new TranslationValidator().validate([block], {
@@ -434,6 +525,71 @@ test("quote normalization and validation reject invented closing boundaries", ()
   );
 });
 
+test("quote normalization removes only closing boundaries unsupported by source", () => {
+  const source = chapterBlock(0, "No quoted boundary appears here.");
+  const normalized = normalizeCandidateTypography({
+    translations: [{ blockId: source.id, text: "正文没有引语。”" }],
+    notes: [],
+    repaired: false,
+  }, { dialogueQuotes: "Chinese curly double quotes" }, [], new Map([
+    [source.id, source.sourceText],
+  ]));
+
+  assert.equal(normalized.translations[0]?.text, "正文没有引语。");
+  const validation = new TranslationValidator().validate([source], normalized);
+  assert.ok(!validation.failures.some((failure) =>
+    failure.code === "quote_boundary_mismatch"));
+});
+
+test("validator recognizes a closing ASCII quote inherited from prior source context", () => {
+  const source = chapterBlock(0, "A quoted sentence continues here.\"");
+  const validation = new TranslationValidator().validate([source], {
+    translations: [{ blockId: source.id, text: "一句引语在这里结束。”" }],
+    notes: [],
+    repaired: false,
+  });
+
+  assert.ok(!validation.failures.some((failure) =>
+    failure.code === "quote_boundary_mismatch"));
+});
+
+test("source quote state preserves an ASCII closing quote at the next block boundary", () => {
+  const first = chapterBlock(0, "He began, \"");
+  const second = chapterBlock(1, "\" and then left the room.");
+  const normalized = normalizeCandidateTypography({
+    translations: [
+      { blockId: first.id, text: "他开口说道：“" },
+      { blockId: second.id, text: "”随后离开了房间。" },
+    ],
+    notes: [],
+    repaired: false,
+  }, { dialogueQuotes: "Chinese curly double quotes" }, [], new Map([
+    [first.id, first.sourceText],
+    [second.id, second.sourceText],
+  ]));
+
+  assert.equal(normalized.translations[1]?.text.startsWith("”"), true);
+  const validation = new TranslationValidator().validate([first, second], normalized);
+  assert.ok(!validation.failures.some((failure) =>
+    failure.code === "quote_boundary_mismatch"), JSON.stringify(validation.failures));
+});
+
+test("quote boundary allowance cannot migrate into a neighboring block", () => {
+  const first = chapterBlock(0, "Plain narration ends here.");
+  const second = chapterBlock(1, "A prior quotation ends here.\"");
+  const validation = new TranslationValidator().validate([first, second], {
+    translations: [
+      { blockId: first.id, text: "普通叙述在这里结束。”" },
+      { blockId: second.id, text: "先前的引语在这里结束。" },
+    ],
+    notes: [],
+    repaired: false,
+  });
+
+  assert.ok(validation.failures.some((failure) =>
+    failure.code === "quote_boundary_mismatch" && failure.blockId === first.id));
+});
+
 test("run-local stable anchors are deterministic validation constraints", () => {
   const block = chapterBlock(0, "Typhon opposed the Conciliator.");
   const validation = new TranslationValidator().validate([block], {
@@ -471,6 +627,92 @@ test("CJK literary blocks reject implausible per-block shortening and expansion"
     failure.code === "abnormal_block_shortening" && failure.blockId === shortBlock.id));
   assert.ok(validation.failures.some((failure) =>
     failure.code === "abnormal_block_expansion" && failure.blockId === expandedBlock.id));
+});
+
+test("paragraph boundaries remain one-to-one across a translated block", () => {
+  const source = chapterBlock(0, Array.from(
+    { length: 13 },
+    (_, index) => `한국어 원문 단락 ${index}에는 충분한 서술이 이어집니다.`.repeat(4),
+  ).join("\n\n"));
+  const validation = new TranslationValidator().validate(
+    [source],
+    {
+      translations: [{
+        blockId: source.id,
+        text: Array.from(
+          { length: 21 },
+          (_, index) => `中文译文第${index}段保留了看似合理的篇幅。`.repeat(3),
+        ).join("\n\n"),
+      }],
+      notes: [],
+      repaired: false,
+    },
+    { sourceLanguageProfile: getSourceLanguageProfile("ko") },
+  );
+
+  assert.ok(validation.failures.some((failure) =>
+    failure.code === "paragraph_count_incompatible" && failure.blockId === source.id));
+});
+
+test("paragraph-level length checks catch a shifted passage hidden by a healthy block total", () => {
+  const source = chapterBlock(0, `${"한국어첫문단".repeat(100)}\n\n${"한국어둘째문단".repeat(100)}`);
+  const validation = new TranslationValidator().validate(
+    [source],
+    {
+      translations: [{
+        blockId: source.id,
+        text: `${"短".repeat(100)}\n\n${"第二段被错误塞入过多未来内容".repeat(90)}`,
+      }],
+      notes: [],
+      repaired: false,
+    },
+    { sourceLanguageProfile: getSourceLanguageProfile("ko") },
+  );
+
+  assert.ok(validation.failures.some((failure) =>
+    failure.code === "paragraph_length_incompatible" && failure.blockId === source.id));
+});
+
+test("adjacent paraphrased paragraph runs are treated as ungrounded cross-block overlap", () => {
+  const first = chapterBlock(0, [
+    "가나다라마바사아자차카타파하".repeat(5),
+    "고노도로모보소오조초코토포호".repeat(5),
+    "구누두루무부수우주추쿠투푸후".repeat(5),
+    "기니디리미비시이지치키티피히".repeat(5),
+  ].join("\n\n"));
+  const second = chapterBlock(1, [
+    "깨내때래매배쌔애째채캐태패해".repeat(5),
+    "꼬또뽀쏘쪼초쿄툐표효".repeat(6),
+    "워눠둬뤄뭐붜숴줘춰쿼퉈풔훠".repeat(5),
+    "계녜뎨례몌볘셰예졔쳬켸톄폐혜".repeat(5),
+  ].join("\n\n"));
+  const firstTarget = [
+    "此外还有一件事情需要禀告大人，我修炼童子功，从来不接近女色，也不需要安排侍女服侍。",
+    "既然大人已经作出决定，我便暂时住进东边的客房，等候下一步命令，不会擅自离开。",
+    "侍从听完这番吩咐，立刻躬身答应下来，并命人收拾房间准备清水和简单饭菜。",
+    "他向堂中众人逐一告辞，随后沿着长廊离去，脚步声很快消失在夜色深处。",
+  ].join("\n\n");
+  const secondTarget = [
+    "此外还有一件事需禀告大人，在下修炼童子功，从不接近女色，也无需安排侍女服侍。",
+    "既然大人已有决定，我便暂住东边客房，等候下一步命令，绝不会擅自离开。",
+    "侍从听完这番吩咐后立刻躬身领命，又命人收拾房间，准备清水和简单饭菜。",
+    "他向堂中众人逐一告辞，随后沿着长廊走远，脚步声渐渐消失在深沉夜色中。",
+  ].join("\n\n");
+  const validation = new TranslationValidator().validateCrossBlockAlignment(
+    [first, second],
+    {
+      translations: [
+        { blockId: first.id, text: firstTarget },
+        { blockId: second.id, text: secondTarget },
+      ],
+      notes: [],
+      repaired: false,
+    },
+  );
+
+  assert.equal(validation.valid, false);
+  assert.ok(validation.failures.some((failure) =>
+    failure.code === "cross_block_translation_overlap"));
 });
 
 test("default language profiles reject one-block omissions hidden by a healthy sibling", () => {
@@ -563,6 +805,29 @@ test("grapheme and invalid-scalar padding cannot forge CJK translation length", 
       assert.ok(validation.failures.some((failure) =>
         failure.code === "invalid_unicode_output" && failure.blockId === item.id));
     }
+  }
+});
+
+test("bidirectional and invisible format controls are rejected from translated prose", () => {
+  const prohibited = [
+    "\u00AD", "\u061C", "\u180E", "\u200B", "\u200E", "\u200F",
+    "\u202A", "\u202B", "\u202C", "\u202D", "\u202E",
+    "\u2060", "\u2066", "\u2067", "\u2068", "\u2069", "\uFEFF",
+  ];
+  for (const [index, control] of prohibited.entries()) {
+    const item = chapterBlock(index, "한국어 문장이 충분히 길게 이어집니다.".repeat(8));
+    const validation = new TranslationValidator().validate(
+      [item],
+      {
+        translations: [{ blockId: item.id, text: `这是一段完整的中文译文${control}并且长度足够。`.repeat(8) }],
+        notes: [],
+        repaired: false,
+      },
+      { sourceLanguageProfile: getSourceLanguageProfile("ko") },
+    );
+    assert.ok(validation.failures.some((failure) =>
+      failure.code === "invalid_unicode_output" && failure.blockId === item.id),
+    `expected U+${control.codePointAt(0)?.toString(16).toUpperCase()} to be rejected`);
   }
 });
 

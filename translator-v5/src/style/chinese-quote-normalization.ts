@@ -45,6 +45,9 @@ function isOpeningAsciiQuote(
   atLineStart: boolean,
   openDoubleQuoteDepth: number,
 ): boolean {
+  if (openDoubleQuoteDepth > 0 && (atLineStart || previousSignificant === undefined)) {
+    return false;
+  }
   if (atLineStart || previousSignificant === undefined) {
     return true;
   }
@@ -117,4 +120,75 @@ export function normalizeChineseQuoteTexts(
     state = normalized.state;
   }
   return { texts: normalizedTexts, state };
+}
+
+function closingBoundaryExcessInNormalizedTexts(texts: readonly string[]): number {
+  let depth = 0;
+  let excess = 0;
+  for (const text of texts) {
+    for (const glyph of Array.from(text)) {
+      if (glyph === "“") {
+        depth += 1;
+      } else if (glyph === "”") {
+        if (depth > 0) depth -= 1;
+        else excess += 1;
+      }
+    }
+  }
+  return excess;
+}
+
+/** Counts closing quote boundaries inherited from source text outside this slice. */
+export function doubleQuoteClosingBoundaryExcess(texts: readonly string[]): number {
+  return closingBoundaryExcessInNormalizedTexts(normalizeChineseQuoteTexts(texts).texts);
+}
+
+/** Maps source-authorized inherited closing boundaries to their exact text slice. */
+export function doubleQuoteClosingBoundaryExcessByText(
+  texts: readonly string[],
+): number[] {
+  let state = normalizedState(undefined);
+  return texts.map((text) => {
+    const normalized = normalizeChineseQuoteText(text, state);
+    state = normalized.state;
+    return closingBoundaryExcessInNormalizedTexts([normalized.text]);
+  });
+}
+
+/**
+ * Normalizes target quote glyphs and removes only unmatched closing marks that
+ * have no corresponding boundary in the source slice. Balanced quotes and
+ * source-authorized cross-slice closing boundaries are preserved verbatim.
+ */
+export function normalizeChineseQuoteTextsAgainstSource(
+  targetTexts: readonly string[],
+  sourceTexts: readonly string[],
+): ChineseQuoteTextsNormalization {
+  const normalized = normalizeChineseQuoteTexts(targetTexts);
+  const allowedClosingsByText = doubleQuoteClosingBoundaryExcessByText(sourceTexts);
+  const texts = normalized.texts.map((text, index) => {
+    let remainingAllowedClosings = allowedClosingsByText[index] ?? 0;
+    let openDoubleQuoteDepth = 0;
+    const result: string[] = [];
+    for (const glyph of Array.from(text)) {
+      if (glyph === "“") {
+        openDoubleQuoteDepth += 1;
+        result.push(glyph);
+        continue;
+      }
+      if (glyph === "”") {
+        if (openDoubleQuoteDepth > 0) {
+          openDoubleQuoteDepth -= 1;
+          result.push(glyph);
+        } else if (remainingAllowedClosings > 0) {
+          remainingAllowedClosings -= 1;
+          result.push(glyph);
+        }
+        continue;
+      }
+      result.push(glyph);
+    }
+    return result.join("");
+  });
+  return { texts, state: normalizeChineseQuoteTexts(texts).state };
 }

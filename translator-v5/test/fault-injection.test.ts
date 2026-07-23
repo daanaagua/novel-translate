@@ -274,7 +274,11 @@ function runnerFixture() {
         windowId: item.windowId,
         translations: item.blockIds.map((blockId) => ({
           blockId,
-          text: "这是完整的中文译文。",
+          text: (blocks.find((block) => block.id === blockId)?.sourceText ?? "")
+            .split(/(?:\r?\n)[\t ]*(?:\r?\n)+/u)
+            .filter((paragraph) => paragraph.trim().length > 0)
+            .map((_, paragraphIndex) => `这是第${paragraphIndex + 1}段完整的中文译文。`)
+            .join("\n\n"),
         })),
         notes: [],
       }],

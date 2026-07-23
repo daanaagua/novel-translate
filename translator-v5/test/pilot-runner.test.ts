@@ -150,7 +150,7 @@ test("cold preview completes five blocks without narrative reads", async () => {
         fauxToolCall("finalize_translation", {
           translations: ids.map((blockId) => ({
             blockId,
-            text: "这是对应文本块的完整中文译文，保留了原文中的叙事与对话。",
+            text: "提丰出现在对应文本块的完整中文译文中，保留了原文中的叙事与对话。",
           })),
           notes: [],
         }),
@@ -219,6 +219,7 @@ test("shared context reuses lexical decisions, bounded tail, and visible memory"
           sourceForm: "Smoky",
           target: "斯莫基",
           mode: "stable",
+          semanticClass: "proper_name",
           confidence: 0.97,
         }],
       }), { stopReason: "toolUse" }),

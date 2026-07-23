@@ -222,7 +222,7 @@ export function App({ api }: AppProps): JSX.Element {
     try {
       const result = await desktopApi.testModel(request);
       if (!result.ok) {
-        setOperationError(result.error);
+        setOperationError(undefined);
         return result;
       }
       beginOnboardingRefresh();
@@ -231,7 +231,7 @@ export function App({ api }: AppProps): JSX.Element {
       return result;
     } catch (error) {
       const rendererError = errorFromUnknown(error);
-      setOperationError(rendererError);
+      setOperationError(undefined);
       return { ok: false, error: rendererError };
     } finally {
       setBusyAction(undefined);

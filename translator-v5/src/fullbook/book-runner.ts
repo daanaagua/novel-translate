@@ -8,6 +8,8 @@ import type { Model } from "@earendil-works/pi-ai";
 import {
   collectWindowAnchorCandidates,
   LexicalAnchorer,
+  sourceAuthoredAnchorFallback,
+  softenModelAnchorTerm,
   type LexicalAnchor,
   type LexicalAnchorOutcome,
 } from "../agents/lexical-anchorer.js";
@@ -57,6 +59,7 @@ import {
 } from "../storage/lossless-book-store.js";
 import type { TranslationMemoryCandidate } from "../tools/candidate-collector.js";
 import type { StyleState } from "../tools/translation-tools.js";
+import { TranslationValidator } from "../validators/translation-validator.js";
 import {
   composeEffectiveStyle,
   createBookStyleConstitution,
@@ -723,9 +726,11 @@ function parseWaveAnchorSnapshot(
     ...snapshot,
     anchors: snapshot.anchors.map((anchor) => ({
       ...anchor,
+      semanticClass: anchor.semanticClass ?? "unclassified",
+      lockEligible: anchor.lockEligible === true,
       target: simplifyChineseTranslation(anchor.target),
     })),
-    terms: snapshot.terms.map((term) => ({
+    terms: snapshot.terms.map((term) => softenModelAnchorTerm({
       ...term,
       target: simplifyChineseTranslation(term.target),
     })),
@@ -803,10 +808,10 @@ function termsFromKnowledge(
         && typeof term.canonicalSource === "string"
         && typeof term.target === "string"
         && typeof term.locked === "boolean") {
-        terms.push({
+        terms.push(softenModelAnchorTerm({
           ...(term as StableTerm),
           origin: term.origin ?? "knowledge",
-        });
+        }));
       }
     }
     if (revision.kind === "entity_alias_link"
@@ -822,15 +827,36 @@ function termsFromKnowledge(
   return terms;
 }
 
+function decidedAnchorFormsFromKnowledge(revisions: readonly unknown[]): string[] {
+  return revisions.flatMap((raw) => {
+    if (raw === null || typeof raw !== "object" || Array.isArray(raw)) {
+      return [];
+    }
+    const revision = raw as { kind?: unknown; payload?: unknown; status?: unknown };
+    if (revision.kind !== "lexical_anchor_decision"
+      || revision.status !== "active"
+      || revision.payload === null
+      || typeof revision.payload !== "object"
+      || Array.isArray(revision.payload)) {
+      return [];
+    }
+    const sourceForm = (revision.payload as { sourceForm?: unknown }).sourceForm;
+    return typeof sourceForm === "string" && sourceForm.trim().length > 0
+      ? [sourceForm]
+      : [];
+  });
+}
+
 function uniqueTerms(
   terms: readonly StableTerm[],
   context: BookContext,
 ): StableTerm[] {
   const byForm = new Map<string, StableTerm>();
   for (const sourceTerm of terms) {
-    const term = sourceTerm.origin === "knowledge"
-      ? { ...sourceTerm, target: simplifyChineseTranslation(sourceTerm.target) }
-      : sourceTerm;
+    const safeSourceTerm = softenModelAnchorTerm(sourceTerm);
+    const term = safeSourceTerm.origin === "knowledge"
+      ? { ...safeSourceTerm, target: simplifyChineseTranslation(safeSourceTerm.target) }
+      : safeSourceTerm;
     const normalized = context.languageProfile.normalizeSourceForm(term.sourceForm);
     const previous = byForm.get(normalized);
     const priority = (value: StableTerm): number => {
@@ -878,16 +904,45 @@ function termsForWindows(
 
 function waveKnowledgeCandidates(
   runId: string,
-  outcome: Pick<WaveAnchorSnapshot, "terms" | "entityLinks"> | undefined,
+  outcome: Pick<WaveAnchorSnapshot, "anchors" | "terms" | "entityLinks"> | undefined,
   context: BookContext,
 ): WaveKnowledgeCandidate[] {
   if (outcome === undefined) {
     return [];
   }
-  const entityForms = new Set(outcome.entityLinks.flatMap((link) =>
-    link.normalizedForms));
+  const entityForms = new Set(outcome.entityLinks
+    .filter((link) => link.status === "confirmed")
+    .flatMap((link) => link.normalizedForms));
+  const projectedTermForms = new Set(outcome.terms.map((term) =>
+    context.languageProfile.normalizeSourceForm(term.sourceForm)));
   const result: WaveKnowledgeCandidate[] = [];
-  for (const term of outcome.terms) {
+  for (const anchor of outcome.anchors) {
+    const normalizedSource = context.languageProfile.normalizeSourceForm(anchor.sourceForm);
+    if (anchor.mode !== "contextual" && !projectedTermForms.has(normalizedSource)) {
+      continue;
+    }
+    const payload = {
+      sourceForm: anchor.sourceForm,
+      target: simplifyChineseTranslation(anchor.target),
+      mode: anchor.mode,
+      semanticClass: anchor.semanticClass ?? "unclassified",
+      confidence: anchor.confidence,
+    };
+    result.push({
+      candidate: {
+        recordId: `wave-anchor-decision-${createHash("sha256")
+          .update(`${runId}\0${canonicalJson(payload)}`)
+          .digest("hex")
+          .slice(0, 24)}`,
+        normalizedSubject: normalizedSource,
+        kind: "lexical_anchor_decision",
+        payload,
+      },
+      sourceForms: [anchor.sourceForm],
+    });
+  }
+  for (const sourceTerm of outcome.terms) {
+    const term = softenModelAnchorTerm(sourceTerm);
     if (entityForms.has(context.languageProfile.normalizeSourceForm(term.sourceForm))) {
       continue;
     }
@@ -935,11 +990,12 @@ function windowContainsAnyForm(
   context: BookContext,
 ): boolean {
   const requested = new Set(forms.map((form) =>
-    context.languageProfile.normalizeSourceForm(form)));
+    context.languageProfile.normalizeAnchorSourceForm(form)));
   return window.blockIds.some((blockId) => {
     const block = blockById.get(blockId);
     return block !== undefined && context.languageProfile.segment(block.sourceText)
-      .some((token) => token.isWordLike && requested.has(token.normalized));
+      .some((token) => token.isWordLike
+        && requested.has(context.languageProfile.normalizeAnchorSourceForm(token.value)));
   });
 }
 
@@ -1285,14 +1341,26 @@ interface MergedTranslationResult {
 }
 
 const RECOVERABLE_STRUCTURAL_SUBMISSION_ERROR = /^(?:missing window submission|duplicate windowId|unknown blockId|duplicate blockId|empty translation|block set mismatch|missing block translations while merging context fragments|duplicate block translation while merging context fragments)/u;
+const RECOVERABLE_LOCAL_DEGENERATION_ERROR = /^(?:validation|cross-block validation) failed after one targeted repair:[\s\S]*(?:untranslated_latin|paragraph_count_incompatible|paragraph_length_incompatible|abnormal_block_shortening|insufficient_lexical_content|abnormal_shortening|cross_block_translation_overlap)/u;
 
-function recoverableStructuralWindowIds(result: TranslationBatchResult): Set<string> {
+function failedWindowIdsMatching(
+  result: TranslationBatchResult,
+  pattern: RegExp,
+): Set<string> {
   return new Set(result.windows.flatMap((window) => (
     window.status === "failed"
-      && RECOVERABLE_STRUCTURAL_SUBMISSION_ERROR.test(window.error ?? "")
+      && pattern.test(window.error ?? "")
       ? [window.windowId]
       : []
   )));
+}
+
+function recoverableStructuralWindowIds(result: TranslationBatchResult): Set<string> {
+  return failedWindowIdsMatching(result, RECOVERABLE_STRUCTURAL_SUBMISSION_ERROR);
+}
+
+function recoverableDegenerationWindowIds(result: TranslationBatchResult): Set<string> {
+  return failedWindowIdsMatching(result, RECOVERABLE_LOCAL_DEGENERATION_ERROR);
 }
 
 function requestWithWindows(
@@ -1649,11 +1717,43 @@ async function runLosslessBook(
         corpusBlocks.map((block) => withoutStructureHeadingLines(block, context))
           .filter((block): block is V4Block => block !== undefined),
         anchorStableTerms,
-        [],
+        decidedAnchorFormsFromKnowledge(snapshot.revisions),
         context.languageProfile,
       );
       const anchorBudget = new BudgetLedger();
       let waveAnchorSnapshot: WaveAnchorSnapshot | undefined;
+      if (anchorCandidates.length === 1
+        && anchorCandidates[0]?.sourceAuthoredTarget !== undefined) {
+        const inputHash = waveAnchorInputHash(context, anchorCandidates, anchorStableTerms);
+        const cached = store.waveAnchorDecision(runId, inputHash);
+        if (cached !== undefined) {
+          waveAnchorSnapshot = parseWaveAnchorSnapshot(cached, inputHash);
+        } else {
+          const outcome = sourceAuthoredAnchorFallback(anchorCandidates);
+          waveAnchorSnapshot = {
+            schemaVersion: "v5-wave-anchor-1",
+            inputHash,
+            anchors: outcome.anchors,
+            entityLinks: outcome.entityLinks,
+            terms: outcome.terms,
+          };
+          const projectedForms = new Set(outcome.terms.map((term) =>
+            context.languageProfile.normalizeSourceForm(term.sourceForm)));
+          const anchorByForm = new Map(outcome.anchors.map((anchor) => [
+            context.languageProfile.normalizeSourceForm(anchor.sourceForm),
+            anchor,
+          ]));
+          const reusableDecision = anchorCandidates.every((candidate) => {
+            const normalized = context.languageProfile.normalizeSourceForm(candidate.sourceForm);
+            const anchor = anchorByForm.get(normalized);
+            return anchor !== undefined
+              && (anchor.mode === "contextual" || projectedForms.has(normalized));
+          });
+          if (reusableDecision) {
+            store.cacheWaveAnchorDecision(runId, inputHash, waveAnchorSnapshot);
+          }
+        }
+      }
       if (anchorCandidates.length >= 2) {
         const inputHash = waveAnchorInputHash(context, anchorCandidates, anchorStableTerms);
         const cached = store.waveAnchorDecision(runId, inputHash);
@@ -1664,34 +1764,77 @@ async function runLosslessBook(
           const anchorRuntime = runtimeSet.mode === "fast"
             ? runtimeSet.primary
             : runtimeSet.escalation;
+          const anchorer = new LexicalAnchorer(new PiRuntime());
+          const anchorInput = (runtime: TranslationRuntime) => ({
+            candidates: anchorCandidates,
+            stableTerms: anchorStableTerms,
+            model: runtime.model,
+            streamFn: runtime.streamFn,
+            budget: anchorBudget,
+            sourceLanguageProfile: context.languageProfile,
+            thinkingLevel: runtime.thinkingLevel,
+            signal: options.signal,
+            deadlineMs: options.hardDeadlineMs,
+          });
           const resolveAnchors = (runtime: TranslationRuntime) =>
-            new LexicalAnchorer(new PiRuntime()).run({
-              candidates: anchorCandidates,
-              stableTerms: anchorStableTerms,
-              model: runtime.model,
-              streamFn: runtime.streamFn,
-              budget: anchorBudget,
-              sourceLanguageProfile: context.languageProfile,
-              signal: options.signal,
-              deadlineMs: options.hardDeadlineMs,
-            });
-          let outcome: LexicalAnchorOutcome;
-          try {
-            outcome = await resolveAnchors(anchorRuntime);
-          } catch (error) {
-            throwIfAborted(options.signal);
-            const escalationIsDistinct = anchorRuntime.model !== runtimeSet.escalation.model
-              || anchorRuntime.streamFn !== runtimeSet.escalation.streamFn
-              || anchorRuntime.effort !== runtimeSet.escalation.effort
-              || anchorRuntime.thinkingLevel !== runtimeSet.escalation.thinkingLevel;
-            const cannotBenefitFromEscalation = error instanceof ModelProviderError
-              && (error.kind === "auth" || error.kind === "quota");
-            if (runtimeSet.mode !== "fast"
-              || !escalationIsDistinct
-              || cannotBenefitFromEscalation) {
-              throw error;
+            anchorer.run(anchorInput(runtime));
+          const resolvePreferredFallback = (runtime: TranslationRuntime) =>
+            anchorer.runPreferredTextFallback(anchorInput(runtime));
+          const preferredOrSourceFallback = async (runtime: TranslationRuntime) => {
+            try {
+              return await resolvePreferredFallback(runtime);
+            } catch (fallbackError) {
+              if (fallbackError instanceof ModelProviderError
+                && fallbackError.kind === "protocol") {
+                return sourceAuthoredAnchorFallback(anchorCandidates);
+              }
+              throw fallbackError;
             }
-            outcome = await resolveAnchors(runtimeSet.escalation);
+          };
+          const escalationIsDistinct = anchorRuntime.model !== runtimeSet.escalation.model
+            || anchorRuntime.streamFn !== runtimeSet.escalation.streamFn
+            || anchorRuntime.effort !== runtimeSet.escalation.effort
+            || anchorRuntime.thinkingLevel !== runtimeSet.escalation.thinkingLevel;
+          let outcome: Pick<LexicalAnchorOutcome, "anchors" | "entityLinks" | "terms">;
+          if (runtimeSet.mode === "fast") {
+            try {
+              outcome = await resolvePreferredFallback(anchorRuntime);
+            } catch (error) {
+              throwIfAborted(options.signal);
+              const cannotBenefitFromEscalation = error instanceof ModelProviderError
+                && (error.kind === "auth" || error.kind === "quota");
+              if (cannotBenefitFromEscalation || !escalationIsDistinct) {
+                if (error instanceof ModelProviderError && error.kind === "protocol") {
+                  outcome = sourceAuthoredAnchorFallback(anchorCandidates);
+                } else {
+                  throw error;
+                }
+              } else {
+                try {
+                  outcome = await resolveAnchors(runtimeSet.escalation);
+                } catch (escalationError) {
+                  if (!(escalationError instanceof ModelProviderError)
+                    || escalationError.kind !== "protocol") {
+                    throw escalationError;
+                  }
+                  outcome = await preferredOrSourceFallback(runtimeSet.escalation);
+                }
+              }
+            }
+          } else {
+            try {
+              outcome = await resolveAnchors(anchorRuntime);
+            } catch (error) {
+              throwIfAborted(options.signal);
+              if (!(error instanceof ModelProviderError) || error.kind !== "protocol") {
+                throw error;
+              }
+              try {
+                outcome = await preferredOrSourceFallback(anchorRuntime);
+              } catch (fallbackError) {
+                throw fallbackError;
+              }
+            }
           }
           waveAnchorSnapshot = {
             schemaVersion: "v5-wave-anchor-1",
@@ -1700,7 +1843,21 @@ async function runLosslessBook(
             entityLinks: outcome.entityLinks,
             terms: outcome.terms,
           };
-          store.cacheWaveAnchorDecision(runId, inputHash, waveAnchorSnapshot);
+          const projectedForms = new Set(outcome.terms.map((term) =>
+            context.languageProfile.normalizeSourceForm(term.sourceForm)));
+          const anchorByForm = new Map(outcome.anchors.map((anchor) => [
+            context.languageProfile.normalizeSourceForm(anchor.sourceForm),
+            anchor,
+          ]));
+          const reusableDecision = anchorCandidates.every((candidate) => {
+            const normalized = context.languageProfile.normalizeSourceForm(candidate.sourceForm);
+            const anchor = anchorByForm.get(normalized);
+            return anchor !== undefined
+              && (anchor.mode === "contextual" || projectedForms.has(normalized));
+          });
+          if (reusableDecision) {
+            store.cacheWaveAnchorDecision(runId, inputHash, waveAnchorSnapshot);
+          }
         }
       }
       const activeTerms = uniqueTerms([
@@ -1736,6 +1893,11 @@ async function runLosslessBook(
       let firstProviderFailure: ModelProviderError | undefined;
       let initialRequestCount = 0;
       let retryRound = 0;
+      const acceptedWaveTranslations = new Map<string, {
+        blockId: string;
+        text: string;
+        windowId: string;
+      }>();
       let anchorBudgetPending = Object.keys(anchorBudget.snapshot()).length > 0;
       const persistedBudgetFor = (
         window: PersistedLosslessWindow,
@@ -1867,7 +2029,12 @@ async function runLosslessBook(
                     };
                     estimator.observeUsage(observation);
                   }
-                  const recoverableWindowIds = recoverableStructuralWindowIds(result);
+                  const structuralWindowIds = recoverableStructuralWindowIds(result);
+                  const degenerationWindowIds = recoverableDegenerationWindowIds(result);
+                  const recoverableWindowIds = new Set([
+                    ...structuralWindowIds,
+                    ...degenerationWindowIds,
+                  ]);
                   if (recoverableWindowIds.size > 0
                     && fragment.input.responseProtocol === "typed_tool"
                     && protocolSplitAttempts < MAX_PROTOCOL_SPLIT_ATTEMPTS) {
@@ -1908,7 +2075,8 @@ async function runLosslessBook(
                     }
                   }
                   if (recoverableWindowIds.size > 0
-                    && fragment.request.windows.length === 1
+                    && (fragment.request.windows.length === 1
+                      || degenerationWindowIds.size > 0)
                     && fragment.depth < MAX_CONTEXT_SPLIT_DEPTH
                     && protocolSplitAttempts < MAX_PROTOCOL_SPLIT_ATTEMPTS) {
                     const failedRequest = requestWithWindows(
@@ -2016,9 +2184,71 @@ async function runLosslessBook(
 
         throwIfAborted(options.signal);
 
+        const currentTranslations = completionOrder.flatMap((completed) =>
+          completed.result?.windows.flatMap((window) => window.status === "failed"
+            ? []
+            : window.translations.map((translation) => ({
+              ...translation,
+              windowId: window.windowId,
+            }))) ?? []);
+        const currentBlockIds = new Set(currentTranslations.map((item) => item.blockId));
+        const currentIndexes = currentTranslations.map((item) =>
+          blockById.get(item.blockId)?.globalIndex)
+          .filter((index): index is number => index !== undefined);
+        const earliestCurrentIndex = currentIndexes.length === 0
+          ? Number.POSITIVE_INFINITY
+          : Math.min(...currentIndexes);
+        const priorActive = store.activeTranslations(runId)
+          .filter((translation) =>
+            (blockById.get(translation.blockId)?.globalIndex ?? Number.POSITIVE_INFINITY)
+              < earliestCurrentIndex)
+          .at(-1);
+        const boundaryTranslations = [
+          ...(priorActive === undefined ? [] : [{
+            blockId: priorActive.blockId,
+            text: priorActive.text,
+          }]),
+          ...[...acceptedWaveTranslations.values()].map(({ blockId, text }) => ({
+            blockId,
+            text,
+          })),
+          ...currentTranslations.map(({ blockId, text }) => ({ blockId, text })),
+        ];
+        const uniqueBoundaryTranslations = [...new Map(boundaryTranslations.map((item) => [
+          item.blockId,
+          item,
+        ])).values()];
+        const boundaryBlocks = uniqueBoundaryTranslations
+          .map((translation) => blockById.get(translation.blockId))
+          .filter((block): block is BookContext["losslessBlocks"][number] => block !== undefined)
+          .map(losslessAsV4);
+        const boundaryValidation = new TranslationValidator().validateCrossBlockAlignment(
+          boundaryBlocks,
+          {
+            translations: uniqueBoundaryTranslations,
+            notes: [],
+            repaired: false,
+          },
+        );
+        const boundaryFailuresByWindow = new Map<string, string[]>();
+        for (const failure of boundaryValidation.failures) {
+          if (failure.blockId === undefined || !currentBlockIds.has(failure.blockId)) {
+            continue;
+          }
+          const windowId = currentTranslations.find((translation) =>
+            translation.blockId === failure.blockId)?.windowId;
+          if (windowId === undefined) {
+            continue;
+          }
+          const messages = boundaryFailuresByWindow.get(windowId) ?? [];
+          messages.push(`${failure.code}: ${failure.message}`);
+          boundaryFailuresByWindow.set(windowId, messages);
+        }
+
         const successfulWindowIds = new Set(completionOrder.flatMap((completed) =>
           completed.result?.windows
-            .filter((window) => window.status !== "failed")
+            .filter((window) => window.status !== "failed"
+              && !boundaryFailuresByWindow.has(window.windowId))
             .map((window) => window.windowId) ?? []));
         const assignedWaveKnowledge = assignWaveKnowledge(
           unpersistedWaveKnowledge,
@@ -2092,8 +2322,11 @@ async function runLosslessBook(
           const result = completed.result as MergedTranslationResult;
           for (const windowResult of result.windows) {
             const window = claimed.get(windowResult.windowId) as PersistedLosslessWindow;
-            if (windowResult.status === "failed") {
-              const error = windowResult.error ?? "invalid batch window submission";
+            const boundaryErrors = boundaryFailuresByWindow.get(window.windowId);
+            if (windowResult.status === "failed" || boundaryErrors !== undefined) {
+              const error = boundaryErrors === undefined
+                ? windowResult.error ?? "invalid batch window submission"
+                : `cross-request boundary validation failed: ${boundaryErrors.join("; ")}`;
               const retry = window.attemptCount < maxAttempts;
               store.failWindow(runId, window.windowId, {
                 error,
@@ -2110,6 +2343,13 @@ async function runLosslessBook(
                   .find((item) => item.windowId === window.windowId) as PersistedLosslessWindow);
               }
               continue;
+            }
+
+            for (const translation of windowResult.translations) {
+              acceptedWaveTranslations.set(translation.blockId, {
+                ...translation,
+                windowId: window.windowId,
+              });
             }
 
             const candidates = [

@@ -41,7 +41,7 @@ class TrackingTokenEstimator extends WeightedTokenEstimator {
   }
 }
 
-function losslessFixture(source: string) {
+function losslessFixture(source: string, sourceLanguage = "en") {
   const directory = mkdtempSync(join(tmpdir(), "v5-lossless-runner-"));
   const rawPath = join(directory, "original.txt");
   const canonicalPath = join(directory, "source.txt");
@@ -59,7 +59,7 @@ function losslessFixture(source: string) {
     source_format: ".txt",
     encoding: "utf-8",
     extractor: "plain-text-v1",
-    sourceLanguage: "en",
+    sourceLanguage,
     canonical_path: "source.txt",
     canonical_chars: scalarLength(source),
     canonical_sha256: hash,
@@ -257,6 +257,175 @@ test("a missing framed submission is retried as smaller lossless block fragments
   assert.ok(fixture.faux.state.callCount <= 6);
 });
 
+test("a degenerate multi-block translation is retried as isolated block fragments", async () => {
+  const fixture = losslessFixture([
+    "Alpha ".repeat(300),
+    "Alpha ".repeat(300),
+  ].join("[[]]"));
+  const observedBlockGroups: string[][] = [];
+  const degenerateFramedResponse = (context: Context) => {
+    const prompt = userText(context);
+    const windows = promptBatchWindows(context);
+    observedBlockGroups.push(windows.flatMap((window) =>
+      window.blocks.map((item) => item.blockId)));
+    const promptLines = prompt.split(/\r?\n/gu).map((line) =>
+      line.replace(/^\d+\.\s+/u, "").trimStart());
+    const lines = windows.flatMap((window) => window.blocks.flatMap((item) => {
+      const begin = promptLines.find((line) =>
+        line.startsWith("@@FOLIOLOOM:") && line.endsWith(`:BEGIN:${item.blockId}@@`));
+      const end = promptLines.find((line) =>
+        line.startsWith("@@FOLIOLOOM:") && line.endsWith(`:END:${item.blockId}@@`));
+      assert.ok(begin && end);
+      return [begin, "摘要。", end];
+    }));
+    return fauxAssistantMessage(lines.join("\n"));
+  };
+  const degenerateRepairResponse = (context: Context) => {
+    const ids = [...new Set([...userText(context).matchAll(/\[(block-[0-9a-f]+)\]/gu)]
+      .map((match) => match[1])
+      .filter((value): value is string => value !== undefined))];
+    return fauxAssistantMessage(fauxToolCall("submit_repaired_translation", {
+      translations: ids.map((blockId) => ({ blockId, text: "摘要。" })),
+      notes: [],
+    }), { stopReason: "toolUse" });
+  };
+  const validResponse = (context: Context) => {
+    observedBlockGroups.push(promptBatchWindows(context).flatMap((window) =>
+      window.blocks.map((item) => item.blockId)));
+    return losslessBatchResponse(context);
+  };
+  fixture.faux.setResponses([
+    degenerateFramedResponse,
+    degenerateRepairResponse,
+    validResponse,
+    validResponse,
+  ]);
+  const model = fixture.faux.getModel();
+  const streamFn = fixture.faux.provider.streamSimple.bind(fixture.faux.provider);
+
+  const result = await runBook({
+    ...fixture.options,
+    model,
+    streamFn,
+    windowOptions: { maxBlocks: 2, maxSourceTokens: 4_000 },
+    maxRequestTokens: 4_000,
+    maxConcurrency: 1,
+    maxWindowsPerRequest: 1,
+    runtimeSet: {
+      mode: "fast",
+      primary: { model, streamFn, effort: "off", thinkingLevel: "off" },
+      escalation: { model, streamFn, effort: "high", thinkingLevel: "high" },
+    },
+  } as never);
+
+  assert.equal(result.status.humanRequiredWindows, 0);
+  assert.equal(result.status.completedWindows, 1);
+  assert.equal(result.windows[0]?.attemptCount, 1, JSON.stringify({
+    windows: result.windows.map((window) => ({
+      status: window.status,
+      attemptCount: window.attemptCount,
+      lastError: window.lastError,
+    })),
+    observedBlockGroups,
+  }));
+  assert.deepEqual(observedBlockGroups.map((items) => items.length), [2, 1, 1]);
+});
+
+test("a copied source-script multi-block translation is isolated before the outer retry", async () => {
+  const fixture = losslessFixture([
+    "\ubb35\ud5a5\uc740 \ucc9c\uc9c0\ubb38\uc73c\ub85c \uac78\uc5b4\uac14\ub2e4. ".repeat(50),
+    "\uc124\uc57d\ubcbd\uc740 \uc625\uad00\ud328\uc5d0\uac8c \uc870\uc6a9\ud788 \ub2f5\ud588\ub2e4. ".repeat(50),
+  ].join("[[]]"), "ko");
+  const observedBlockGroups: string[][] = [];
+  const copiedById = new Map<string, string>();
+  const copiedResponse = (context: Context) => {
+    const prompt = userText(context);
+    const windows = promptBatchWindows(context);
+    observedBlockGroups.push(windows.flatMap((window) => window.blocks.map((item) => item.blockId)));
+    const promptLines = prompt.split(/\r?\n/gu).map((line) =>
+      line.replace(/^\d+\.\s+/u, "").trimStart());
+    const lines = windows.flatMap((window) => window.blocks.flatMap((item) => {
+      assert.ok(item.sourceText);
+      copiedById.set(item.blockId, item.sourceText);
+      const begin = promptLines.find((line) =>
+        line.startsWith("@@FOLIOLOOM:") && line.endsWith(`:BEGIN:${item.blockId}@@`));
+      const end = promptLines.find((line) =>
+        line.startsWith("@@FOLIOLOOM:") && line.endsWith(`:END:${item.blockId}@@`));
+      assert.ok(begin && end);
+      return [begin, item.sourceText, end];
+    }));
+    return fauxAssistantMessage(lines.join("\n"));
+  };
+  const copiedRepair = (context: Context) => {
+    const ids = [...new Set([...userText(context).matchAll(/\[(block-[0-9a-f]+)\]/gu)]
+      .map((match) => match[1])
+      .filter((value): value is string => value !== undefined))];
+    return fauxAssistantMessage(fauxToolCall("submit_repaired_translation", {
+      translations: ids.map((blockId) => ({
+        blockId,
+        text: copiedById.get(blockId) ?? "\ubb35\ud5a5\uc740 \uadf8\ub300\ub85c \uc11c \uc788\uc5c8\ub2e4.",
+      })),
+      notes: [],
+    }), { stopReason: "toolUse" });
+  };
+  const validResponse = (context: Context) => {
+    const prompt = userText(context);
+    const windows = promptBatchWindows(context);
+    observedBlockGroups.push(windows.flatMap((window) =>
+      window.blocks.map((item) => item.blockId)));
+    const promptLines = prompt.split(/\r?\n/gu).map((line) =>
+      line.replace(/^\d+\.\s+/u, "").trimStart());
+    const lines = windows.flatMap((window) => window.blocks.flatMap((item) => {
+      assert.ok(item.sourceText);
+      const begin = promptLines.find((line) =>
+        line.startsWith("@@FOLIOLOOM:") && line.endsWith(`:BEGIN:${item.blockId}@@`));
+      const end = promptLines.find((line) =>
+        line.startsWith("@@FOLIOLOOM:") && line.endsWith(`:END:${item.blockId}@@`));
+      assert.ok(begin && end);
+      const sentence = item.sourceText.includes("\ubb35\ud5a5")
+        ? "墨香沿着山路走向天地门，叙事保留了沿途细节与行动因果。"
+        : "薛若碧低声回答玉冠霸，译文完整保留了人物关系与现场变化。";
+      const text = sentence.repeat(Math.ceil(Array.from(item.sourceText).length * 0.72 / Array.from(sentence).length));
+      return [begin, text, end];
+    }));
+    return fauxAssistantMessage(lines.join("\n"));
+  };
+  fixture.faux.setResponses([
+    copiedResponse,
+    copiedRepair,
+    ...Array.from({ length: 10 }, () => validResponse),
+  ]);
+  const model = fixture.faux.getModel();
+  const streamFn = fixture.faux.provider.streamSimple.bind(fixture.faux.provider);
+
+  const result = await runBook({
+    ...fixture.options,
+    model,
+    streamFn,
+    windowOptions: { maxBlocks: 2, maxSourceTokens: 4_000 },
+    maxRequestTokens: 4_000,
+    maxConcurrency: 1,
+    maxWindowsPerRequest: 1,
+    runtimeSet: {
+      mode: "fast",
+      primary: { model, streamFn, effort: "off", thinkingLevel: "off" },
+      escalation: { model, streamFn, effort: "high", thinkingLevel: "high" },
+    },
+  } as never);
+
+  assert.equal(result.status.humanRequiredWindows, 0, JSON.stringify({
+    observedBlockGroups,
+    callCount: fixture.faux.state.callCount,
+    windows: result.windows.map((window) => ({
+      status: window.status,
+      attemptCount: window.attemptCount,
+      lastError: window.lastError,
+    })),
+  }));
+  assert.equal(result.windows[0]?.attemptCount, 1, JSON.stringify(result.windows));
+  assert.deepEqual(observedBlockGroups.map((items) => items.length), [2, 1, 1]);
+});
+
 function createFixture(path: string, blockCount: number): void {
   const database = new DatabaseSync(path);
   database.exec(`
@@ -344,19 +513,27 @@ function losslessBatchResponse(context: Context) {
   const submission = {
     windows: windows.map((window) => ({
       windowId: window.windowId,
-      translations: window.blocks.map((block) => ({
-        blockId: block.blockId,
-        text: `${[...block.blockId.slice(-8)].map((digit) => ({
+      translations: window.blocks.map((block) => {
+        const prefix = [...block.blockId.slice(-8)].map((digit) => ({
           "0": "零", "1": "一", "2": "二", "3": "三",
           "4": "四", "5": "五", "6": "六", "7": "七",
           "8": "八", "9": "九", a: "甲", b: "乙", c: "丙",
           d: "丁", e: "戊", f: "己",
-        })[digit] ?? "庚").join("")}${terms.filter((term) => block.sourceText.toLocaleLowerCase()
+        })[digit] ?? "庚").join("");
+        const relevantTargets = terms.filter((term) => block.sourceText.toLocaleLowerCase()
           .includes(term.sourceForm.toLocaleLowerCase()))
-          .map((term) => term.target).join("、")}${"完整译文".repeat(
-            Math.max(1, Math.ceil([...block.sourceText].length / 12)),
-          )}。`,
-      })),
+          .map((term) => term.target).join("、");
+        const paragraphs = block.sourceText
+          .split(/(?:\r?\n)[\t ]*(?:\r?\n)+/u)
+          .filter((paragraph) => paragraph.trim().length > 0);
+        return {
+          blockId: block.blockId,
+          text: paragraphs.map((paragraph, index) =>
+            `${index === 0 ? `${prefix}${relevantTargets}` : "续"}${"完整译文".repeat(
+              Math.max(1, Math.ceil([...paragraph].length / 12)),
+            )}。`).join("\n\n"),
+        };
+      }),
       notes: [],
     })),
   };
@@ -383,14 +560,14 @@ function losslessBatchResponse(context: Context) {
 
 function promptBatchWindows(context: Context): Array<{
   windowId: string;
-  blocks: Array<{ blockId: string }>;
+  blocks: Array<{ blockId: string; sourceText?: string }>;
 }> {
   const prompt = userText(context);
   const match = /WINDOWS\n\n(\[[\s\S]*?\])\n\nSTABLE TERMS/u.exec(prompt);
   assert.ok(match?.[1], prompt.slice(0, 500));
   return JSON.parse(match[1]) as Array<{
     windowId: string;
-    blocks: Array<{ blockId: string }>;
+    blocks: Array<{ blockId: string; sourceText?: string }>;
   }>;
 }
 
@@ -413,6 +590,9 @@ function lexicalAnchorResponse(
         ? entityLink.proposedTarget
         : `译-${candidate.sourceForm}`,
       mode: "stable",
+      semanticClass: entityLink?.sourceForms.includes(candidate.sourceForm)
+        ? "proper_name"
+        : "technical_term",
       confidence: 0.95,
     })),
     entityLinks: entityLink === undefined ? [] : [{
@@ -423,7 +603,265 @@ function lexicalAnchorResponse(
   }), { stopReason: "toolUse" });
 }
 
-test("wave anchor runs once and every physical request receives the same confirmed alias target", async () => {
+function lexicalPreferredFallbackResponse(
+  context: Context,
+  targets: Readonly<Record<string, string>>,
+) {
+  const prompt = userText(context);
+  const begin = /^@@FOLIOLOOM:LEXICAL-PREFERRED:[a-f0-9]+:BEGIN@@$/mu.exec(prompt)?.[0];
+  const end = /^@@FOLIOLOOM:LEXICAL-PREFERRED:[a-f0-9]+:END@@$/mu.exec(prompt)?.[0];
+  assert.ok(begin, prompt.slice(0, 1_000));
+  assert.ok(end, prompt.slice(0, 1_000));
+  return fauxAssistantMessage([
+    begin,
+    JSON.stringify(Object.entries(targets).map(([sourceForm, target]) => ({
+      sourceForm,
+      target,
+      semanticClass: "proper_name",
+      confidence: 0.95,
+    }))),
+    end,
+  ].join("\n"));
+}
+
+test("completed waves remember contextual anchor decisions and free later slots for names", async () => {
+  const diffuse = [
+    "보이지", "정점", "있던", "빨리", "얘기", "제자", "교주님", "하지",
+    "그들", "음식", "주십시오", "사부님", "선배님", "지나자", "아니", "보여",
+  ];
+  const commonText = diffuse.map((form) => `${form}는 ${form}가`).join(". ");
+  const namedText = `${commonText}. 진양은 진양이 진양을 만났다. 옥관패는 옥관패가 옥관패를 들었다.`;
+  const fixture = losslessFixture([
+    commonText,
+    commonText,
+    namedText,
+    namedText,
+  ].join("[[]]"), "ko");
+  const anchorWaves: string[][] = [];
+  const response = (context: Context) => {
+    const prompt = userText(context);
+    if (prompt.includes("SOURCE-LANGUAGE FORMS AND COMPACT CONCORDANCE")) {
+      const match = /SOURCE-LANGUAGE FORMS AND COMPACT CONCORDANCE\n\n(\[[\s\S]*?\])\n\nESTABLISHED TERMS/u.exec(prompt);
+      assert.ok(match?.[1]);
+      const candidates = JSON.parse(match[1]) as Array<{ sourceForm: string }>;
+      anchorWaves.push(candidates.map((candidate) => candidate.sourceForm));
+      return fauxAssistantMessage(fauxToolCall("submit_lexical_anchors", {
+        anchors: candidates.map((candidate) => ({
+          sourceForm: candidate.sourceForm,
+          target: "",
+          mode: "contextual",
+          semanticClass: "ordinary_word",
+          confidence: 0.99,
+        })),
+        entityLinks: [],
+      }), { stopReason: "toolUse" });
+    }
+    return losslessBatchResponse(context);
+  };
+  fixture.faux.setResponses(Array.from({ length: 12 }, () => response));
+  const model = fixture.faux.getModel();
+  const streamFn = fixture.faux.provider.streamSimple.bind(fixture.faux.provider);
+
+  const result = await runBook({
+    ...fixture.options,
+    model,
+    streamFn,
+    windowOptions: { maxBlocks: 1, maxSourceTokens: 1_000 },
+    maxRequestTokens: 1_000,
+    maxWindowsPerRequest: 1,
+    maxConcurrency: 1,
+    runtimeSet: {
+      mode: "fast",
+      primary: { model, streamFn, effort: "off", thinkingLevel: "off" },
+      escalation: { model, streamFn, effort: "high", thinkingLevel: "high" },
+    },
+  } as never);
+
+  assert.equal(result.status.humanRequiredWindows, 0);
+  assert.ok(anchorWaves.length >= 2, JSON.stringify(anchorWaves));
+  assert.ok(anchorWaves[1]?.includes("진양"), JSON.stringify(anchorWaves));
+  assert.ok(anchorWaves[1]?.includes("옥관패"), JSON.stringify(anchorWaves));
+  assert.ok(anchorWaves[1]?.every((form) => !anchorWaves[0]?.includes(form)), JSON.stringify(anchorWaves));
+});
+
+test("a stable anchor below the projection threshold is reconsidered in the next wave", async () => {
+  const source = "Smoky met Edgewood. Smoky left Edgewood.";
+  const fixture = losslessFixture(`${source}[[]]${source}`);
+  const anchorWaves: string[][] = [];
+  const response = (context: Context) => {
+    const prompt = userText(context);
+    if (prompt.includes("SOURCE-LANGUAGE FORMS AND COMPACT CONCORDANCE")) {
+      const match = /SOURCE-LANGUAGE FORMS AND COMPACT CONCORDANCE\n\n(\[[\s\S]*?\])\n\nESTABLISHED TERMS/u.exec(prompt);
+      assert.ok(match?.[1]);
+      const candidates = JSON.parse(match[1]) as Array<{ sourceForm: string }>;
+      anchorWaves.push(candidates.map((candidate) => candidate.sourceForm));
+      return fauxAssistantMessage(fauxToolCall("submit_lexical_anchors", {
+        anchors: candidates.map((candidate) => ({
+          sourceForm: candidate.sourceForm,
+          target: `\u8bd1-${candidate.sourceForm}`,
+          mode: "stable",
+          semanticClass: "proper_name",
+          confidence: 0.79,
+        })),
+        entityLinks: [],
+      }), { stopReason: "toolUse" });
+    }
+    return losslessBatchResponse(context);
+  };
+  fixture.faux.setResponses(Array.from({ length: 8 }, () => response));
+  const model = fixture.faux.getModel();
+  const streamFn = fixture.faux.provider.streamSimple.bind(fixture.faux.provider);
+
+  const runOptions = {
+    ...fixture.options,
+    model,
+    streamFn,
+    windowOptions: { maxBlocks: 1, maxSourceTokens: 1_000 },
+    maxRequestTokens: 1_000,
+    maxWindowsPerRequest: 1,
+    maxConcurrency: 1,
+  };
+  const first = await runBook({ ...runOptions, maxWindows: 1 } as never);
+  assert.equal(first.status.completedWindows, 1);
+  const result = await runBook(runOptions as never);
+
+  assert.equal(result.status.completedWindows, 2);
+  assert.equal(anchorWaves.length, 2, JSON.stringify(anchorWaves));
+  assert.ok(anchorWaves[0]?.every((form) => anchorWaves[1]?.includes(form)));
+});
+
+test("adjacent physical requests cannot commit the same ungrounded long translation", async () => {
+  const fixture = losslessFixture([
+    "alpha river stone wind ".repeat(24),
+    "beta forest cloud rain ".repeat(24),
+  ].join("[[]]"));
+  let translationCall = 0;
+  const response = (context: Context) => {
+    translationCall += 1;
+    const prompt = userText(context);
+    const windows = promptBatchWindows(context);
+    const promptLines = prompt.split(/\r?\n/gu).map((line) =>
+      line.replace(/^\d+\.\s+/u, "").trimStart());
+    const responseLines = windows.flatMap((window) => window.blocks.flatMap((item) => {
+      const begin = promptLines.find((line) =>
+        line.startsWith("@@FOLIOLOOM:") && line.endsWith(`:BEGIN:${item.blockId}@@`));
+      const end = promptLines.find((line) =>
+        line.startsWith("@@FOLIOLOOM:") && line.endsWith(`:END:${item.blockId}@@`));
+      assert.ok(begin && end);
+      const text = translationCall <= 2
+        ? "这是跨请求重复的同一段错误译文。".repeat(22)
+        : translationCall === 3
+          ? "晨光越过群山，旅人沿着石径缓缓走向远方。".repeat(18)
+          : "夜潮拍打礁岸，渔船收起风帆驶入寂静港湾。".repeat(18);
+      return [begin, text, end];
+    }));
+    return fauxAssistantMessage(responseLines.join("\n"));
+  };
+  fixture.faux.setResponses(Array.from({ length: 8 }, () => response));
+  const model = fixture.faux.getModel();
+  const streamFn = fixture.faux.provider.streamSimple.bind(fixture.faux.provider);
+
+  const result = await runBook({
+    ...fixture.options,
+    model,
+    streamFn,
+    windowOptions: { maxBlocks: 1, maxSourceTokens: 1_000 },
+    maxRequestTokens: 1_000,
+    maxWindowsPerRequest: 1,
+    maxConcurrency: 1,
+    runtimeSet: {
+      mode: "fast",
+      primary: { model, streamFn, effort: "off", thinkingLevel: "off" },
+      escalation: { model, streamFn, effort: "high", thinkingLevel: "high" },
+    },
+  } as never);
+
+  assert.equal(result.status.humanRequiredWindows, 0, JSON.stringify({
+    translationCall,
+    windows: result.windows.map((window) => ({
+      status: window.status,
+      attemptCount: window.attemptCount,
+      lastError: window.lastError,
+    })),
+  }));
+  assert.ok(translationCall >= 3, `expected a boundary retry, got ${translationCall} calls`);
+  const store = new LosslessBookStore(fixture.options.storePath);
+  try {
+    assert.equal(new Set(store.activeTranslations("run-lossless").map((item) => item.text)).size, 2);
+  } finally {
+    store.close();
+  }
+});
+
+test("cross-window overlap after repair is isolated at immutable window boundaries", async () => {
+  const fixture = losslessFixture([
+    "alpha river stone wind ".repeat(24),
+    "beta forest cloud rain ".repeat(24),
+  ].join("[[]]"));
+  const observedBlockGroups: string[][] = [];
+  const duplicateResponse = (context: Context) => {
+    const prompt = userText(context);
+    const windows = promptBatchWindows(context);
+    observedBlockGroups.push(windows.flatMap((window) =>
+      window.blocks.map((item) => item.blockId)));
+    const promptLines = prompt.split(/\r?\n/gu).map((line) =>
+      line.replace(/^\d+\.\s+/u, "").trimStart());
+    return fauxAssistantMessage(windows.flatMap((window) => window.blocks.flatMap((item) => {
+      const begin = promptLines.find((line) =>
+        line.startsWith("@@FOLIOLOOM:") && line.endsWith(`:BEGIN:${item.blockId}@@`));
+      const end = promptLines.find((line) =>
+        line.startsWith("@@FOLIOLOOM:") && line.endsWith(`:END:${item.blockId}@@`));
+      assert.ok(begin && end);
+      return [begin, "这是跨窗口重复的同一段错误译文。".repeat(22), end];
+    })).join("\n"));
+  };
+  const duplicateRepair = (context: Context) => {
+    const ids = [...new Set([...userText(context).matchAll(/\[(block-[0-9a-f]+)\]/gu)]
+      .map((match) => match[1])
+      .filter((value): value is string => value !== undefined))];
+    return fauxAssistantMessage(fauxToolCall("submit_repaired_translation", {
+      translations: ids.map((blockId) => ({
+        blockId,
+        text: "这是跨窗口重复的同一段错误译文。".repeat(22),
+      })),
+      notes: [],
+    }), { stopReason: "toolUse" });
+  };
+  const validResponse = (context: Context) => {
+    observedBlockGroups.push(promptBatchWindows(context).flatMap((window) =>
+      window.blocks.map((item) => item.blockId)));
+    return losslessBatchResponse(context);
+  };
+  fixture.faux.setResponses([
+    duplicateResponse,
+    duplicateRepair,
+    validResponse,
+    validResponse,
+  ]);
+  const model = fixture.faux.getModel();
+  const streamFn = fixture.faux.provider.streamSimple.bind(fixture.faux.provider);
+
+  const result = await runBook({
+    ...fixture.options,
+    model,
+    streamFn,
+    windowOptions: { maxBlocks: 1, maxSourceTokens: 1_000 },
+    tinyWindowTokens: 1_000,
+    maxRequestTokens: 2_000,
+    maxWindowsPerRequest: 2,
+    maxConcurrency: 1,
+    runtimeSet: {
+      mode: "fast",
+      primary: { model, streamFn, effort: "off", thinkingLevel: "off" },
+      escalation: { model, streamFn, effort: "high", thinkingLevel: "high" },
+    },
+  } as never);
+
+  assert.equal(result.status.humanRequiredWindows, 0, JSON.stringify(result.windows));
+  assert.deepEqual(observedBlockGroups.map((items) => items.length), [2, 1, 1]);
+});
+
+test("wave anchor runs once and every physical request receives the same preferred alias targets", async () => {
   const fixture = losslessFixture(
     "Loukianos, whom they called Lucian the Scoffer, laughed.\n\nBOOK ONE",
   );
@@ -461,6 +899,7 @@ test("wave anchor runs once and every physical request receives the same confirm
       sourceForm: string;
       target: string;
       conceptId: string;
+      locked: boolean;
     }>;
   });
   assert.deepEqual(projectedTerms[0], projectedTerms[1]);
@@ -468,12 +907,42 @@ test("wave anchor runs once and every physical request receives the same confirm
     term.sourceForm === "Loukianos" || term.sourceForm === "Lucian");
   assert.equal(aliases.length, 2);
   assert.equal(new Set(aliases.map((term) => term.target)).size, 1);
-  assert.equal(new Set(aliases.map((term) => term.conceptId)).size, 1);
+  assert.equal(new Set(aliases.map((term) => term.conceptId)).size, 2);
+  assert.ok(aliases.every((term) => term.locked === false));
 
   const store = new LosslessBookStore(fixture.options.storePath);
   const revisions = store.knowledgeRevisions("run-lossless");
   store.close();
   assert.equal(revisions.filter((revision) => revision.kind === "entity_alias_link").length, 1);
+});
+
+test("one source-authored Hanja candidate reaches translation without a model anchor round trip", async () => {
+  const fixture = losslessFixture(
+    "\uc625\uad00\ud328(\u7389\u51a0\u8987)\uac00 \uc654\ub2e4. \uc625\uad00\ud328\uac00 \ub2e4\uc2dc \uc654\ub2e4.",
+    "ko",
+  );
+  fixture.faux.setResponses([(context) => {
+    const prompt = userText(context);
+    assert.doesNotMatch(prompt, /SOURCE-LANGUAGE FORMS AND COMPACT CONCORDANCE/u);
+    const match = /STABLE TERMS\n\n(\[[\s\S]*?\])\n\nUNRESOLVED ENTITY LINKS/u.exec(prompt);
+    assert.ok(match?.[1]);
+    const terms = JSON.parse(match[1]) as Array<{
+      sourceForm: string;
+      target: string;
+      policy: string;
+    }>;
+    assert.deepEqual(
+      terms.filter((term) => term.sourceForm === "\uc625\uad00\ud328")
+        .map((term) => [term.target, term.policy]),
+      [["\u7389\u51a0\u9738", "preferred"]],
+    );
+    return losslessBatchResponse(context);
+  }]);
+
+  const result = await runBook(fixture.options as never);
+
+  assert.equal(result.status.completedWindows, 1);
+  assert.equal(fixture.faux.state.callCount, 1);
 });
 
 test("failed wave promotes no anchor knowledge and resume reuses its cached anchor decision", async () => {
@@ -533,7 +1002,7 @@ test("two tiny logical windows use one physical model session and commit indepen
     assert.deepEqual(store.listTranslationRuns()[0]?.metadata, {
       sourceLanguageProfile: {
         id: "en",
-        version: "source-language-profile-4",
+        version: "source-language-profile-5",
         compatibilityMode: false,
       },
       sourceAnomalies: {
@@ -1010,17 +1479,16 @@ test("quality mode falls back from a malformed typed payload to framed text befo
   assert.equal(result.status.completedWindows, result.status.totalWindows);
 });
 
-test("fast mode resolves lexical anchors on the primary runtime and leaves high effort for escalation", async () => {
+test("fast mode resolves lexical anchors with one framed primary call and leaves high effort for escalation", async () => {
   const fixture = losslessFixture(
     "Loukianos, whom they called Lucian the Scoffer, laughed.\n\nBOOK ONE",
   );
   const primary = fauxProvider();
   const escalation = fauxProvider();
   primary.setResponses([
-    (context) => lexicalAnchorResponse(context, {
-      sourceForms: ["Loukianos", "Lucian"],
-      proposedTarget: "卢基阿诺斯",
-      evidenceQuote: "Loukianos, whom they called Lucian the Scoffer, laughed.",
+    (context) => lexicalPreferredFallbackResponse(context, {
+      Loukianos: "卢基阿诺斯",
+      Lucian: "卢基安",
     }),
     losslessBatchResponse,
     losslessBatchResponse,
@@ -1056,7 +1524,7 @@ test("fast mode resolves lexical anchors on the primary runtime and leaves high 
   assert.equal(result.status.completedWindows, 2);
 });
 
-test("fast mode escalates only a failed lexical-anchor call and resumes translation on the primary runtime", async () => {
+test("fast mode escalates only a failed framed lexical call and resumes translation on the primary runtime", async () => {
   const fixture = losslessFixture(
     "Loukianos, whom they called Lucian the Scoffer, laughed.\n\nBOOK ONE",
   );
@@ -1104,6 +1572,47 @@ test("fast mode escalates only a failed lexical-anchor call and resumes translat
   assert.equal(primary.state.callCount, 3);
   assert.equal(escalation.state.callCount, 1);
   assert.equal(result.status.completedWindows, 2);
+});
+
+test("a framed preferred fallback preserves Korean names when structured anchor calls fail", async () => {
+  const fixture = losslessFixture(
+    "용천익 당주가 묵향을 만났다. 용천익은 묵향에게 다시 말했다.",
+    "ko",
+  );
+  fixture.faux.setResponses([
+    fauxAssistantMessage("The required structured tool call is unavailable."),
+    (context) => lexicalPreferredFallbackResponse(context, {
+      용천익: "龙天翼",
+      묵향: "墨香",
+    }),
+    (context) => {
+      const prompt = userText(context);
+      const match = /STABLE TERMS\n\n(\[[\s\S]*?\])\n\nUNRESOLVED ENTITY LINKS/u.exec(prompt);
+      assert.ok(match?.[1]);
+      const terms = JSON.parse(match[1]) as Array<{
+        sourceForm: string;
+        target: string;
+        policy: string;
+        locked: boolean;
+      }>;
+      assert.deepEqual(
+        terms.filter((term) => term.sourceForm === "용천익" || term.sourceForm === "묵향")
+          .map((term) => [term.sourceForm, term.target, term.policy, term.locked])
+          .sort((left, right) => String(left[0]).localeCompare(String(right[0]))),
+        [
+          ["묵향", "墨香", "preferred", false],
+          ["용천익", "龙天翼", "preferred", false],
+        ],
+      );
+      return losslessBatchResponse(context);
+    },
+  ]);
+
+  const result = await runBook(fixture.options as never);
+
+  assert.equal(fixture.faux.state.callCount, 3);
+  assert.equal(result.status.humanRequiredWindows, 0);
+  assert.equal(result.status.completedWindows, result.status.totalWindows);
 });
 
 test("lossless runner resumes the same isolated run and promotes the remaining ordinal", async () => {

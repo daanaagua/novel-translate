@@ -11,10 +11,12 @@ import type {
   DesktopTestModelRequest,
   DesktopTestModelResult,
 } from "../../../contracts.js";
+import { redactTechnicalDetails, TechnicalDetails } from "./TechnicalDetails.js";
 
 interface ConnectionFeedback {
   status: DesktopModelProbe["status"];
   message: string;
+  technicalDetails?: string;
 }
 
 interface ProviderSetupProps {
@@ -60,6 +62,19 @@ function probeFeedback(report: DesktopModelProbe): ConnectionFeedback {
   };
 }
 
+function shouldShowPersistedProbe(
+  probe: DesktopModelProbe | undefined,
+  activeModel: DesktopModelSummary | undefined,
+): probe is DesktopModelProbe {
+  if (probe === undefined || activeModel === undefined) {
+    return probe !== undefined;
+  }
+  if (probe.providerId !== undefined || probe.modelId !== undefined) {
+    return probe.providerId === activeModel.providerId && probe.modelId === activeModel.modelId;
+  }
+  return probe.status === "ready";
+}
+
 export function ProviderSetup({
   providers,
   activeModel,
@@ -91,9 +106,7 @@ export function ProviderSetup({
   const [discoveredModels, setDiscoveredModels] = useState<readonly DesktopModelOption[]>([]);
   const [testingConnection, setTestingConnection] = useState(false);
   const [connectionFeedback, setConnectionFeedback] = useState<ConnectionFeedback | undefined>(
-    () => latestProbe === undefined || (activeModel !== undefined && latestProbe.status !== "ready")
-      ? undefined
-      : probeFeedback(latestProbe),
+    () => shouldShowPersistedProbe(latestProbe, activeModel) ? probeFeedback(latestProbe) : undefined,
   );
   const synchronizedActiveModel = useRef<string | undefined>(undefined);
   const synchronizedProviderId = useRef(providerId);
@@ -188,7 +201,10 @@ export function ProviderSetup({
           status: "failed",
           message: result.error.message.trim().length === 0
             ? "连接测试未能完成，请检查设置后重试。"
-            : `连接测试失败：${result.error.message.trim()}`,
+            : redactTechnicalDetails(result.error.message.trim()),
+          ...(result.error.technicalDetails === undefined
+            ? {}
+            : { technicalDetails: redactTechnicalDetails(result.error.technicalDetails) }),
         });
         return;
       }
@@ -356,9 +372,10 @@ export function ProviderSetup({
             {activeModel?.providerId === selectedProvider.id ? <span className="model-status">当前已选择 {activeModel.modelId}</span> : null}
           </div>
           {connectionFeedback === undefined ? null : (
-            <p className={`connection-feedback is-${connectionFeedback.status}`} role="status" aria-live="polite">
-              {connectionFeedback.message}
-            </p>
+            <div className={`connection-feedback is-${connectionFeedback.status}`} role="status" aria-live="polite">
+              <p>{connectionFeedback.message}</p>
+              <TechnicalDetails details={connectionFeedback.technicalDetails} />
+            </div>
           )}
         </div>
       )}

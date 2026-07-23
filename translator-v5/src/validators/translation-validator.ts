@@ -1,12 +1,21 @@
 import type { V4Block } from "../domain/types.js";
 import { getSourceLanguageProfile } from "../language/profiles.js";
 import type { SourceLanguageProfile } from "../language/types.js";
-import { normalizeSourceSceneSeparators } from "../source/layout-separators.js";
+import {
+  doubleQuoteClosingBoundaryExcess,
+  doubleQuoteClosingBoundaryExcessByText,
+} from "../style/chinese-quote-normalization.js";
+import {
+  embeddedSceneSeparatorSpans,
+  normalizeSourceSceneSeparators,
+  sourceTextForTranslation,
+} from "../source/layout-separators.js";
 import {
   alignmentFingerprint,
   hanGraphemeLength,
   hasSemanticText,
   hasInvalidUnicodeScalar,
+  hasProhibitedFormatControl,
   letterGraphemeLength,
   semanticCharacterLength,
 } from "../text/semantic-text.js";
@@ -24,11 +33,14 @@ export interface TranslationValidationPolicy {
   sourceLanguageProfile?: SourceLanguageProfile;
 }
 
-function paragraphCount(text: string): number {
-  return normalizeSourceSceneSeparators(text)
+function semanticParagraphs(text: string, sourceLayout: boolean): string[] {
+  return (sourceLayout ? normalizeSourceSceneSeparators(text) : text)
     .split(/(?:\r?\n)[\t ]*(?:\r?\n)+/u)
-    .filter(hasSemanticText)
-    .length;
+    .filter(hasSemanticText);
+}
+
+function paragraphCount(text: string, sourceLayout: boolean): number {
+  return semanticParagraphs(text, sourceLayout).length;
 }
 
 function meaningfulLength(text: string): number {
@@ -37,13 +49,87 @@ function meaningfulLength(text: string): number {
 
 const MIN_CROSS_BLOCK_PARAGRAPH_CHARACTERS = 48;
 
-function normalizedLongParagraphs(text: string): Set<string> {
-  return new Set(normalizeSourceSceneSeparators(text)
-    .split(/(?:\r?\n)[\t ]*(?:\r?\n)+/u)
+function normalizedLongParagraphs(text: string, sourceLayout: boolean): Set<string> {
+  return new Set(semanticParagraphs(text, sourceLayout)
     .map(alignmentFingerprint)
     .filter((paragraph) => (
       [...paragraph].length >= MIN_CROSS_BLOCK_PARAGRAPH_CHARACTERS
     )));
+}
+
+interface BoundaryOverlap {
+  paragraphCount: number;
+  averageContainment: number;
+  minimumContainment: number;
+  matchedCharacters: number;
+}
+
+function characterBigrams(text: string): Set<string> {
+  const characters = [...alignmentFingerprint(text)];
+  const grams = new Set<string>();
+  for (let index = 0; index + 1 < characters.length; index += 1) {
+    grams.add(`${characters[index]}${characters[index + 1]}`);
+  }
+  return grams;
+}
+
+function ngramContainment(left: string, right: string): number {
+  const leftGrams = characterBigrams(left);
+  const rightGrams = characterBigrams(right);
+  const denominator = Math.min(leftGrams.size, rightGrams.size);
+  if (denominator === 0) return 0;
+  const smaller = leftGrams.size <= rightGrams.size ? leftGrams : rightGrams;
+  const larger = smaller === leftGrams ? rightGrams : leftGrams;
+  let matches = 0;
+  for (const gram of smaller) {
+    if (larger.has(gram)) matches += 1;
+  }
+  return matches / denominator;
+}
+
+function nearDuplicateBoundary(
+  leftText: string,
+  rightText: string,
+  sourceLayout: boolean,
+): BoundaryOverlap | undefined {
+  const left = semanticParagraphs(leftText, sourceLayout).map(alignmentFingerprint);
+  const right = semanticParagraphs(rightText, sourceLayout).map(alignmentFingerprint);
+  const maximum = Math.min(12, left.length, right.length);
+  let best: BoundaryOverlap | undefined;
+  for (let count = 1; count <= maximum; count += 1) {
+    const scores: number[] = [];
+    let matchedCharacters = 0;
+    for (let offset = 0; offset < count; offset += 1) {
+      const leftParagraph = left[left.length - count + offset] ?? "";
+      const rightParagraph = right[offset] ?? "";
+      scores.push(ngramContainment(leftParagraph, rightParagraph));
+      matchedCharacters += Math.min(
+        [...leftParagraph].length,
+        [...rightParagraph].length,
+      );
+    }
+    const averageContainment = scores.reduce((sum, score) => sum + score, 0) / count;
+    const minimumContainment = Math.min(...scores);
+    const qualifies = count === 1
+      ? matchedCharacters >= 120 && averageContainment >= 0.78
+      : count >= 3
+        && matchedCharacters >= 120
+        && minimumContainment >= 0.28
+        && averageContainment >= 0.5;
+    if (qualifies && (best === undefined || count > best.paragraphCount)) {
+      best = { paragraphCount: count, averageContainment, minimumContainment, matchedCharacters };
+    }
+  }
+  return best;
+}
+
+function ratioBoundsForLength(
+  profile: SourceLanguageProfile,
+  sourceLength: number,
+): { min: number; max: number } | undefined {
+  return [...(profile.translationLengthRatioBands ?? [])]
+    .filter((band) => sourceLength >= band.minSourceCharacters)
+    .sort((left, right) => right.minSourceCharacters - left.minSourceCharacters)[0];
 }
 
 const SYSTEM_LEAK_PATTERNS = [
@@ -74,11 +160,11 @@ export class TranslationValidator {
   ): TranslationValidation {
     const sourceParagraphs = new Map(blocks.map((block) => [
       block.id,
-      normalizedLongParagraphs(block.sourceText),
+      normalizedLongParagraphs(block.sourceText, true),
     ]));
     const targetParagraphs = new Map(candidate.translations.map((translation) => [
       translation.blockId,
-      normalizedLongParagraphs(translation.text),
+      normalizedLongParagraphs(translation.text, false),
     ]));
     const signatureCounts = (
       paragraphsByBlock: ReadonlyMap<string, Set<string>>,
@@ -128,6 +214,40 @@ export class TranslationValidator {
       message: `target contains ${summary.groups} ungrounded repeated long paragraph group(s) spanning up to ${summary.maximumGroupSize} blocks`,
       repairable: true,
     }));
+    const sourceById = new Map(blocks.map((block) => [block.id, block.sourceText]));
+    const targetById = new Map(candidate.translations.map((item) => [item.blockId, item.text]));
+    const orderedBlocks = [...blocks].sort((left, right) =>
+      left.globalIndex - right.globalIndex || left.id.localeCompare(right.id));
+    const alreadyFailed = new Set(failures.map((failure) => failure.blockId));
+    for (let index = 0; index + 1 < orderedBlocks.length; index += 1) {
+      const left = orderedBlocks[index] as V4Block;
+      const right = orderedBlocks[index + 1] as V4Block;
+      const leftTarget = targetById.get(left.id);
+      const rightTarget = targetById.get(right.id);
+      if (leftTarget === undefined || rightTarget === undefined) continue;
+      const targetOverlap = nearDuplicateBoundary(leftTarget, rightTarget, false);
+      if (targetOverlap === undefined) continue;
+      const sourceOverlap = nearDuplicateBoundary(
+        sourceById.get(left.id) ?? "",
+        sourceById.get(right.id) ?? "",
+        true,
+      );
+      if (sourceOverlap !== undefined
+        && sourceOverlap.paragraphCount >= targetOverlap.paragraphCount
+        && sourceOverlap.averageContainment >= targetOverlap.averageContainment * 0.8) {
+        continue;
+      }
+      for (const blockId of [left.id, right.id]) {
+        if (alreadyFailed.has(blockId)) continue;
+        failures.push({
+          code: "cross_block_translation_overlap",
+          blockId,
+          message: `target has an ungrounded near-duplicate boundary run spanning ${targetOverlap.paragraphCount} paragraph(s)`,
+          repairable: true,
+        });
+        alreadyFailed.add(blockId);
+      }
+    }
     return { valid: failures.length === 0, failures };
   }
 
@@ -153,21 +273,6 @@ export class TranslationValidator {
 
     const sourceText = blocks.map((block) => block.sourceText).join("\n");
     const targetText = candidate.translations.map((item) => item.text).join("\n");
-    const sourceClosingExcess = Math.max(
-      0,
-      [...sourceText.matchAll(/”/gu)].length - [...sourceText.matchAll(/“/gu)].length,
-    );
-    const targetClosingExcess = Math.max(
-      0,
-      [...targetText.matchAll(/”/gu)].length - [...targetText.matchAll(/“/gu)].length,
-    );
-    if (targetClosingExcess > sourceClosingExcess) {
-      failures.push({
-        code: "quote_boundary_mismatch",
-        message: `target has ${targetClosingExcess} excess closing double quotes; source boundary allowance is ${sourceClosingExcess}`,
-        repairable: true,
-      });
-    }
     if (/["‛‟〝〞„]/u.test(targetText)) {
       failures.push({
         code: "nonstandard_quote_glyph",
@@ -177,6 +282,14 @@ export class TranslationValidator {
     }
 
     const blockById = new Map(blocks.map((block) => [block.id, block]));
+    const orderedQuoteBlocks = [...blocks].sort((left, right) =>
+      left.globalIndex - right.globalIndex || left.id.localeCompare(right.id));
+    const sourceClosingExcessByBlock = new Map(
+      doubleQuoteClosingBoundaryExcessByText(orderedQuoteBlocks.map((block) => block.sourceText))
+        .map((excess, index) => [orderedQuoteBlocks[index]?.id ?? "", excess] as const),
+    );
+    const sourceWindowContainsLayoutToken = blocks.some((block) =>
+      embeddedSceneSeparatorSpans(block.sourceText).length > 0);
     const profile = policy.sourceLanguageProfile ?? getSourceLanguageProfile("en");
     let sourceLength = 0;
     let targetLength = 0;
@@ -218,6 +331,16 @@ export class TranslationValidator {
       if (source === undefined) {
         continue;
       }
+      const sourceClosingExcess = sourceClosingExcessByBlock.get(source.id) ?? 0;
+      const targetClosingExcess = doubleQuoteClosingBoundaryExcess([translation.text]);
+      if (targetClosingExcess > sourceClosingExcess) {
+        failures.push({
+          code: "quote_boundary_mismatch",
+          blockId: translation.blockId,
+          message: `target has ${targetClosingExcess} excess closing double quotes; source boundary allowance is ${sourceClosingExcess}`,
+          repairable: true,
+        });
+      }
       for (const term of policy.requiredTerms ?? []) {
         if (source.sourceText.toLocaleLowerCase().includes(
           term.sourceForm.toLocaleLowerCase(),
@@ -230,19 +353,41 @@ export class TranslationValidator {
           });
         }
       }
-      const sourceParagraphs = paragraphCount(source.sourceText);
-      const targetParagraphs = paragraphCount(translation.text);
-      const minimumParagraphs = Math.max(1, Math.ceil(sourceParagraphs * 0.5));
-      const maximumParagraphs = Math.max(2, sourceParagraphs * 2);
-      if (targetParagraphs < minimumParagraphs || targetParagraphs > maximumParagraphs) {
+      const sourceParagraphItems = semanticParagraphs(source.sourceText, true);
+      const targetParagraphItems = semanticParagraphs(translation.text, false);
+      const sourceParagraphCount = sourceParagraphItems.length;
+      const targetParagraphCount = targetParagraphItems.length;
+      if (targetParagraphCount !== sourceParagraphCount) {
         failures.push({
           code: "paragraph_count_incompatible",
           blockId: translation.blockId,
-          message: `source paragraphs=${sourceParagraphs}, target paragraphs=${targetParagraphs}`,
+          message: `source paragraphs=${sourceParagraphCount}, target paragraphs=${targetParagraphCount}; preserve one target paragraph for each source paragraph`,
           repairable: true,
         });
+      } else {
+        for (let paragraphIndex = 0; paragraphIndex < sourceParagraphCount; paragraphIndex += 1) {
+          const paragraphSourceLength = meaningfulLength(
+            sourceParagraphItems[paragraphIndex] ?? "",
+          );
+          const paragraphTargetLength = meaningfulLength(
+            targetParagraphItems[paragraphIndex] ?? "",
+          );
+          const paragraphBounds = ratioBoundsForLength(profile, paragraphSourceLength);
+          if (paragraphBounds === undefined || paragraphSourceLength === 0) continue;
+          const paragraphRatio = paragraphTargetLength / paragraphSourceLength;
+          if (paragraphRatio < paragraphBounds.min || paragraphRatio > paragraphBounds.max) {
+            failures.push({
+              code: "paragraph_length_incompatible",
+              blockId: translation.blockId,
+              message: `paragraph ${paragraphIndex + 1} target/source character ratio ${paragraphRatio.toFixed(3)} is outside ${paragraphBounds.min.toFixed(2)}-${paragraphBounds.max.toFixed(2)} for ${profile.id}`,
+              repairable: true,
+            });
+            break;
+          }
+        }
       }
-      if (SOURCE_LAYOUT_TOKEN_PATTERN.test(translation.text)) {
+      if (sourceWindowContainsLayoutToken
+        && SOURCE_LAYOUT_TOKEN_PATTERN.test(translation.text)) {
         failures.push({
           code: "source_layout_token_leak",
           blockId: translation.blockId,
@@ -266,6 +411,14 @@ export class TranslationValidator {
           repairable: true,
         });
       }
+      if (hasProhibitedFormatControl(translation.text)) {
+        failures.push({
+          code: "invalid_unicode_output",
+          blockId: translation.blockId,
+          message: "translation contains prohibited invisible or bidirectional format controls",
+          repairable: true,
+        });
+      }
       if (/[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F-\u009F]/u.test(translation.text)) {
         failures.push({
           code: "invalid_unicode_output",
@@ -274,11 +427,10 @@ export class TranslationValidator {
           repairable: true,
         });
       }
-      const blockSourceLength = meaningfulLength(source.sourceText);
+      const semanticSourceText = sourceTextForTranslation(source.sourceText);
+      const blockSourceLength = meaningfulLength(semanticSourceText);
       const blockTargetLength = meaningfulLength(translation.text);
-      const ratioBounds = [...(profile.translationLengthRatioBands ?? [])]
-        .filter((band) => blockSourceLength >= band.minSourceCharacters)
-        .sort((left, right) => right.minSourceCharacters - left.minSourceCharacters)[0];
+      const ratioBounds = ratioBoundsForLength(profile, blockSourceLength);
       if (ratioBounds !== undefined) {
         const ratio = blockTargetLength / blockSourceLength;
         if (ratio < ratioBounds.min) {
@@ -296,9 +448,9 @@ export class TranslationValidator {
             repairable: true,
           });
         }
-        const sourceLetterLength = letterGraphemeLength(source.sourceText);
+        const sourceLetterLength = letterGraphemeLength(semanticSourceText);
         const targetLetterLength = letterGraphemeLength(translation.text);
-        if (sourceLetterLength >= 8
+        if (sourceLetterLength >= 1
           && targetLetterLength / sourceLetterLength < ratioBounds.min * 0.5) {
           failures.push({
             code: "insufficient_lexical_content",

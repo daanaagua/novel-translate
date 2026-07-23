@@ -19,6 +19,18 @@ test("language profile registry resolves supported ids deterministically", () =>
   assert.equal(getSourceLanguageProfile("EN"), getSourceLanguageProfile("en"));
 });
 
+test("English alias cues reject an ordinary transitive call", () => {
+  const english = getSourceLanguageProfile("en");
+
+  assert.equal(english.hasExplicitEntityNamingCue("John called Peter."), false);
+  assert.equal(
+    english.hasExplicitEntityNamingCue(
+      "Loukianos, whom they called Lucian the Scoffer, laughed.",
+    ),
+    true,
+  );
+});
+
 test("Korean is detected independently of undetermined text", () => {
   const source = "\ud55c\uad6d\uc5b4 \ubb38\uc7a5\uc785\ub2c8\ub2e4. \uc774\uac83\uc740 \uc790\uc5f0\uc2a4\ub7ec\uc6b4 \ud14c\uc2a4\ud2b8\uc785\ub2c8\ub2e4. ".repeat(8);
   const detected = detectLanguage(source);

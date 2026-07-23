@@ -322,7 +322,7 @@ test("source importer exposes only safe encoding alternatives for an ambiguous l
   }
 });
 
-test("source importer refuses ambiguous non-BOM bytes instead of replacing them", async () => {
+test("source importer refuses unsafe non-BOM bytes instead of replacing them", async () => {
   const fixture = writeFixture("legacy.txt", Buffer.from([0x80, 0x81, 0x82]));
   const destination = projectDirectory(fixture.directory);
   try {
@@ -330,7 +330,7 @@ test("source importer refuses ambiguous non-BOM bytes instead of replacing them"
       sourcePath: fixture.sourcePath,
       projectDirectory: destination,
       sourceLanguage: "und",
-    }), "SOURCE_ENCODING_AMBIGUOUS");
+    }), "SOURCE_ENCODING_UNSUPPORTED");
     assert.equal(existsSync(destination), false);
   } finally {
     rmSync(fixture.directory, { recursive: true, force: true });

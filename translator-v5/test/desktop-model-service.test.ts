@@ -81,11 +81,15 @@ test("model service persists only ready non-secret model settings and never retu
     });
 
     assert.equal(result.report.status, "ready");
+    assert.equal(result.report.providerId, "deepseek");
+    assert.equal(result.report.modelId, "deepseek-reasoner");
     assert.deepEqual(preferences.loadState().activeModelProfile, {
       providerId: "deepseek",
       modelId: "deepseek-reasoner",
       reasoningEffort: "max",
     });
+    assert.equal(preferences.loadState().latestProbe?.providerId, "deepseek");
+    assert.equal(preferences.loadState().latestProbe?.modelId, "deepseek-reasoner");
     assert.deepEqual(providers.seenCredentials, [apiKey]);
     assert.doesNotMatch(JSON.stringify(result), new RegExp(apiKey));
     assert.doesNotMatch(readFileSync(preferencesPath, "utf8"), new RegExp(apiKey));

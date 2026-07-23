@@ -307,6 +307,8 @@ function publicProbe(probe: DesktopIpcModelSnapshot["latestProbe"]): DesktopMode
   }
   return {
     status: probe.status,
+    ...(probe.providerId === undefined ? {} : { providerId: probe.providerId }),
+    ...(probe.modelId === undefined ? {} : { modelId: probe.modelId }),
     ...(probe.code === undefined ? {} : { code: probe.code }),
     ...(probe.message === undefined ? {} : { message: probe.message }),
     ...(probe.retryable === undefined ? {} : { retryable: probe.retryable }),

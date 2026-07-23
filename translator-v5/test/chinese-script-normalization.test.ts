@@ -16,3 +16,10 @@ test("locked target forms survive script normalization verbatim", () => {
     "龍与后来的龍同行。",
   );
 });
+
+test("Japanese-compatible Hanja is fully normalized through traditional Chinese", () => {
+  assert.equal(
+    simplifyChineseTranslation("\u885B\u58EB\u8207\u8987\u4E3B\uFF0C\u98DC\u8EAB\u4EE5\u5F8C\u654E\u5C0E\u69EA\u8981\uFF0C\u6CA2\u9ED2\u7ADC"),
+    "\u536B\u58EB\u4E0E\u9738\u4E3B\uFF0C\u7FFB\u8EAB\u4EE5\u540E\u6559\u5BFC\u6982\u8981\uFF0C\u6CFD\u9ED1\u9F99",
+  );
+});

@@ -54,6 +54,8 @@ test("schema one recent projects migrate without persisting model secrets", () =
       } as unknown as DesktopModelPreference,
       latestProbe: {
         status: "ready",
+        providerId: "deepseek",
+        modelId: "deepseek-reasoner",
         code: "READY",
         message: "Connected",
         apiKey: "must-not-persist",
@@ -76,6 +78,8 @@ test("schema one recent projects migrate without persisting model secrets", () =
     });
     assert.deepEqual(payload.latestProbe, {
       status: "ready",
+      providerId: "deepseek",
+      modelId: "deepseek-reasoner",
       code: "READY",
       message: "Connected",
     });

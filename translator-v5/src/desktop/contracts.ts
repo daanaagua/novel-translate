@@ -127,6 +127,8 @@ export interface DesktopModelOption {
 
 export interface DesktopModelProbe {
   status: "ready" | "limited" | "failed";
+  providerId?: string;
+  modelId?: string;
   code?: string;
   message?: string;
   retryable?: boolean;

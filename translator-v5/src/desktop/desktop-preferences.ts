@@ -19,6 +19,8 @@ export type DesktopProbeStatus = "ready" | "limited" | "failed";
 
 export interface DesktopProbePreference {
   status: DesktopProbeStatus;
+  providerId?: ProviderId;
+  modelId?: string;
   code?: string;
   message?: string;
   retryable?: boolean;
@@ -131,16 +133,22 @@ function probePreference(value: unknown): DesktopProbePreference | undefined {
   const code = candidate.code === undefined ? undefined : text(candidate.code);
   const message = candidate.message === undefined ? undefined : text(candidate.message);
   const checkedAt = candidate.checkedAt === undefined ? undefined : text(candidate.checkedAt);
+  const providerId = candidate.providerId === undefined ? undefined : text(candidate.providerId);
+  const modelId = candidate.modelId === undefined ? undefined : text(candidate.modelId);
   if (
     (candidate.code !== undefined && code === undefined)
     || (candidate.message !== undefined && message === undefined)
     || (candidate.checkedAt !== undefined && checkedAt === undefined)
+    || (candidate.providerId !== undefined && providerId === undefined)
+    || (candidate.modelId !== undefined && modelId === undefined)
     || (candidate.retryable !== undefined && typeof candidate.retryable !== "boolean")
   ) {
     return undefined;
   }
   return {
     status,
+    ...(providerId === undefined ? {} : { providerId: providerId as ProviderId }),
+    ...(modelId === undefined ? {} : { modelId }),
     ...(code === undefined ? {} : { code }),
     ...(message === undefined ? {} : { message }),
     ...(typeof candidate.retryable === "boolean" ? { retryable: candidate.retryable } : {}),
