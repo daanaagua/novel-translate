@@ -16,7 +16,9 @@
     "desktop:build": "electron-vite build && node --test --import tsx test/verify-desktop-build.test.ts",
     "desktop:typecheck": "tsc --noEmit -p tsconfig.desktop.json",
     "desktop:test": "node --test --import tsx test/desktop-*.test.ts && vitest run --config vitest.desktop.config.ts --passWithNoTests",
-    "desktop:dist": "npm run desktop:build && electron-builder --win portable --x64"
+    "desktop:dist:exe": "npm run desktop:build && electron-builder --win portable --x64",
+    "desktop:dist:folder": "npm run desktop:build && electron-builder --win --dir --x64 && tsx scripts/package-folder-portable.ts",
+    "desktop:dist": "npm run desktop:build && electron-builder --win portable --x64 && tsx scripts/package-folder-portable.ts"
   },
   "dependencies": {
     "@earendil-works/pi-agent-core": "0.80.10",

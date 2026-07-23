@@ -26,8 +26,16 @@ test("desktop package scripts and portable metadata stay explicit", () => {
   assert.match(scripts["desktop:test"] ?? "", /vitest run/);
   assert.match(scripts["desktop:test"] ?? "", /--passWithNoTests/);
   assert.equal(
-    scripts["desktop:dist"],
+    scripts["desktop:dist:exe"],
     "npm run desktop:build && electron-builder --win portable --x64",
+  );
+  assert.equal(
+    scripts["desktop:dist:folder"],
+    "npm run desktop:build && electron-builder --win --dir --x64 && tsx scripts/package-folder-portable.ts",
+  );
+  assert.equal(
+    scripts["desktop:dist"],
+    "npm run desktop:build && electron-builder --win portable --x64 && tsx scripts/package-folder-portable.ts",
   );
   for (const dependency of [
     "@earendil-works/pi-agent-core",
