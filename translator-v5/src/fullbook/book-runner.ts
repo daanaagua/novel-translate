@@ -1671,6 +1671,11 @@ async function runLosslessBook(
     while (processedWindows < maxWindows) {
       throwIfAborted(options.signal);
       assertSourceVersionUnchanged(context);
+      // A book or project catalog can be edited by another completed run while
+      // this run is paused. Synchronize only at the wave boundary, before any
+      // window is claimed, so the next request sees the newest durable user
+      // knowledge without ever changing a running/staged wave.
+      store.syncScopedKnowledge(runId);
       const allWindows = store.allWindows(runId);
       const barrier = firstUncommitted(allWindows);
       if (barrier === undefined || barrier.status !== "pending") {

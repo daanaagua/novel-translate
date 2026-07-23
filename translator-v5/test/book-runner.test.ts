@@ -26,6 +26,7 @@ import { SourceLedger } from "../src/source/source-ledger.js";
 import { annotateStructure } from "../src/source/structure-annotator.js";
 import { BookStore } from "../src/storage/book-store.js";
 import { LosslessBookStore } from "../src/storage/lossless-book-store.js";
+import { createKnowledgeSnapshot } from "../src/knowledge/snapshot.js";
 import { scalarLength } from "../src/source/types.js";
 import {
   WeightedTokenEstimator,
@@ -1639,6 +1640,76 @@ test("lossless runner resumes the same isolated run and promotes the remaining o
   assert.equal(resumed.processedWindows, 1);
   assert.equal(resumed.status.completedWindows, 2);
   assert.deepEqual(resumed.windows.map((window) => window.status), ["completed", "completed"]);
+});
+
+test("lossless resume synchronizes newer book knowledge before the next wave", async () => {
+  const fixture = losslessFixture("EDGEWOOD\n\nBOOK ONE\n\nArchon returned.");
+  fixture.faux.setResponses([losslessBatchResponse]);
+  await runBook({ ...fixture.options, maxWindows: 1 } as never);
+
+  const editor = new LosslessBookStore(fixture.options.storePath);
+  try {
+    const sourceVersion = editor.listTranslationRuns()
+      .find((run) => run.runId === "run-lossless")!.sourceVersion;
+    const editorRunId = "run-catalog-editor";
+    const initialSnapshot = createKnowledgeSnapshot(editorRunId, []);
+    editor.createTranslationRun({
+      runId: editorRunId,
+      sourceVersion,
+      protocolVersion: "lossless-v5-1",
+      modelId: "catalog-editor",
+      initialSnapshotId: initialSnapshot.id,
+      initialSnapshot,
+    });
+    const state = editor.knowledgeState(editorRunId);
+    editor.commitKnowledgeCommands({
+      requestId: "catalog-editor-archon",
+      runId: editorRunId,
+      expectedGeneration: state.generation,
+      expectedSnapshotId: state.snapshotId,
+      commands: [{
+        type: "upsert",
+        objectType: "term",
+        normalizedSubject: "archon",
+        kind: "lexical_anchor",
+        expectedRevision: null,
+        expectedScopeRevision: null,
+        fieldPatch: {
+          sourceForm: "Archon",
+          target: "阁下",
+          locked: true,
+          policy: "locked",
+        },
+        ownedFields: ["/target", "/locked", "/policy"],
+        scope: "book",
+        evidence: [],
+        origin: "manual",
+      }],
+    });
+  } finally {
+    editor.close();
+  }
+
+  const resumedProvider = fauxProvider();
+  resumedProvider.setResponses([losslessBatchResponse]);
+  await runBook({
+    ...fixture.options,
+    model: resumedProvider.getModel(),
+    streamFn: resumedProvider.provider.streamSimple.bind(resumedProvider.provider),
+  } as never);
+
+  const reopened = new LosslessBookStore(fixture.options.storePath);
+  try {
+    const archon = reopened.latestKnowledgeSnapshot("run-lossless").revisions
+      .find((revision) => revision.normalizedSubject === "archon");
+    assert.equal((archon?.payload as { target?: string })?.target, "阁下");
+    assert.equal(
+      reopened.knowledgeState("run-lossless").appliedBookGeneration,
+      1,
+    );
+  } finally {
+    reopened.close();
+  }
 });
 
 function commitManualKnowledge(
