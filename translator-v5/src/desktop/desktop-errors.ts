@@ -98,6 +98,16 @@ const PUBLIC_ERRORS: Readonly<Record<string, PublicErrorDefinition>> = Object.fr
     message: "试译已取消",
     retryable: true,
   },
+  KNOWLEDGE_IMPORT_ALREADY_COMMITTED: {
+    message: "这份知识已经导入",
+    nextAction: "如需再次导入，请先撤销上一次导入，或修改文件内容。",
+    retryable: false,
+  },
+  KNOWLEDGE_IMPORT_BATCH_NOT_STAGED: {
+    message: "这项暂存导入已经失效",
+    nextAction: "请重新选择知识文件开始导入。",
+    retryable: false,
+  },
 });
 
 export function redactDesktopTechnicalDetails(value: string): string {
@@ -122,10 +132,15 @@ export function toDesktopError(error: unknown): DesktopError {
   const structured = error !== null && typeof error === "object"
     ? error as { code?: unknown }
     : {};
+  const details = redactDesktopTechnicalDetails(error instanceof Error ? error.message : String(error));
+  const messageCode = error instanceof Error
+    ? error.message.match(/^[A-Z][A-Z0-9_]+/u)?.[0]
+    : undefined;
   const code = typeof structured.code === "string" && structured.code.trim().length > 0
     ? structured.code
-    : "DESKTOP_ERROR";
-  const details = redactDesktopTechnicalDetails(error instanceof Error ? error.message : String(error));
+    : messageCode !== undefined && PUBLIC_ERRORS[messageCode] !== undefined
+      ? messageCode
+      : "DESKTOP_ERROR";
   const definition = PUBLIC_ERRORS[code];
   if (definition !== undefined) {
     return {

@@ -129,6 +129,16 @@ function tableExists(path: string, name: string): boolean {
   return row !== undefined;
 }
 
+function queryPlan(path: string, sql: string): string[] {
+  const database = new DatabaseSync(path);
+  const rows = database.prepare(`EXPLAIN QUERY PLAN ${sql}`).all(
+    "run-v1",
+    "record-v1",
+  ) as unknown as Array<{ detail: string }>;
+  database.close();
+  return rows.map((row) => row.detail);
+}
+
 test("creates a fresh schema v3 store", () => {
   const path = fixturePath();
   const store = new LosslessBookStore(path);
@@ -145,6 +155,20 @@ test("creates a fresh schema v3 store", () => {
     "project_knowledge_revisions",
     "project_knowledge_state",
   ]);
+});
+
+test("indexes active run knowledge by stable record identity", () => {
+  const path = fixturePath();
+  const store = new LosslessBookStore(path);
+  store.close();
+
+  assert.match(
+    queryPlan(path, `
+      UPDATE knowledge_records SET active=0
+      WHERE run_id=? AND record_id=? AND active=1
+    `).join("\n"),
+    /idx_v5_knowledge_records_active_record/u,
+  );
 });
 
 test("opens a v2 store as v3 without changing knowledge identities", () => {

@@ -150,6 +150,7 @@ async function assertFileSize(path: string): Promise<void> {
 async function* parseCsvRows(
   path: string,
   encoding: ImportTextEncoding,
+  headerRow: number,
 ): AsyncGenerator<ParsedCsvRow> {
   await assertFileSize(path);
   const input = createReadStream(path);
@@ -172,7 +173,9 @@ async function* parseCsvRows(
       readonly info: { readonly lines: number };
     }>) {
       records += 1;
-      validateRowCount(records, path);
+      // MAX_IMPORT_ROWS limits importable records. The selected header and
+      // any explicitly skipped preamble rows are structural input.
+      validateRowCount(Math.max(0, records - headerRow), path);
       validateColumnCount(item.record.length, `row ${item.info.lines}`);
       yield {
         rowNumber: item.info.lines,
@@ -212,7 +215,7 @@ export async function* streamCsvRecords(
   let ordinal = 0;
   let parsedRow = 0;
   let columns: readonly ImportColumn[] | undefined;
-  for await (const row of parseCsvRows(path, encoding)) {
+  for await (const row of parseCsvRows(path, encoding, headerRow)) {
     parsedRow += 1;
     if (parsedRow < headerRow) continue;
     if (parsedRow === headerRow) {
@@ -288,7 +291,7 @@ export async function inspectCsv(
   const firstRows: ParsedCsvRow[] = [];
   let parsedRow = 0;
   try {
-    for await (const row of parseCsvRows(path, encoding)) {
+    for await (const row of parseCsvRows(path, encoding, headerRow)) {
       parsedRow += 1;
       if (parsedRow <= 20) firstRows.push(row);
     }

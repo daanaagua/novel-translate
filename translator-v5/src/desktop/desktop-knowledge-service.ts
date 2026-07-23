@@ -44,6 +44,8 @@ type KnowledgeTarget = {
   readonly sourceLanguage: string;
 };
 
+const MAX_RELATED_KNOWLEDGE = 200;
+
 function publicError(error: unknown): DesktopError {
   let normalized = error;
   if (error instanceof Error
@@ -149,7 +151,12 @@ function detailForId(
   objectId: string,
 ): DesktopKnowledgeDetail {
   const source = store.knowledgeQuerySource(runId);
-  return desktopDetail(new KnowledgeQueryService(source).detail(objectId), source.listKnowledgeRecords());
+  const detail = new KnowledgeQueryService(source).detail(objectId);
+  const records = source.relatedKnowledgeRecords?.(
+    [detail.current.id, detail.current.normalizedSubject],
+    MAX_RELATED_KNOWLEDGE,
+  ) ?? source.listKnowledgeRecords();
+  return desktopDetail(detail, records);
 }
 
 function detailForSubject(
@@ -159,13 +166,21 @@ function detailForSubject(
   kind: string,
 ): DesktopKnowledgeDetail {
   const source = store.knowledgeQuerySource(runId);
-  const record = source.listKnowledgeRecords().find((item) =>
+  const record = source.knowledgeRecordBySubject?.(
+    normalizedSubject,
+    kind,
+  ) ?? source.listKnowledgeRecords().find((item) =>
     item.revision.normalizedSubject === normalizedSubject
-    && item.revision.kind === kind);
+      && item.revision.kind === kind);
   if (record === undefined) {
     throw new Error("KNOWLEDGE_NOT_FOUND");
   }
-  return desktopDetail(new KnowledgeQueryService(source).detail(record.id), source.listKnowledgeRecords());
+  const detail = new KnowledgeQueryService(source).detail(record.id);
+  const records = source.relatedKnowledgeRecords?.(
+    [detail.current.id, detail.current.normalizedSubject],
+    MAX_RELATED_KNOWLEDGE,
+  ) ?? source.listKnowledgeRecords();
+  return desktopDetail(detail, records);
 }
 
 function mutationResult(
@@ -402,11 +417,19 @@ export class DesktopKnowledgeService {
   diagnostics(): DesktopResult<DesktopKnowledgeDiagnostics> {
     return this.#withCurrentStore("read-only", (store, target) => {
       const state = store.knowledgeState(target.runId);
-      const records = store.knowledgeQuerySource(target.runId).listKnowledgeRecords();
-      const countsByType: Record<string, number> = {};
-      const countsByStatus: Record<string, number> = {};
-      let pendingImpacts = 0;
-      for (const record of records) {
+      const source = store.knowledgeQuerySource(target.runId);
+      const summary = source.knowledgeDiagnostics?.();
+      const records = summary === undefined
+        ? source.listKnowledgeRecords()
+        : undefined;
+      const countsByType: Record<string, number> = {
+        ...(summary?.countsByType ?? {}),
+      };
+      const countsByStatus: Record<string, number> = {
+        ...(summary?.countsByStatus ?? {}),
+      };
+      let pendingImpacts = summary?.pendingImpacts ?? 0;
+      for (const record of records ?? []) {
         countsByType[record.objectType] = (countsByType[record.objectType] ?? 0) + 1;
         countsByStatus[record.revision.status] =
           (countsByStatus[record.revision.status] ?? 0) + 1;

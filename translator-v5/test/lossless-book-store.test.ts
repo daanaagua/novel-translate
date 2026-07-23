@@ -292,6 +292,21 @@ test("read-only store reads the newest state held in the source WAL", () => {
   }
 });
 
+test("read-only snapshot cleanup survives rapid GUI-style reopen cycles", () => {
+  const path = fixturePath();
+  const writable = new LosslessBookStore(path);
+  const runId = initialize(writable);
+  try {
+    for (let attempt = 0; attempt < 40; attempt += 1) {
+      const readOnly = LosslessBookStore.openReadOnly(path);
+      assert.equal(readOnly.listTranslationRuns()[0]?.runId, runId);
+      assert.doesNotThrow(() => readOnly.close());
+    }
+  } finally {
+    writable.close();
+  }
+});
+
 test("read-only store rejects mutations", () => {
   const path = fixturePath();
   const writable = new LosslessBookStore(path);

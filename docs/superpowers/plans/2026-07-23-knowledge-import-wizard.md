@@ -1,6 +1,6 @@
 # FolioLoom 多格式知识导入向导实现计划
 
-> **面向 AI 代理的工作者：** 必需子技能：使用 superpowers:subagent-driven-development（推荐）或 superpowers:executing-plans 逐任务实现此计划。步骤使用复选框（`- [ ]`）语法来跟踪进度。
+> **面向 AI 代理的工作者：** 必需子技能：使用 superpowers:subagent-driven-development（推荐）或 superpowers:executing-plans 逐任务实现此计划。步骤使用复选框（`- [x]`）语法来跟踪进度。
 
 **目标：** 在知识工作台核心完成后，交付 JSON、YAML、CSV、XLSX 的安全导入、字段映射、预览校验、冲突处理、幂等提交和整批撤销。
 
@@ -723,7 +723,7 @@ git commit -m "feat: map external fields to knowledge objects"
 - 测试：`translator-v5/test/knowledge-import-conflicts.test.ts`
 - 测试：`translator-v5/test/knowledge-import-service.test.ts`
 
-- [ ] **步骤 1：编写五种分类和无部分 staging 失败测试**
+- [x] **步骤 1：编写五种分类和无部分 staging 失败测试**
 
 ```ts
 test("classifies add, safe merge, conflict and invalid deterministically", () => {
@@ -762,7 +762,7 @@ test("cancels a long stage at a checkpoint without leaving partial rows", async 
 });
 ```
 
-- [ ] **步骤 2：运行测试确认失败**
+- [x] **步骤 2：运行测试确认失败**
 
 运行：
 
@@ -772,7 +772,7 @@ node --test --import tsx test/knowledge-import-conflicts.test.ts test/knowledge-
 
 预期：FAIL，分类器和服务不存在。
 
-- [ ] **步骤 3：实现确定性冲突分类**
+- [x] **步骤 3：实现确定性冲突分类**
 
 分类规则：
 
@@ -799,7 +799,7 @@ export function classifyImport(
 }
 ```
 
-- [ ] **步骤 4：实现 inspect 与 stage 生命周期**
+- [x] **步骤 4：实现 inspect 与 stage 生命周期**
 
 `KnowledgeImportService`：
 
@@ -827,7 +827,7 @@ stage 对完整文件解析、规范化和分类，在一个数据库事务中�
 
 `discardStaged` 只接受状态仍为 staged 的 batch：在一个事务中把 batch 标为 `discarded`，将聚合计数写入 report 后删除对应 staging rows。它不改变知识 generation/snapshot；committed/rolled_back batch 不能走此入口。
 
-- [ ] **步骤 5：实现决策约束**
+- [x] **步骤 5：实现决策约束**
 
 使用 `types.ts` 中已经定义的冲突决策枚举：
 
@@ -842,7 +842,7 @@ type ImportConflictDecision =
 
 `merge_as_alias` 只对 term/entity/alias 且通过引用校验时开放；`create_separate` 必须给出新的规范 subject。批量应用要求 conflict signature 完全相同。
 
-- [ ] **步骤 6：运行 staging 和分类测试**
+- [x] **步骤 6：运行 staging 和分类测试**
 
 运行：
 
@@ -852,7 +852,7 @@ node --test --import tsx test/knowledge-import-conflicts.test.ts test/knowledge-
 
 预期：PASS；错误定位到输入行，故障不留下 batch/row。
 
-- [ ] **步骤 7：Commit**
+- [x] **步骤 7：Commit**
 
 ```powershell
 git add translator-v5/src/knowledge-import/conflict-classifier.ts translator-v5/src/knowledge-import/knowledge-import-service.ts translator-v5/src/storage/lossless-book-store.ts translator-v5/test/knowledge-import-conflicts.test.ts translator-v5/test/knowledge-import-service.test.ts
@@ -869,7 +869,7 @@ git commit -m "feat: stage and classify knowledge imports"
 - 测试：`translator-v5/test/knowledge-import-service.test.ts`
 - 测试：`translator-v5/test/fault-injection.test.ts`
 
-- [ ] **步骤 1：编写 unresolved、重复提交、故障和撤销失败测试**
+- [x] **步骤 1：编写 unresolved、重复提交、故障和撤销失败测试**
 
 ```ts
 test("refuses commit while any conflict has no explicit decision", async () => {
@@ -896,7 +896,7 @@ test("rolls back every import revision by appending rollback revisions", async (
 });
 ```
 
-- [ ] **步骤 2：运行测试确认失败**
+- [x] **步骤 2：运行测试确认失败**
 
 运行：
 
@@ -906,7 +906,7 @@ node --test --import tsx test/knowledge-import-service.test.ts test/fault-inject
 
 预期：FAIL，commit/rollback 尚未完整实现。
 
-- [ ] **步骤 3：原子提交整个批次**
+- [x] **步骤 3：原子提交整个批次**
 
 在一个 `BEGIN IMMEDIATE` 中：
 
@@ -936,7 +936,7 @@ node --test --import tsx test/knowledge-import-service.test.ts test/fault-inject
 }
 ```
 
-- [ ] **步骤 4：保证幂等**
+- [x] **步骤 4：保证幂等**
 
 `run_id + source_hash + mapping_hash` 唯一，`mapping_json` 保存生成该哈希的 canonical 内容供审计。重复 inspect/stage 返回现有 batch 摘要；重复 commit 返回已保存 report。相同 batchId 但 payload identity 不一致报 `KNOWLEDGE_IMPORT_IDENTITY_CONFLICT`。
 
@@ -950,7 +950,7 @@ if (existing && existing.mappingHash !== mappingHash) {
 }
 ```
 
-- [ ] **步骤 5：实现整批撤销**
+- [x] **步骤 5：实现整批撤销**
 
 撤销加载该 batch 创建的每个 active revision，找到其前一有效 revision；对有前身者追加 rollback revision，对纯新增者追加 `superseded` revision。整批只创建一个 snapshot/generation/event。已经 rollback 的 batch 重试返回原报告。
 
@@ -968,7 +968,7 @@ return store.commitImportRollbackInOpenTransaction({
 });
 ```
 
-- [ ] **步骤 6：运行提交、撤销和存储审计**
+- [x] **步骤 6：运行提交、撤销和存储审计**
 
 运行：
 
@@ -978,7 +978,7 @@ node --test --import tsx test/knowledge-import-service.test.ts test/knowledge-co
 
 预期：PASS；任何故障都不出现部分导入，重复操作不增加 revision。
 
-- [ ] **步骤 7：Commit**
+- [x] **步骤 7：Commit**
 
 ```powershell
 git add translator-v5/src/knowledge-import/knowledge-import-service.ts translator-v5/src/knowledge/knowledge-commands.ts translator-v5/src/storage/lossless-book-store.ts translator-v5/test/knowledge-import-service.test.ts translator-v5/test/fault-injection.test.ts
@@ -997,7 +997,7 @@ git commit -m "feat: commit and roll back knowledge imports"
 - 修改：`translator-v5/test/desktop-ipc.test.ts`
 - 修改：`translator-v5/test/desktop-main-security.test.ts`
 
-- [ ] **步骤 1：编写文件选择、opaque ID 和恶意路径失败测试**
+- [x] **步骤 1：编写文件选择、opaque ID 和恶意路径失败测试**
 
 ```ts
 test("returns an opaque pending file before inspection", async () => {
@@ -1020,7 +1020,7 @@ test("rejects a renderer supplied path and unknown mapping fields", async () => 
 });
 ```
 
-- [ ] **步骤 2：运行 IPC 测试确认失败**
+- [x] **步骤 2：运行 IPC 测试确认失败**
 
 运行：
 
@@ -1030,7 +1030,7 @@ node --test --import tsx test/desktop-ipc.test.ts test/desktop-main-security.tes
 
 预期：FAIL，导入通道不存在。
 
-- [ ] **步骤 3：注册有限导入通道**
+- [x] **步骤 3：注册有限导入通道**
 
 加入：
 
@@ -1052,7 +1052,7 @@ node --test --import tsx test/desktop-ipc.test.ts test/desktop-main-security.tes
 
 文件选择过滤器只含 json/yaml/yml/csv/xlsx，选择通道只登记路径并返回 `PendingKnowledgeImport`。inspect/编码确认只接受 pendingImportId、operationId 和 `ImportTextEncoding` 枚举；所有后续调用只接受 pendingImportId 或 batchId、operationId、枚举 selection 和严格映射对象。
 
-- [ ] **步骤 4：扩展 preload**
+- [x] **步骤 4：扩展 preload**
 
 ```ts
 chooseKnowledgeImport(): Promise<DesktopResult<PendingKnowledgeImport>>;
@@ -1072,7 +1072,7 @@ discardStagedKnowledgeImport(request: DiscardStagedImportRequest): Promise<Deskt
 
 不暴露 `readFile`、`openPath`、generic invoke 或 parser。
 
-- [ ] **步骤 5：运行 IPC、安全和桌面类型检查**
+- [x] **步骤 5：运行 IPC、安全和桌面类型检查**
 
 运行：
 
@@ -1083,7 +1083,7 @@ npm run desktop:typecheck
 
 预期：PASS。
 
-- [ ] **步骤 6：Commit**
+- [x] **步骤 6：Commit**
 
 ```powershell
 git add translator-v5/src/desktop/knowledge-contracts.ts translator-v5/src/desktop/desktop-knowledge-service.ts translator-v5/src/desktop/main/ipc.ts translator-v5/src/desktop/preload/index.ts translator-v5/src/desktop/preload/folioloom-api.d.ts translator-v5/test/desktop-ipc.test.ts translator-v5/test/desktop-main-security.test.ts
@@ -1101,7 +1101,7 @@ git commit -m "feat: expose safe knowledge import IPC"
 - 修改：`translator-v5/src/desktop/renderer/src/components/KnowledgeWorkbench.tsx`
 - 修改：`translator-v5/src/desktop/renderer/src/styles.css`
 
-- [ ] **步骤 1：编写官方模板、映射、冲突和刷新失败测试**
+- [x] **步骤 1：编写官方模板、映射、冲突和刷新失败测试**
 
 ```tsx
 it("skips manual mapping for an official template but still shows preview", async () => {
@@ -1149,7 +1149,7 @@ it("cancels an active inspection and keeps the wizard usable", async () => {
 });
 ```
 
-- [ ] **步骤 2：运行组件测试确认失败**
+- [x] **步骤 2：运行组件测试确认失败**
 
 运行：
 
@@ -1159,7 +1159,7 @@ npx vitest run --config vitest.desktop.config.ts KnowledgeImportWizard
 
 预期：FAIL，向导组件不存在。
 
-- [ ] **步骤 3：实现四步状态机**
+- [x] **步骤 3：实现四步状态机**
 
 ```ts
 type ImportWizardState =
@@ -1191,7 +1191,7 @@ type ImportWizardState =
 
 选择文件后立即生成 operationId 并调用 `inspectKnowledgeImport`；busy 状态显示“取消检查”。当 CSV 返回 `encoding_required` 时，向导先展示候选编码和短预览；确认后使用新的 operationId 调主进程重新严格解码，成功才进入 map。编码失败保留选择界面和错误，不清空 pending file。stage/commit/rollback 各自使用新的 operationId，进度区在操作结束前始终提供取消按钮。
 
-- [ ] **步骤 4：实现映射界面**
+- [x] **步骤 4：实现映射界面**
 
 显示：
 
@@ -1218,7 +1218,7 @@ return (
 );
 ```
 
-- [ ] **步骤 5：实现冲突和错误界面**
+- [x] **步骤 5：实现冲突和错误界面**
 
 按新增、安全合并、冲突、无效分组。每条冲突提供允许的决策；批量操作显示影响条数。存在 unresolved 或未 skip 的 invalid 时禁用提交。
 
@@ -1237,7 +1237,7 @@ return (
 );
 ```
 
-- [ ] **步骤 6：接入知识工作台刷新**
+- [x] **步骤 6：接入知识工作台刷新**
 
 `KnowledgeWorkbench` 在 import commit/rollback 后：
 
@@ -1258,7 +1258,7 @@ async function refreshAfterImport(result: CommittedImportReport | RolledBackImpo
 }
 ```
 
-- [ ] **步骤 7：运行组件、桌面和构建测试**
+- [x] **步骤 7：运行组件、桌面和构建测试**
 
 运行：
 
@@ -1270,7 +1270,7 @@ npm run desktop:build
 
 预期：PASS；键盘可以完成选择、映射、决策和提交，焦点不会落到遮罩后方。
 
-- [ ] **步骤 8：Commit**
+- [x] **步骤 8：Commit**
 
 ```powershell
 git add translator-v5/src/desktop/renderer/src/components/KnowledgeImportWizard.tsx translator-v5/src/desktop/renderer/src/components/ImportMappingStep.tsx translator-v5/src/desktop/renderer/src/components/ImportConflictStep.tsx translator-v5/src/desktop/renderer/src/components/KnowledgeImportWizard.test.tsx translator-v5/src/desktop/renderer/src/components/KnowledgeWorkbench.tsx translator-v5/src/desktop/renderer/src/styles.css
@@ -1284,7 +1284,7 @@ git commit -m "feat: add knowledge import wizard"
 - 修改：`translator-v5/README.md`
 - 创建：`docs/superpowers/reports/2026-07-23-knowledge-import-validation.md`
 
-- [ ] **步骤 1：验证四种格式产生相同语义结果**
+- [x] **步骤 1：验证四种格式产生相同语义结果**
 
 用同一组 20 条术语分别生成 JSON、YAML、CSV、XLSX，完成导入后比较：
 
@@ -1305,7 +1305,7 @@ node --test --import tsx --test-name-pattern="four formats produce identical kno
 
 预期：PASS，四个数据库的规范化语义摘要相同。
 
-- [ ] **步骤 2：验证冲突与重启恢复**
+- [x] **步骤 2：验证冲突与重启恢复**
 
 执行：
 
@@ -1327,7 +1327,7 @@ node --test --import tsx --test-name-pattern="restart|idempotently|rolls back ev
 
 预期：PASS，重开 fixture 可继续同一 batch，重试不增加 revision。
 
-- [ ] **步骤 3：验证恶意和损坏输入**
+- [x] **步骤 3：验证恶意和损坏输入**
 
 测试：
 
@@ -1353,7 +1353,7 @@ node --test --import tsx test/knowledge-import-input-policy.test.ts test/knowled
 
 预期：PASS，每个恶意 fixture 命中指定错误码且 batch/row 计数保持 0。
 
-- [ ] **步骤 4：运行完整验证**
+- [x] **步骤 4：运行完整验证**
 
 运行：
 
@@ -1368,7 +1368,7 @@ npm run desktop:build
 
 预期：全部 PASS，audit 无 high/critical。
 
-- [ ] **步骤 5：更新 README**
+- [x] **步骤 5：更新 README**
 
 写明：
 
@@ -1392,7 +1392,7 @@ README 使用以下结构：
 ### 安全边界与不支持的格式
 ```
 
-- [ ] **步骤 6：记录验证报告**
+- [x] **步骤 6：记录验证报告**
 
 `docs/superpowers/reports/2026-07-23-knowledge-import-validation.md` 记录：
 
@@ -1415,7 +1415,7 @@ README 使用以下结构：
 ## 非 P0/P1 限制
 ```
 
-- [ ] **步骤 7：Commit**
+- [x] **步骤 7：Commit**
 
 ```powershell
 git add translator-v5/README.md docs/superpowers/reports/2026-07-23-knowledge-import-validation.md

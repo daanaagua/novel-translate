@@ -106,6 +106,28 @@ const project: DesktopProjectSnapshot = {
   runSelection: "none",
 };
 
+const knowledgeReadyProject: DesktopProjectSnapshot = {
+  ...project,
+  selectedRunId: "run-ready",
+  runs: [
+    {
+      runId: "run-ready",
+      sourceVersion: "source-example",
+      modelId: "deepseek-v4-flash",
+      status: "ready",
+      progress: {
+        totalWindows: 4,
+        pendingWindows: 0,
+        completedWindows: 4,
+        warningWindows: 0,
+        humanRequiredWindows: 0,
+        failedWindows: 0,
+      },
+    },
+  ],
+  runSelection: "selected",
+};
+
 const emptyOnboarding: DesktopOnboardingState = {
   providers,
   readiness: { source: false, model: false, trial: false },
@@ -179,6 +201,37 @@ function createApi(overrides: Partial<FolioLoomDesktopApi> = {}): FolioLoomDeskt
     startTrial: vi.fn().mockResolvedValue(failure("DESKTOP_TRIAL_NOT_READY", "试译尚未准备好")),
     cancelTrial: vi.fn().mockResolvedValue(ok(undefined)),
     onTrialProgress: vi.fn().mockReturnValue(() => undefined),
+    listKnowledge: vi.fn().mockResolvedValue(ok({
+      generation: 0,
+      snapshotId: "snapshot-0",
+      items: [],
+    })),
+    getKnowledgeDetail: vi.fn().mockResolvedValue(failure("KNOWLEDGE_NOT_FOUND", "没有知识条目")),
+    mutateKnowledge: vi.fn().mockResolvedValue(failure("KNOWLEDGE_NOT_FOUND", "没有知识条目")),
+    promoteKnowledgeToGlobal: vi.fn().mockResolvedValue(failure("KNOWLEDGE_NOT_FOUND", "没有知识条目")),
+    listGlobalKnowledge: vi.fn().mockResolvedValue(ok({ items: [] })),
+    attachGlobalKnowledge: vi.fn().mockResolvedValue(failure("GLOBAL_KNOWLEDGE_REVISION_NOT_FOUND", "没有通用条目")),
+    getKnowledgeDiagnostics: vi.fn().mockResolvedValue(ok({
+      schemaVersion: 3,
+      knowledgeGeneration: 0,
+      countsByType: {},
+      countsByStatus: {},
+      pendingImpacts: 0,
+      latestMigration: "lossless-book-schema-v3",
+    })),
+    chooseKnowledgeImport: vi.fn().mockResolvedValue(failure("DESKTOP_SELECTION_CANCELLED", "已取消选择")),
+    inspectKnowledgeImport: vi.fn().mockResolvedValue(failure("KNOWLEDGE_IMPORT_NOT_FOUND", "没有待导入文件")),
+    confirmKnowledgeImportEncoding: vi.fn().mockResolvedValue(failure("KNOWLEDGE_IMPORT_NOT_FOUND", "没有待导入文件")),
+    listStagedKnowledgeImports: vi.fn().mockResolvedValue(ok([])),
+    getStagedKnowledgeImport: vi.fn().mockResolvedValue(failure("KNOWLEDGE_IMPORT_BATCH_NOT_FOUND", "没有导入批次")),
+    suggestKnowledgeImport: vi.fn().mockResolvedValue(failure("KNOWLEDGE_IMPORT_NOT_FOUND", "没有待导入文件")),
+    stageKnowledgeImport: vi.fn().mockResolvedValue(failure("KNOWLEDGE_IMPORT_NOT_FOUND", "没有待导入文件")),
+    decideKnowledgeImport: vi.fn().mockResolvedValue(failure("KNOWLEDGE_IMPORT_BATCH_NOT_FOUND", "没有导入批次")),
+    commitKnowledgeImport: vi.fn().mockResolvedValue(failure("KNOWLEDGE_IMPORT_BATCH_NOT_FOUND", "没有导入批次")),
+    rollbackKnowledgeImport: vi.fn().mockResolvedValue(failure("KNOWLEDGE_IMPORT_BATCH_NOT_FOUND", "没有导入批次")),
+    cancelKnowledgeImportOperation: vi.fn().mockResolvedValue(ok(undefined)),
+    cancelPendingKnowledgeImport: vi.fn().mockResolvedValue(ok(undefined)),
+    discardStagedKnowledgeImport: vi.fn().mockResolvedValue(ok(undefined)),
     chooseProject: vi.fn().mockResolvedValue(failure("DESKTOP_NO_PROJECT", "没有可打开的书稿")),
     chooseStore: vi.fn().mockResolvedValue(failure("DESKTOP_NO_PROJECT", "没有可打开的书稿")),
     refreshProject: vi.fn().mockResolvedValue(failure("DESKTOP_NO_PROJECT", "没有可打开的书稿")),
@@ -210,6 +263,22 @@ describe("FolioLoom desktop onboarding", () => {
 
     await user.click(memory);
     expect(await screen.findByRole("heading", { name: "开始翻译一本书" })).toBeTruthy();
+  });
+
+  it("opens the knowledge workspace only for a ready selected run", async () => {
+    const user = userEvent.setup();
+    const onboarding = {
+      ...sourceOnlyOnboarding,
+      project: knowledgeReadyProject,
+    };
+    render(<App api={createApi({
+      getOnboardingState: vi.fn().mockResolvedValue(ok(onboarding)),
+    })} />);
+
+    const memory = await screen.findByRole("button", { name: "术语与记忆" });
+    expect((memory as HTMLButtonElement).disabled).toBe(false);
+    await user.click(memory);
+    expect(await screen.findByRole("heading", { name: "术语与记忆" })).toBeTruthy();
   });
 
   it("uses the visible manuscript button to call the desktop bridge and advance to model setup", async () => {

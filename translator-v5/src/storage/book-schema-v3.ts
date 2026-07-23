@@ -147,8 +147,7 @@ export const LOSSLESS_BOOK_SCHEMA_V3_EXTENSION = `
       CHECK(status IN ('staged', 'committed', 'rolled_back', 'discarded', 'failed')),
     report_json TEXT NOT NULL DEFAULT '{}' CHECK(json_valid(report_json)),
     created_at TEXT NOT NULL DEFAULT (datetime('now')),
-    PRIMARY KEY(run_id, batch_id),
-    UNIQUE(run_id, source_hash, mapping_hash)
+    PRIMARY KEY(run_id, batch_id)
   ) STRICT;
 
   CREATE TABLE knowledge_import_rows(
@@ -167,6 +166,9 @@ export const LOSSLESS_BOOK_SCHEMA_V3_EXTENSION = `
 
   CREATE INDEX idx_v5_knowledge_records_list
     ON knowledge_records(run_id, active, normalized_subject, kind, record_id);
+  CREATE UNIQUE INDEX idx_v5_knowledge_records_active_record
+    ON knowledge_records(run_id, record_id)
+    WHERE active=1;
   CREATE INDEX idx_v5_book_knowledge_active
     ON book_knowledge_revisions(
       source_version, active, object_type, normalized_subject, kind, record_id
@@ -179,6 +181,9 @@ export const LOSSLESS_BOOK_SCHEMA_V3_EXTENSION = `
     ON knowledge_block_impacts(run_id, status, created_at, block_id);
   CREATE INDEX idx_v5_import_batches_status
     ON knowledge_import_batches(run_id, status, created_at, batch_id);
+  CREATE UNIQUE INDEX idx_v5_import_batches_active_identity
+    ON knowledge_import_batches(run_id, source_hash, mapping_hash)
+    WHERE status IN ('staged', 'committed');
   CREATE INDEX idx_v5_import_rows_state
     ON knowledge_import_rows(run_id, batch_id, state, row_ordinal);
 `;

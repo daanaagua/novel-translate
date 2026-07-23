@@ -60,6 +60,8 @@ import {
   validateKnowledgeCommand,
   type KnowledgeObjectType,
 } from "../../knowledge/knowledge-commands.js";
+import { knowledgeImportFields } from "../../knowledge-import/field-mapping.js";
+import { MAX_STAGED_IMPORT_PAGE_SIZE } from "../../knowledge-import/types.js";
 import { DesktopInputError, fail, ok, toDesktopError } from "../desktop-errors.js";
 
 export const DESKTOP_IPC_CHANNELS = [
@@ -239,16 +241,6 @@ const IMPORT_DECISIONS = new Set([
   "keep_existing", "use_imported", "merge_as_alias",
   "create_separate", "skip",
 ] as const);
-const IMPORT_FIELDS = new Set([
-  "sourceForm", "canonicalSource", "target", "alternatives", "policy",
-  "locked", "note", "canonicalName", "targetName", "entityType",
-  "description", "alias", "entityId", "context", "fromEntityId",
-  "relationType", "toEntityId", "position", "summary", "startBlockId",
-  "endBlockId", "entities", "narrativeDistance", "dialogueRegister",
-  "technicalProse", "formality", "rhythm", "imagery", "terminology",
-  "sentenceTexture", "additionalInstruction",
-]);
-
 function failure<T = never>(code: string, message: string): DesktopResult<T> {
   return fail({ code, message, retryable: false });
 }
@@ -372,7 +364,11 @@ function positiveInteger(value: unknown, label: string): number {
 
 function pageLimit(value: unknown): number {
   const limit = positiveInteger(value, "limit");
-  if (limit > 200) return inputError("limit must not exceed 200");
+  if (limit > MAX_STAGED_IMPORT_PAGE_SIZE) {
+    return inputError(
+      `limit must not exceed ${MAX_STAGED_IMPORT_PAGE_SIZE}`,
+    );
+  }
   return limit;
 }
 
@@ -594,13 +590,15 @@ function importSelection(value: unknown): ImportSelection {
 
 function importFields(
   value: unknown,
+  objectType: KnowledgeObjectType,
 ): StageImportRequest["fields"] {
   if (value === null || typeof value !== "object" || Array.isArray(value)) {
     return inputError("fields must be a JSON object");
   }
   const fields = value as Record<string, unknown>;
   const keys = Object.keys(fields);
-  if (keys.length > IMPORT_FIELDS.size) {
+  const allowedFields = new Set(knowledgeImportFields(objectType));
+  if (keys.length > allowedFields.size) {
     return inputError("fields contains too many mappings");
   }
   const result: Record<
@@ -611,7 +609,7 @@ function importFields(
     NonNullable<StageImportRequest["fields"][string]> | undefined
   >;
   for (const key of keys) {
-    if (!IMPORT_FIELDS.has(key)) {
+    if (!allowedFields.has(key)) {
       return inputError(`fields contains unsupported target field ${key}`);
     }
     const raw = fields[key];
@@ -627,7 +625,7 @@ function importFields(
       mapping.targetField,
       `fields.${key}.targetField`,
     );
-    if (targetField !== key || !IMPORT_FIELDS.has(targetField)) {
+    if (targetField !== key || !allowedFields.has(targetField)) {
       return inputError(`fields.${key}.targetField must equal ${key}`);
     }
     const sourceColumn = boundedText(
@@ -718,6 +716,7 @@ function stageImportRequest(value: unknown): StageImportRequest {
     "pendingImportId", "operationId", "expectedGeneration",
     "expectedSnapshotId", "selection", "fields",
   ]);
+  const selection = importSelection(input.selection);
   return {
     pendingImportId: pendingImportId(input.pendingImportId),
     operationId: operationId(input.operationId),
@@ -726,8 +725,8 @@ function stageImportRequest(value: unknown): StageImportRequest {
       "expectedGeneration",
     ),
     expectedSnapshotId: snapshotId(input.expectedSnapshotId),
-    selection: importSelection(input.selection),
-    fields: importFields(input.fields),
+    selection,
+    fields: importFields(input.fields, selection.objectType),
   };
 }
 

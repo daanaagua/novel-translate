@@ -17,6 +17,7 @@ import type {
 } from "../../contracts.js";
 import type { FolioLoomDesktopApi } from "../../preload/folioloom-api.js";
 import { Onboarding } from "./components/Onboarding.js";
+import { KnowledgeWorkbench } from "./components/KnowledgeWorkbench.js";
 import { Sidebar } from "./components/Sidebar.js";
 import { WindowTitlebar } from "./components/WindowTitlebar.js";
 import { WorkspacePlaceholder } from "./components/WorkspacePlaceholder.js";
@@ -53,6 +54,26 @@ function unavailableApi(): FolioLoomDesktopApi {
     startTrial: async (_request) => unavailableResult(),
     cancelTrial: async () => unavailableResult(),
     onTrialProgress: () => () => undefined,
+    listKnowledge: async () => unavailableResult(),
+    getKnowledgeDetail: async () => unavailableResult(),
+    mutateKnowledge: async () => unavailableResult(),
+    promoteKnowledgeToGlobal: async () => unavailableResult(),
+    listGlobalKnowledge: async () => unavailableResult(),
+    attachGlobalKnowledge: async () => unavailableResult(),
+    getKnowledgeDiagnostics: async () => unavailableResult(),
+    chooseKnowledgeImport: async () => unavailableResult(),
+    inspectKnowledgeImport: async () => unavailableResult(),
+    confirmKnowledgeImportEncoding: async () => unavailableResult(),
+    listStagedKnowledgeImports: async () => unavailableResult(),
+    getStagedKnowledgeImport: async () => unavailableResult(),
+    suggestKnowledgeImport: async () => unavailableResult(),
+    stageKnowledgeImport: async () => unavailableResult(),
+    decideKnowledgeImport: async () => unavailableResult(),
+    commitKnowledgeImport: async () => unavailableResult(),
+    rollbackKnowledgeImport: async () => unavailableResult(),
+    cancelKnowledgeImportOperation: async () => unavailableResult(),
+    cancelPendingKnowledgeImport: async () => unavailableResult(),
+    discardStagedKnowledgeImport: async () => unavailableResult(),
     chooseProject: async () => unavailableResult(),
     chooseStore: async () => unavailableResult(),
     refreshProject: async () => unavailableResult(),
@@ -126,6 +147,15 @@ export function App({ api }: AppProps): JSX.Element {
   useEffect(() => desktopApi.onTrialProgress((progress) => {
     setTrialProgress(progress);
   }), [desktopApi]);
+
+  const knowledgeAvailable = onboarding.project?.store.state === "ready"
+    && onboarding.project.selectedRunId !== undefined;
+
+  useEffect(() => {
+    if (activeWorkspace === "memory" && !knowledgeAvailable) {
+      setActiveWorkspace("overview");
+    }
+  }, [activeWorkspace, knowledgeAvailable]);
 
   async function acceptSourceChoice(
     choice: DesktopChooseSourceResult,
@@ -301,6 +331,7 @@ export function App({ api }: AppProps): JSX.Element {
       <Sidebar
         activeWorkspace={activeWorkspace}
         hasProject={onboarding.project !== undefined}
+        knowledgeAvailable={knowledgeAvailable}
         onSelectWorkspace={setActiveWorkspace}
       />
       <div className="workbench-main">
@@ -319,6 +350,11 @@ export function App({ api }: AppProps): JSX.Element {
             onForgetCredential={forgetCredential}
             onStartTrial={startTrial}
             onCancelTrial={cancelTrial}
+          />
+        ) : activeWorkspace === "memory" && knowledgeAvailable ? (
+          <KnowledgeWorkbench
+            key={`${onboarding.project?.sourceVersion ?? "none"}:${onboarding.project?.selectedRunId ?? "none"}`}
+            api={desktopApi}
           />
         ) : (
           <WorkspacePlaceholder

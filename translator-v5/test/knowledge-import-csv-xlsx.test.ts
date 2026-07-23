@@ -118,6 +118,43 @@ test("streams UTF-8 BOM CSV and preserves source row numbers", async () => {
   assert.equal(rows[1]?.values["column:1"], "扈从");
 });
 
+test("counts CSV data records without charging the selected header row", async () => {
+  const acceptedPath = await temporaryPath("one-hundred-thousand.csv");
+  await writeFile(
+    acceptedPath,
+    [
+      "source,target",
+      ...Array.from({ length: 100_000 }, (_item, index) => `term-${index},译名-${index}`),
+      "",
+    ].join("\n"),
+    "utf8",
+  );
+  let accepted = 0;
+  for await (const _record of streamCsvRecords(acceptedPath, { headerRow: 1 })) {
+    accepted += 1;
+  }
+  assert.equal(accepted, 100_000);
+
+  const rejectedPath = await temporaryPath("one-hundred-thousand-and-one.csv");
+  await writeFile(
+    rejectedPath,
+    [
+      "source,target",
+      ...Array.from({ length: 100_001 }, (_item, index) => `term-${index},译名-${index}`),
+      "",
+    ].join("\n"),
+    "utf8",
+  );
+  await assert.rejects(
+    async () => {
+      for await (const _record of streamCsvRecords(rejectedPath, { headerRow: 1 })) {
+        // Consume the stream so the boundary is exercised.
+      }
+    },
+    /KNOWLEDGE_IMPORT_ROW_LIMIT/u,
+  );
+});
+
 test("requires explicit confirmation for non-UTF-8 CSV", async () => {
   const path = await temporaryPath("shift-jis.csv");
   await writeFile(path, Buffer.concat([

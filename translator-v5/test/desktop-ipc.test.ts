@@ -523,6 +523,84 @@ test("knowledge import IPC owns file paths and rejects renderer path injection",
     assert.equal(injected.ok, false);
     if (!injected.ok) assert.equal(injected.error.code, "DESKTOP_INPUT_INVALID");
     assert.equal(fixture.knowledgeImportCalls.staged.length, 0);
+
+    const valid = await handler(
+      fixture,
+      "folioloom:knowledge-import-stage",
+    )(fixture.trustedEvent, {
+      pendingImportId: "a22f46e4-539b-45e1-84a7-9c58a69eb92d",
+      operationId: "65e535fb-69e7-40af-b531-c5840741ee81",
+      expectedGeneration: 0,
+      expectedSnapshotId:
+        "0000000000000000000000000000000000000000000000000000000000000000",
+      selection: {
+        recordPathId: "$.records",
+        objectType: "term",
+        scope: "book",
+      },
+      fields: {
+        source: {
+          targetField: "source",
+          sourceColumn: "source",
+          confidence: "high",
+          confirmed: true,
+        },
+        sourceForms: {
+          targetField: "sourceForms",
+          sourceColumn: "forms",
+          confidence: "high",
+          confirmed: true,
+        },
+        contexts: {
+          targetField: "contexts",
+          sourceColumn: "contexts",
+          confidence: "high",
+          confirmed: true,
+        },
+        register: {
+          targetField: "register",
+          sourceColumn: "register",
+          confidence: "high",
+          confirmed: true,
+        },
+      },
+    }) as DesktopResult<unknown>;
+    assert.equal(valid.ok, true);
+    assert.deepEqual(
+      Object.keys((fixture.knowledgeImportCalls.staged[0] as {
+        fields: Record<string, unknown>;
+      }).fields).sort(),
+      ["contexts", "register", "source", "sourceForms"],
+    );
+
+    const wrongObjectType = await handler(
+      fixture,
+      "folioloom:knowledge-import-stage",
+    )(fixture.trustedEvent, {
+      pendingImportId: "a22f46e4-539b-45e1-84a7-9c58a69eb92d",
+      operationId: "65e535fb-69e7-40af-b531-c5840741ee82",
+      expectedGeneration: 0,
+      expectedSnapshotId:
+        "0000000000000000000000000000000000000000000000000000000000000000",
+      selection: {
+        recordPathId: "$.records",
+        objectType: "term",
+        scope: "book",
+      },
+      fields: {
+        canonicalName: {
+          targetField: "canonicalName",
+          sourceColumn: "name",
+          confidence: "high",
+          confirmed: true,
+        },
+      },
+    }) as DesktopResult<unknown>;
+    assert.equal(wrongObjectType.ok, false);
+    if (!wrongObjectType.ok) {
+      assert.equal(wrongObjectType.error.code, "DESKTOP_INPUT_INVALID");
+    }
+    assert.equal(fixture.knowledgeImportCalls.staged.length, 1);
   } finally {
     rmSync(fixture.directory, { recursive: true, force: true });
   }

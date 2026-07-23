@@ -634,6 +634,77 @@ test("pushes store search, filters, and seek cursors into SQLite", () => {
   }
 });
 
+test("pushes exact lookup, bounded relations, and diagnostics into SQLite", () => {
+  const fixture = storeQueryFixture(["Piaton shared Typhon's body."], {
+    translatedIndexes: [0],
+  });
+  try {
+    commitKnowledge(fixture, [
+      {
+        type: "upsert",
+        objectType: "entity",
+        normalizedSubject: "piaton",
+        kind: "entity_identity",
+        expectedRevision: null,
+        expectedScopeRevision: null,
+        fieldPatch: {
+          canonicalName: "Piaton",
+          targetName: "皮亚顿",
+          entityType: "person",
+        },
+        ownedFields: ["/canonicalName", "/targetName", "/entityType"],
+        scope: "book",
+        evidence: [],
+        origin: "manual",
+      },
+      {
+        type: "upsert",
+        objectType: "relation",
+        normalizedSubject: "relation:piaton-typhon",
+        kind: "entity_relation",
+        expectedRevision: null,
+        expectedScopeRevision: null,
+        fieldPatch: {
+          fromEntityId: "piaton",
+          relationType: "shares_body_with",
+          toEntityId: "typhon",
+        },
+        ownedFields: ["/fromEntityId", "/relationType", "/toEntityId"],
+        scope: "book",
+        evidence: [],
+        origin: "manual",
+      },
+    ]);
+    const source = fixture.store.knowledgeQuerySource(fixture.runId);
+    assert.equal(typeof source.knowledgeRecordBySubject, "function");
+    assert.equal(typeof source.relatedKnowledgeRecords, "function");
+    assert.equal(typeof source.knowledgeDiagnostics, "function");
+
+    const entity = source.knowledgeRecordBySubject?.(
+      "piaton",
+      "entity_identity",
+    );
+    assert.equal(entity?.revision.normalizedSubject, "piaton");
+    assert.deepEqual(
+      source.relatedKnowledgeRecords?.(["piaton", entity!.id], 20)
+        .map((item) => item.revision.normalizedSubject),
+      ["relation:piaton-typhon"],
+    );
+    assert.deepEqual(source.knowledgeDiagnostics?.(), {
+      countsByType: {
+        entity: 1,
+        relation: 1,
+      },
+      countsByStatus: {
+        active: 2,
+      },
+      pendingImpacts: 0,
+    });
+  } finally {
+    fixture.store.close();
+  }
+});
+
 test("writes impacts only for active translations that conservatively match explicit forms", () => {
   const fixture = storeQueryFixture([
     "The Archon entered.",

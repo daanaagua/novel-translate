@@ -51,3 +51,26 @@ test("unknown desktop errors keep a stable public code and sanitized details", (
   assert.equal(result.retryable, false);
   assert.equal(result.technicalDetails, "unexpected internal failure");
 });
+
+test("known knowledge import failures remain actionable across the IPC boundary", () => {
+  assert.deepEqual(
+    toDesktopError(new Error("KNOWLEDGE_IMPORT_ALREADY_COMMITTED")),
+    {
+      code: "KNOWLEDGE_IMPORT_ALREADY_COMMITTED",
+      message: "这份知识已经导入",
+      nextAction: "如需再次导入，请先撤销上一次导入，或修改文件内容。",
+      retryable: false,
+      technicalDetails: "KNOWLEDGE_IMPORT_ALREADY_COMMITTED",
+    },
+  );
+  assert.deepEqual(
+    toDesktopError(new Error("KNOWLEDGE_IMPORT_BATCH_NOT_STAGED")),
+    {
+      code: "KNOWLEDGE_IMPORT_BATCH_NOT_STAGED",
+      message: "这项暂存导入已经失效",
+      nextAction: "请重新选择知识文件开始导入。",
+      retryable: false,
+      technicalDetails: "KNOWLEDGE_IMPORT_BATCH_NOT_STAGED",
+    },
+  );
+});

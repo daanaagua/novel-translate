@@ -5,10 +5,16 @@ import { WORKSPACES, type WorkspaceId } from "../types.js";
 interface SidebarProps {
   activeWorkspace: WorkspaceId;
   hasProject: boolean;
+  knowledgeAvailable: boolean;
   onSelectWorkspace(workspace: WorkspaceId): void;
 }
 
-export function Sidebar({ activeWorkspace, hasProject, onSelectWorkspace }: SidebarProps): JSX.Element {
+export function Sidebar({
+  activeWorkspace,
+  hasProject,
+  knowledgeAvailable,
+  onSelectWorkspace,
+}: SidebarProps): JSX.Element {
   return (
     <aside className="sidebar">
       <div className="brand-lockup">
@@ -23,7 +29,8 @@ export function Sidebar({ activeWorkspace, hasProject, onSelectWorkspace }: Side
         <p className="nav-label">工作区</p>
         {WORKSPACES.map((workspace, index) => {
           const selected = workspace.id === activeWorkspace;
-          const available = workspace.id === "overview";
+          const available = workspace.id === "overview"
+            || (workspace.id === "memory" && knowledgeAvailable);
           return (
             <button
               className={`nav-item${selected ? " is-active" : ""}`}

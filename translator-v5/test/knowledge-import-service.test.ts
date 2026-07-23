@@ -1,9 +1,10 @@
 import assert from "node:assert/strict";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { createHash, randomUUID } from "node:crypto";
 import test from "node:test";
+import ExcelJS from "exceljs";
 
 import {
   KnowledgeImportService,
@@ -119,6 +120,13 @@ function importFixture(
 async function stageTerms(
   service: KnowledgeImportService,
   path: string,
+  expected: {
+    readonly generation: number;
+    readonly snapshotId: string;
+  } = {
+    generation: 0,
+    snapshotId: createKnowledgeSnapshot("run-import", []).id,
+  },
 ): Promise<StagedImportReport> {
   const pending = service.registerPending(path);
   const inspection = await service.inspect({
@@ -132,12 +140,53 @@ async function stageTerms(
   return service.stage({
     pendingImportId: pending.pendingImportId,
     operationId: randomUUID(),
-    expectedGeneration: 0,
-    expectedSnapshotId: createKnowledgeSnapshot("run-import", []).id,
+    expectedGeneration: expected.generation,
+    expectedSnapshotId: expected.snapshotId,
     selection: termSelection(recordPathId),
     fields: {
       source: mapField("source", "source"),
       target: mapField("target", "target"),
+    },
+  });
+}
+
+async function stageTermsFromAnyFormat(
+  fixture: ReturnType<typeof importFixture>,
+  path: string,
+): Promise<StagedImportReport> {
+  const pending = fixture.service.registerPending(path);
+  const inspection = await fixture.service.inspect({
+    pendingImportId: pending.pendingImportId,
+    operationId: randomUUID(),
+  });
+  assert.equal(inspection.status, "ready");
+  if (inspection.status !== "ready") assert.fail("expected ready import");
+  const descriptor = inspection.inspection;
+  const sample = descriptor.sample[0];
+  assert.ok(sample);
+  const entries = Object.entries(sample.values);
+  const sourceColumn = entries.find(([, value]) => value === "Archon")?.[0];
+  const targetColumn = entries.find(([, value]) => value === "执政官")?.[0];
+  assert.ok(sourceColumn);
+  assert.ok(targetColumn);
+  const sheet = descriptor.sheets[0];
+  const selection: ImportSelection = sheet === undefined
+    ? termSelection(descriptor.recordPaths[0]?.id)
+    : {
+        objectType: "term",
+        scope: "book",
+        sheetId: sheet.id,
+        headerRow: sheet.suggestedHeaderRows[0] ?? 1,
+      };
+  return fixture.service.stage({
+    pendingImportId: pending.pendingImportId,
+    operationId: randomUUID(),
+    expectedGeneration: 0,
+    expectedSnapshotId: createKnowledgeSnapshot(fixture.runId, []).id,
+    selection,
+    fields: {
+      source: mapField("source", sourceColumn),
+      target: mapField("target", targetColumn),
     },
   });
 }
@@ -423,11 +472,23 @@ test("persists staged rows, pages them and discards them without changing knowle
       await fixture.service.discardStaged({ batchId: staged.batchId });
       assert.equal((await fixture.service.listStaged()).length, 0);
       assert.deepEqual(currentImportState(fixture), before);
-      const discarded = await fixture.service.getStaged({
-        batchId: staged.batchId,
-        limit: 100,
+      await assert.rejects(
+        fixture.service.getStaged({
+          batchId: staged.batchId,
+          limit: 100,
+        }),
+        /KNOWLEDGE_IMPORT_BATCH_NOT_STAGED/u,
+      );
+
+      const restaged = await stageTerms(fixture.service, path);
+      assert.notEqual(restaged.batchId, staged.batchId);
+      assert.deepEqual(restaged.counts, {
+        ready: 2,
+        merge: 0,
+        conflict: 0,
+        invalid: 0,
+        skipped: 0,
       });
-      assert.equal(discarded.rows.length, 0);
     } finally {
       fixture.store.close();
     }
@@ -562,6 +623,128 @@ test("requires explicit decisions for conflicts and invalid rows before commit",
   });
 });
 
+test("binds case-equivalent imports to the existing canonical knowledge identity", async () => {
+  await withTempDirectory(async (directory) => {
+    const fixture = importFixture(directory);
+    try {
+      const state = currentImportState(fixture);
+      fixture.store.commitKnowledgeCommands({
+        requestId: randomUUID(),
+        runId: fixture.runId,
+        expectedGeneration: state.generation,
+        expectedSnapshotId: state.snapshotId,
+        commands: [{
+          type: "upsert",
+          objectType: "term",
+          normalizedSubject: "archon",
+          kind: "lexical_anchor",
+          expectedRevision: null,
+          expectedScopeRevision: null,
+          fieldPatch: {
+            sourceForm: "Archon",
+            canonicalSource: "archon",
+            target: "Existing",
+          },
+          ownedFields: ["/sourceForm", "/canonicalSource", "/target"],
+          scope: "book",
+          evidence: [],
+          origin: "manual",
+        }],
+      });
+      const path = join(directory, "case-equivalent.json");
+      await writeFile(path, JSON.stringify([
+        { source: "Archon", target: "Imported" },
+      ]), "utf8");
+      let staged = await stageTerms(
+        fixture.service,
+        path,
+        currentImportState(fixture),
+      );
+      assert.equal(staged.counts.conflict, 1);
+      staged = await fixture.service.setDecisions({
+        batchId: staged.batchId,
+        decisions: [{
+          rowOrdinal: staged.rows[0]!.ordinal,
+          decision: { action: "use_imported" },
+        }],
+      });
+
+      const committed = await commitBatch(fixture, staged.batchId);
+      assert.equal(committed.updated, 1);
+      const active = fixture.store.knowledgeRevisions(fixture.runId)
+        .filter((revision) => revision.status === "active");
+      assert.equal(active.at(-1)?.normalizedSubject, "archon");
+      assert.equal(
+        (active.at(-1)?.payload as { target?: string } | undefined)?.target,
+        "Imported",
+      );
+    } finally {
+      fixture.store.close();
+    }
+  });
+});
+
+test("merges aliases through the canonical identity selected during staging", async () => {
+  await withTempDirectory(async (directory) => {
+    const fixture = importFixture(directory);
+    try {
+      const state = currentImportState(fixture);
+      fixture.store.commitKnowledgeCommands({
+        requestId: randomUUID(),
+        runId: fixture.runId,
+        expectedGeneration: state.generation,
+        expectedSnapshotId: state.snapshotId,
+        commands: [{
+          type: "upsert",
+          objectType: "term",
+          normalizedSubject: "archon",
+          kind: "lexical_anchor",
+          expectedRevision: null,
+          expectedScopeRevision: null,
+          fieldPatch: {
+            sourceForm: "Archon",
+            canonicalSource: "archon",
+            target: "Existing",
+          },
+          ownedFields: ["/sourceForm", "/canonicalSource", "/target"],
+          scope: "book",
+          evidence: [],
+          origin: "manual",
+        }],
+      });
+      const path = join(directory, "case-alias.json");
+      await writeFile(path, JSON.stringify([
+        { source: "ARCHON", target: "Imported" },
+      ]), "utf8");
+      let staged = await stageTerms(
+        fixture.service,
+        path,
+        currentImportState(fixture),
+      );
+      staged = await fixture.service.setDecisions({
+        batchId: staged.batchId,
+        decisions: [{
+          rowOrdinal: staged.rows[0]!.ordinal,
+          decision: { action: "merge_as_alias" },
+        }],
+      });
+
+      const committed = await commitBatch(fixture, staged.batchId);
+      assert.equal(committed.merged, 1);
+      const active = fixture.store.knowledgeRevisions(fixture.runId)
+        .filter((revision) => revision.status === "active").at(-1);
+      assert.equal(active?.normalizedSubject, "archon");
+      assert.deepEqual(
+        (active?.payload as { sourceForms?: readonly string[] } | undefined)
+          ?.sourceForms,
+        ["ARCHON", "Archon", "archon"],
+      );
+    } finally {
+      fixture.store.close();
+    }
+  });
+});
+
 test("stages and commits the same import idempotently", async () => {
   await withTempDirectory(async (directory) => {
     const path = join(directory, "terms.json");
@@ -574,6 +757,10 @@ test("stages and commits the same import idempotently", async () => {
       const duplicateStage = await stageTerms(fixture.service, path);
       assert.equal(duplicateStage.batchId, firstStage.batchId);
       const firstCommit = await commitBatch(fixture, firstStage.batchId);
+      await assert.rejects(
+        stageTerms(fixture.service, path),
+        /KNOWLEDGE_IMPORT_ALREADY_COMMITTED/u,
+      );
       const revisionCount = fixture.store.knowledgeRevisions(fixture.runId).length;
       const replay = await fixture.service.commit({
         batchId: firstStage.batchId,
@@ -588,6 +775,76 @@ test("stages and commits the same import idempotently", async () => {
       );
     } finally {
       fixture.store.close();
+    }
+  });
+});
+
+test("four formats produce identical knowledge", async () => {
+  await withTempDirectory(async (directory) => {
+    const records = Array.from({ length: 20 }, (_item, index) => ({
+      source: index === 0 ? "Archon" : `Term-${index.toString().padStart(2, "0")}`,
+      target: index === 0 ? "执政官" : `术语-${index.toString().padStart(2, "0")}`,
+    }));
+    const formats = ["json", "yaml", "csv", "xlsx"] as const;
+    const summaries: unknown[] = [];
+    for (const format of formats) {
+      const formatDirectory = join(directory, format);
+      await mkdir(formatDirectory);
+      const path = join(formatDirectory, `terms.${format}`);
+      if (format === "json") {
+        await writeFile(path, JSON.stringify(records), "utf8");
+      } else if (format === "yaml") {
+        await writeFile(path, [
+          "records:",
+          ...records.flatMap((record) => [
+            `  - source: "${record.source}"`,
+            `    target: "${record.target}"`,
+          ]),
+          "",
+        ].join("\n"), "utf8");
+      } else if (format === "csv") {
+        await writeFile(path, [
+          "source,target",
+          ...records.map((record) => `${record.source},${record.target}`),
+          "",
+        ].join("\n"), "utf8");
+      } else {
+        const workbook = new ExcelJS.Workbook();
+        const sheet = workbook.addWorksheet("Terms");
+        sheet.addRow(["source", "target"]);
+        for (const record of records) {
+          sheet.addRow([record.source, record.target]);
+        }
+        await workbook.xlsx.writeFile(path);
+      }
+
+      const fixture = importFixture(formatDirectory);
+      try {
+        const staged = await stageTermsFromAnyFormat(fixture, path);
+        const committed = await commitBatch(fixture, staged.batchId);
+        const revisions = fixture.store.knowledgeRevisions(fixture.runId);
+        const snapshot = fixture.store.latestKnowledgeSnapshot(fixture.runId);
+        summaries.push({
+          counts: {
+            added: committed.added,
+            updated: committed.updated,
+            merged: committed.merged,
+            skipped: committed.skipped,
+            invalid: committed.invalid,
+            committed: committed.committed,
+          },
+          generation: committed.generation,
+          snapshotId: committed.snapshotId,
+          revisions,
+          snapshot,
+        });
+      } finally {
+        fixture.store.close();
+      }
+    }
+    assert.equal(summaries.length, formats.length);
+    for (const summary of summaries.slice(1)) {
+      assert.deepEqual(summary, summaries[0]);
     }
   });
 });
@@ -689,6 +946,14 @@ test("rolls back additions and updates as one idempotent batch", async () => {
         fixture.store.knowledgeRevisions(fixture.runId).length,
         historyCount,
       );
+
+      const restaged = await stageTerms(
+        fixture.service,
+        additionPath,
+        currentImportState(fixture),
+      );
+      assert.notEqual(restaged.batchId, addition.batchId);
+      assert.equal(restaged.counts.ready, 1);
     } finally {
       fixture.store.close();
     }

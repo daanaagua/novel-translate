@@ -1,6 +1,6 @@
 # FolioLoom 知识工作台核心实现计划
 
-> **面向 AI 代理的工作者：** 必需子技能：使用 superpowers:subagent-driven-development（推荐）或 superpowers:executing-plans 逐任务实现此计划。步骤使用复选框（`- [ ]`）语法来跟踪进度。
+> **面向 AI 代理的工作者：** 必需子技能：使用 superpowers:subagent-driven-development（推荐）或 superpowers:executing-plans 逐任务实现此计划。步骤使用复选框（`- [x]`）语法来跟踪进度。
 
 **目标：** 在现有 V5 无损书库中加入可追溯的人工知识修订、分页查询、证据/版本/影响查看、全局术语提升，并在 Electron 中交付可用的“术语与记忆”工作台。
 
@@ -966,7 +966,7 @@ git commit -m "feat: apply edited knowledge during translation"
 - 修改：`translator-v5/src/knowledge/knowledge-commands.ts`
 - 测试：`translator-v5/test/global-knowledge-store.test.ts`
 
-- [ ] **步骤 1：编写提升、重启和类型限制失败测试**
+- [x] **步骤 1：编写提升、重启和类型限制失败测试**
 
 ```ts
 test("promotes a book term and reopens the same global revision", () => {
@@ -995,7 +995,7 @@ test("lists reusable terms and attaches an immutable snapshot to another project
 });
 ```
 
-- [ ] **步骤 2：运行测试确认失败**
+- [x] **步骤 2：运行测试确认失败**
 
 运行：
 
@@ -1005,7 +1005,7 @@ node --test --import tsx test/global-knowledge-store.test.ts
 
 预期：FAIL，`GlobalKnowledgeStore` 不存在。
 
-- [ ] **步骤 3：实现独立 SQLite 修订库**
+- [x] **步骤 3：实现独立 SQLite 修订库**
 
 全局库路径由主进程固定为 `app.getPath("userData")/global-knowledge.db`，schema 只含：
 
@@ -1036,7 +1036,7 @@ CREATE TABLE global_knowledge_events(
 
 只允许 `term` 和 `style`。提升时复制经过验证的语义文档，不保存项目路径、原文证据或运行 ID。
 
-- [ ] **步骤 4：把全局条目快照回当前项目**
+- [x] **步骤 4：把全局条目快照回当前项目**
 
 当用户选择“保存为通用术语”时：
 
@@ -1064,7 +1064,7 @@ function attachGlobalRevision(
 }
 ```
 
-- [ ] **步骤 5：运行全局库测试**
+- [x] **步骤 5：运行全局库测试**
 
 运行：
 
@@ -1074,7 +1074,7 @@ node --test --import tsx test/global-knowledge-store.test.ts test/knowledge-comm
 
 预期：PASS；重启后仍可读取，剧情记忆/人物关系无法提升。
 
-- [ ] **步骤 6：Commit**
+- [x] **步骤 6：Commit**
 
 ```powershell
 git add translator-v5/src/knowledge/global-knowledge-store.ts translator-v5/src/knowledge/knowledge-commands.ts translator-v5/test/global-knowledge-store.test.ts
@@ -1091,7 +1091,7 @@ git commit -m "feat: add reusable global terminology"
 - 修改：`translator-v5/src/desktop/desktop-project-service.ts`
 - 测试：`translator-v5/test/desktop-knowledge-service.test.ts`
 
-- [ ] **步骤 1：编写路径隔离与持久化失败测试**
+- [x] **步骤 1：编写路径隔离与持久化失败测试**
 
 ```ts
 test("resolves the store and run only from the current trusted project", () => {
@@ -1113,7 +1113,7 @@ test("persists an edit and returns the newer generation after restart", () => {
 });
 ```
 
-- [ ] **步骤 2：运行测试确认失败**
+- [x] **步骤 2：运行测试确认失败**
 
 运行：
 
@@ -1123,7 +1123,7 @@ node --test --import tsx test/desktop-knowledge-service.test.ts
 
 预期：FAIL，服务和合约不存在。
 
-- [ ] **步骤 3：定义 renderer-safe 合约**
+- [x] **步骤 3：定义 renderer-safe 合约**
 
 `knowledge-contracts.ts` 定义：
 
@@ -1244,7 +1244,7 @@ export interface DesktopKnowledgeDiagnostics {
 
 响应只含 opaque object ID、短证据、页游标和语义字段；不得包含 `storePath`、`manifestPath`、SQL、API Key 或任意文件句柄。
 
-- [ ] **步骤 4：让项目服务解析可信目标**
+- [x] **步骤 4：让项目服务解析可信目标**
 
 在 `DesktopProjectService` 增加只供主进程调用的方法：
 
@@ -1259,7 +1259,7 @@ resolveKnowledgeTarget(request: DesktopProjectRequest): DesktopResult<{
 
 它复用现有 manifest/store/run 校验；无状态库、无匹配运行或多运行未选择时返回稳定错误码，不接受渲染进程路径。
 
-- [ ] **步骤 5：实现 DesktopKnowledgeService**
+- [x] **步骤 5：实现 DesktopKnowledgeService**
 
 每次操作：
 
@@ -1295,7 +1295,7 @@ export class DesktopKnowledgeService {
 
 `#withCurrentStore` 只调用注入的 `getCurrentRequest()`，再把结果交给 `resolveKnowledgeTarget`；renderer 的知识 IPC 请求中没有 manifest/store 路径字段。
 
-- [ ] **步骤 6：运行服务与安全测试**
+- [x] **步骤 6：运行服务与安全测试**
 
 运行：
 
@@ -1305,7 +1305,7 @@ node --test --import tsx test/desktop-knowledge-service.test.ts test/desktop-pro
 
 预期：PASS；响应 JSON 中无本地绝对路径。
 
-- [ ] **步骤 7：Commit**
+- [x] **步骤 7：Commit**
 
 ```powershell
 git add translator-v5/src/desktop/knowledge-contracts.ts translator-v5/src/desktop/desktop-knowledge-service.ts translator-v5/src/desktop/contracts.ts translator-v5/src/desktop/desktop-project-service.ts translator-v5/test/desktop-knowledge-service.test.ts
@@ -1323,7 +1323,7 @@ git commit -m "feat: add trusted desktop knowledge service"
 - 测试：`translator-v5/test/desktop-ipc.test.ts`
 - 测试：`translator-v5/test/desktop-main-security.test.ts`
 
-- [ ] **步骤 1：编写通道和恶意载荷失败测试**
+- [x] **步骤 1：编写通道和恶意载荷失败测试**
 
 ```ts
 test("rejects knowledge mutation payloads containing a path or SQL", async () => {
@@ -1347,7 +1347,7 @@ test("does not expose generic invoke or raw database methods in preload", () => 
 });
 ```
 
-- [ ] **步骤 2：运行测试确认失败**
+- [x] **步骤 2：运行测试确认失败**
 
 运行：
 
@@ -1357,7 +1357,7 @@ node --test --import tsx test/desktop-ipc.test.ts test/desktop-main-security.tes
 
 预期：FAIL，知识通道和 preload 方法尚未注册。
 
-- [ ] **步骤 3：增加有限通道**
+- [x] **步骤 3：增加有限通道**
 
 只加入：
 
@@ -1373,7 +1373,7 @@ node --test --import tsx test/desktop-ipc.test.ts test/desktop-main-security.tes
 
 所有 payload 使用 `exactRecord`、枚举白名单、长度/limit 上限和 UUID requestId 校验。详情只接收 opaque `objectId`；诊断不接收 SQL。
 
-- [ ] **步骤 4：暴露窄 preload API**
+- [x] **步骤 4：暴露窄 preload API**
 
 ```ts
 listKnowledge(request): Promise<DesktopResult<DesktopKnowledgePage>>;
@@ -1387,7 +1387,7 @@ getKnowledgeDiagnostics(): Promise<DesktopResult<DesktopKnowledgeDiagnostics>>;
 
 主进程在 `app.whenReady` 后构造全局库和 `DesktopKnowledgeService`，退出时关闭全局库。
 
-- [ ] **步骤 5：运行 IPC、preload 和构建测试**
+- [x] **步骤 5：运行 IPC、preload 和构建测试**
 
 运行：
 
@@ -1398,7 +1398,7 @@ npm run desktop:typecheck
 
 预期：PASS；TypeScript 不允许 renderer 构造数据库路径参数。
 
-- [ ] **步骤 6：Commit**
+- [x] **步骤 6：Commit**
 
 ```powershell
 git add translator-v5/src/desktop/main/ipc.ts translator-v5/src/desktop/main/index.ts translator-v5/src/desktop/preload/index.ts translator-v5/src/desktop/preload/folioloom-api.d.ts translator-v5/test/desktop-ipc.test.ts translator-v5/test/desktop-main-security.test.ts
@@ -1419,7 +1419,7 @@ git commit -m "feat: expose safe knowledge IPC"
 - 修改：`translator-v5/src/desktop/renderer/src/styles.css`
 - 测试：`translator-v5/src/desktop/renderer/src/components/KnowledgeWorkbench.test.tsx`
 
-- [ ] **步骤 1：编写侧栏、分页和详情失败测试**
+- [x] **步骤 1：编写侧栏、分页和详情失败测试**
 
 ```tsx
 it("opens the real knowledge workspace only for a ready selected run", async () => {
@@ -1440,7 +1440,7 @@ it("loads the next page without replacing the selected detail", async () => {
 });
 ```
 
-- [ ] **步骤 2：运行组件测试确认失败**
+- [x] **步骤 2：运行组件测试确认失败**
 
 运行：
 
@@ -1450,7 +1450,7 @@ npx vitest run --config vitest.desktop.config.ts KnowledgeWorkbench
 
 预期：FAIL，组件不存在，侧栏仍禁用。
 
-- [ ] **步骤 3：实现工作台状态机**
+- [x] **步骤 3：实现工作台状态机**
 
 `KnowledgeWorkbench` 维护：
 
@@ -1464,7 +1464,7 @@ type KnowledgeViewState =
 
 搜索和筛选变化时丢弃旧 cursor；请求带本地 nonce，迟到响应不能覆盖新筛选。列表保留当前已选 ID，详情独立加载并可关闭。
 
-- [ ] **步骤 4：实现表格与详情抽屉**
+- [x] **步骤 4：实现表格与详情抽屉**
 
 表格列为原文形式、当前译法/名称、类型、作用域、状态、来源、修订。长表格使用固定 44 px 行高、滚动容器、前后各 8 行 overscan 和游标“加载更多”；`KnowledgeTable` 只渲染可见窗口，不引入第三方虚拟列表。
 
@@ -1496,7 +1496,7 @@ return (
 );
 ```
 
-- [ ] **步骤 5：启用侧栏并保持无项目边界**
+- [x] **步骤 5：启用侧栏并保持无项目边界**
 
 `Sidebar` 的 available 条件：
 
@@ -1507,7 +1507,7 @@ const available = workspace.id === "overview"
 
 `knowledgeAvailable` 仅在 store ready 且 `selectedRunId` 存在时为 true。更换书稿后若失去知识目标，App 自动回到 overview 并清空工作台状态。
 
-- [ ] **步骤 6：运行组件与布局测试**
+- [x] **步骤 6：运行组件与布局测试**
 
 运行：
 
@@ -1517,7 +1517,7 @@ npm run desktop:test
 
 预期：PASS；无项目时入口禁用，有项目时可浏览，筛选迟到响应不会覆盖当前状态。
 
-- [ ] **步骤 7：Commit**
+- [x] **步骤 7：Commit**
 
 ```powershell
 git add translator-v5/src/desktop/renderer/src/components/KnowledgeWorkbench.tsx translator-v5/src/desktop/renderer/src/components/KnowledgeTable.tsx translator-v5/src/desktop/renderer/src/components/KnowledgeDetailDrawer.tsx translator-v5/src/desktop/renderer/src/App.tsx translator-v5/src/desktop/renderer/src/App.test.tsx translator-v5/src/desktop/renderer/src/components/Sidebar.tsx translator-v5/src/desktop/renderer/src/types.ts translator-v5/src/desktop/renderer/src/styles.css translator-v5/src/desktop/renderer/src/components/KnowledgeWorkbench.test.tsx
@@ -1538,7 +1538,7 @@ git commit -m "feat: add desktop knowledge workbench"
 - 修改：`translator-v5/src/desktop/renderer/src/styles.css`
 - 修改：`translator-v5/README.md`
 
-- [ ] **步骤 1：编写编辑、冲突和撤销失败测试**
+- [x] **步骤 1：编写编辑、冲突和撤销失败测试**
 
 ```tsx
 it("saves a term, refreshes generation and keeps the drawer open", async () => {
@@ -1575,7 +1575,7 @@ it("attaches an explicitly selected global revision to this book", async () => {
 });
 ```
 
-- [ ] **步骤 2：运行组件测试确认失败**
+- [x] **步骤 2：运行组件测试确认失败**
 
 运行：
 
@@ -1585,7 +1585,7 @@ npx vitest run --config vitest.desktop.config.ts KnowledgeWorkbench
 
 预期：FAIL，编辑器和诊断组件不存在。
 
-- [ ] **步骤 3：实现六类语义表单**
+- [x] **步骤 3：实现六类语义表单**
 
 `KnowledgeEditor` 按 objectType 显示白名单字段。保存请求只发送发生变化的字段及对应 ownedFields；原文证据只可选择已有证据或填写位置明确的新证据，不能把整段自由文本当作 SQL/路径。
 
@@ -1605,7 +1605,7 @@ const fieldPatch = diffEditableFields(initial, draft, EDITABLE_FIELDS[detail.obj
 const ownedFields = Object.keys(fieldPatch).map((field) => `/${escapeJsonPointer(field)}`);
 ```
 
-- [ ] **步骤 4：实现撤销和全局提升**
+- [x] **步骤 4：实现撤销和全局提升**
 
 历史行“恢复此版本”发 rollback command，并清楚提示它会创建新修订。只有 term/style 显示“保存为通用术语/风格”；提升前列出不随之复制的书内证据。
 
@@ -1635,7 +1635,7 @@ async function attachGlobal(recordId: string, revision: number): Promise<void> {
 }
 ```
 
-- [ ] **步骤 5：实现固定只读诊断**
+- [x] **步骤 5：实现固定只读诊断**
 
 诊断组件只显示服务返回的：
 
@@ -1657,7 +1657,7 @@ async function attachGlobal(recordId: string, revision: number): Promise<void> {
 
 默认只显示顶层摘要；用户打开“高级只读诊断”后，服务才返回 schema v3 固定 allowlist 表的名称/行数、最近 20 条事件的 kind/时间和 `PRAGMA integrity_check` 结果。界面没有 SQL 输入框，也没有任意表名、PRAGMA 或查询参数。
 
-- [ ] **步骤 6：实现有界局部关系图**
+- [x] **步骤 6：实现有界局部关系图**
 
 `KnowledgeRelationGraph` 只接收详情响应中的邻接点，不自行查询数据库。默认展示当前对象和一层关系，用户展开后最多两层、最多 40 个节点；超过上限显示“还有更多关系，请用表格筛选查看”。节点点击只切换当前详情，关系创建和修改仍使用结构化表单。
 
@@ -1672,7 +1672,7 @@ const visible = boundedBreadthFirst(detail.relationNeighborhood, {
 return <RelationCanvas nodes={visible.nodes} edges={visible.edges} onNodeClick={onSelect} />;
 ```
 
-- [ ] **步骤 7：运行桌面全套和构建**
+- [x] **步骤 7：运行桌面全套和构建**
 
 运行：
 
@@ -1686,7 +1686,7 @@ npm run desktop:build
 
 预期：全部 PASS，Electron 构建产物通过 preload/renderer 安全检查。
 
-- [ ] **步骤 8：更新用户文档**
+- [x] **步骤 8：更新用户文档**
 
 在 `translator-v5/README.md` 增加：
 
@@ -1708,7 +1708,7 @@ npm run desktop:build
 ### 只读诊断
 ```
 
-- [ ] **步骤 9：Commit**
+- [x] **步骤 9：Commit**
 
 ```powershell
 git add translator-v5/src/desktop/renderer/src/components/KnowledgeEditor.tsx translator-v5/src/desktop/renderer/src/components/KnowledgeDiagnostics.tsx translator-v5/src/desktop/renderer/src/components/KnowledgeRelationGraph.tsx translator-v5/src/desktop/renderer/src/components/GlobalKnowledgePicker.tsx translator-v5/src/desktop/renderer/src/components/KnowledgeWorkbench.tsx translator-v5/src/desktop/renderer/src/components/KnowledgeDetailDrawer.tsx translator-v5/src/desktop/renderer/src/components/KnowledgeWorkbench.test.tsx translator-v5/src/desktop/renderer/src/styles.css translator-v5/README.md
@@ -1721,7 +1721,7 @@ git commit -m "feat: edit and audit desktop knowledge"
 
 - 创建：`docs/superpowers/reports/2026-07-23-knowledge-workbench-validation.md`
 
-- [ ] **步骤 1：运行确定性持久化验收**
+- [x] **步骤 1：运行确定性持久化验收**
 
 建立一个临时项目并执行：
 
@@ -1742,7 +1742,7 @@ node --test --import tsx --test-name-pattern="reopens user knowledge|rollback ap
 
 预期：PASS，进程重开后 book/project catalog、当前快照和历史一致。
 
-- [ ] **步骤 2：运行翻译投影验收**
+- [x] **步骤 2：运行翻译投影验收**
 
 用只含两个小块的合成书：
 
@@ -1761,7 +1761,7 @@ node --test --import tsx --test-name-pattern="manual term|conflicting model cand
 
 预期：PASS，两个合成块的请求投影与断言一致。
 
-- [ ] **步骤 3：运行安全与性能验收**
+- [x] **步骤 3：运行安全与性能验收**
 
 运行：
 
@@ -1782,7 +1782,7 @@ npm run desktop:build
 
 若机器不满足时间阈值，测试报告必须记录实际时间并停止合并，不能放宽断言掩盖索引问题。
 
-- [ ] **步骤 4：写验证报告**
+- [x] **步骤 4：写验证报告**
 
 创建 `docs/superpowers/reports/2026-07-23-knowledge-workbench-validation.md`，列出命令、通过数量、迁移 fixture、性能数字、已知非 P0/P1 限制。不得使用“应该可用”替代实测结果。
 
@@ -1799,7 +1799,7 @@ npm run desktop:build
 ## 非 P0/P1 限制
 ```
 
-- [ ] **步骤 5：Commit**
+- [x] **步骤 5：Commit**
 
 ```powershell
 git add docs/superpowers/reports/2026-07-23-knowledge-workbench-validation.md

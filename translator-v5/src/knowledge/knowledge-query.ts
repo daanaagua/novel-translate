@@ -121,6 +121,12 @@ export interface KnowledgeRecordPageQuery {
   readonly limit: number;
 }
 
+export interface KnowledgeDiagnosticsSummary {
+  readonly countsByType: Readonly<Partial<Record<KnowledgeObjectType, number>>>;
+  readonly countsByStatus: Readonly<Partial<Record<KnowledgeStatus, number>>>;
+  readonly pendingImpacts: number;
+}
+
 /**
  * The database adapter deliberately exposes no SQL or paths. A store only
  * needs to provide a generation token, active records, and one lazy detail
@@ -133,6 +139,15 @@ export interface KnowledgeQuerySource {
     query: KnowledgeRecordPageQuery,
   ): readonly KnowledgeQueryRecord[];
   knowledgeRecord(id: string): KnowledgeQueryRecord | undefined;
+  knowledgeRecordBySubject?(
+    normalizedSubject: string,
+    kind: string,
+  ): KnowledgeQueryRecord | undefined;
+  relatedKnowledgeRecords?(
+    identifiers: readonly string[],
+    limit: number,
+  ): readonly KnowledgeQueryRecord[];
+  knowledgeDiagnostics?(): KnowledgeDiagnosticsSummary;
 }
 
 interface NormalizedFilters {

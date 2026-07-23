@@ -239,3 +239,4 @@ export type {
   StagedImportReport,
   StagedImportSummary,
 } from "./knowledge-contracts.js";
+export { MAX_STAGED_IMPORT_PAGE_SIZE } from "./knowledge-contracts.js";

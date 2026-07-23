@@ -22,6 +22,9 @@ import type {
   PreparedImportRecord,
 } from "../knowledge-import/knowledge-import-service.js";
 import type {
+  NormalizedImportRecord,
+} from "../knowledge-import/record-normalizer.js";
+import type {
   CommittedImportReport,
   DiscardStagedImportRequest,
   ImportConflictDecision,
@@ -36,6 +39,7 @@ import type {
   StagedImportReport,
   StagedImportSummary,
 } from "../knowledge-import/types.js";
+import { MAX_STAGED_IMPORT_PAGE_SIZE } from "../knowledge-import/types.js";
 import {
   getSourceLanguageProfile,
   supportedSourceLanguageIds,
@@ -83,6 +87,7 @@ import {
 } from "../knowledge/snapshot.js";
 import {
   knowledgeRevisionMatchesSearch,
+  type KnowledgeDiagnosticsSummary,
   type KnowledgeImpactView,
   type KnowledgeRecordPageQuery,
   type KnowledgeQueryRecord,
@@ -250,7 +255,7 @@ export interface PersistKnowledgeImportStageInput {
   readonly mappingJson: string;
   readonly mappingHash: string;
   readonly request: StageImportRequest;
-  readonly records: readonly PreparedImportRecord[];
+  readonly records: Iterable<PreparedImportRecord>;
 }
 
 export interface CommitStoredKnowledgeImportInput {
@@ -443,6 +448,32 @@ function isMissingPath(error: unknown): boolean {
     && (error as { code?: unknown }).code === "ENOENT";
 }
 
+function isTransientSnapshotCleanupError(error: unknown): boolean {
+  return error !== null
+    && typeof error === "object"
+    && ["EBUSY", "ENOTEMPTY", "EPERM"].includes(
+      String((error as { code?: unknown }).code),
+    );
+}
+
+function removeReadOnlySnapshotDirectory(directory: string): void {
+  try {
+    rmSync(directory, {
+      recursive: true,
+      force: true,
+      maxRetries: 10,
+      retryDelay: 50,
+    });
+  } catch (error) {
+    // SQLite and virus scanners can briefly retain a copied WAL/SHM handle on
+    // Windows after DatabaseSync.close(). A disposable snapshot must never
+    // turn a successful project read into a startup failure.
+    if (!isTransientSnapshotCleanupError(error)) {
+      throw error;
+    }
+  }
+}
+
 function readOnlySourceFileState(path: string): ReadOnlySourceFileState {
   const stats = statSync(path);
   if (!stats.isFile()) {
@@ -484,13 +515,13 @@ function createReadOnlySnapshot(path: string): ReadOnlySnapshot {
         return { databasePath, directory };
       }
     } catch (error) {
-      rmSync(directory, { recursive: true, force: true });
+      removeReadOnlySnapshotDirectory(directory);
       if (!isMissingPath(error)) {
         throw error;
       }
       continue;
     }
-    rmSync(directory, { recursive: true, force: true });
+    removeReadOnlySnapshotDirectory(directory);
   }
   throw new LosslessReadSnapshotError();
 }
@@ -896,6 +927,28 @@ function importIdentityKey(normalizedSubject: string, kind: string): string {
     + `\0${kind.normalize("NFKC").trim().toLocaleLowerCase("und")}`;
 }
 
+function bindImportRecordIdentity(
+  record: NormalizedImportRecord,
+  existing: ExistingImportKnowledge | undefined,
+): NormalizedImportRecord {
+  if (existing === undefined
+    || existing.objectType !== record.command.objectType
+    || (existing.normalizedSubject === record.command.normalizedSubject
+      && existing.kind === record.command.kind)) {
+    return record;
+  }
+  const command = Object.freeze({
+    ...record.command,
+    normalizedSubject: existing.normalizedSubject,
+    kind: existing.kind,
+  });
+  return Object.freeze({
+    ...record,
+    command,
+    canonicalHash: hashText(canonicalJson(command)),
+  });
+}
+
 function parseCommittedImportReport(value: string): CommittedImportReport {
   const report = JSON.parse(value) as CommittedImportReport;
   if (report === null || typeof report !== "object"
@@ -1064,7 +1117,7 @@ export class LosslessBookStore {
     } catch (error) {
       this.#database.close();
       if (this.#temporarySnapshotDirectory !== undefined) {
-        rmSync(this.#temporarySnapshotDirectory, { recursive: true, force: true });
+        removeReadOnlySnapshotDirectory(this.#temporarySnapshotDirectory);
       }
       throw error;
     }
@@ -1081,7 +1134,7 @@ export class LosslessBookStore {
         snapshot.directory,
       );
     } catch (error) {
-      rmSync(snapshot.directory, { recursive: true, force: true });
+      removeReadOnlySnapshotDirectory(snapshot.directory);
       throw error;
     }
   }
@@ -2429,6 +2482,29 @@ export class LosslessBookStore {
         requireCurrentGeneration();
         return this.#knowledgeQueryRecord(run, id);
       },
+      knowledgeRecordBySubject: (
+        normalizedSubject: string,
+        kind: string,
+      ) => {
+        requireCurrentGeneration();
+        requireNonempty(normalizedSubject, "normalizedSubject");
+        requireNonempty(kind, "kind");
+        return this.#knowledgeQueryRecord(
+          run,
+          knowledgeRecordId(normalizedSubject, kind),
+        );
+      },
+      relatedKnowledgeRecords: (
+        identifiers: readonly string[],
+        limit: number,
+      ) => {
+        requireCurrentGeneration();
+        return this.#relatedKnowledgeRecords(run, identifiers, limit);
+      },
+      knowledgeDiagnostics: () => {
+        requireCurrentGeneration();
+        return this.#knowledgeDiagnostics(run);
+      },
     });
   }
 
@@ -2461,6 +2537,9 @@ export class LosslessBookStore {
         this.#database.prepare(`
           SELECT * FROM knowledge_import_batches
           WHERE run_id=? AND source_hash=? AND mapping_hash=?
+            AND status IN ('staged', 'committed')
+          ORDER BY created_at DESC, batch_id DESC
+          LIMIT 1
         `),
         input.runId,
         input.sourceHash,
@@ -2474,9 +2553,15 @@ export class LosslessBookStore {
           || existing.mapping_json !== input.mappingJson) {
           throw new Error("KNOWLEDGE_IMPORT_IDENTITY_CONFLICT");
         }
-        return this.#stagedImportReport(input.runId, existing.batch_id, {
-          limit: 100,
-        });
+        if (existing.status === "staged") {
+          return this.#stagedImportReport(input.runId, existing.batch_id, {
+            limit: MAX_STAGED_IMPORT_PAGE_SIZE,
+          });
+        }
+        if (existing.status === "committed") {
+          throw new Error("KNOWLEDGE_IMPORT_ALREADY_COMMITTED");
+        }
+        throw new Error("KNOWLEDGE_IMPORT_BATCH_NOT_STAGED");
       }
 
       const run = this.#run(input.runId);
@@ -2516,84 +2601,6 @@ export class LosslessBookStore {
         simulated.set(key, candidate);
       }
 
-      const stored: {
-        readonly ordinal: number;
-        readonly state: ImportPreviewRow["state"];
-        readonly normalizedJson: string;
-        readonly diagnosticsJson: string;
-      }[] = [];
-      const ordinals = new Set<number>();
-      for (const prepared of input.records) {
-        const ordinal = prepared.state === "normalized"
-          ? prepared.record.ordinal
-          : prepared.ordinal;
-        if (!Number.isSafeInteger(ordinal) || ordinal < 0
-          || ordinals.has(ordinal)) {
-          throw new Error("KNOWLEDGE_IMPORT_ROW_ORDINAL_INVALID");
-        }
-        ordinals.add(ordinal);
-        if (prepared.state === "invalid") {
-          const persisted: StoredNormalizedImportRow = {
-            state: "invalid",
-            prepared,
-            classification: {
-              allowedDecisions: Object.freeze(["skip"]),
-            },
-            displayFields: Object.freeze({}),
-          };
-          stored.push({
-            ordinal,
-            state: "invalid",
-            normalizedJson: canonicalJson(persisted),
-            diagnosticsJson: canonicalJson(prepared.diagnostics),
-          });
-          continue;
-        }
-        const record = prepared.record;
-        const key = importIdentityKey(
-          record.command.normalizedSubject,
-          record.command.kind,
-        );
-        const current = simulated.get(key);
-        const classification = classifyImport(current, record);
-        const persisted: StoredNormalizedImportRow = {
-          state: classification.state,
-          prepared,
-          classification: {
-            allowedDecisions: classification.allowedDecisions,
-            ...(classification.conflictSignature === undefined
-              ? {}
-              : { conflictSignature: classification.conflictSignature }),
-          },
-          displayFields: Object.freeze({ ...record.command.fieldPatch }),
-        };
-        stored.push({
-          ordinal,
-          state: classification.state,
-          normalizedJson: canonicalJson(persisted),
-          diagnosticsJson: canonicalJson(classification.diagnostics),
-        });
-        if (classification.state === "ready"
-          || classification.state === "merge") {
-          simulated.set(key, {
-            id: current?.id ?? knowledgeRecordId(
-              record.command.normalizedSubject,
-              record.command.kind,
-            ),
-            objectType: record.command.objectType,
-            normalizedSubject: record.command.normalizedSubject,
-            kind: record.command.kind,
-            payload: validateKnowledgePayload(
-              record.command.objectType,
-              applyKnowledgeFieldPatch(
-                current?.payload,
-                record.command.fieldPatch,
-              ),
-            ),
-          });
-        }
-      }
-      stored.sort((left, right) => left.ordinal - right.ordinal);
       const insertBatch = this.#database.prepare(`
         INSERT INTO knowledge_import_batches(
           run_id, batch_id, source_hash, source_name, source_format,
@@ -2615,18 +2622,86 @@ export class LosslessBookStore {
           diagnostics_json, decision_json
         ) VALUES(?, ?, ?, ?, ?, ?, NULL)
       `);
-      for (const row of stored) {
+      const ordinals = new Set<number>();
+      for (const prepared of input.records) {
+        const ordinal = prepared.state === "normalized"
+          ? prepared.record.ordinal
+          : prepared.ordinal;
+        if (!Number.isSafeInteger(ordinal) || ordinal < 0
+          || ordinals.has(ordinal)) {
+          throw new Error("KNOWLEDGE_IMPORT_ROW_ORDINAL_INVALID");
+        }
+        ordinals.add(ordinal);
+        if (prepared.state === "invalid") {
+          const persisted: StoredNormalizedImportRow = {
+            state: "invalid",
+            prepared,
+            classification: {
+              allowedDecisions: Object.freeze(["skip"]),
+            },
+            displayFields: Object.freeze({}),
+          };
+          insertRow.run(
+            input.runId,
+            input.batchId,
+            ordinal,
+            "invalid",
+            canonicalJson(persisted),
+            canonicalJson(prepared.diagnostics),
+          );
+          continue;
+        }
+        const incomingRecord = prepared.record;
+        const key = importIdentityKey(
+          incomingRecord.command.normalizedSubject,
+          incomingRecord.command.kind,
+        );
+        const current = simulated.get(key);
+        const record = bindImportRecordIdentity(incomingRecord, current);
+        const canonicalPrepared: PreparedImportRecord = record === incomingRecord
+          ? prepared
+          : Object.freeze({ state: "normalized", record });
+        const classification = classifyImport(current, record);
+        const persisted: StoredNormalizedImportRow = {
+          state: classification.state,
+          prepared: canonicalPrepared,
+          classification: {
+            allowedDecisions: classification.allowedDecisions,
+            ...(classification.conflictSignature === undefined
+              ? {}
+              : { conflictSignature: classification.conflictSignature }),
+          },
+          displayFields: Object.freeze({ ...record.command.fieldPatch }),
+        };
         insertRow.run(
           input.runId,
           input.batchId,
-          row.ordinal,
-          row.state,
-          row.normalizedJson,
-          row.diagnosticsJson,
+          ordinal,
+          classification.state,
+          canonicalJson(persisted),
+          canonicalJson(classification.diagnostics),
         );
+        if (classification.state === "ready"
+          || classification.state === "merge") {
+          simulated.set(key, {
+            id: current?.id ?? knowledgeRecordId(
+              record.command.normalizedSubject,
+              record.command.kind,
+            ),
+            objectType: record.command.objectType,
+            normalizedSubject: record.command.normalizedSubject,
+            kind: record.command.kind,
+            payload: validateKnowledgePayload(
+              record.command.objectType,
+              applyKnowledgeFieldPatch(
+                current?.payload,
+                record.command.fieldPatch,
+              ),
+            ),
+          });
+        }
       }
-      const rows = this.#knowledgeImportRows(input.runId, input.batchId);
-      const summary = importCounts(rows);
+      const summary = this.#knowledgeImportSummary(input.runId, input.batchId);
       this.#database.prepare(`
         UPDATE knowledge_import_batches SET report_json=?
         WHERE run_id=? AND batch_id=? AND status='staged'
@@ -2648,7 +2723,7 @@ export class LosslessBookStore {
       });
       this.#faultInjector?.checkpoint("knowledge_import_stage_before_commit");
       return this.#stagedImportReport(input.runId, input.batchId, {
-        limit: 100,
+        limit: MAX_STAGED_IMPORT_PAGE_SIZE,
       });
     });
   }
@@ -2663,9 +2738,7 @@ export class LosslessBookStore {
       ORDER BY created_at, batch_id
     `), runId);
     return Object.freeze(batches.map((batch) => {
-      const summary = importCounts(
-        this.#knowledgeImportRows(runId, batch.batch_id),
-      );
+      const summary = this.#knowledgeImportSummary(runId, batch.batch_id);
       return Object.freeze({
         batchId: batch.batch_id,
         sourceName: batch.source_name,
@@ -2746,8 +2819,7 @@ export class LosslessBookStore {
           item.rowOrdinal,
         );
       }
-      const rows = this.#knowledgeImportRows(runId, input.batchId);
-      const summary = importCounts(rows);
+      const summary = this.#knowledgeImportSummary(runId, input.batchId);
       this.#database.prepare(`
         UPDATE knowledge_import_batches SET report_json=?
         WHERE run_id=? AND batch_id=? AND status='staged'
@@ -2760,7 +2832,9 @@ export class LosslessBookStore {
         runId,
         input.batchId,
       );
-      return this.#stagedImportReport(runId, input.batchId, { limit: 100 });
+      return this.#stagedImportReport(runId, input.batchId, {
+        limit: MAX_STAGED_IMPORT_PAGE_SIZE,
+      });
     });
   }
 
@@ -2773,8 +2847,9 @@ export class LosslessBookStore {
       if (batch.status !== "staged") {
         throw new Error("KNOWLEDGE_IMPORT_BATCH_NOT_STAGED");
       }
-      const rows = this.#knowledgeImportRows(runId, input.batchId);
-      const summary = importCounts(rows);
+      const summary = this.#knowledgeImportSummary(runId, input.batchId);
+      const rowCount = Object.values(summary.counts)
+        .reduce((total, count) => total + count, 0);
       this.#database.prepare(`
         UPDATE knowledge_import_batches
         SET status='discarded', report_json=?
@@ -2784,7 +2859,7 @@ export class LosslessBookStore {
           batchId: input.batchId,
           counts: summary.counts,
           unresolved: summary.unresolved,
-          discarded: rows.length,
+          discarded: rowCount,
         }),
         runId,
         input.batchId,
@@ -2794,7 +2869,7 @@ export class LosslessBookStore {
       `).run(runId, input.batchId);
       this.#appendEvent(runId, "knowledge_import_discarded", {
         batchId: input.batchId,
-        rows: rows.length,
+        rows: rowCount,
       });
     });
   }
@@ -4108,7 +4183,7 @@ export class LosslessBookStore {
       this.#database.close();
     } finally {
       if (this.#temporarySnapshotDirectory !== undefined) {
-        rmSync(this.#temporarySnapshotDirectory, { recursive: true, force: true });
+        removeReadOnlySnapshotDirectory(this.#temporarySnapshotDirectory);
       }
     }
   }
@@ -4684,19 +4759,84 @@ export class LosslessBookStore {
     `), runId, batchId);
   }
 
+  #knowledgeImportSummary(
+    runId: string,
+    batchId: string,
+  ): {
+    readonly counts: ImportCountSummary;
+    readonly unresolved: number;
+  } {
+    const row = one<{
+      ready: number;
+      merge: number;
+      conflict: number;
+      invalid: number;
+      skipped: number;
+      unresolved: number;
+    }>(this.#database.prepare(`
+      WITH effective AS (
+        SELECT
+          state,
+          COALESCE(json_extract(decision_json, '$.action'), '') AS action,
+          decision_json
+        FROM knowledge_import_rows
+        WHERE run_id=? AND batch_id=?
+      )
+      SELECT
+        COALESCE(SUM(CASE
+          WHEN state='ready' AND action NOT IN ('skip', 'keep_existing')
+          THEN 1 ELSE 0 END), 0) AS ready,
+        COALESCE(SUM(CASE
+          WHEN state='merge' AND action NOT IN ('skip', 'keep_existing')
+          THEN 1 ELSE 0 END), 0) AS merge,
+        COALESCE(SUM(CASE
+          WHEN state='conflict' AND action NOT IN ('skip', 'keep_existing')
+          THEN 1 ELSE 0 END), 0) AS conflict,
+        COALESCE(SUM(CASE
+          WHEN state='invalid' AND action NOT IN ('skip', 'keep_existing')
+          THEN 1 ELSE 0 END), 0) AS invalid,
+        COALESCE(SUM(CASE
+          WHEN state='skipped' OR action IN ('skip', 'keep_existing')
+          THEN 1 ELSE 0 END), 0) AS skipped,
+        COALESCE(SUM(CASE
+          WHEN state IN ('conflict', 'invalid') AND decision_json IS NULL
+          THEN 1 ELSE 0 END), 0) AS unresolved
+      FROM effective
+    `), runId, batchId);
+    return {
+      counts: Object.freeze({
+        ready: row?.ready ?? 0,
+        merge: row?.merge ?? 0,
+        conflict: row?.conflict ?? 0,
+        invalid: row?.invalid ?? 0,
+        skipped: row?.skipped ?? 0,
+      }),
+      unresolved: row?.unresolved ?? 0,
+    };
+  }
+
   #stagedImportReport(
     runId: string,
     batchId: string,
     page: { readonly cursor?: string; readonly limit: number },
   ): StagedImportReport {
-    this.#requireKnowledgeImportBatch(runId, batchId);
-    if (!Number.isSafeInteger(page.limit) || page.limit < 1 || page.limit > 100) {
+    const batch = this.#requireKnowledgeImportBatch(runId, batchId);
+    if (batch.status !== "staged") {
+      throw new Error("KNOWLEDGE_IMPORT_BATCH_NOT_STAGED");
+    }
+    if (!Number.isSafeInteger(page.limit)
+      || page.limit < 1
+      || page.limit > MAX_STAGED_IMPORT_PAGE_SIZE) {
       throw new Error("KNOWLEDGE_IMPORT_PAGE_LIMIT_INVALID");
     }
     const after = parseImportCursor(page.cursor, batchId);
-    const allRows = this.#knowledgeImportRows(runId, batchId);
-    const summary = importCounts(allRows);
-    const available = allRows.filter((row) => row.row_ordinal > after);
+    const summary = this.#knowledgeImportSummary(runId, batchId);
+    const available = all<KnowledgeImportRow>(this.#database.prepare(`
+      SELECT * FROM knowledge_import_rows
+      WHERE run_id=? AND batch_id=? AND row_ordinal>?
+      ORDER BY row_ordinal
+      LIMIT ?
+    `), runId, batchId, after, page.limit + 1);
     const pageRows = available.slice(0, page.limit);
     const hasMore = available.length > pageRows.length;
     return Object.freeze({
@@ -5422,6 +5562,170 @@ export class LosslessBookStore {
       }
     }
     return revision;
+  }
+
+  #relatedKnowledgeRecords(
+    run: RunRow,
+    rawIdentifiers: readonly string[],
+    limit: number,
+  ): readonly KnowledgeQueryRecord[] {
+    if (!Array.isArray(rawIdentifiers) || rawIdentifiers.length > 16) {
+      throw new RangeError("knowledge relation identifiers must contain at most 16 values");
+    }
+    if (!Number.isSafeInteger(limit) || limit < 1 || limit > 200) {
+      throw new RangeError("knowledge relation limit must be between 1 and 200");
+    }
+    const identifiers = [...new Set(rawIdentifiers.map((value) => {
+      requireNonempty(value, "knowledge relation identifier");
+      if (value.length > 512) {
+        throw new RangeError("knowledge relation identifier is too long");
+      }
+      return value;
+    }))];
+    if (identifiers.length === 0) return Object.freeze([]);
+    const placeholders = identifiers.map(() => "?").join(", ");
+    const rows = all<{ record_id: string }>(this.#database.prepare(`
+      SELECT records.record_id
+      FROM knowledge_records AS records
+      LEFT JOIN project_knowledge_revisions AS project_catalog
+        ON json_extract(
+          records.payload_json,
+          '$.authority.provenance.catalog'
+        ) = 'project'
+       AND project_catalog.revision_id = json_extract(
+         records.payload_json,
+         '$.authority.provenance.catalogRevisionId'
+       )
+      LEFT JOIN book_knowledge_revisions AS book_catalog
+        ON json_extract(
+          records.payload_json,
+          '$.authority.provenance.catalog'
+        ) = 'book'
+       AND book_catalog.source_version = ?
+       AND book_catalog.revision_id = json_extract(
+         records.payload_json,
+         '$.authority.provenance.catalogRevisionId'
+       )
+      WHERE records.run_id = ?
+        AND records.active = 1
+        AND COALESCE(
+          project_catalog.object_type,
+          book_catalog.object_type,
+          folioloom_knowledge_object_type(records.payload_json)
+        ) = 'relation'
+        AND (
+          json_extract(records.payload_json, '$.payload.fromEntityId')
+            IN (${placeholders})
+          OR json_extract(records.payload_json, '$.payload.subjectId')
+            IN (${placeholders})
+          OR json_extract(records.payload_json, '$.payload.toEntityId')
+            IN (${placeholders})
+          OR json_extract(records.payload_json, '$.payload.objectId')
+            IN (${placeholders})
+        )
+      ORDER BY records.normalized_subject, records.kind, records.record_id
+      LIMIT ?
+    `),
+    run.source_version,
+    run.run_id,
+    ...identifiers,
+    ...identifiers,
+    ...identifiers,
+    ...identifiers,
+    limit);
+    return Object.freeze(rows.map((row) => {
+      const record = this.#knowledgeQueryRecord(run, row.record_id);
+      if (record === undefined || record.objectType !== "relation") {
+        throw new Error(`corrupt relation knowledge row ${row.record_id}`);
+      }
+      return record;
+    }));
+  }
+
+  #knowledgeDiagnostics(run: RunRow): KnowledgeDiagnosticsSummary {
+    const base = `
+      FROM knowledge_records AS records
+      LEFT JOIN project_knowledge_revisions AS project_catalog
+        ON json_extract(
+          records.payload_json,
+          '$.authority.provenance.catalog'
+        ) = 'project'
+       AND project_catalog.revision_id = json_extract(
+         records.payload_json,
+         '$.authority.provenance.catalogRevisionId'
+       )
+      LEFT JOIN book_knowledge_revisions AS book_catalog
+        ON json_extract(
+          records.payload_json,
+          '$.authority.provenance.catalog'
+        ) = 'book'
+       AND book_catalog.source_version = ?
+       AND book_catalog.revision_id = json_extract(
+         records.payload_json,
+         '$.authority.provenance.catalogRevisionId'
+       )
+      WHERE records.run_id = ? AND records.active = 1
+    `;
+    const typeRows = all<{ key: string; count: number }>(
+      this.#database.prepare(`
+        SELECT COALESCE(
+          project_catalog.object_type,
+          book_catalog.object_type,
+          folioloom_knowledge_object_type(records.payload_json)
+        ) AS key, COUNT(*) AS count
+        ${base}
+        GROUP BY key
+        ORDER BY key
+      `),
+      run.source_version,
+      run.run_id,
+    );
+    const statusRows = all<{ key: string; count: number }>(
+      this.#database.prepare(`
+        SELECT records.status AS key, COUNT(*) AS count
+        ${base}
+        GROUP BY records.status
+        ORDER BY records.status
+      `),
+      run.source_version,
+      run.run_id,
+    );
+    const countsByType: Partial<Record<KnowledgeObjectType, number>> = {};
+    for (const row of typeRows) {
+      if (!["term", "entity", "alias", "relation", "memory", "style"]
+        .includes(row.key)) {
+        throw new Error(`corrupt knowledge object type ${row.key}`);
+      }
+      countsByType[row.key as KnowledgeObjectType] = row.count;
+    }
+    const countsByStatus: Partial<Record<KnowledgeStatus, number>> = {};
+    for (const row of statusRows) {
+      if (![
+        "candidate",
+        "provisional",
+        "active",
+        "needs_revalidate",
+        "contextual",
+        "superseded",
+      ].includes(row.key)) {
+        throw new Error(`corrupt knowledge status ${row.key}`);
+      }
+      countsByStatus[row.key as KnowledgeStatus] = row.count;
+    }
+    const pendingImpacts = one<{ count: number }>(this.#database.prepare(`
+      SELECT COUNT(*) AS count
+      FROM knowledge_block_impacts AS impacts
+      JOIN knowledge_records AS records
+        ON records.run_id = impacts.run_id
+       AND records.revision_id = impacts.revision_id
+       AND records.active = 1
+      WHERE impacts.run_id = ? AND impacts.status = 'pending'
+    `), run.run_id)?.count ?? 0;
+    return Object.freeze({
+      countsByType: Object.freeze(countsByType),
+      countsByStatus: Object.freeze(countsByStatus),
+      pendingImpacts,
+    });
   }
 
   #queryKnowledgeRecordsPage(

@@ -7,6 +7,7 @@ import type { KnowledgeObjectType } from "../knowledge/knowledge-commands.js";
 export type KnowledgeImportFormat = "json" | "yaml" | "csv" | "xlsx";
 export type ImportOperationId = string;
 export type KnowledgeImportScope = Extract<KnowledgeScope, "book" | "project">;
+export const MAX_STAGED_IMPORT_PAGE_SIZE = 100;
 export type ImportTextEncoding =
   | "utf-8" | "utf-16le" | "utf-16be"
   | "shift_jis" | "euc-jp" | "euc-kr" | "windows-949";

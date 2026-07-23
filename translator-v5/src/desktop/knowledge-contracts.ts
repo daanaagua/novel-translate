@@ -42,6 +42,7 @@ export type {
   StagedImportReport,
   StagedImportSummary,
 } from "../knowledge-import/types.js";
+export { MAX_STAGED_IMPORT_PAGE_SIZE } from "../knowledge-import/types.js";
 
 export interface DesktopSuggestKnowledgeImportRequest {
   readonly pendingImportId: PendingKnowledgeImport["pendingImportId"];
