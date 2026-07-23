@@ -38,7 +38,11 @@ npm.cmd run desktop:dev
 - 试译写入项目内 `artifacts/folioloom/book.db`，支持读取上次已提交结果；取消或退出不会中断已经进入的原子提交。
 - “术语与记忆”已经支持分页浏览、筛选、详情、证据、关系、历史、影响诊断、人工修改、恢复旧版本、全局术语附加与多格式导入。
 - 全书开始、暂停、恢复、批量审阅和导出尚未接入桌面入口，继续使用 CLI。
-- `desktop:dist` 可生成本地 Windows x64 portable 构建；仓库目前仍不发布现成安装包。
+- `desktop:dist` 会同时生成 Windows x64 单文件便携版
+  `release/FolioLoom-portable-win-x64.exe` 和目录便携版
+  `release/FolioLoom-portable-win-x64.zip`。普通用户建议下载 ZIP，完整解压后直接双击根目录的
+  `FolioLoom.exe`；旁边的 DLL、`resources` 和 `locales` 都是运行所需内容，不能只把 EXE
+  单独移动出去。
 
 ## 术语与记忆工作台
 
