@@ -603,7 +603,7 @@ git commit -m "feat: read CSV and XLSX knowledge files"
 - 创建：`translator-v5/src/knowledge-import/record-normalizer.ts`
 - 测试：`translator-v5/test/knowledge-import-mapping.test.ts`
 
-- [ ] **步骤 1：编写高、中、低置信与多语言表头失败测试**
+- [x] **步骤 1：编写高、中、低置信与多语言表头失败测试**
 
 ```ts
 test("suggests source and target without auto-accepting an ambiguous note column", () => {
@@ -635,7 +635,7 @@ test("leaves low-confidence fields unmapped", () => {
 });
 ```
 
-- [ ] **步骤 2：运行测试确认失败**
+- [x] **步骤 2：运行测试确认失败**
 
 运行：
 
@@ -645,7 +645,7 @@ node --test --import tsx test/knowledge-import-mapping.test.ts
 
 预期：FAIL，映射器和规范器不存在。
 
-- [ ] **步骤 3：实现可解释映射评分**
+- [x] **步骤 3：实现可解释映射评分**
 
 每个目标字段计算：
 
@@ -662,7 +662,7 @@ score =
 
 字段别名表覆盖英文和常见中文（如 source/原文/原词、target/译文/译名、alias/别名、note/备注），但不含小说专有名词。高置信须有唯一领先候选且超过固定阈值；中置信只提示；低置信不映射。返回 `reasons` 供 UI 显示。
 
-- [ ] **步骤 4：规范化为知识命令**
+- [x] **步骤 4：规范化为知识命令**
 
 `normalizeImportRecord` 接收用户确认映射，输出：
 
@@ -678,7 +678,7 @@ export interface NormalizedImportRecord {
 
 六种 objectType 分别调用 `validateKnowledgeCommand`。数组字段支持真实数组或用户明确指定的分隔符；默认不凭逗号拆人名/备注。空字符串不等于删除，只有显式 `nullMeansDelete` 映射选项才能形成 tombstone。
 
-- [ ] **步骤 5：加入映射身份**
+- [x] **步骤 5：加入映射身份**
 
 映射 canonical JSON 包含格式、记录路径/工作表/标题行、objectType、scope、字段映射和分隔规则，计算 `mappingHash`。它与文件 hash 一起构成幂等批次身份。
 
@@ -696,7 +696,7 @@ export function mappingIdentity(
 }
 ```
 
-- [ ] **步骤 6：运行映射和命令校验测试**
+- [x] **步骤 6：运行映射和命令校验测试**
 
 运行：
 
@@ -706,7 +706,7 @@ node --test --import tsx test/knowledge-import-mapping.test.ts test/knowledge-co
 
 预期：PASS；低置信字段不会自动进入命令。
 
-- [ ] **步骤 7：Commit**
+- [x] **步骤 7：Commit**
 
 ```powershell
 git add translator-v5/src/knowledge-import/mapping-suggester.ts translator-v5/src/knowledge-import/record-normalizer.ts translator-v5/test/knowledge-import-mapping.test.ts
