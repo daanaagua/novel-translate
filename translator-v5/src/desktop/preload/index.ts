@@ -2,10 +2,12 @@ import { contextBridge, ipcRenderer, type IpcRendererEvent } from "electron";
 
 import {
   DESKTOP_TRIAL_PROGRESS_CHANNEL,
+  DESKTOP_FULLBOOK_PROGRESS_CHANNEL,
   type DesktopTrialProgress,
   type DesktopTrialStage,
 } from "../contracts.js";
 import type { FolioLoomDesktopApi } from "./folioloom-api.js";
+import { parseDesktopFullBookProgress } from "./progress-validation.js";
 
 const TRIAL_STAGES = new Set<DesktopTrialStage>([
   "preparing",
@@ -41,6 +43,23 @@ const desktopApi: FolioLoomDesktopApi = {
     ipcRenderer.on(DESKTOP_TRIAL_PROGRESS_CHANNEL, forward);
     return () => ipcRenderer.removeListener(DESKTOP_TRIAL_PROGRESS_CHANNEL, forward);
   },
+  getFullBookState: () => ipcRenderer.invoke("folioloom:fullbook-state"),
+  startFullBook: (request) => ipcRenderer.invoke("folioloom:start-fullbook", request),
+  pauseFullBook: () => ipcRenderer.invoke("folioloom:pause-fullbook"),
+  resumeFullBook: (request) => ipcRenderer.invoke("folioloom:resume-fullbook", request),
+  onFullBookProgress: (listener) => {
+    const forward = (_event: IpcRendererEvent, value: unknown): void => {
+      const progress = parseDesktopFullBookProgress(value);
+      if (progress !== undefined) listener(progress);
+    };
+    ipcRenderer.on(DESKTOP_FULLBOOK_PROGRESS_CHANNEL, forward);
+    return () => ipcRenderer.removeListener(DESKTOP_FULLBOOK_PROGRESS_CHANNEL, forward);
+  },
+  getExportState: () => ipcRenderer.invoke("folioloom:export-state"),
+  chooseExportDirectory: () => ipcRenderer.invoke("folioloom:choose-export-directory"),
+  exportBook: (request) => ipcRenderer.invoke("folioloom:export-book", request),
+  openExportDirectory: (exportId) =>
+    ipcRenderer.invoke("folioloom:open-export-directory", exportId),
   listKnowledge: (request) => ipcRenderer.invoke("folioloom:knowledge-list", request),
   getKnowledgeDetail: (objectId) => ipcRenderer.invoke("folioloom:knowledge-detail", objectId),
   mutateKnowledge: (request) => ipcRenderer.invoke("folioloom:knowledge-mutate", request),

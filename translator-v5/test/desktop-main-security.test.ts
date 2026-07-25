@@ -13,6 +13,7 @@ import {
   resolveDesktopRendererTarget,
   type DesktopNavigationWebContents,
 } from "../src/desktop/main/runtime.js";
+import { parseDesktopFullBookProgress } from "../src/desktop/preload/progress-validation.js";
 
 test("desktop chrome keeps native controls in a dark overlay and removes the application menu", () => {
   assert.deepEqual(desktopWindowChrome(), {
@@ -136,6 +137,15 @@ test("preload exposes named onboarding operations without a generic IPC or crede
     "startTrial",
     "cancelTrial",
     "onTrialProgress",
+    "getFullBookState",
+    "startFullBook",
+    "pauseFullBook",
+    "resumeFullBook",
+    "onFullBookProgress",
+    "getExportState",
+    "chooseExportDirectory",
+    "exportBook",
+    "openExportDirectory",
     "listKnowledge",
     "getKnowledgeDetail",
     "mutateKnowledge",
@@ -160,6 +170,49 @@ test("preload exposes named onboarding operations without a generic IPC or crede
     assert.match(preloadSource, new RegExp(`\\b${operation}\\s*:`));
   }
   assert.match(preloadSource, /removeListener\s*\(\s*DESKTOP_TRIAL_PROGRESS_CHANNEL/u);
+  assert.match(preloadSource, /removeListener\s*\(\s*DESKTOP_FULLBOOK_PROGRESS_CHANNEL/u);
   assert.doesNotMatch(preloadSource, /invoke\s*\(\s*(?:channel|name|method)\b/u);
   assert.doesNotMatch(preloadSource, /\b(?:getCredential|readCredential|readFile|globalThis\.fetch)\b/u);
+});
+
+test("full-book progress bridge forwards only exact bounded public projections", () => {
+  const progress = {
+    runId: "run-a",
+    phase: "running",
+    progress: {
+      totalWindows: 10,
+      pendingWindows: 8,
+      runningWindows: 1,
+      stagedWindows: 0,
+      completedWindows: 1,
+      warningWindows: 0,
+      humanRequiredWindows: 0,
+      failedWindows: 0,
+    },
+  };
+  assert.deepEqual(parseDesktopFullBookProgress(progress), progress);
+  assert.equal(parseDesktopFullBookProgress({ ...progress, storePath: "C:\\book.db" }), undefined);
+  assert.equal(parseDesktopFullBookProgress({
+    ...progress,
+    progress: { ...progress.progress, pendingWindows: -1 },
+  }), undefined);
+  assert.equal(parseDesktopFullBookProgress({ ...progress, phase: "unknown" }), undefined);
+});
+
+test("main process shares one runtime resolver and settles translation before quit", () => {
+  const mainSource = readFileSync(
+    new URL("../src/desktop/main/index.ts", import.meta.url),
+    "utf8",
+  );
+  assert.match(mainSource, /const runtimeResolver:\s*DesktopRuntimeResolver/u);
+  assert.match(
+    mainSource,
+    /new DesktopTrialService\s*\(\s*\{[\s\S]*?runtime:\s*runtimeResolver/u,
+  );
+  assert.match(
+    mainSource,
+    /new DesktopFullBookService\s*\(\s*\{[\s\S]*?runtime:\s*runtimeResolver/u,
+  );
+  assert.match(mainSource, /fullBookServiceForShutdown\?\.settleForShutdown\s*\(\s*\)/u);
+  assert.match(mainSource, /shell\.openPath\s*\(\s*path\s*\)/u);
 });

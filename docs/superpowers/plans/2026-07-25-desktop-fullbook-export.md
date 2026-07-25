@@ -528,7 +528,7 @@ git commit -m "feat(desktop): add strict export service"
 - 修改：`translator-v5/test/desktop-ipc.test.ts`
 - 修改：`translator-v5/test/desktop-main-security.test.ts`
 
-- [ ] **步骤 1：先扩展 IPC 失败测试**
+- [x] **步骤 1：先扩展 IPC 失败测试**
 
 新增固定 channel：
 
@@ -554,7 +554,7 @@ git commit -m "feat(desktop): add strict export service"
 - 非可信事件、额外字段和多余参数均失败；
 - 目录选择器使用 `openDirectory/createDirectory`，取消不清空旧 destination。
 
-- [ ] **步骤 2：运行 IPC 测试确认失败**
+- [x] **步骤 2：运行 IPC 测试确认失败**
 
 ```powershell
 node --test --import tsx test/desktop-ipc.test.ts test/desktop-main-security.test.ts
@@ -562,7 +562,7 @@ node --test --import tsx test/desktop-ipc.test.ts test/desktop-main-security.tes
 
 预期：FAIL，新 channel 未注册。
 
-- [ ] **步骤 3：实现 IPC 和 preload bridge**
+- [x] **步骤 3：实现 IPC 和 preload bridge**
 
 preload API 固定新增：
 
@@ -580,11 +580,11 @@ openExportDirectory(exportId: string): Promise<DesktopResult<void>>;
 
 进度事件验证必须检查精确字段、phase 枚举和非负整数，不转发未知对象。
 
-- [ ] **步骤 4：实例化服务并统一 runtime resolver**
+- [x] **步骤 4：实例化服务并统一 runtime resolver**
 
 `main/index.ts` 建立一个共享 `DesktopRuntimeResolver`，同时传给 trial 和 fullbook；广播 `DESKTOP_FULLBOOK_PROGRESS_CHANNEL`。`before-quit` 同时等待 trial cancel 和 fullbook `settleForShutdown()`。注入 Electron `shell.openPath`，非空错误字符串转换为失败结果。
 
-- [ ] **步骤 5：运行 IPC、preload、主进程和 typecheck**
+- [x] **步骤 5：运行 IPC、preload、主进程和 typecheck**
 
 ```powershell
 node --test --import tsx test/desktop-ipc.test.ts test/desktop-main-security.test.ts test/desktop-provider-adapter.test.ts
@@ -593,7 +593,7 @@ npm run desktop:typecheck
 
 预期：全部 PASS。
 
-- [ ] **步骤 6：提交**
+- [x] **步骤 6：提交**
 
 ```powershell
 git add translator-v5/src/desktop/main/ipc.ts translator-v5/src/desktop/main/index.ts translator-v5/src/desktop/preload/folioloom-api.d.ts translator-v5/src/desktop/preload/index.ts translator-v5/test/desktop-ipc.test.ts translator-v5/test/desktop-main-security.test.ts

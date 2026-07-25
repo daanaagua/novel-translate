@@ -4,6 +4,14 @@ import type {
   DesktopChooseSourceResult,
   DesktopConfirmSourceEncodingRequest,
   DesktopDoctorReport,
+  DesktopExportDestination,
+  DesktopExportFormat,
+  DesktopExportRequest,
+  DesktopExportResult,
+  DesktopExportSnapshot,
+  DesktopFullBookSnapshot,
+  DesktopResumeFullBookRequest,
+  DesktopStartFullBookRequest,
   DesktopAttachGlobalKnowledgeRequest,
   DesktopGlobalKnowledgeListRequest,
   DesktopGlobalKnowledgePage,
@@ -73,6 +81,14 @@ export const DESKTOP_IPC_CHANNELS = [
   "folioloom:forget-credential",
   "folioloom:start-trial",
   "folioloom:cancel-trial",
+  "folioloom:fullbook-state",
+  "folioloom:start-fullbook",
+  "folioloom:pause-fullbook",
+  "folioloom:resume-fullbook",
+  "folioloom:export-state",
+  "folioloom:choose-export-directory",
+  "folioloom:export-book",
+  "folioloom:open-export-directory",
   "folioloom:knowledge-list",
   "folioloom:knowledge-detail",
   "folioloom:knowledge-mutate",
@@ -109,7 +125,7 @@ export interface DesktopIpcMain {
 }
 
 export interface DesktopOpenDialogOptions {
-  properties: "openFile"[];
+  properties: Array<"openFile" | "openDirectory" | "createDirectory">;
   filters: Array<{ name: string; extensions: string[] }>;
 }
 
@@ -164,6 +180,30 @@ export interface DesktopIpcTrialService {
   cancel(): Promise<void>;
 }
 
+export interface DesktopIpcFullBookService {
+  snapshot(project: DesktopProjectRequest): DesktopFullBookSnapshot;
+  start(
+    project: DesktopProjectRequest,
+    request: DesktopStartFullBookRequest,
+  ): Promise<DesktopFullBookSnapshot>;
+  pause(): Promise<DesktopFullBookSnapshot>;
+  resume(
+    project: DesktopProjectRequest,
+    request: DesktopResumeFullBookRequest,
+  ): Promise<DesktopFullBookSnapshot>;
+  hasActiveTask(): boolean;
+}
+
+export interface DesktopIpcExportService {
+  snapshot(project: DesktopProjectRequest): DesktopExportSnapshot;
+  registerDestination(path: string): DesktopExportDestination;
+  export(
+    project: DesktopProjectRequest,
+    request: DesktopExportRequest,
+  ): Promise<DesktopExportResult>;
+  completedDirectory(exportId: string): string | undefined;
+}
+
 export interface DesktopIpcKnowledgeService {
   list(request: DesktopKnowledgeListRequest): DesktopResult<DesktopKnowledgePage>;
   detail(objectId: string): DesktopResult<DesktopKnowledgeDetail>;
@@ -200,11 +240,14 @@ export interface DesktopIpcDependencies {
   sourceService: DesktopIpcSourceService;
   modelService: DesktopIpcModelService;
   trialService: DesktopIpcTrialService;
+  fullBookService: DesktopIpcFullBookService;
+  exportService: DesktopIpcExportService;
   knowledgeService: DesktopIpcKnowledgeService;
   knowledgeImportService: DesktopIpcKnowledgeImportService;
   isTrustedEvent(event: unknown): boolean;
   getCurrentRequest(): DesktopProjectRequest | undefined;
   setCurrentRequest(request: DesktopProjectRequest): void;
+  openDirectory(path: string): Promise<string>;
 }
 
 const manuscriptFilter = [{ name: "书稿", extensions: ["txt", "md", "markdown", "epub", "docx"] }];
@@ -241,6 +284,11 @@ const IMPORT_DECISIONS = new Set([
   "keep_existing", "use_imported", "merge_as_alias",
   "create_separate", "skip",
 ] as const);
+const EXPORT_FORMATS = new Set<DesktopExportFormat>([
+  "translation_txt",
+  "bilingual_txt",
+  "epub",
+]);
 function failure<T = never>(code: string, message: string): DesktopResult<T> {
   return fail({ code, message, retryable: false });
 }
@@ -276,6 +324,18 @@ async function chooseSingleFile(
   filters: Array<{ name: string; extensions: string[] }>,
 ): Promise<string | undefined> {
   const selection = await dialog.showOpenDialog({ properties: ["openFile"], filters });
+  return selection.canceled || selection.filePaths.length !== 1
+    ? undefined
+    : selection.filePaths[0];
+}
+
+async function chooseDirectory(
+  dialog: DesktopDialog,
+): Promise<string | undefined> {
+  const selection = await dialog.showOpenDialog({
+    properties: ["openDirectory", "createDirectory"],
+    filters: [],
+  });
   return selection.canceled || selection.filePaths.length !== 1
     ? undefined
     : selection.filePaths[0];
@@ -913,6 +973,37 @@ function startTrialRequest(value: unknown): DesktopStartTrialRequest {
   return { mode };
 }
 
+function startFullBookRequest(value: unknown): DesktopStartFullBookRequest {
+  const input = exactRecord(value, "start-fullbook payload", ["mode"]);
+  const mode = requiredText(input.mode, "mode");
+  if (mode !== "quality" && mode !== "fast") {
+    return inputError("mode must be quality or fast");
+  }
+  return { mode };
+}
+
+function resumeFullBookRequest(value: unknown): DesktopResumeFullBookRequest {
+  const input = exactRecord(value, "resume-fullbook payload", ["runId"]);
+  return { runId: boundedText(input.runId, "runId", 200) };
+}
+
+function exportBookRequest(value: unknown): DesktopExportRequest {
+  const input = exactRecord(
+    value,
+    "export-book payload",
+    ["runId", "destinationId", "formats"],
+  );
+  const formats = enumArray(input.formats, "formats", EXPORT_FORMATS);
+  if (formats === undefined || formats.length === 0) {
+    return inputError("formats must contain at least one export format");
+  }
+  return {
+    runId: boundedText(input.runId, "runId", 200),
+    destinationId: boundedText(input.destinationId, "destinationId", 200),
+    formats,
+  };
+}
+
 function publicProviders(snapshot: DesktopIpcModelSnapshot): readonly DesktopOnboardingProvider[] {
   return snapshot.providers.map((provider) => ({
     id: provider.id,
@@ -989,6 +1080,7 @@ function onboardingState(
 
 export function registerDesktopIpc(dependencies: DesktopIpcDependencies): void {
   let activeSnapshot: DesktopProjectSnapshot | undefined;
+  let activeExportDestination: DesktopExportDestination | undefined;
 
   const handleTrusted = (channel: DesktopIpcChannel, handler: DesktopIpcHandler): void => {
     dependencies.ipcMain.handle(channel, async (event, ...args) => {
@@ -1020,6 +1112,7 @@ export function registerDesktopIpc(dependencies: DesktopIpcDependencies): void {
       return fail(result.error);
     }
     dependencies.setCurrentRequest(request);
+    activeExportDestination = undefined;
     return ok({ status: "ready", project: result.value });
   };
 
@@ -1042,6 +1135,12 @@ export function registerDesktopIpc(dependencies: DesktopIpcDependencies): void {
 
   handleTrusted("folioloom:choose-source", async (_event, ...args) => resultFrom(async () => {
     noArguments(args, "choose-source");
+    if (dependencies.fullBookService.hasActiveTask()) {
+      return failure(
+        "DESKTOP_FULLBOOK_ACTIVE",
+        "请先暂停当前整本翻译，再更换书稿",
+      );
+    }
     const sourcePath = await chooseSingleFile(dependencies.dialog, manuscriptFilter);
     if (sourcePath === undefined) {
       return canceledSelection();
@@ -1123,6 +1222,107 @@ export function registerDesktopIpc(dependencies: DesktopIpcDependencies): void {
     await dependencies.trialService.cancel();
     return ok(undefined);
   }));
+
+  handleTrusted("folioloom:fullbook-state", async (_event, ...args) => resultFrom(() => {
+    noArguments(args, "fullbook-state");
+    const current = dependencies.getCurrentRequest();
+    if (current === undefined) {
+      return failure("DESKTOP_NO_PROJECT", "choose a manuscript before viewing full-book progress");
+    }
+    return ok(dependencies.fullBookService.snapshot(current));
+  }));
+
+  handleTrusted("folioloom:start-fullbook", async (_event, ...args) => resultFrom(async () => {
+    const request = startFullBookRequest(oneArgument(args, "start-fullbook"));
+    const current = dependencies.getCurrentRequest();
+    if (current === undefined) {
+      return failure("DESKTOP_NO_PROJECT", "choose a manuscript before starting a full-book translation");
+    }
+    return ok(await dependencies.fullBookService.start(current, request));
+  }));
+
+  handleTrusted("folioloom:pause-fullbook", async (_event, ...args) => resultFrom(async () => {
+    noArguments(args, "pause-fullbook");
+    return ok(await dependencies.fullBookService.pause());
+  }));
+
+  handleTrusted("folioloom:resume-fullbook", async (_event, ...args) => resultFrom(async () => {
+    const request = resumeFullBookRequest(oneArgument(args, "resume-fullbook"));
+    const current = dependencies.getCurrentRequest();
+    if (current === undefined) {
+      return failure("DESKTOP_NO_PROJECT", "choose a manuscript before resuming a full-book translation");
+    }
+    const snapshot = dependencies.fullBookService.snapshot(current);
+    if (!snapshot.runs.some((run) => run.runId === request.runId)) {
+      return failure("DESKTOP_FULLBOOK_RUN_NOT_FOUND", "the selected full-book run does not exist");
+    }
+    return ok(await dependencies.fullBookService.resume(current, request));
+  }));
+
+  handleTrusted("folioloom:export-state", async (_event, ...args) => resultFrom(() => {
+    noArguments(args, "export-state");
+    const current = dependencies.getCurrentRequest();
+    if (current === undefined) {
+      return failure("DESKTOP_NO_PROJECT", "choose a manuscript before exporting");
+    }
+    const value = dependencies.exportService.snapshot(current);
+    activeExportDestination ??= value.defaultDestination;
+    return ok({
+      ...value,
+      ...(activeExportDestination === undefined
+        ? {}
+        : { defaultDestination: activeExportDestination }),
+    });
+  }));
+
+  handleTrusted(
+    "folioloom:choose-export-directory",
+    async (_event, ...args) => resultFrom(async () => {
+      noArguments(args, "choose-export-directory");
+      if (dependencies.getCurrentRequest() === undefined) {
+        return failure("DESKTOP_NO_PROJECT", "choose a manuscript before selecting an export folder");
+      }
+      const path = await chooseDirectory(dependencies.dialog);
+      if (path === undefined) {
+        return activeExportDestination === undefined
+          ? canceledSelection()
+          : ok(activeExportDestination);
+      }
+      activeExportDestination = dependencies.exportService.registerDestination(path);
+      return ok(activeExportDestination);
+    }),
+  );
+
+  handleTrusted("folioloom:export-book", async (_event, ...args) => resultFrom(async () => {
+    const request = exportBookRequest(oneArgument(args, "export-book"));
+    const current = dependencies.getCurrentRequest();
+    if (current === undefined) {
+      return failure("DESKTOP_NO_PROJECT", "choose a manuscript before exporting");
+    }
+    return ok(await dependencies.exportService.export(current, request));
+  }));
+
+  handleTrusted(
+    "folioloom:open-export-directory",
+    async (_event, ...args) => resultFrom(async () => {
+      const exportId = boundedText(
+        oneArgument(args, "open-export-directory"),
+        "exportId",
+        200,
+      );
+      const path = dependencies.exportService.completedDirectory(exportId);
+      if (path === undefined) {
+        return failure(
+          "DESKTOP_EXPORT_NOT_FOUND",
+          "只能打开本次程序运行中已经成功完成的导出",
+        );
+      }
+      const error = await dependencies.openDirectory(path);
+      return error.length === 0
+        ? ok(undefined)
+        : failure("DESKTOP_EXPORT_OPEN_FAILED", error);
+    }),
+  );
 
   handleTrusted("folioloom:knowledge-list", async (_event, ...args) => resultFrom(() =>
     dependencies.knowledgeService.list(

@@ -7,6 +7,9 @@ import test from "node:test";
 import type {
   DesktopChooseSourceResult,
   DesktopDoctorReport,
+  DesktopExportFormat,
+  DesktopExportRequest,
+  DesktopFullBookSnapshot,
   DesktopKnowledgeDiagnostics,
   DesktopKnowledgeMutationRequest,
   DesktopKnowledgePage,
@@ -88,6 +91,8 @@ interface IpcFixtureOptions {
   testStatus?: "ready" | "limited" | "failed";
   sourceEncodingRequired?: boolean;
   pickedKnowledgeImport?: boolean;
+  pickedExportDirectory?: "selected" | "cancel-after-selected";
+  fullBookActive?: boolean;
 }
 
 interface IpcFixture {
@@ -109,6 +114,16 @@ interface IpcFixture {
     starts: readonly { manifestPath: string; mode: DesktopTrialMode }[];
     cancellations: number;
   };
+  fullBookCalls: {
+    starts: readonly unknown[];
+    pauses: number;
+    resumes: readonly unknown[];
+  };
+  exportCalls: {
+    destinations: readonly string[];
+    exports: readonly unknown[];
+    opened: readonly string[];
+  };
   knowledgeCalls: {
     lists: readonly unknown[];
     mutations: readonly unknown[];
@@ -118,6 +133,7 @@ interface IpcFixture {
     staged: readonly unknown[];
   };
   dialogFilters: ReadonlyArray<{ name: string; extensions: string[] }>;
+  dialogProperties: readonly string[][];
   currentRequest: DesktopProjectRequest | undefined;
 }
 
@@ -129,6 +145,7 @@ function registerFixtureHandlers(options: IpcFixtureOptions = {}): IpcFixture {
   const invalidSourcePath = join(directory, "chapter.exe");
   const textPath = join(directory, "not-a-store.txt");
   const knowledgeImportPath = join(directory, "terms.xlsx");
+  const exportDirectory = join(directory, "exports");
   const activeRunIds = options.activeRunIds ?? [];
   const handlers = new Map<string, DesktopIpcHandler>();
   const sourceImports: string[] = [];
@@ -141,8 +158,16 @@ function registerFixtureHandlers(options: IpcFixtureOptions = {}): IpcFixture {
   const knowledgeMutations: unknown[] = [];
   const registeredKnowledgeImports: string[] = [];
   const stagedKnowledgeImports: unknown[] = [];
+  const fullBookStarts: unknown[] = [];
+  const fullBookResumes: unknown[] = [];
+  const exportDestinations: string[] = [];
+  const exportRequests: unknown[] = [];
+  const openedDirectories: string[] = [];
   let trialCancellations = 0;
+  let fullBookPauses = 0;
+  let exportDialogCount = 0;
   const dialogFilters: Array<{ name: string; extensions: string[] }> = [];
+  const dialogProperties: string[][] = [];
   const trustedEvent = {
     sender: { id: 7 },
     senderFrame: { url: "file:///folioloom/index.html", parent: null },
@@ -197,10 +222,20 @@ function registerFixtureHandlers(options: IpcFixtureOptions = {}): IpcFixture {
     },
     dialog: {
       async showOpenDialog(dialogOptions) {
+        dialogProperties.push([...dialogOptions.properties]);
         dialogFilters.push(...dialogOptions.filters.map((filter) => ({
           name: filter.name,
           extensions: [...filter.extensions],
         })));
+        if (dialogOptions.properties.includes("openDirectory")) {
+          exportDialogCount += 1;
+          const selected = options.pickedExportDirectory === "selected"
+            || (options.pickedExportDirectory === "cancel-after-selected"
+              && exportDialogCount === 1);
+          return selected
+            ? { canceled: false, filePaths: [exportDirectory] }
+            : { canceled: true, filePaths: [] };
+        }
         const extension = dialogOptions.filters[0]?.extensions[0];
         const selected = dialogOptions.filters[0]?.extensions.includes("xlsx")
           ? options.pickedKnowledgeImport
@@ -296,6 +331,92 @@ function registerFixtureHandlers(options: IpcFixtureOptions = {}): IpcFixture {
       async cancel() {
         trialCancellations += 1;
       },
+    },
+    fullBookService: {
+      snapshot() {
+        return {
+          ...(options.fullBookActive ? { activeRunId: "run-a" } : {}),
+          runs: activeRunIds.map((runId) => ({
+            runId,
+            sourceVersion: "source-v1",
+            modelId: "desktop-test-model",
+            mode: "quality" as const,
+            phase: "paused" as const,
+            progress: {
+              totalWindows: 2,
+              pendingWindows: 1,
+              runningWindows: 0,
+              stagedWindows: 0,
+              completedWindows: 1,
+              warningWindows: 0,
+              humanRequiredWindows: 0,
+              failedWindows: 0,
+            },
+            canPause: false,
+            canResume: true,
+            canExport: false,
+          })),
+        } satisfies DesktopFullBookSnapshot;
+      },
+      async start(project, request) {
+        fullBookStarts.push({ project, request });
+        return this.snapshot(project);
+      },
+      async pause() {
+        fullBookPauses += 1;
+        return this.snapshot({ manifestPath });
+      },
+      async resume(project, request) {
+        fullBookResumes.push({ project, request });
+        return this.snapshot(project);
+      },
+      hasActiveTask() {
+        return options.fullBookActive === true;
+      },
+    },
+    exportService: {
+      snapshot() {
+        return {
+          candidates: [{
+            runId: "run-a",
+            modelId: "desktop-test-model",
+            status: "ready" as const,
+            completedWindows: 2,
+            totalWindows: 2,
+            blockers: [],
+          }],
+          defaultDestination: {
+            destinationId: "default-destination",
+            displayPath: join(directory, "default-exports"),
+          },
+        };
+      },
+      registerDestination(path) {
+        exportDestinations.push(path);
+        return {
+          destinationId: "chosen-destination",
+          displayPath: path,
+        };
+      },
+      async export(project, request) {
+        exportRequests.push({ project, request });
+        return {
+          exportId: "export-1",
+          runId: request.runId,
+          directory: exportDirectory,
+          files: request.formats.map((format: DesktopExportFormat) => ({
+            format,
+            fileName: `${format}.file`,
+          })),
+        };
+      },
+      completedDirectory(exportId) {
+        return exportId === "export-1" ? exportDirectory : undefined;
+      },
+    },
+    async openDirectory(path) {
+      openedDirectories.push(path);
+      return "";
     },
     knowledgeService: {
       list(request) {
@@ -418,6 +539,20 @@ function registerFixtureHandlers(options: IpcFixtureOptions = {}): IpcFixture {
     get trialCalls() {
       return { starts: trialStarts, cancellations: trialCancellations };
     },
+    get fullBookCalls() {
+      return {
+        starts: fullBookStarts,
+        pauses: fullBookPauses,
+        resumes: fullBookResumes,
+      };
+    },
+    get exportCalls() {
+      return {
+        destinations: exportDestinations,
+        exports: exportRequests,
+        opened: openedDirectories,
+      };
+    },
     get knowledgeCalls() {
       return { lists: knowledgeLists, mutations: knowledgeMutations };
     },
@@ -429,6 +564,9 @@ function registerFixtureHandlers(options: IpcFixtureOptions = {}): IpcFixture {
     },
     get dialogFilters() {
       return dialogFilters;
+    },
+    get dialogProperties() {
+      return dialogProperties;
     },
     get currentRequest() {
       return currentRequest;
@@ -451,10 +589,12 @@ test("IPC only registers the desktop allowlist", () => {
       "folioloom:choose-source",
       "folioloom:confirm-source-encoding",
       "folioloom:choose-project",
+      "folioloom:choose-export-directory",
       "folioloom:choose-store",
       "folioloom:discover-models",
       "folioloom:doctor",
       "folioloom:forget-credential",
+      "folioloom:fullbook-state",
       "folioloom:knowledge-list",
       "folioloom:knowledge-detail",
       "folioloom:knowledge-mutate",
@@ -476,9 +616,15 @@ test("IPC only registers the desktop allowlist", () => {
       "folioloom:knowledge-import-cancel-pending",
       "folioloom:knowledge-import-discard-staged",
       "folioloom:onboarding-state",
+      "folioloom:open-export-directory",
+      "folioloom:pause-fullbook",
       "folioloom:refresh-project",
+      "folioloom:resume-fullbook",
       "folioloom:select-run",
+      "folioloom:export-book",
+      "folioloom:export-state",
       "folioloom:test-model",
+      "folioloom:start-fullbook",
       "folioloom:start-trial",
       "folioloom:cancel-trial",
     ].sort());
@@ -684,6 +830,160 @@ test("trial IPC accepts only an explicit mode, keeps the manuscript main-process
       manifestPath: fixture.manifestPath,
       mode: "quality",
     }]);
+  } finally {
+    rmSync(fixture.directory, { recursive: true, force: true });
+  }
+});
+
+test("full-book IPC owns project paths and validates start, pause, and existing-run resume", async () => {
+  const fixture = registerFixtureHandlers({ activeRunIds: ["run-a"] });
+  try {
+    const state = await handler(fixture, "folioloom:fullbook-state")(
+      fixture.trustedEvent,
+    ) as DesktopResult<DesktopFullBookSnapshot>;
+    assert.equal(state.ok, true);
+
+    const started = await handler(fixture, "folioloom:start-fullbook")(
+      fixture.trustedEvent,
+      { mode: "quality" },
+    ) as DesktopResult<DesktopFullBookSnapshot>;
+    assert.equal(started.ok, true);
+    assert.deepEqual(fixture.fullBookCalls.starts, [{
+      project: { manifestPath: fixture.manifestPath },
+      request: { mode: "quality" },
+    }]);
+
+    const resumed = await handler(fixture, "folioloom:resume-fullbook")(
+      fixture.trustedEvent,
+      { runId: "run-a" },
+    ) as DesktopResult<DesktopFullBookSnapshot>;
+    assert.equal(resumed.ok, true);
+    assert.deepEqual(fixture.fullBookCalls.resumes, [{
+      project: { manifestPath: fixture.manifestPath },
+      request: { runId: "run-a" },
+    }]);
+
+    const missing = await handler(fixture, "folioloom:resume-fullbook")(
+      fixture.trustedEvent,
+      { runId: "run-missing" },
+    ) as DesktopResult<unknown>;
+    assert.equal(missing.ok, false);
+    assert.equal(fixture.fullBookCalls.resumes.length, 1);
+
+    const paused = await handler(fixture, "folioloom:pause-fullbook")(
+      fixture.trustedEvent,
+    ) as DesktopResult<DesktopFullBookSnapshot>;
+    assert.equal(paused.ok, true);
+    assert.equal(fixture.fullBookCalls.pauses, 1);
+
+    for (const [channel, payload] of [
+      ["folioloom:start-fullbook", { mode: "fast", manifestPath: "C:\\outside\\source_manifest.json" }],
+      ["folioloom:resume-fullbook", { runId: "run-a", storePath: "C:\\outside\\book.db" }],
+    ] as const) {
+      const result = await handler(fixture, channel)(
+        fixture.trustedEvent,
+        payload,
+      ) as DesktopResult<unknown>;
+      assert.equal(result.ok, false);
+    }
+    const extraPause = await handler(fixture, "folioloom:pause-fullbook")(
+      fixture.trustedEvent,
+      {},
+    ) as DesktopResult<unknown>;
+    assert.equal(extraPause.ok, false);
+  } finally {
+    rmSync(fixture.directory, { recursive: true, force: true });
+  }
+});
+
+test("active full-book translation prevents replacing the manuscript before opening a dialog", async () => {
+  const fixture = registerFixtureHandlers({
+    pickedSource: "source",
+    fullBookActive: true,
+  });
+  try {
+    const result = await handler(fixture, "folioloom:choose-source")(
+      fixture.trustedEvent,
+    ) as DesktopResult<unknown>;
+    assert.equal(result.ok, false);
+    if (!result.ok) assert.equal(result.error.code, "DESKTOP_FULLBOOK_ACTIVE");
+    assert.equal(fixture.sourceImports.length, 0);
+    assert.equal(fixture.dialogProperties.length, 0);
+  } finally {
+    rmSync(fixture.directory, { recursive: true, force: true });
+  }
+});
+
+test("export IPC preserves directory grants, validates formats, and opens only completed exports", async () => {
+  const fixture = registerFixtureHandlers({
+    activeRunIds: ["run-a"],
+    pickedExportDirectory: "cancel-after-selected",
+  });
+  try {
+    const state = await handler(fixture, "folioloom:export-state")(
+      fixture.trustedEvent,
+    ) as DesktopResult<unknown>;
+    assert.equal(state.ok, true);
+
+    const chosen = await handler(fixture, "folioloom:choose-export-directory")(
+      fixture.trustedEvent,
+    ) as DesktopResult<{ destinationId: string; displayPath: string }>;
+    assert.equal(chosen.ok, true);
+    const canceled = await handler(fixture, "folioloom:choose-export-directory")(
+      fixture.trustedEvent,
+    ) as DesktopResult<{ destinationId: string; displayPath: string }>;
+    assert.deepEqual(canceled, chosen);
+    assert.deepEqual(fixture.dialogProperties.slice(-2), [
+      ["openDirectory", "createDirectory"],
+      ["openDirectory", "createDirectory"],
+    ]);
+
+    if (!chosen.ok) throw new Error("destination should be selected");
+    const request: DesktopExportRequest = {
+      runId: "run-a",
+      destinationId: chosen.value.destinationId,
+      formats: ["translation_txt", "epub"],
+    };
+    const exported = await handler(fixture, "folioloom:export-book")(
+      fixture.trustedEvent,
+      request,
+    ) as DesktopResult<{ exportId: string }>;
+    assert.equal(exported.ok, true);
+    assert.deepEqual(fixture.exportCalls.exports, [{
+      project: { manifestPath: fixture.manifestPath },
+      request,
+    }]);
+
+    for (const payload of [
+      { ...request, formats: ["translation_txt", "translation_txt"] },
+      { ...request, formats: ["pdf"] },
+      { ...request, outputPath: "C:\\outside", formats: ["translation_txt"] },
+    ]) {
+      const invalid = await handler(fixture, "folioloom:export-book")(
+        fixture.trustedEvent,
+        payload,
+      ) as DesktopResult<unknown>;
+      assert.equal(invalid.ok, false);
+    }
+    assert.equal(fixture.exportCalls.exports.length, 1);
+
+    const opened = await handler(fixture, "folioloom:open-export-directory")(
+      fixture.trustedEvent,
+      "export-1",
+    ) as DesktopResult<void>;
+    assert.deepEqual(opened, ok(undefined));
+    assert.equal(fixture.exportCalls.opened.length, 1);
+    const unknown = await handler(fixture, "folioloom:open-export-directory")(
+      fixture.trustedEvent,
+      "export-missing",
+    ) as DesktopResult<unknown>;
+    assert.equal(unknown.ok, false);
+    const extra = await handler(fixture, "folioloom:open-export-directory")(
+      fixture.trustedEvent,
+      "export-1",
+      "C:\\outside",
+    ) as DesktopResult<unknown>;
+    assert.equal(extra.ok, false);
   } finally {
     rmSync(fixture.directory, { recursive: true, force: true });
   }

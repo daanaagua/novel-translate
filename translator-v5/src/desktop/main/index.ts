@@ -2,21 +2,29 @@ import { existsSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { app, BrowserWindow, dialog, ipcMain, Menu, safeStorage } from "electron";
+import { app, BrowserWindow, dialog, ipcMain, Menu, safeStorage, shell } from "electron";
 
 import {
+  DESKTOP_FULLBOOK_PROGRESS_CHANNEL,
   DESKTOP_TRIAL_PROGRESS_CHANNEL,
+  type DesktopFullBookProgress,
   type DesktopProjectRequest,
   type DesktopTrialProgress,
 } from "../contracts.js";
 import { DesktopCredentialStore } from "../desktop-credential-store.js";
+import { DesktopExportService } from "../desktop-export-service.js";
+import { DesktopFullBookService } from "../desktop-fullbook-service.js";
 import { DesktopKnowledgeImportStorage } from "../desktop-knowledge-import-storage.js";
 import { DesktopKnowledgeService } from "../desktop-knowledge-service.js";
 import { DesktopModelService } from "../desktop-model-service.js";
 import { DesktopPreferences } from "../desktop-preferences.js";
 import { DesktopProjectService } from "../desktop-project-service.js";
 import { DesktopSourceService } from "../desktop-source-service.js";
-import { DesktopTrialService, type DesktopTrialRuntime } from "../desktop-trial-service.js";
+import { DesktopTrialService } from "../desktop-trial-service.js";
+import type {
+  DesktopRuntimeResolver,
+  DesktopTranslationRuntime,
+} from "../desktop-runtime-plan.js";
 import { createProviderRuntime } from "../../providers/runtime.js";
 import { providerRegistry } from "../../providers/registry.js";
 import type { ModelProfile } from "../../providers/types.js";
@@ -36,6 +44,7 @@ const currentDirectory = dirname(fileURLToPath(import.meta.url));
 const trustedRendererUrls = new Map<number, string>();
 const desktopChrome = desktopWindowChrome();
 let trialServiceForShutdown: DesktopTrialService | undefined;
+let fullBookServiceForShutdown: DesktopFullBookService | undefined;
 let globalKnowledgeStoreForShutdown: GlobalKnowledgeStore | undefined;
 let quitAfterTrialSettles = false;
 let quitSettlementStarted = false;
@@ -44,6 +53,13 @@ function broadcastTrialProgress(progress: DesktopTrialProgress): void {
   for (const window of BrowserWindow.getAllWindows()) {
     if (window.isDestroyed() || !trustedRendererUrls.has(window.webContents.id)) continue;
     window.webContents.send(DESKTOP_TRIAL_PROGRESS_CHANNEL, progress);
+  }
+}
+
+function broadcastFullBookProgress(progress: DesktopFullBookProgress): void {
+  for (const window of BrowserWindow.getAllWindows()) {
+    if (window.isDestroyed() || !trustedRendererUrls.has(window.webContents.id)) continue;
+    window.webContents.send(DESKTOP_FULLBOOK_PROGRESS_CHANNEL, progress);
   }
 }
 
@@ -114,32 +130,39 @@ void app.whenReady().then(() => {
     preferences,
     credentials: credentialStore,
   });
-  const trialService = new DesktopTrialService({
-    runtime: {
-      async resolve() {
-        const profile = preferences.loadState().activeModelProfile;
-        if (profile === undefined) return undefined;
-        const credential = credentialStore.read(profile.providerId);
-        if (credential.status !== "available") return undefined;
-        const createRuntime = (candidate: ModelProfile): DesktopTrialRuntime => {
-          const resolved = providerRegistry.resolve(candidate);
-          const runtime = createProviderRuntime(resolved.profile, credential.credential);
-          return {
-            profile: resolved.profile,
-            model: runtime.model,
-            streamFn: runtime.streamFn,
-            supportedEfforts: resolved.definition.capabilities.efforts,
-            createWithProfile: createRuntime,
-          };
+  const runtimeResolver: DesktopRuntimeResolver = {
+    async resolve() {
+      const profile = preferences.loadState().activeModelProfile;
+      if (profile === undefined) return undefined;
+      const credential = credentialStore.read(profile.providerId);
+      if (credential.status !== "available") return undefined;
+      const createRuntime = (candidate: ModelProfile): DesktopTranslationRuntime => {
+        const resolved = providerRegistry.resolve(candidate);
+        const runtime = createProviderRuntime(resolved.profile, credential.credential);
+        return {
+          profile: resolved.profile,
+          model: runtime.model,
+          streamFn: runtime.streamFn,
+          supportedEfforts: resolved.definition.capabilities.efforts,
+          createWithProfile: createRuntime,
         };
-        return createRuntime(profile);
-      },
+      };
+      return createRuntime(profile);
     },
+  };
+  const trialService = new DesktopTrialService({
+    runtime: runtimeResolver,
     onProgress(stage) {
       broadcastTrialProgress({ stage });
     },
   });
+  const fullBookService = new DesktopFullBookService({
+    runtime: runtimeResolver,
+    onProgress: broadcastFullBookProgress,
+  });
+  const exportService = new DesktopExportService();
   trialServiceForShutdown = trialService;
+  fullBookServiceForShutdown = fullBookService;
   let currentRequest = loadRecentRequest(preferences);
   const globalKnowledgeStore = new GlobalKnowledgeStore(
     join(app.getPath("userData"), "global-knowledge.db"),
@@ -172,6 +195,8 @@ void app.whenReady().then(() => {
     sourceService,
     modelService,
     trialService,
+    fullBookService,
+    exportService,
     knowledgeService,
     knowledgeImportService,
     isTrustedEvent(event) {
@@ -183,6 +208,9 @@ void app.whenReady().then(() => {
     setCurrentRequest(request) {
       currentRequest = request;
       preferences.save(request);
+    },
+    openDirectory(path) {
+      return shell.openPath(path);
     },
   });
 
@@ -207,11 +235,15 @@ app.on("will-quit", () => {
 });
 
 app.on("before-quit", (event) => {
-  if (quitAfterTrialSettles || trialServiceForShutdown === undefined) return;
+  if (quitAfterTrialSettles
+    || (trialServiceForShutdown === undefined && fullBookServiceForShutdown === undefined)) return;
   event.preventDefault();
   if (quitSettlementStarted) return;
   quitSettlementStarted = true;
-  void trialServiceForShutdown.cancel().finally(() => {
+  void Promise.all([
+    trialServiceForShutdown?.cancel(),
+    fullBookServiceForShutdown?.settleForShutdown(),
+  ]).finally(() => {
     quitAfterTrialSettles = true;
     app.quit();
   });

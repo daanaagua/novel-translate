@@ -3,6 +3,14 @@ import type {
   DesktopConfirmSourceEncodingRequest,
   DesktopDiscoverModelsRequest,
   DesktopDoctorReport,
+  DesktopExportDestination,
+  DesktopExportRequest,
+  DesktopExportResult,
+  DesktopExportSnapshot,
+  DesktopFullBookProgress,
+  DesktopFullBookSnapshot,
+  DesktopResumeFullBookRequest,
+  DesktopStartFullBookRequest,
   DesktopAttachGlobalKnowledgeRequest,
   DesktopGlobalKnowledgeListRequest,
   DesktopGlobalKnowledgePage,
@@ -53,6 +61,19 @@ export interface FolioLoomDesktopApi {
   startTrial(request: DesktopStartTrialRequest): Promise<DesktopResult<DesktopTrialResult>>;
   cancelTrial(): Promise<DesktopResult<void>>;
   onTrialProgress(listener: (progress: DesktopTrialProgress) => void): () => void;
+  getFullBookState(): Promise<DesktopResult<DesktopFullBookSnapshot>>;
+  startFullBook(
+    request: DesktopStartFullBookRequest,
+  ): Promise<DesktopResult<DesktopFullBookSnapshot>>;
+  pauseFullBook(): Promise<DesktopResult<DesktopFullBookSnapshot>>;
+  resumeFullBook(
+    request: DesktopResumeFullBookRequest,
+  ): Promise<DesktopResult<DesktopFullBookSnapshot>>;
+  onFullBookProgress(listener: (value: DesktopFullBookProgress) => void): () => void;
+  getExportState(): Promise<DesktopResult<DesktopExportSnapshot>>;
+  chooseExportDirectory(): Promise<DesktopResult<DesktopExportDestination>>;
+  exportBook(request: DesktopExportRequest): Promise<DesktopResult<DesktopExportResult>>;
+  openExportDirectory(exportId: string): Promise<DesktopResult<void>>;
   listKnowledge(request: DesktopKnowledgeListRequest): Promise<DesktopResult<DesktopKnowledgePage>>;
   getKnowledgeDetail(objectId: string): Promise<DesktopResult<DesktopKnowledgeDetail>>;
   mutateKnowledge(request: DesktopKnowledgeMutationRequest): Promise<DesktopResult<DesktopKnowledgeMutationResult>>;

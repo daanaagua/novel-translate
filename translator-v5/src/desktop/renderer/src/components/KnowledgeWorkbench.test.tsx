@@ -134,6 +134,15 @@ function api(overrides: Partial<FolioLoomDesktopApi> = {}): FolioLoomDesktopApi 
     startTrial: unavailable,
     cancelTrial: unavailable,
     onTrialProgress: () => () => undefined,
+    getFullBookState: unavailable,
+    startFullBook: unavailable,
+    pauseFullBook: unavailable,
+    resumeFullBook: unavailable,
+    onFullBookProgress: () => () => undefined,
+    getExportState: unavailable,
+    chooseExportDirectory: unavailable,
+    exportBook: unavailable,
+    openExportDirectory: unavailable,
     listKnowledge: vi.fn().mockResolvedValue(ok(page())),
     getKnowledgeDetail: vi.fn().mockImplementation(async (id: string) =>
       id === piaton.id
