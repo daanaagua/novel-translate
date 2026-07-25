@@ -613,7 +613,7 @@ git commit -m "feat(desktop): wire full-book and export IPC"
 - 修改：`translator-v5/src/desktop/renderer/src/components/WorkspacePlaceholder.tsx`
 - 修改：`translator-v5/src/desktop/renderer/src/styles.css`
 
-- [ ] **步骤 1：编写运行页失败测试**
+- [x] **步骤 1：编写运行页失败测试**
 
 覆盖：
 
@@ -635,7 +635,7 @@ expect(screen.getByRole("progress").getAttribute("aria-valuenow")).toBe("32");
 - 网络错误保留进度和重试入口；
 - 内部 run id、SQLite 路径和协议名默认不可见。
 
-- [ ] **步骤 2：编写导出页失败测试**
+- [x] **步骤 2：编写导出页失败测试**
 
 覆盖：
 
@@ -649,7 +649,7 @@ expect(screen.getByRole("progress").getAttribute("aria-valuenow")).toBe("32");
 - 选择器取消不清空当前目录；
 - 失败时显示下一步和折叠技术详情。
 
-- [ ] **步骤 3：运行 renderer 测试确认失败**
+- [x] **步骤 3：运行 renderer 测试确认失败**
 
 ```powershell
 npx vitest run --config vitest.desktop.config.ts src/desktop/renderer/src/components/RunWorkspace.test.tsx src/desktop/renderer/src/components/ExportWorkspace.test.tsx
@@ -657,7 +657,7 @@ npx vitest run --config vitest.desktop.config.ts src/desktop/renderer/src/compon
 
 预期：FAIL，组件尚不存在。
 
-- [ ] **步骤 4：实现两个工作区**
+- [x] **步骤 4：实现两个工作区**
 
 `RunWorkspace` 只通过回调接收动作：
 
@@ -690,11 +690,11 @@ interface ExportWorkspaceProps {
 
 使用现有色彩、间距、按钮和卡片语汇；进度条有文本替代，窄窗口不产生横向滚动条。
 
-- [ ] **步骤 5：接入 App 和事件刷新**
+- [x] **步骤 5：接入 App 和事件刷新**
 
 `App` 在进入 runs/export 时读取快照；订阅 fullbook progress 后更新运行快照并刷新 onboarding/export 候选。更换书稿后清空旧 run/export UI。`WorkspacePlaceholder` 只处理 review；memory 继续使用 KnowledgeWorkbench。
 
-- [ ] **步骤 6：运行 renderer 回归**
+- [x] **步骤 6：运行 renderer 回归**
 
 ```powershell
 npx vitest run --config vitest.desktop.config.ts
@@ -702,7 +702,7 @@ npx vitest run --config vitest.desktop.config.ts
 
 预期：全部 PASS。
 
-- [ ] **步骤 7：提交**
+- [x] **步骤 7：提交**
 
 ```powershell
 git add translator-v5/src/desktop/renderer/src/App.tsx translator-v5/src/desktop/renderer/src/App.test.tsx translator-v5/src/desktop/renderer/src/types.ts translator-v5/src/desktop/renderer/src/styles.css translator-v5/src/desktop/renderer/src/components/RunWorkspace.tsx translator-v5/src/desktop/renderer/src/components/RunWorkspace.test.tsx translator-v5/src/desktop/renderer/src/components/ExportWorkspace.tsx translator-v5/src/desktop/renderer/src/components/ExportWorkspace.test.tsx translator-v5/src/desktop/renderer/src/components/WorkspacePlaceholder.tsx

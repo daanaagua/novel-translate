@@ -6,6 +6,12 @@ import type {
   DesktopSourceEncodingRequired,
   DesktopDiscoverModelsRequest,
   DesktopError,
+  DesktopExportDestination,
+  DesktopExportRequest,
+  DesktopExportResult,
+  DesktopExportSnapshot,
+  DesktopFullBookProgress,
+  DesktopFullBookSnapshot,
   DesktopModelOption,
   DesktopOnboardingState,
   DesktopResult,
@@ -17,7 +23,9 @@ import type {
 } from "../../contracts.js";
 import type { FolioLoomDesktopApi } from "../../preload/folioloom-api.js";
 import { Onboarding } from "./components/Onboarding.js";
+import { ExportWorkspace } from "./components/ExportWorkspace.js";
 import { KnowledgeWorkbench } from "./components/KnowledgeWorkbench.js";
+import { RunWorkspace } from "./components/RunWorkspace.js";
 import { Sidebar } from "./components/Sidebar.js";
 import { WindowTitlebar } from "./components/WindowTitlebar.js";
 import { WorkspacePlaceholder } from "./components/WorkspacePlaceholder.js";
@@ -105,6 +113,27 @@ function errorFromUnknown(error: unknown): DesktopError {
   };
 }
 
+function mergeFullBookProgress(
+  snapshot: DesktopFullBookSnapshot,
+  event: DesktopFullBookProgress,
+): DesktopFullBookSnapshot {
+  if (!snapshot.runs.some((run) => run.runId === event.runId)) return snapshot;
+  return {
+    ...snapshot,
+    ...(event.phase === "preparing" || event.phase === "running" || event.phase === "pausing"
+      ? { activeRunId: event.runId }
+      : { activeRunId: undefined }),
+    runs: snapshot.runs.map((run) => run.runId !== event.runId ? run : {
+      ...run,
+      phase: event.phase,
+      progress: event.progress,
+      canPause: event.phase === "preparing" || event.phase === "running",
+      canResume: event.phase === "paused" || event.phase === "failed",
+      canExport: event.phase === "completed",
+    }),
+  };
+}
+
 export function App({ api }: AppProps): JSX.Element {
   const fallbackApi = useMemo(browserApi, []);
   const desktopApi = api ?? fallbackApi;
@@ -114,8 +143,15 @@ export function App({ api }: AppProps): JSX.Element {
   const [operationError, setOperationError] = useState<DesktopError>();
   const [trialProgress, setTrialProgress] = useState<DesktopTrialProgress>();
   const [trialResult, setTrialResult] = useState<DesktopTrialResult>();
+  const [fullBookSnapshot, setFullBookSnapshot] = useState<DesktopFullBookSnapshot>({ runs: [] });
+  const [fullBookError, setFullBookError] = useState<DesktopError>();
+  const [exportSnapshot, setExportSnapshot] = useState<DesktopExportSnapshot>({ candidates: [] });
+  const [exportDestination, setExportDestination] = useState<DesktopExportDestination>();
+  const [exportResult, setExportResult] = useState<DesktopExportResult>();
+  const [exportError, setExportError] = useState<DesktopError>();
   const [pendingEncoding, setPendingEncoding] = useState<DesktopSourceEncodingRequired>();
   const onboardingGeneration = useRef(0);
+  const projectGeneration = useRef(0);
 
   function beginOnboardingRefresh(): number {
     onboardingGeneration.current += 1;
@@ -134,6 +170,74 @@ export function App({ api }: AppProps): JSX.Element {
     setOnboarding(result.value);
     setOperationError(undefined);
     return true;
+  }
+
+  async function refreshFullBookState(showBusy = false): Promise<void> {
+    if (onboarding.project === undefined) return;
+    const generation = projectGeneration.current;
+    if (showBusy) setBusyAction("load-fullbook");
+    try {
+      const result = await desktopApi.getFullBookState();
+      if (generation !== projectGeneration.current) return;
+      if (!result.ok) {
+        setFullBookError(result.error);
+        return;
+      }
+      setFullBookSnapshot(result.value);
+      setFullBookError(undefined);
+    } catch (error) {
+      if (generation === projectGeneration.current) {
+        setFullBookError(errorFromUnknown(error));
+      }
+    } finally {
+      if (showBusy && generation === projectGeneration.current) {
+        setBusyAction(undefined);
+      }
+    }
+  }
+
+  async function refreshExportState(showBusy = false): Promise<void> {
+    if (onboarding.project === undefined) return;
+    const generation = projectGeneration.current;
+    if (showBusy) setBusyAction("load-export");
+    try {
+      const result = await desktopApi.getExportState();
+      if (generation !== projectGeneration.current) return;
+      if (!result.ok) {
+        setExportError(result.error);
+        return;
+      }
+      setExportSnapshot(result.value);
+      setExportDestination((current) => current ?? result.value.defaultDestination);
+      setExportError(undefined);
+    } catch (error) {
+      if (generation === projectGeneration.current) {
+        setExportError(errorFromUnknown(error));
+      }
+    } finally {
+      if (showBusy && generation === projectGeneration.current) {
+        setBusyAction(undefined);
+      }
+    }
+  }
+
+  async function refreshProjectAfterRunChange(): Promise<void> {
+    const generation = projectGeneration.current;
+    try {
+      const [onboardingResult, exportState] = await Promise.all([
+        desktopApi.getOnboardingState(),
+        desktopApi.getExportState(),
+      ]);
+      if (generation !== projectGeneration.current) return;
+      if (onboardingResult.ok) setOnboarding(onboardingResult.value);
+      if (exportState.ok) {
+        setExportSnapshot(exportState.value);
+        setExportDestination((current) => current ?? exportState.value.defaultDestination);
+      }
+    } catch {
+      // The durable run snapshot remains visible; the next workspace refresh
+      // can retry these presentation-only projections.
+    }
   }
 
   useEffect(() => {
@@ -157,6 +261,14 @@ export function App({ api }: AppProps): JSX.Element {
     setTrialProgress(progress);
   }), [desktopApi]);
 
+  useEffect(() => desktopApi.onFullBookProgress((progress) => {
+    setFullBookSnapshot((current) => mergeFullBookProgress(current, progress));
+    void refreshFullBookState(false);
+    if (["paused", "completed", "needs_attention", "failed"].includes(progress.phase)) {
+      void refreshProjectAfterRunChange();
+    }
+  }), [desktopApi, onboarding.project?.sourceVersion]);
+
   const knowledgeAvailable = onboarding.project?.store.state === "ready"
     && onboarding.project.selectedRunId !== undefined;
 
@@ -165,6 +277,15 @@ export function App({ api }: AppProps): JSX.Element {
       setActiveWorkspace("overview");
     }
   }, [activeWorkspace, knowledgeAvailable]);
+
+  useEffect(() => {
+    if (onboarding.project === undefined) return;
+    if (activeWorkspace === "runs") {
+      void refreshFullBookState(true);
+    } else if (activeWorkspace === "export") {
+      void refreshExportState(true);
+    }
+  }, [activeWorkspace, desktopApi, onboarding.project?.sourceVersion]);
 
   async function acceptSourceChoice(
     choice: DesktopChooseSourceResult,
@@ -177,8 +298,15 @@ export function App({ api }: AppProps): JSX.Element {
     setPendingEncoding(undefined);
     // A source identity change invalidates every projected trial artifact even
     // when refreshing the richer onboarding snapshot subsequently fails.
+    projectGeneration.current += 1;
     setTrialProgress(undefined);
     setTrialResult(undefined);
+    setFullBookSnapshot({ runs: [] });
+    setFullBookError(undefined);
+    setExportSnapshot({ candidates: [] });
+    setExportDestination(undefined);
+    setExportResult(undefined);
+    setExportError(undefined);
     const generation = beginOnboardingRefresh();
     const stateResult = await desktopApi.getOnboardingState();
     if (!isCurrentOnboardingRefresh(generation)) return;
@@ -334,6 +462,108 @@ export function App({ api }: AppProps): JSX.Element {
     }
   }
 
+  async function startFullBook(mode: DesktopTrialMode): Promise<void> {
+    setBusyAction("start-fullbook");
+    setFullBookError(undefined);
+    try {
+      const result = await desktopApi.startFullBook({ mode });
+      if (!result.ok) {
+        setFullBookError(result.error);
+        return;
+      }
+      setFullBookSnapshot(result.value);
+    } catch (error) {
+      setFullBookError(errorFromUnknown(error));
+    } finally {
+      setBusyAction(undefined);
+    }
+  }
+
+  async function pauseFullBook(): Promise<void> {
+    setBusyAction("pause-fullbook");
+    setFullBookError(undefined);
+    try {
+      const result = await desktopApi.pauseFullBook();
+      if (!result.ok) {
+        setFullBookError(result.error);
+        return;
+      }
+      setFullBookSnapshot(result.value);
+    } catch (error) {
+      setFullBookError(errorFromUnknown(error));
+    } finally {
+      setBusyAction(undefined);
+    }
+  }
+
+  async function resumeFullBook(runId: string): Promise<void> {
+    setBusyAction("resume-fullbook");
+    setFullBookError(undefined);
+    try {
+      const result = await desktopApi.resumeFullBook({ runId });
+      if (!result.ok) {
+        setFullBookError(result.error);
+        return;
+      }
+      setFullBookSnapshot(result.value);
+    } catch (error) {
+      setFullBookError(errorFromUnknown(error));
+    } finally {
+      setBusyAction(undefined);
+    }
+  }
+
+  async function chooseExportDirectory(): Promise<void> {
+    setBusyAction("choose-export-directory");
+    try {
+      const result = await desktopApi.chooseExportDirectory();
+      if (!result.ok) {
+        if (result.error.code !== "DESKTOP_SELECTION_CANCELLED") {
+          setExportError(result.error);
+        }
+        return;
+      }
+      setExportDestination(result.value);
+      setExportError(undefined);
+    } catch (error) {
+      setExportError(errorFromUnknown(error));
+    } finally {
+      setBusyAction(undefined);
+    }
+  }
+
+  async function exportBook(request: DesktopExportRequest): Promise<void> {
+    setBusyAction("export-book");
+    setExportError(undefined);
+    setExportResult(undefined);
+    try {
+      const result = await desktopApi.exportBook(request);
+      if (!result.ok) {
+        setExportError(result.error);
+        return;
+      }
+      setExportResult(result.value);
+      await refreshExportState(false);
+    } catch (error) {
+      setExportError(errorFromUnknown(error));
+    } finally {
+      setBusyAction(undefined);
+    }
+  }
+
+  async function openExportDirectory(exportId: string): Promise<void> {
+    setBusyAction("open-export-directory");
+    try {
+      const result = await desktopApi.openExportDirectory(exportId);
+      if (!result.ok) setExportError(result.error);
+      else setExportError(undefined);
+    } catch (error) {
+      setExportError(errorFromUnknown(error));
+    } finally {
+      setBusyAction(undefined);
+    }
+  }
+
   return (
     <div className="workbench-shell">
       <WindowTitlebar />
@@ -360,14 +590,43 @@ export function App({ api }: AppProps): JSX.Element {
             onStartTrial={startTrial}
             onCancelTrial={cancelTrial}
           />
+        ) : activeWorkspace === "runs" && onboarding.project !== undefined ? (
+          <RunWorkspace
+            title={onboarding.project.title}
+            modelReady={onboarding.activeModel?.capability === "ready"}
+            snapshot={fullBookSnapshot}
+            busy={busyAction === "load-fullbook"
+              || busyAction === "start-fullbook"
+              || busyAction === "pause-fullbook"
+              || busyAction === "resume-fullbook"}
+            error={fullBookError}
+            onStart={(mode) => { void startFullBook(mode); }}
+            onPause={() => { void pauseFullBook(); }}
+            onResume={(runId) => { void resumeFullBook(runId); }}
+          />
         ) : activeWorkspace === "memory" && knowledgeAvailable ? (
           <KnowledgeWorkbench
             key={`${onboarding.project?.sourceVersion ?? "none"}:${onboarding.project?.selectedRunId ?? "none"}`}
             api={desktopApi}
           />
+        ) : activeWorkspace === "export" && onboarding.project !== undefined ? (
+          <ExportWorkspace
+            title={onboarding.project.title}
+            snapshot={exportSnapshot}
+            destination={exportDestination}
+            result={exportResult}
+            busy={busyAction === "load-export"
+              || busyAction === "choose-export-directory"
+              || busyAction === "export-book"
+              || busyAction === "open-export-directory"}
+            error={exportError}
+            onChooseDirectory={() => { void chooseExportDirectory(); }}
+            onExport={(request) => { void exportBook(request); }}
+            onOpenDirectory={(exportId) => { void openExportDirectory(exportId); }}
+          />
         ) : (
           <WorkspacePlaceholder
-            workspace={activeWorkspace}
+            workspace="review"
             snapshot={onboarding.project}
             onChooseProject={() => { void chooseSource(); }}
           />

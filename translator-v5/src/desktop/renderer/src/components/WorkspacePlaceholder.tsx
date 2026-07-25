@@ -4,16 +4,13 @@ import type { DesktopProjectSnapshot } from "../../../contracts.js";
 import { WORKSPACES, type WorkspaceId } from "../types.js";
 
 interface WorkspacePlaceholderProps {
-  workspace: Exclude<WorkspaceId, "overview">;
+  workspace: Extract<WorkspaceId, "review">;
   snapshot: DesktopProjectSnapshot | undefined;
   onChooseProject(): void;
 }
 
-const workspaceCopy: Record<Exclude<WorkspaceId, "overview">, string> = {
-  runs: "整本翻译开始后，可以在这里查看进度、暂停任务或继续运行。",
-  memory: "这里将集中展示术语、人物别名和翻译过程中积累的故事记忆。",
+const workspaceCopy: Record<Extract<WorkspaceId, "review">, string> = {
   review: "这里将收纳需要人工确认的译文、名称和其他疑问。",
-  export: "这里将用于生成 TXT、EPUB 等便于阅读和分享的文件。",
 };
 
 export function WorkspacePlaceholder({ workspace, snapshot, onChooseProject }: WorkspacePlaceholderProps): JSX.Element {

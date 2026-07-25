@@ -30,7 +30,8 @@ export function Sidebar({
         {WORKSPACES.map((workspace, index) => {
           const selected = workspace.id === activeWorkspace;
           const available = workspace.id === "overview"
-            || (workspace.id === "memory" && knowledgeAvailable);
+            || (workspace.id === "memory" && knowledgeAvailable)
+            || (workspace.id !== "memory" && hasProject);
           return (
             <button
               className={`nav-item${selected ? " is-active" : ""}`}

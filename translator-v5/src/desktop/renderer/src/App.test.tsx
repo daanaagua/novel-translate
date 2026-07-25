@@ -4,6 +4,9 @@ import { userEvent } from "@testing-library/user-event";
 
 import type {
   DesktopChooseSourceResult,
+  DesktopExportSnapshot,
+  DesktopFullBookProgress,
+  DesktopFullBookSnapshot,
   DesktopOnboardingState,
   DesktopProjectSnapshot,
   DesktopResult,
@@ -288,6 +291,98 @@ describe("FolioLoom desktop onboarding", () => {
     expect((memory as HTMLButtonElement).disabled).toBe(false);
     await user.click(memory);
     expect(await screen.findByRole("heading", { name: "术语与记忆" })).toBeTruthy();
+  });
+
+  it("opens the full-book workspace and applies progress events without restarting the run", async () => {
+    const user = userEvent.setup();
+    let publishProgress: ((progress: DesktopFullBookProgress) => void) | undefined;
+    const afterEvent = deferred<DesktopResult<DesktopFullBookSnapshot>>();
+    const running: DesktopFullBookSnapshot = {
+      activeRunId: "run-hidden",
+      runs: [{
+        runId: "run-hidden",
+        sourceVersion: project.sourceVersion,
+        modelId: "deepseek-v4",
+        mode: "quality",
+        phase: "running",
+        progress: {
+          totalWindows: 100,
+          pendingWindows: 89,
+          runningWindows: 1,
+          stagedWindows: 0,
+          completedWindows: 10,
+          warningWindows: 0,
+          humanRequiredWindows: 0,
+          failedWindows: 0,
+        },
+        canPause: true,
+        canResume: false,
+        canExport: false,
+      }],
+    };
+    const getFullBookState = vi.fn()
+      .mockResolvedValueOnce(ok(running))
+      .mockReturnValueOnce(afterEvent.promise);
+    const startFullBook = vi.fn();
+    render(<App api={createApi({
+      getOnboardingState: vi.fn().mockResolvedValue(ok(readyOnboarding)),
+      getFullBookState,
+      startFullBook,
+      onFullBookProgress: vi.fn().mockImplementation((listener) => {
+        publishProgress = listener;
+        return () => { publishProgress = undefined; };
+      }),
+    })} />);
+
+    await user.click(await screen.findByRole("button", { name: "翻译运行" }));
+    expect(await screen.findByText("10 / 100 个文本块")).toBeTruthy();
+    act(() => publishProgress?.({
+      runId: "run-hidden",
+      phase: "running",
+      progress: {
+        ...running.runs[0]!.progress,
+        pendingWindows: 67,
+        completedWindows: 32,
+      },
+    }));
+    expect(await screen.findByText("32 / 100 个文本块")).toBeTruthy();
+    expect(startFullBook).not.toHaveBeenCalled();
+
+    await act(async () => afterEvent.resolve(failure(
+      "REQUEST_TIMEOUT",
+      "刷新状态超时",
+      "socket timeout",
+    )));
+    expect(screen.getByText("32 / 100 个文本块")).toBeTruthy();
+    expect(await screen.findByText("刷新状态超时")).toBeTruthy();
+  });
+
+  it("opens the export workspace with the current candidates and destination", async () => {
+    const user = userEvent.setup();
+    const exportState: DesktopExportSnapshot = {
+      candidates: [{
+        runId: "run-hidden",
+        modelId: "deepseek-v4",
+        status: "ready",
+        completedWindows: 100,
+        totalWindows: 100,
+        blockers: [],
+      }],
+      defaultDestination: {
+        destinationId: "destination-hidden",
+        displayPath: "D:\\Books\\Exports",
+      },
+    };
+    render(<App api={createApi({
+      getOnboardingState: vi.fn().mockResolvedValue(ok(readyOnboarding)),
+      getExportState: vi.fn().mockResolvedValue(ok(exportState)),
+    })} />);
+
+    await user.click(await screen.findByRole("button", { name: "导出" }));
+    expect(await screen.findByRole("heading", { name: "导出" })).toBeTruthy();
+    expect(screen.getByText("100 / 100 个文本块")).toBeTruthy();
+    expect(screen.getByText("D:\\Books\\Exports")).toBeTruthy();
+    expect(screen.queryByText("run-hidden")).toBeNull();
   });
 
   it("uses the visible manuscript button to call the desktop bridge and advance to model setup", async () => {
