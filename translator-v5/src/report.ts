@@ -509,6 +509,33 @@ export function losslessBookArtifactPaths(
   };
 }
 
+export function losslessBookTranslations(
+  store: LosslessBookStore,
+  runId: string,
+): PilotTranslation[] {
+  const state = store.auditState(runId);
+  const active = new Map(store.activeTranslations(runId).map((item) => [item.blockId, item]));
+  const windowById = new Map(state.windows.map((window) => [window.windowId, window]));
+  const windowIdByBlock = new Map(
+    state.memberships.map((membership) => [membership.blockId, membership.windowId]),
+  );
+  return state.blocks
+    .filter((block) => active.has(block.blockId))
+    .sort((left, right) => left.globalIndex - right.globalIndex)
+    .map((block) => {
+      const translation = active.get(block.blockId)!;
+      const window = windowById.get(windowIdByBlock.get(block.blockId) ?? "");
+      return {
+        blockId: block.blockId,
+        globalIndex: block.globalIndex,
+        chapterId: window?.chapterId ?? null,
+        chapterTitle: window?.chapterTitle ?? null,
+        sourceText: block.sourceText,
+        text: translation.text,
+      };
+    });
+}
+
 export function writeLosslessBookArtifacts(
   store: LosslessBookStore,
   runId: string,
@@ -524,27 +551,7 @@ export function writeLosslessBookArtifacts(
       `strict book export requires ${audit.totalBlockCount} translated blocks; found ${audit.translatedBlockCount}`,
     );
   }
-  const state = store.auditState(runId);
-  const active = new Map(store.activeTranslations(runId).map((item) => [item.blockId, item]));
-  const windowById = new Map(state.windows.map((window) => [window.windowId, window]));
-  const windowIdByBlock = new Map(
-    state.memberships.map((membership) => [membership.blockId, membership.windowId]),
-  );
-  const translations: PilotTranslation[] = state.blocks
-    .filter((block) => active.has(block.blockId))
-    .sort((left, right) => left.globalIndex - right.globalIndex)
-    .map((block) => {
-      const translation = active.get(block.blockId)!;
-      const window = windowById.get(windowIdByBlock.get(block.blockId) ?? "");
-      return {
-        blockId: block.blockId,
-        globalIndex: block.globalIndex,
-        chapterId: window?.chapterId ?? null,
-        chapterTitle: window?.chapterTitle ?? null,
-        sourceText: block.sourceText,
-        text: translation.text,
-      };
-    });
+  const translations = losslessBookTranslations(store, runId);
   mkdirSync(outputDirectory, { recursive: true });
   const paths = losslessBookArtifactPaths(outputDirectory, audit.complete);
   writeFileSync(paths.translation, renderTranslation(translations, {

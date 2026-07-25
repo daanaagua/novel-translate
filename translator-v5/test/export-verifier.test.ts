@@ -6,7 +6,12 @@ import { dirname, join } from "node:path";
 import test from "node:test";
 
 import { parseArgs } from "../src/cli.js";
+import { writeLosslessBookEpub } from "../src/export/epub-writer.js";
 import { verifyExport } from "../src/export/export-verifier.js";
+import {
+  readStoredZipEntries,
+  writeStoredZip,
+} from "../src/export/stored-zip.js";
 import { BookContext } from "../src/fullbook/book-context.js";
 import { planBookWindows } from "../src/fullbook/window-planner.js";
 import { createKnowledgeSnapshot } from "../src/knowledge/snapshot.js";
@@ -108,19 +113,6 @@ function fixture(): {
   return { store, context, output: join(dirname(manifest), "out") };
 }
 
-function storedZipEntry(name: string, payload: Buffer): Buffer {
-  const nameBytes = Buffer.from(name, "utf8");
-  const header = Buffer.alloc(30);
-  header.writeUInt32LE(0x04034b50, 0);
-  header.writeUInt16LE(20, 4);
-  header.writeUInt16LE(0, 6);
-  header.writeUInt16LE(0, 8);
-  header.writeUInt32LE(payload.length, 18);
-  header.writeUInt32LE(payload.length, 22);
-  header.writeUInt16LE(nameBytes.length, 26);
-  return Buffer.concat([header, nameBytes, payload]);
-}
-
 test("lossless translation rendering does not leak or duplicate source-language headings", () => {
   const rendered = renderTranslation([{
     blockId: "block-heading",
@@ -159,6 +151,37 @@ test("lossless export writes stable lineage sidecars and verifier detects tamper
     const verification = verifyExport(paths, item.store, "run-a");
     assert.equal(verification.ok, false);
     assert.ok(verification.incidentCodes.includes("LINEAGE_MISMATCH"));
+  } finally {
+    item.store.close();
+    item.context.close();
+  }
+});
+
+test("verifier detects tampering in each rendered text artifact", () => {
+  const item = fixture();
+  try {
+    addRun(item.store, item.context, "run-a", item.context.losslessBlocks.length);
+    let paths = writeLosslessBookArtifacts(item.store, "run-a", item.output);
+
+    writeFileSync(paths.translation, "tampered translation\n", "utf8");
+    assert.ok(
+      verifyExport(paths, item.store, "run-a").incidentCodes
+        .includes("TRANSLATION_CONTENT_MISMATCH"),
+    );
+
+    paths = writeLosslessBookArtifacts(item.store, "run-a", item.output);
+    writeFileSync(paths.bilingual, "tampered bilingual\n", "utf8");
+    assert.ok(
+      verifyExport(paths, item.store, "run-a").incidentCodes
+        .includes("BILINGUAL_CONTENT_MISMATCH"),
+    );
+
+    paths = writeLosslessBookArtifacts(item.store, "run-a", item.output);
+    writeFileSync(paths.audit, '{"schema":"tampered"}\n', "utf8");
+    assert.ok(
+      verifyExport(paths, item.store, "run-a").incidentCodes
+        .includes("AUDIT_CONTENT_MISMATCH"),
+    );
   } finally {
     item.store.close();
     item.context.close();
@@ -212,19 +235,70 @@ test("verifier checks the EPUB embedded lineage projection", () => {
     addRun(item.store, item.context, "run-a", item.context.losslessBlocks.length);
     const paths = writeLosslessBookArtifacts(item.store, "run-a", item.output);
     const epub = join(item.output, "book.epub");
-    writeFileSync(epub, storedZipEntry(
-      "META-INF/v5-lineage.json",
-      Buffer.from(readFileSync(paths.translationLineage, "utf8"), "utf8"),
-    ));
+    writeLosslessBookEpub(item.store, "run-a", epub, {
+      title: "Verified export",
+      language: "zh-CN",
+    });
     assert.equal(verifyExport({ ...paths, epub }, item.store, "run-a").ok, true);
 
-    writeFileSync(epub, storedZipEntry(
-      "META-INF/v5-lineage.json",
-      Buffer.from('{"schema":"v5-book-lineage-1","runId":"run-b"}', "utf8"),
-    ));
+    const entries = readStoredZipEntries(epub).map((entry) => ({
+      name: entry.name,
+      data: entry.name === "META-INF/v5-lineage.json"
+        ? '{"schema":"v5-book-lineage-1","runId":"run-b"}'
+        : entry.data,
+    }));
+    writeStoredZip(epub, entries);
     const verification = verifyExport({ ...paths, epub }, item.store, "run-a");
     assert.equal(verification.ok, false);
     assert.ok(verification.incidentCodes.includes("EPUB_LINEAGE_MISMATCH"));
+  } finally {
+    item.store.close();
+    item.context.close();
+  }
+});
+
+test("verifier rejects malformed EPUB mimetype, package, and navigation", () => {
+  const item = fixture();
+  try {
+    addRun(item.store, item.context, "run-a", item.context.losslessBlocks.length);
+    const paths = writeLosslessBookArtifacts(item.store, "run-a", item.output);
+    const epub = join(item.output, "book.epub");
+    writeLosslessBookEpub(item.store, "run-a", epub, {
+      title: "Verified export",
+      language: "zh-CN",
+    });
+    const original = readStoredZipEntries(epub);
+
+    writeStoredZip(epub, original.map((entry) => ({
+      name: entry.name,
+      data: entry.name === "mimetype" ? "application/zip" : entry.data,
+    })));
+    assert.ok(
+      verifyExport({ ...paths, epub }, item.store, "run-a").incidentCodes
+        .includes("EPUB_MIMETYPE_INVALID"),
+    );
+
+    writeStoredZip(epub, original.map((entry) => ({
+      name: entry.name,
+      data: entry.name === "META-INF/container.xml"
+        ? '<?xml version="1.0"?><container><rootfiles/></container>'
+        : entry.data,
+    })));
+    assert.ok(
+      verifyExport({ ...paths, epub }, item.store, "run-a").incidentCodes
+        .includes("EPUB_PACKAGE_INVALID"),
+    );
+
+    writeStoredZip(epub, original.map((entry) => ({
+      name: entry.name,
+      data: entry.name === "EPUB/nav.xhtml"
+        ? entry.data.toString("utf8").replace("section-1.xhtml", "missing.xhtml")
+        : entry.data,
+    })));
+    assert.ok(
+      verifyExport({ ...paths, epub }, item.store, "run-a").incidentCodes
+        .includes("EPUB_NAVIGATION_INVALID"),
+    );
   } finally {
     item.store.close();
     item.context.close();

@@ -1,8 +1,15 @@
 import { readFileSync } from "node:fs";
-import { inflateRawSync } from "node:zlib";
+import { posix } from "node:path";
 
+import { XMLParser, XMLValidator } from "fast-xml-parser";
+
+import { readStoredZipEntries, type StoredZipEntry } from "./stored-zip.js";
 import {
+  auditLosslessBookStore,
   losslessBookLineage,
+  losslessBookTranslations,
+  renderBilingual,
+  renderTranslation,
   type LosslessBookArtifactPaths,
   type LosslessBookLineage,
 } from "../report.js";
@@ -14,7 +21,14 @@ export type ExportVerificationIncidentCode =
   | "LINEAGE_MISMATCH"
   | "RUN_MISMATCH"
   | "EPUB_LINEAGE_MISSING"
-  | "EPUB_LINEAGE_MISMATCH";
+  | "EPUB_LINEAGE_MISMATCH"
+  | "TRANSLATION_CONTENT_MISMATCH"
+  | "BILINGUAL_CONTENT_MISMATCH"
+  | "AUDIT_CONTENT_MISMATCH"
+  | "EPUB_INVALID"
+  | "EPUB_MIMETYPE_INVALID"
+  | "EPUB_PACKAGE_INVALID"
+  | "EPUB_NAVIGATION_INVALID";
 
 export interface ExportVerificationResult {
   schema: "v5-export-verification-1";
@@ -47,34 +61,229 @@ function parseLineage(path: string): LosslessBookLineage {
   return parsed as LosslessBookLineage;
 }
 
-function zipEntry(path: string, entryName: string): Buffer | undefined {
-  const zip = readFileSync(path);
-  let offset = 0;
-  while (offset + 30 <= zip.length && zip.readUInt32LE(offset) === 0x04034b50) {
-    const flags = zip.readUInt16LE(offset + 6);
-    const method = zip.readUInt16LE(offset + 8);
-    const compressedSize = zip.readUInt32LE(offset + 18);
-    const nameLength = zip.readUInt16LE(offset + 26);
-    const extraLength = zip.readUInt16LE(offset + 28);
-    if ((flags & 0x08) !== 0) {
-      throw new Error("ZIP data descriptors are not supported for lineage verification");
-    }
-    const nameStart = offset + 30;
-    const dataStart = nameStart + nameLength + extraLength;
-    const name = zip.subarray(nameStart, nameStart + nameLength).toString("utf8");
-    const compressed = zip.subarray(dataStart, dataStart + compressedSize);
-    if (name === entryName) {
-      if (method === 0) {
-        return compressed;
-      }
-      if (method === 8) {
-        return inflateRawSync(compressed);
-      }
-      throw new Error(`unsupported ZIP compression method ${method}`);
-    }
-    offset = dataStart + compressedSize;
+function readMatches(path: string, expected: string): boolean {
+  try {
+    return readFileSync(path, "utf8") === expected;
+  } catch {
+    return false;
   }
-  return undefined;
+}
+
+function validXml(text: string): boolean {
+  return XMLValidator.validate(text) === true;
+}
+
+function arrayOf<T>(value: T | readonly T[] | undefined): readonly T[] {
+  if (value === undefined) return [];
+  return Array.isArray(value) ? value : [value] as readonly T[];
+}
+
+type XmlObject = Record<string, unknown>;
+
+function xmlObject(value: unknown): XmlObject | undefined {
+  return value !== null && typeof value === "object" && !Array.isArray(value)
+    ? value as XmlObject
+    : undefined;
+}
+
+function attribute(value: unknown, name: string): string | undefined {
+  const item = xmlObject(value)?.[`@_${name}`];
+  return typeof item === "string" ? item : undefined;
+}
+
+function safeEntryPath(basePath: string, reference: string): string | undefined {
+  if (reference.length === 0
+    || reference.startsWith("/")
+    || reference.includes("\\")
+    || reference.split("/").includes("..")) {
+    return undefined;
+  }
+  const resolved = posix.normalize(posix.join(posix.dirname(basePath), reference));
+  return resolved.startsWith("../") || resolved === ".." ? undefined : resolved;
+}
+
+function collectElements(value: unknown, tag: string, target: unknown[] = []): unknown[] {
+  if (Array.isArray(value)) {
+    for (const item of value) collectElements(item, tag, target);
+    return target;
+  }
+  const object = xmlObject(value);
+  if (object === undefined) return target;
+  for (const [key, item] of Object.entries(object)) {
+    if (key === tag) {
+      target.push(...arrayOf(item));
+    }
+    collectElements(item, tag, target);
+  }
+  return target;
+}
+
+const epubXmlParser = new XMLParser({
+  ignoreAttributes: false,
+  removeNSPrefix: true,
+  parseTagValue: false,
+  trimValues: false,
+});
+
+function verifyEpub(
+  path: string,
+  expectedLineageJson: string,
+  incidents: Set<ExportVerificationIncidentCode>,
+): void {
+  let entries: readonly StoredZipEntry[];
+  try {
+    entries = readStoredZipEntries(path);
+  } catch {
+    incidents.add("EPUB_INVALID");
+    return;
+  }
+  if (entries.length === 0) {
+    incidents.add("EPUB_INVALID");
+    return;
+  }
+  const names = new Set<string>();
+  for (const entry of entries) {
+    if (names.has(entry.name)
+      || entry.name.length === 0
+      || entry.name.startsWith("/")
+      || entry.name.includes("\\")
+      || entry.name.split("/").some((part) => part === "." || part === "..")) {
+      incidents.add("EPUB_INVALID");
+    }
+    names.add(entry.name);
+  }
+  const byName = new Map(entries.map((entry) => [entry.name, entry]));
+  const mimetype = entries[0];
+  if (mimetype?.name !== "mimetype"
+    || mimetype.method !== 0
+    || mimetype.data.toString("utf8") !== "application/epub+zip") {
+    incidents.add("EPUB_MIMETYPE_INVALID");
+  }
+
+  const lineagePayload = byName.get("META-INF/v5-lineage.json")?.data;
+  if (lineagePayload === undefined) {
+    incidents.add("EPUB_LINEAGE_MISSING");
+  } else {
+    try {
+      if (canonical(JSON.parse(lineagePayload.toString("utf8"))) !== expectedLineageJson) {
+        incidents.add("EPUB_LINEAGE_MISMATCH");
+      }
+    } catch {
+      incidents.add("EPUB_LINEAGE_MISMATCH");
+    }
+  }
+
+  let packagePath: string | undefined;
+  const containerText = byName.get("META-INF/container.xml")?.data.toString("utf8");
+  if (containerText === undefined || !validXml(containerText)) {
+    incidents.add("EPUB_PACKAGE_INVALID");
+  } else {
+    try {
+      const container = epubXmlParser.parse(containerText) as unknown;
+      const rootfiles = collectElements(container, "rootfile");
+      const rootPaths = rootfiles
+        .map((rootfile) => attribute(rootfile, "full-path"))
+        .filter((item): item is string => item !== undefined);
+      if (rootPaths.length !== 1 || rootPaths[0] !== "EPUB/package.opf") {
+        incidents.add("EPUB_PACKAGE_INVALID");
+      } else {
+        packagePath = rootPaths[0];
+      }
+    } catch {
+      incidents.add("EPUB_PACKAGE_INVALID");
+    }
+  }
+  if (packagePath === undefined) return;
+
+  const packageText = byName.get(packagePath)?.data.toString("utf8");
+  if (packageText === undefined || !validXml(packageText)) {
+    incidents.add("EPUB_PACKAGE_INVALID");
+    return;
+  }
+  let manifestById = new Map<string, { path: string; mediaType: string; properties: string }>();
+  let spinePaths: string[] = [];
+  let navPath: string | undefined;
+  try {
+    const packageDocument = epubXmlParser.parse(packageText) as unknown;
+    const packageNode = xmlObject(xmlObject(packageDocument)?.package);
+    const manifestNode = xmlObject(packageNode?.manifest);
+    const spineNode = xmlObject(packageNode?.spine);
+    const manifestItems = arrayOf(manifestNode?.item);
+    for (const item of manifestItems) {
+      const id = attribute(item, "id");
+      const href = attribute(item, "href");
+      const mediaType = attribute(item, "media-type");
+      const properties = attribute(item, "properties") ?? "";
+      const resolved = href === undefined ? undefined : safeEntryPath(packagePath, href);
+      if (id === undefined || mediaType === undefined || resolved === undefined
+        || manifestById.has(id) || !byName.has(resolved)) {
+        incidents.add("EPUB_PACKAGE_INVALID");
+        continue;
+      }
+      manifestById.set(id, { path: resolved, mediaType, properties });
+      if (properties.split(/\s+/u).includes("nav")) {
+        if (navPath !== undefined || mediaType !== "application/xhtml+xml") {
+          incidents.add("EPUB_PACKAGE_INVALID");
+        }
+        navPath = resolved;
+      }
+    }
+    const itemrefs = arrayOf(spineNode?.itemref);
+    for (const itemref of itemrefs) {
+      const idref = attribute(itemref, "idref");
+      const manifestItem = idref === undefined ? undefined : manifestById.get(idref);
+      if (manifestItem === undefined
+        || manifestItem.mediaType !== "application/xhtml+xml"
+        || manifestItem.properties.split(/\s+/u).includes("nav")) {
+        incidents.add("EPUB_PACKAGE_INVALID");
+      } else {
+        spinePaths.push(manifestItem.path);
+      }
+    }
+    if (manifestById.size === 0 || spinePaths.length === 0 || navPath === undefined) {
+      incidents.add("EPUB_PACKAGE_INVALID");
+    }
+  } catch {
+    incidents.add("EPUB_PACKAGE_INVALID");
+    return;
+  }
+
+  for (const xhtmlPath of spinePaths) {
+    const text = byName.get(xhtmlPath)?.data.toString("utf8");
+    if (text === undefined || !validXml(text)) {
+      incidents.add("EPUB_INVALID");
+    } else {
+      try {
+        epubXmlParser.parse(text);
+      } catch {
+        incidents.add("EPUB_INVALID");
+      }
+    }
+  }
+
+  const navText = navPath === undefined
+    ? undefined
+    : byName.get(navPath)?.data.toString("utf8");
+  if (navPath === undefined || navText === undefined || !validXml(navText)) {
+    incidents.add("EPUB_NAVIGATION_INVALID");
+    return;
+  }
+  try {
+    const navDocument = epubXmlParser.parse(navText) as unknown;
+    const hrefs = collectElements(navDocument, "a")
+      .map((anchor) => attribute(anchor, "href"))
+      .filter((item): item is string => item !== undefined);
+    const targets = new Set(
+      hrefs
+        .map((href) => safeEntryPath(navPath, href.split("#", 1)[0] ?? ""))
+        .filter((item): item is string => item !== undefined && byName.has(item)),
+    );
+    if (hrefs.length === 0 || spinePaths.some((spinePath) => !targets.has(spinePath))) {
+      incidents.add("EPUB_NAVIGATION_INVALID");
+    }
+  } catch {
+    incidents.add("EPUB_NAVIGATION_INVALID");
+  }
 }
 
 export function verifyExport(
@@ -85,6 +294,23 @@ export function verifyExport(
   const incidents = new Set<ExportVerificationIncidentCode>();
   const expected = losslessBookLineage(store, runId);
   const expectedJson = canonical(expected);
+  const translations = losslessBookTranslations(store, runId);
+  if (!readMatches(paths.translation, renderTranslation(translations, {
+    includeChapterMetadata: false,
+  }))) {
+    incidents.add("TRANSLATION_CONTENT_MISMATCH");
+  }
+  if (!readMatches(paths.bilingual, renderBilingual(translations))) {
+    incidents.add("BILINGUAL_CONTENT_MISMATCH");
+  }
+  try {
+    const actualAudit = JSON.parse(readFileSync(paths.audit, "utf8")) as unknown;
+    if (canonical(actualAudit) !== canonical(auditLosslessBookStore(store, runId))) {
+      incidents.add("AUDIT_CONTENT_MISMATCH");
+    }
+  } catch {
+    incidents.add("AUDIT_CONTENT_MISMATCH");
+  }
   for (const path of [
     paths.translationLineage,
     paths.bilingualLineage,
@@ -109,19 +335,7 @@ export function verifyExport(
     }
   }
   if (paths.epub !== undefined) {
-    try {
-      const payload = zipEntry(paths.epub, "META-INF/v5-lineage.json");
-      if (payload === undefined) {
-        incidents.add("EPUB_LINEAGE_MISSING");
-      } else {
-        const lineage = JSON.parse(payload.toString("utf8")) as unknown;
-        if (canonical(lineage) !== expectedJson) {
-          incidents.add("EPUB_LINEAGE_MISMATCH");
-        }
-      }
-    } catch {
-      incidents.add("EPUB_LINEAGE_MISMATCH");
-    }
+    verifyEpub(paths.epub, expectedJson, incidents);
   }
   const incidentCodes = [...incidents].sort();
   return {

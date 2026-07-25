@@ -288,7 +288,7 @@ git commit -m "feat(desktop): add durable full-book runner"
 - 修改：`translator-v5/src/export/export-verifier.ts`
 - 修改：`translator-v5/test/export-verifier.test.ts`
 
-- [ ] **步骤 1：编写 EPUB 失败测试**
+- [x] **步骤 1：编写 EPUB 失败测试**
 
 测试用包含 `& < > " '`, 中文、日文和韩文的译文夹具，断言：
 
@@ -310,7 +310,7 @@ assert.ok(entries.some((entry) => entry.name === "META-INF/v5-lineage.json"));
 
 用 `fast-xml-parser` 解析 container、OPF、nav 和全部正文 XHTML；断言 XML 特殊字符被转义、段落顺序与 `globalIndex` 一致。另一个夹具没有 chapterId，断言按字符上限在块边界稳定分节。
 
-- [ ] **步骤 2：运行测试确认失败**
+- [x] **步骤 2：运行测试确认失败**
 
 ```powershell
 node --test --import tsx test/epub-writer.test.ts
@@ -318,7 +318,7 @@ node --test --import tsx test/epub-writer.test.ts
 
 预期：FAIL，EPUB writer 尚不存在。
 
-- [ ] **步骤 3：实现确定性 Store ZIP**
+- [x] **步骤 3：实现确定性 Store ZIP**
 
 `stored-zip.ts` 提供：
 
@@ -338,7 +338,7 @@ export function readStoredZipEntries(path: string): readonly {
 
 实现本地文件头、CRC32、中央目录和 EOCD；禁止 data descriptor，拒绝重复、绝对、反斜杠和 `..` 路径。`mimetype` 由 EPUB writer 固定放在第一项且 Store。
 
-- [ ] **步骤 4：抽取有序译文投影并实现 EPUB**
+- [x] **步骤 4：抽取有序译文投影并实现 EPUB**
 
 `report.ts` 新增：
 
@@ -368,7 +368,7 @@ export function writeLosslessBookEpub(
 
 连续相同 chapterId 归入同一 section；缺少章节时累计到 120,000 字符并只在块边界切分。正文每个块保留空行分隔；段内换行写成 `<br/>`。导航标题使用“第 N 节”，避免把未翻译 source metadata 泄漏到中文成品。
 
-- [ ] **步骤 5：增强导出校验**
+- [x] **步骤 5：增强导出校验**
 
 `ExportVerificationIncidentCode` 增加：
 
@@ -384,7 +384,7 @@ export function writeLosslessBookEpub(
 
 `verifyExport()` 从 store 重建预期中文 TXT、双语 TXT 和 audit JSON，比较实际内容；存在 EPUB 时读取全部 ZIP 项，检查首项 mimetype、container rootfile、OPF manifest/spine、nav 目标、XHTML 可解析性和 lineage。
 
-- [ ] **步骤 6：运行 EPUB、验证器和 CLI 回归**
+- [x] **步骤 6：运行 EPUB、验证器和 CLI 回归**
 
 ```powershell
 node --test --import tsx test/epub-writer.test.ts test/export-verifier.test.ts test/cli.test.ts
@@ -392,7 +392,7 @@ node --test --import tsx test/epub-writer.test.ts test/export-verifier.test.ts t
 
 预期：全部 PASS，现有 CLI 不带 EPUB 时行为不变。
 
-- [ ] **步骤 7：提交**
+- [x] **步骤 7：提交**
 
 ```powershell
 git add translator-v5/src/export/stored-zip.ts translator-v5/src/export/epub-writer.ts translator-v5/src/report.ts translator-v5/src/export/export-verifier.ts translator-v5/test/epub-writer.test.ts translator-v5/test/export-verifier.test.ts
