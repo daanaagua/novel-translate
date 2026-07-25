@@ -4,9 +4,9 @@
 
 FolioLoom 是一个面向长篇小说的开源 AI 翻译引擎。它把原文完整性、叙事记忆、实体别名、术语连续性、局部风格和失败恢复作为同一条可审计流水线处理，目标是让复杂小说在分块、并行和长时间运行后仍保持可追溯的一致性。
 
-当前版本为 **FolioLoom v1.2.0**。正式内核位于 [`translator-v5/`](translator-v5/)，以 TypeScript 编写；仓库根目录的 Python 代码主要承担 TXT、Markdown、DOCX、EPUB 输入适配，并保留 V1–V4 的研究历史。
+当前版本为 **FolioLoom v1.3.0**。正式内核位于 [`translator-v5/`](translator-v5/)，以 TypeScript 编写；仓库根目录的 Python 代码主要承担 TXT、Markdown、DOCX、EPUB 输入适配，并保留 V1–V4 的研究历史。
 
-## V1.2 能做什么
+## V1.3 能做什么
 
 - 为原始文本建立带哈希和位置映射的无损账本；
 - 按逻辑窗口串行或有限并行翻译，并在中断后恢复；
@@ -22,7 +22,7 @@ FolioLoom 是一个面向长篇小说的开源 AI 翻译引擎。它把原文完
 ## 当前限制
 
 - 当前发布 Windows x64 单文件便携版和目录便携 ZIP，尚未提供代码签名；
-- V4 的本地裁决页和旧 Streamlit 页面仍保留，但不是 V1.1 主入口；
+- V4 的本地裁决页和旧 Streamlit 页面仍保留，但不是 V1.3 主入口；
 - 已完成离线回归和真实模型的一窗口、三窗口门禁，尚未发布最新版架构的全书质量基准；
 - 桌面端已接通书稿导入、模型兼容性检查、单片段试译、整本开始、暂停、恢复和严格导出；批量审阅队列仍是后续工作；
 - 桌面端内置 DeepSeek、Kimi、阿里云百炼、火山方舟、OpenAI、硅基流动及自定义 OpenAI-compatible 接口入口；各模型仍须通过真实兼容性检查。
@@ -43,7 +43,7 @@ npm.cmd ci
 Set-Location ..
 ```
 
-复制示例配置。V1.2 可以把真实 API Key 写入不会被 Git 跟踪的 `config/config.yaml`，也可以在运行命令中使用 `--opencode-auth` 从本机 OpenCode 的认证文件读取：
+复制示例配置。V1.3 可以把真实 API Key 写入不会被 Git 跟踪的 `config/config.yaml`，也可以在运行命令中使用 `--opencode-auth` 从本机 OpenCode 的认证文件读取：
 
 ```powershell
 Copy-Item config\config.example.yaml config\config.yaml
