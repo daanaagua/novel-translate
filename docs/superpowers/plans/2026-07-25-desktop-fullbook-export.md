@@ -833,7 +833,7 @@ git commit -m "docs: prepare FolioLoom 1.2.0 desktop workflow"
 **文件：**
 - 仅修复验证发现的直接回归，不扩大功能范围。
 
-- [ ] **步骤 1：运行所有内核测试**
+- [x] **步骤 1：运行所有内核测试**
 
 ```powershell
 npm test
@@ -841,7 +841,7 @@ npm test
 
 预期：全部 PASS，无跳过新增测试。
 
-- [ ] **步骤 2：运行类型与桌面测试**
+- [x] **步骤 2：运行类型与桌面测试**
 
 ```powershell
 npm run typecheck
@@ -851,7 +851,7 @@ npm run desktop:test
 
 预期：全部 PASS。
 
-- [ ] **步骤 3：构建 production 桌面代码**
+- [x] **步骤 3：构建 production 桌面代码**
 
 ```powershell
 npm run desktop:build
@@ -859,7 +859,7 @@ npm run desktop:build
 
 预期：main、preload、renderer 构建成功，构建验证 PASS。
 
-- [ ] **步骤 4：生成 win-unpacked 与文件夹便携包**
+- [x] **步骤 4：生成 win-unpacked 与文件夹便携包**
 
 ```powershell
 npm run desktop:dist:folder
@@ -871,7 +871,7 @@ npm run desktop:dist:folder
 - `translator-v5/release/FolioLoom-portable-win-x64.zip` 存在；
 - ZIP 解压后保留 exe 与资源目录，而不是单文件安装器。
 
-- [ ] **步骤 5：执行本地 GUI 烟雾测试**
+- [x] **步骤 5：执行本地 GUI 烟雾测试**
 
 从 `win-unpacked` 启动，使用小型测试书稿和假/测试模型入口确认：
 
@@ -882,7 +882,7 @@ npm run desktop:dist:folder
 5. 导出后 TXT 和 EPUB 存在；
 6. 页面无水平滚动条、空白占位和失效按钮。
 
-- [ ] **步骤 6：检查工作树与最终提交**
+- [x] **步骤 6：检查工作树与最终提交**
 
 ```powershell
 git diff --check
