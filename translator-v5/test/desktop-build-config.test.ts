@@ -61,12 +61,14 @@ test("desktop package scripts and portable metadata stay explicit", () => {
     apiKeyPolicy: string;
     projectDataPolicy: string;
     translationWritePolicy: string;
+    exportPolicy: string;
   };
   assert.deepEqual(resource, {
     schema: "folioloom-desktop-resource-1",
     apiKeyPolicy: "never-packaged",
     projectDataPolicy: "user-selected",
-    translationWritePolicy: "single-window-trial",
+    translationWritePolicy: "single-window-trial-and-durable-fullbook",
+    exportPolicy: "strict-txt-bilingual-epub",
   });
 
   const gitignore = readText(join(repositoryRoot, ".gitignore"));

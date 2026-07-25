@@ -37,6 +37,7 @@ import type {
   DesktopExportSnapshot,
   DesktopProjectRequest,
 } from "./contracts.js";
+import { desktopProjectTitle } from "./desktop-project-metadata.js";
 
 const DEFAULT_DESTINATION_TTL_MS = 24 * 60 * 60 * 1_000;
 const EXPORT_FORMATS = new Set<DesktopExportFormat>([
@@ -141,7 +142,7 @@ function normalizeProject(project: DesktopProjectRequest): NormalizedExportProje
     storePath,
     projectDirectory: dirname(manifestPath),
     sourceVersion: ledger.sourceVersion,
-    title: basename(ledger.rawPath, extname(ledger.rawPath)),
+    title: desktopProjectTitle(manifestPath, ledger.rawPath),
   };
 }
 

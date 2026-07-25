@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { mkdirSync } from "node:fs";
-import { join, resolve } from "node:path";
+import { dirname, join, resolve } from "node:path";
 
 import type { StreamFn } from "@earendil-works/pi-agent-core";
 import type { Model } from "@earendil-works/pi-ai";
@@ -1564,6 +1564,7 @@ async function runLosslessBook(
       `run model mismatch: metadata declares ${modelId}, provider model is ${runtimeSet.primary.model.id}`,
     );
   }
+  mkdirSync(dirname(resolve(options.storePath)), { recursive: true });
   let lease: ReturnType<typeof RunLease.acquire>;
   try {
     lease = RunLease.acquire(

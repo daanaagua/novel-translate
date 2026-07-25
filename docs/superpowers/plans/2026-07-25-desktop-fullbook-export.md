@@ -719,7 +719,7 @@ git commit -m "feat(desktop): add full-book and export workspaces"
 - 修改：`README.md`
 - 修改：`translator-v5/README.md`
 
-- [ ] **步骤 1：编写端到端失败测试**
+- [x] **步骤 1：编写端到端失败测试**
 
 测试使用临时 TXT 和确定性 fake stream，执行：
 
@@ -788,7 +788,7 @@ assert.deepEqual(
 
 最后重新打开 store 并对发布目录运行 `verifyExport()`；断言中文、日文、韩文 Unicode 均未乱码。
 
-- [ ] **步骤 2：运行端到端测试确认行为**
+- [x] **步骤 2：运行端到端测试确认行为**
 
 ```powershell
 node --test --import tsx test/desktop-fullbook-export-flow.test.ts
@@ -796,7 +796,7 @@ node --test --import tsx test/desktop-fullbook-export-flow.test.ts
 
 预期：PASS；如果测试揭示状态竞争，只修服务契约，不在测试中增加固定 sleep。
 
-- [ ] **步骤 3：更新版本和说明**
+- [x] **步骤 3：更新版本和说明**
 
 把 `package.json`、package-lock 根包版本改为 `1.2.0`。README 明确：
 
@@ -812,7 +812,7 @@ translationWritePolicy: "single-window-trial-and-durable-fullbook",
 exportPolicy: "strict-txt-bilingual-epub",
 ```
 
-- [ ] **步骤 4：运行文档与构建配置回归**
+- [x] **步骤 4：运行文档与构建配置回归**
 
 ```powershell
 node --test --import tsx test/desktop-build-config.test.ts test/verify-desktop-build.test.ts
@@ -821,7 +821,7 @@ npm run desktop:typecheck
 
 预期：全部 PASS。
 
-- [ ] **步骤 5：提交**
+- [x] **步骤 5：提交**
 
 ```powershell
 git add translator-v5/test/desktop-fullbook-export-flow.test.ts translator-v5/test/desktop-build-config.test.ts translator-v5/package.json translator-v5/package-lock.json README.md translator-v5/README.md

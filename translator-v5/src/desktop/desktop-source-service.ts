@@ -1,6 +1,15 @@
 import { createHash, randomUUID } from "node:crypto";
 import type { Dirent } from "node:fs";
-import { mkdir, readFile, readdir, realpath, rename, rm, stat } from "node:fs/promises";
+import {
+  mkdir,
+  readFile,
+  readdir,
+  realpath,
+  rename,
+  rm,
+  stat,
+  writeFile,
+} from "node:fs/promises";
 import { basename, extname, isAbsolute, join, resolve } from "node:path";
 
 import {
@@ -14,6 +23,10 @@ import {
   type SourceEncodingDecision,
 } from "../source/encoding-policy.js";
 import { SourceLedger } from "../source/source-ledger.js";
+import {
+  createDesktopProjectMetadata,
+  desktopProjectMetadataPath,
+} from "./desktop-project-metadata.js";
 
 export interface DesktopSourceServiceOptions {
   projectsRoot: string;
@@ -314,6 +327,11 @@ export class DesktopSourceService {
       const projectDirectory = await unusedProjectDirectory(
         this.#projectsRoot,
         projectName(sourcePath, initialRawSha256),
+      );
+      await writeFile(
+        desktopProjectMetadataPath(probeDirectory),
+        `${JSON.stringify(createDesktopProjectMetadata(sourcePath), null, 2)}\n`,
+        "utf8",
       );
       await rename(probeDirectory, projectDirectory);
       return {

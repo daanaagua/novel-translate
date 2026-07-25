@@ -1,6 +1,6 @@
 # FolioLoom V5
 
-`translator-v5/` 是 FolioLoom 的 TypeScript 翻译内核，也是本地 Electron 工作台的运行目录。它保留完整命令行工作流，并提供书稿导入、模型连接检查与单片段试译入口。
+`translator-v5/` 是 FolioLoom 的 TypeScript 翻译内核，也是本地 Electron 工作台的运行目录。它保留完整命令行工作流，并提供书稿导入、模型连接检查、单片段试译、整本运行与严格导出入口。
 
 ## 安装
 
@@ -15,11 +15,13 @@ npm.cmd install
 
 ## 本地桌面工作台
 
-桌面端已经随 FolioLoom v1.1.1 提供 Windows x64 便携包。普通用户不需要理解内部清单或数据库，按三步操作即可：
+桌面端已经随 FolioLoom v1.2.0 提供 Windows x64 便携包。普通用户不需要理解内部清单或数据库，按以下步骤操作即可：
 
 1. 选择 TXT、EPUB、DOCX 或 Markdown 书稿；
 2. 选择 DeepSeek、Kimi、阿里云百炼、火山方舟、OpenAI、硅基流动或自定义兼容服务，填写 API Key、模型与 provider 原始 effort 值；
-3. 完成真实兼容性检查后，试译一个短片段。
+3. 完成真实兼容性检查后，试译一个短片段；
+4. 在“翻译运行”中开始整本翻译，需要时安全暂停，并可在应用重启后继续；
+5. 完整性审计通过后，从“导出”选择中文 TXT、双语 TXT、EPUB 或全部格式。
 
 ```powershell
 Set-Location translator-v5
@@ -31,7 +33,7 @@ npm.cmd run desktop:dev
 [GitHub Releases](https://github.com/daanaagua/novel-translate/releases/latest)
 下载 `FolioLoom-portable-win-x64.zip`，完整解压后运行根目录的 `FolioLoom.exe`。
 
-连接检查会验证真实流式响应、工具调用和多轮连续性；只有 `ready` 状态可以开始试译。`limited` 和 `failed` 会显示可执行原因，不会被包装成成功。试译只运行一个串行窗口，不会暗中启动全书翻译。
+连接检查会验证真实流式响应、工具调用和多轮连续性；只有 `ready` 状态可以开始试译或整本翻译。`limited` 和 `failed` 会显示可执行原因，不会被包装成成功。试译只运行一个串行窗口，不会暗中启动全书翻译。
 
 ### 当前边界与密钥策略
 
@@ -40,8 +42,10 @@ npm.cmd run desktop:dev
 - 预设厂商地址由程序固定，普通界面不要求填写协议或 Base URL；只有自定义兼容入口允许填写经过校验的 HTTPS 地址或本机 loopback HTTP 地址。
 - 书稿导入复制原始字节并建立可校验项目，绝不覆盖用户选择的原文件。
 - 试译写入项目内 `artifacts/folioloom/book.db`，支持读取上次已提交结果；取消或退出不会中断已经进入的原子提交。
+- 整本运行同一时间只允许一个活动任务；暂停会停在持久边界，重启后根据 SQLite 中的原运行元数据继续，不会悄悄更换模型或 effort。
+- 导出只开放完整且审计通过的运行；中文 TXT、双语 TXT 和 EPUB 会先写入临时目录并严格校验，通过后再原子发布到用户选择的目录。
 - “术语与记忆”已经支持分页浏览、筛选、详情、证据、关系、历史、影响诊断、人工修改、恢复旧版本、全局术语附加与多格式导入。
-- 全书开始、暂停、恢复、批量审阅和导出尚未接入桌面入口，继续使用 CLI。
+- 批量审阅队列尚未接入桌面入口，继续作为后续功能；命令行工作流保持兼容。
 - `desktop:dist` 会同时生成 Windows x64 单文件便携版
   `release/FolioLoom-portable-win-x64.exe` 和目录便携版
   `release/FolioLoom-portable-win-x64.zip`。普通用户建议下载 ZIP，完整解压后直接双击根目录的

@@ -13,6 +13,7 @@ import type {
   DesktopRunSummary,
 } from "./contracts.js";
 import { DesktopInputError, fail, ok, toDesktopError } from "./desktop-errors.js";
+import { desktopProjectTitle } from "./desktop-project-metadata.js";
 
 type Doctor = typeof doctorBook;
 
@@ -116,6 +117,7 @@ function discoverStorePath(manifestPath: string): string | undefined {
 
 function snapshotBase(
   ledger: SourceLedger,
+  manifestPath: string,
 ): Pick<
   DesktopProjectSnapshot,
   | "title"
@@ -128,7 +130,7 @@ function snapshotBase(
   | "sourceVersion"
 > {
   return {
-    title: basename(ledger.rawPath, extname(ledger.rawPath)),
+    title: desktopProjectTitle(manifestPath, ledger.rawPath),
     sourceLanguage: ledger.sourceLanguage,
     detectedLanguage: sourceLanguageLabel(ledger.sourceLanguage, ledger.languageProfile.displayName),
     sourceEncoding: ledger.encoding,
@@ -246,7 +248,7 @@ export class DesktopProjectService {
       const candidateStorePath = request.storePath === undefined
         ? discoverStorePath(manifestPath)
         : requireStorePath(request.storePath);
-      const base = snapshotBase(ledger);
+      const base = snapshotBase(ledger, manifestPath);
       if (candidateStorePath === undefined) {
         return ok({
           ...base,
