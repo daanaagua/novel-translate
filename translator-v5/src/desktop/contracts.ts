@@ -201,6 +201,56 @@ export interface DesktopTrialResult {
   translationText: string;
 }
 
+export type DesktopFullBookPhase =
+  | "idle"
+  | "preparing"
+  | "running"
+  | "pausing"
+  | "paused"
+  | "completed"
+  | "needs_attention"
+  | "failed";
+
+export type DesktopFullBookWindowProgress = DesktopRunSummary["progress"] & {
+  runningWindows: number;
+  stagedWindows: number;
+};
+
+export interface DesktopFullBookRunSnapshot {
+  runId: string;
+  sourceVersion: string;
+  modelId: string;
+  mode: DesktopTrialMode;
+  phase: DesktopFullBookPhase;
+  progress: DesktopFullBookWindowProgress;
+  canPause: boolean;
+  canResume: boolean;
+  canExport: boolean;
+  error?: DesktopError;
+}
+
+export interface DesktopFullBookSnapshot {
+  activeRunId?: string;
+  runs: readonly DesktopFullBookRunSnapshot[];
+}
+
+export interface DesktopStartFullBookRequest {
+  mode: DesktopTrialMode;
+}
+
+export interface DesktopResumeFullBookRequest {
+  runId: string;
+}
+
+export const DESKTOP_FULLBOOK_PROGRESS_CHANNEL =
+  "folioloom:fullbook-progress" as const;
+
+export interface DesktopFullBookProgress {
+  runId: string;
+  phase: DesktopFullBookPhase;
+  progress: DesktopFullBookWindowProgress;
+}
+
 export type {
   DesktopAttachGlobalKnowledgeRequest,
   DesktopGlobalKnowledgeListRequest,

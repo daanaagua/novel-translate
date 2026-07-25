@@ -153,7 +153,7 @@ git commit -m "refactor(desktop): share translation runtime planning"
 - 创建：`translator-v5/test/desktop-fullbook-service.test.ts`
 - 修改：`translator-v5/src/desktop/contracts.ts`
 
-- [ ] **步骤 1：先定义 renderer DTO 并编写失败测试**
+- [x] **步骤 1：先定义 renderer DTO 并编写失败测试**
 
 新增合同：
 
@@ -214,7 +214,7 @@ export interface DesktopFullBookProgress {
 9. human-required 投影为 `needs_attention`；
 10. completed/warning 完整任务投影为 `completed` 且 `canExport=true`。
 
-- [ ] **步骤 2：运行测试确认失败**
+- [x] **步骤 2：运行测试确认失败**
 
 ```powershell
 node --test --import tsx test/desktop-fullbook-service.test.ts
@@ -222,7 +222,7 @@ node --test --import tsx test/desktop-fullbook-service.test.ts
 
 预期：FAIL，服务与合同尚不存在。
 
-- [ ] **步骤 3：实现后台运行和持久化投影**
+- [x] **步骤 3：实现后台运行和持久化投影**
 
 服务公开 API：
 
@@ -263,7 +263,7 @@ export class DesktopFullBookService {
 - 恢复前读取已存 run 元数据并比较序列化指纹；
 - 只允许恢复带有效 desktopFullBook 元数据的正式 run。
 
-- [ ] **步骤 4：运行服务测试**
+- [x] **步骤 4：运行服务测试**
 
 ```powershell
 node --test --import tsx test/desktop-fullbook-service.test.ts test/desktop-runtime-plan.test.ts test/book-runner.test.ts
@@ -271,7 +271,7 @@ node --test --import tsx test/desktop-fullbook-service.test.ts test/desktop-runt
 
 预期：全部 PASS。
 
-- [ ] **步骤 5：提交**
+- [x] **步骤 5：提交**
 
 ```powershell
 git add translator-v5/src/desktop/contracts.ts translator-v5/src/desktop/desktop-fullbook-service.ts translator-v5/test/desktop-fullbook-service.test.ts
