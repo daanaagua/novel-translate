@@ -4,7 +4,7 @@
 
 FolioLoom 是一个面向长篇小说的开源 AI 翻译引擎。它把原文完整性、叙事记忆、实体别名、术语连续性、局部风格和失败恢复作为同一条可审计流水线处理，目标是让复杂小说在分块、并行和长时间运行后仍保持可追溯的一致性。
 
-当前版本为 **FolioLoom v1.3.0**。正式内核位于 [`translator-v5/`](translator-v5/)，以 TypeScript 编写；仓库根目录的 Python 代码主要承担 TXT、Markdown、DOCX、EPUB 输入适配，并保留 V1–V4 的研究历史。
+当前版本为 **FolioLoom v1.3.0**。正式内核位于 [`folioloom/`](folioloom/)，以 TypeScript 编写；仓库根目录的 Python 代码主要承担 TXT、Markdown、DOCX、EPUB 输入适配，并保留 V1–V4 的研究历史。
 
 ## V1.3 能做什么
 
@@ -38,7 +38,7 @@ Set-Location novel-translate
 python -m venv .venv
 .\.venv\Scripts\python.exe -m pip install -r requirements.txt
 
-Set-Location translator-v5
+Set-Location folioloom
 npm.cmd ci
 Set-Location ..
 ```
@@ -63,7 +63,7 @@ Copy-Item config\config.example.yaml config\config.yaml
 .\.venv\Scripts\python.exe main.py init my_book "D:\books\my_book.epub" `
   --source-language en
 
-Set-Location translator-v5
+Set-Location folioloom
 
 # 只读检查原文覆盖、分块和异常，不调用模型
 npm.cmd run folioloom -- book doctor `
@@ -89,7 +89,7 @@ npm.cmd run folioloom -- book status `
 桌面工作台允许普通用户选择书稿、连接模型、先试译一小段，再开始整本翻译和导出。它可以直接导入 TXT、EPUB、DOCX 或 Markdown；内部项目文件和数据库无需手动选择。
 
 ```powershell
-Set-Location translator-v5
+Set-Location folioloom
 npm.cmd install
 npm.cmd run desktop:dev
 ```
@@ -104,7 +104,7 @@ npm.cmd run desktop:dev
 
 API Key 不会进入项目、日志、界面返回值或安装包。Windows 系统加密可用时，密钥以 Electron `safeStorage` 密文保存；不可用时只保留到当前应用会话结束。试译固定为一个串行窗口；整本运行把进度和译文提交到该书稿自己的 SQLite 状态库，不改写原始文件。暂停或关闭应用会先取消当前模型请求并等待持久状态落稳；恢复时沿用原运行的模型策略。导出只接受已完整翻译且严格校验通过的运行，并为 TXT 与 EPUB 保留可追溯谱系。
 
-`npm.cmd run desktop:dist` 可在本机生成 Windows x64 portable 构建；普通用户也可以从 [GitHub Releases](https://github.com/daanaagua/novel-translate/releases/latest) 下载目录便携 ZIP。桌面端的开发与安全边界见 [`translator-v5/README.md`](translator-v5/README.md)。
+`npm.cmd run desktop:dist` 可在本机生成 Windows x64 portable 构建；普通用户也可以从 [GitHub Releases](https://github.com/daanaagua/novel-translate/releases/latest) 下载目录便携 ZIP。桌面端的开发与安全边界见 [`folioloom/README.md`](folioloom/README.md)。
 
 ## 调整翻译文风
 
@@ -206,7 +206,7 @@ npm.cmd run folioloom -- book run `
 
 ## V1.0 命令
 
-所有命令在 `translator-v5/` 中执行。
+所有命令在 `folioloom/` 中执行。
 
 ```powershell
 # 使用旧 V4 SQLite 数据估算窗口；只读且不调用模型
@@ -270,7 +270,7 @@ FolioLoom 的核心不是把尽可能多的背景材料塞进模型，而是只�
 .\.venv\Scripts\python.exe main.py export-v4 my_book
 ```
 
-这些入口继续可用，但 FolioLoom V1.0 的正式翻译内核是 `translator-v5`。
+这些入口继续可用，但 FolioLoom V1.0 的正式翻译内核是 `folioloom`。
 
 ## License
 

@@ -133,6 +133,6 @@
 - 完整日文测试书为 74,703 字符、61/61 blocks；严格终验重跑约 1,189.5 秒，完整性和乱码/残留检查全部通过。
 - 韩文词汇定向复测确认“墨香”“龙天益”“赫武相”跨块一致；无汉字证据的人名只建立可修订软锚点，不做错误硬锁定。
 - 核心测试 489 通过、0 失败、1 跳过；桌面 Node 测试 64 通过、0 失败、1 跳过；renderer 30/30 通过；核心与桌面 typecheck、production build、Windows x64 portable 打包及打包产物冷启动全部通过。
-- portable 产物：`translator-v5/release/FolioLoom-portable-win-x64.exe`。
+- portable 产物：`folioloom/release/FolioLoom-portable-win-x64.exe`。
 - 三路独立审查均已完成：未发现 P0/P1；剩余 P2 为低置信度别名的独立全书再验证，以及 Flash 文学质量需在正式模型发布后重新盲评。
-- 详细报告：`translator-v5/docs/superpowers/reports/2026-07-22-cjk-desktop-validation.md`。
+- 详细报告：`folioloom/docs/superpowers/reports/2026-07-22-cjk-desktop-validation.md`。

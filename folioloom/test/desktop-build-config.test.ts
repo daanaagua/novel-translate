@@ -72,6 +72,6 @@ test("desktop package scripts and portable metadata stay explicit", () => {
   });
 
   const gitignore = readText(join(repositoryRoot, ".gitignore"));
-  assert.match(gitignore, /^translator-v5\/out\/$/m);
-  assert.match(gitignore, /^translator-v5\/release\/$/m);
+  assert.match(gitignore, /^folioloom\/out\/$/m);
+  assert.match(gitignore, /^folioloom\/release\/$/m);
 });

@@ -47,14 +47,17 @@ streamlit
 test.txt
 log.txt
 
-# V5 TypeScript pilot
-translator-v5/node_modules/
-translator-v5/dist/
-translator-v5/.pilot/
-translator-v5/coverage/
-translator-v5/out/
-translator-v5/release/
-translator-v5/.local/
+# FolioLoom
+folioloom/node_modules/
+folioloom/dist/
+folioloom/.pilot/
+folioloom/coverage/
+folioloom/out/
+folioloom/release/
+folioloom/.local/
+
+# Local archives kept outside the public repository
+local-archive/
 用于测试的模型.txt
 
 # Local copyrighted source text

@@ -1,4 +1,4 @@
-"""Read-only, single-run exporter for the lossless translator-v5 schema."""
+"""Read-only, single-run exporter for the lossless folioloom schema."""
 
 from __future__ import annotations
 
@@ -29,7 +29,7 @@ REQUIRED_TABLES = frozenset(
 )
 
 
-class V5BookExporter(BookExporter):
+class FolioLoomBookExporter(BookExporter):
     """Project exactly one schema-v2 run into TXT/EPUB plus stable lineage."""
 
     def __init__(
@@ -40,9 +40,18 @@ class V5BookExporter(BookExporter):
         run_id: str | None = None,
     ):
         super().__init__(project)
-        self.database_path = Path(database_path) if database_path else (
+        canonical_database = (
+            Path(project.root_dir) / "artifacts" / "folioloom" / "book.db"
+        )
+        legacy_database = (
             Path(project.root_dir) / "artifacts" / "translator_v5" / "book.db"
         )
+        if database_path is not None:
+            self.database_path = Path(database_path)
+        elif canonical_database.exists() or not legacy_database.exists():
+            self.database_path = canonical_database
+        else:
+            self.database_path = legacy_database
         self.requested_run_id = run_id
         self.run_id: str | None = None
         self._cached_chapters: List[Chapter] | None = None
@@ -71,12 +80,16 @@ class V5BookExporter(BookExporter):
             ).fetchall()
         }
         if version != LOSSLESS_SCHEMA_VERSION or not REQUIRED_TABLES.issubset(tables):
-            raise ValueError("V5 exporter requires the lossless schema v2 database")
+            raise ValueError(
+                "FolioLoom exporter requires the lossless schema v2 database"
+            )
         marker = database.execute(
             "SELECT value FROM lossless_schema_meta WHERE key='marker'"
         ).fetchone()
         if marker is None or marker[0] != LOSSLESS_SCHEMA_MARKER:
-            raise ValueError("V5 exporter requires the lossless schema v2 marker")
+            raise ValueError(
+                "FolioLoom exporter requires the lossless schema v2 marker"
+            )
 
     def _select_run(self, database: sqlite3.Connection) -> sqlite3.Row:
         candidates = database.execute(
@@ -101,7 +114,9 @@ class V5BookExporter(BookExporter):
 
     def _load_projection(self) -> tuple[list[sqlite3.Row], sqlite3.Row]:
         if not self.database_path.exists():
-            raise FileNotFoundError(f"V5 database does not exist: {self.database_path}")
+            raise FileNotFoundError(
+                f"FolioLoom database does not exist: {self.database_path}"
+            )
         uri = f"{self.database_path.resolve().as_uri()}?mode=ro"
         with sqlite3.connect(uri, uri=True) as database:
             database.row_factory = sqlite3.Row
@@ -254,7 +269,7 @@ class V5BookExporter(BookExporter):
         ]
         return self._cached_chapters
 
-    def export_v5(
+    def export_folioloom(
         self,
         output_dir: str | Path | None = None,
         *,
@@ -269,7 +284,7 @@ class V5BookExporter(BookExporter):
             if self._missing_ids:
                 raise ValueError(f"{len(self._missing_ids)} text blocks have no active translation")
         target_dir = output_dir or (
-            Path(self.project.root_dir) / "exports" / "translator_v5"
+            Path(self.project.root_dir) / "exports" / "folioloom"
         )
         result = self.export(
             output_dir=target_dir,
@@ -293,3 +308,20 @@ class V5BookExporter(BookExporter):
                 compress_type=ZIP_DEFLATED,
             )
         return result
+
+    def export_v5(
+        self,
+        output_dir: str | Path | None = None,
+        *,
+        allow_incomplete: bool = False,
+    ) -> ExportResult:
+        """Backward-compatible alias for projects scripted before the rename."""
+
+        return self.export_folioloom(
+            output_dir=output_dir,
+            allow_incomplete=allow_incomplete,
+        )
+
+
+# Backward-compatible import alias for third-party scripts.
+V5BookExporter = FolioLoomBookExporter

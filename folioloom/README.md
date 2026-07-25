@@ -1,13 +1,13 @@
-# FolioLoom V5
+# FolioLoom
 
-`translator-v5/` 是 FolioLoom 的 TypeScript 翻译内核，也是本地 Electron 工作台的运行目录。它保留完整命令行工作流，并提供书稿导入、模型连接检查、单片段试译、整本运行与严格导出入口。
+`folioloom/` 是 FolioLoom 的 TypeScript 翻译内核，也是本地 Electron 工作台的运行目录。它保留完整命令行工作流，并提供书稿导入、模型连接检查、单片段试译、整本运行与严格导出入口。
 
 ## 安装
 
 要求：Node.js 24+ 与 Windows。
 
 ```powershell
-Set-Location translator-v5
+Set-Location folioloom
 npm.cmd install
 ```
 
@@ -24,7 +24,7 @@ npm.cmd install
 5. 完整性审计通过后，从“导出”选择中文 TXT、双语 TXT、EPUB 或全部格式。
 
 ```powershell
-Set-Location translator-v5
+Set-Location folioloom
 npm.cmd install
 npm.cmd run desktop:dev
 ```

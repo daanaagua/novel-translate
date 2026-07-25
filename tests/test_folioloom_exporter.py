@@ -10,7 +10,10 @@ from zipfile import ZipFile
 import pytest
 
 import main as cli
-from src.core.v5_exporter import V5BookExporter
+from src.core.folioloom_exporter import (
+    FolioLoomBookExporter,
+    V5BookExporter,
+)
 
 
 SCHEMA_MARKER = "deepnovel-lossless-book-store-v2-knowledge-history"
@@ -42,7 +45,7 @@ def _store(
     corrupt_translation_hash: bool = False,
     quarantined: tuple[str, ...] = (),
 ) -> Path:
-    path = project.root_dir / "artifacts" / "translator_v5" / "book.db"
+    path = project.root_dir / "artifacts" / "folioloom" / "book.db"
     path.parent.mkdir(parents=True)
     blocks = [
         ("b1", 0, "Source one."),
@@ -194,7 +197,11 @@ def test_schema_v2_export_selects_one_run_and_embeds_identical_lineage(tmp_path)
     project = _project(tmp_path)
     store = _store(project, run_ids=("run-a", "run-b"))
 
-    result = V5BookExporter(project, database_path=store, run_id="run-a").export_v5()
+    result = FolioLoomBookExporter(
+        project,
+        database_path=store,
+        run_id="run-a",
+    ).export_folioloom()
 
     text = result.txt_path.read_text(encoding="utf-8-sig")
     assert "run-a-译文-0" in text
@@ -226,7 +233,7 @@ def test_omitted_run_requires_one_non_quarantined_candidate(tmp_path):
     project = _project(tmp_path)
     store = _store(project, run_ids=("run-a", "run-b"))
     with pytest.raises(ValueError, match=r"--run-id|run ID|run_id"):
-        V5BookExporter(project, database_path=store).export_v5()
+        FolioLoomBookExporter(project, database_path=store).export_folioloom()
 
     project_unique = _project(tmp_path / "unique")
     unique_store = _store(
@@ -234,7 +241,10 @@ def test_omitted_run_requires_one_non_quarantined_candidate(tmp_path):
         run_ids=("run-a", "old-run"),
         quarantined=("old-run",),
     )
-    result = V5BookExporter(project_unique, database_path=unique_store).export_v5()
+    result = FolioLoomBookExporter(
+        project_unique,
+        database_path=unique_store,
+    ).export_folioloom()
     lineage = json.loads(_lineage_path(result.txt_path).read_text(encoding="utf-8"))
     assert lineage["runId"] == "run-a"
 
@@ -242,11 +252,15 @@ def test_omitted_run_requires_one_non_quarantined_candidate(tmp_path):
 def test_strict_and_partial_exports_preserve_missing_lineage(tmp_path):
     project = _project(tmp_path)
     store = _store(project, missing_last=True)
-    exporter = V5BookExporter(project, database_path=store, run_id="run-a")
+    exporter = FolioLoomBookExporter(
+        project,
+        database_path=store,
+        run_id="run-a",
+    )
     with pytest.raises(ValueError, match="1"):
-        exporter.export_v5()
+        exporter.export_folioloom()
 
-    result = exporter.export_v5(allow_incomplete=True)
+    result = exporter.export_folioloom(allow_incomplete=True)
     lineage = json.loads(_lineage_path(result.txt_path).read_text(encoding="utf-8"))
     assert lineage["complete"] is False
     assert lineage["missingBlockIds"] == ["b3"]
@@ -257,9 +271,17 @@ def test_export_rejects_stale_translation_and_legacy_schema(tmp_path):
     project = _project(tmp_path)
     stale = _store(project, corrupt_translation_hash=True)
     with pytest.raises(ValueError, match=r"hash|哈希"):
-        V5BookExporter(project, database_path=stale, run_id="run-a").export_v5()
+        FolioLoomBookExporter(
+            project,
+            database_path=stale,
+            run_id="run-a",
+        ).export_folioloom()
     with pytest.raises(ValueError, match=r"hash|哈希"):
-        V5BookExporter(project, database_path=stale, run_id="run-a").export_v5(
+        FolioLoomBookExporter(
+            project,
+            database_path=stale,
+            run_id="run-a",
+        ).export_folioloom(
             allow_incomplete=True
         )
 
@@ -268,10 +290,28 @@ def test_export_rejects_stale_translation_and_legacy_schema(tmp_path):
     with sqlite3.connect(legacy_path) as db:
         db.execute("CREATE TABLE book_meta(key TEXT PRIMARY KEY, value TEXT)")
     with pytest.raises(ValueError, match=r"schema v2|Schema v2"):
-        V5BookExporter(legacy_project, database_path=legacy_path, run_id="run-a").export_v5()
+        FolioLoomBookExporter(
+            legacy_project,
+            database_path=legacy_path,
+            run_id="run-a",
+        ).export_folioloom()
 
 
-def test_export_v5_cli_routes_explicit_run(monkeypatch, tmp_path):
+def test_legacy_exporter_import_and_method_remain_compatible(tmp_path):
+    project = _project(tmp_path)
+    store = _store(project)
+
+    assert V5BookExporter is FolioLoomBookExporter
+    result = V5BookExporter(
+        project,
+        database_path=store,
+        run_id="run-a",
+    ).export_v5()
+
+    assert result.txt_path.exists()
+
+
+def test_export_folioloom_cli_routes_explicit_run(monkeypatch, tmp_path):
     project = _project(tmp_path)
     calls = {}
 
@@ -280,15 +320,20 @@ def test_export_v5_cli_routes_explicit_run(monkeypatch, tmp_path):
             assert received is project
             calls["run_id"] = run_id
 
-        def export_v5(self, output_dir=None, allow_incomplete=False):
+        def export_folioloom(self, output_dir=None, allow_incomplete=False):
             calls.update(output_dir=output_dir, allow_incomplete=allow_incomplete)
             return SimpleNamespace(txt_path=Path("draft.txt"), epub_path=Path("draft.epub"))
 
     monkeypatch.setattr(cli, "_load_project_or_error", lambda _book_id: project)
-    monkeypatch.setattr(cli, "V5BookExporter", FakeExporter, raising=False)
+    monkeypatch.setattr(
+        cli,
+        "FolioLoomBookExporter",
+        FakeExporter,
+        raising=False,
+    )
 
     result = cli.main([
-        "export-v5",
+        "export-folioloom",
         "sample",
         "--run-id",
         "run-a",
