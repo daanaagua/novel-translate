@@ -407,7 +407,7 @@ git commit -m "feat(export): add verified EPUB output"
 - 修改：`translator-v5/src/desktop/contracts.ts`
 - 修改：`translator-v5/src/report.ts`
 
-- [ ] **步骤 1：定义导出合同并编写失败测试**
+- [x] **步骤 1：定义导出合同并编写失败测试**
 
 新增：
 
@@ -464,7 +464,7 @@ export interface DesktopExportResult {
 - 未选择格式的主文件与对应 lineage 不留在最终目录；
 - 同名目录使用稳定后缀而不覆盖旧成品。
 
-- [ ] **步骤 2：运行测试确认失败**
+- [x] **步骤 2：运行测试确认失败**
 
 ```powershell
 node --test --import tsx test/desktop-export-service.test.ts
@@ -472,7 +472,7 @@ node --test --import tsx test/desktop-export-service.test.ts
 
 预期：FAIL，服务尚不存在。
 
-- [ ] **步骤 3：支持 GUI 友好文件名但保持 CLI 默认**
+- [x] **步骤 3：支持 GUI 友好文件名但保持 CLI 默认**
 
 扩展 `writeLosslessBookArtifacts()`：
 
@@ -485,7 +485,7 @@ export interface WriteLosslessBookArtifactsOptions {
 
 `fileStem` 未提供时继续生成 `v5_book_translation.txt` 等旧名称；提供时生成 `<安全书名>-中文.txt`、`<安全书名>-双语.txt` 及对应审计、指标和 lineage。
 
-- [ ] **步骤 4：实现受控目录和原子导出**
+- [x] **步骤 4：实现受控目录和原子导出**
 
 服务 API：
 
@@ -503,7 +503,7 @@ export class DesktopExportService {
 
 实现严格审计、友好文件名、EPUB、`verifyExport()`、选择格式后的清理和原子 rename。默认 destination 注册项目目录下的 `exports`，renderer 永远不直接提交文件系统路径。
 
-- [ ] **步骤 5：运行导出服务与报告回归**
+- [x] **步骤 5：运行导出服务与报告回归**
 
 ```powershell
 node --test --import tsx test/desktop-export-service.test.ts test/export-verifier.test.ts test/lossless-audit.test.ts
@@ -511,7 +511,7 @@ node --test --import tsx test/desktop-export-service.test.ts test/export-verifie
 
 预期：全部 PASS。
 
-- [ ] **步骤 6：提交**
+- [x] **步骤 6：提交**
 
 ```powershell
 git add translator-v5/src/desktop/contracts.ts translator-v5/src/desktop/desktop-export-service.ts translator-v5/src/report.ts translator-v5/test/desktop-export-service.test.ts

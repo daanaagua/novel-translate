@@ -124,6 +124,32 @@ export function bookArtifactFileNames(complete: boolean): BookArtifactPaths {
   };
 }
 
+function safeArtifactFileStem(value: string): string {
+  const sanitized = value
+    .normalize("NFC")
+    .replace(/[\u0000-\u001f<>:"/\\|?*]/gu, " ")
+    .replace(/\s+/gu, " ")
+    .replace(/[.\s]+$/gu, "")
+    .trim()
+    .slice(0, 100)
+    .replace(/[.\s]+$/gu, "");
+  return sanitized.length > 0 ? sanitized : "FolioLoom";
+}
+
+function friendlyBookArtifactFileNames(
+  complete: boolean,
+  fileStem: string,
+): BookArtifactPaths {
+  const stem = safeArtifactFileStem(fileStem);
+  const qualifier = complete ? "" : "-未完成";
+  return {
+    translation: `${stem}-中文${qualifier}.txt`,
+    bilingual: `${stem}-双语${qualifier}.txt`,
+    audit: `${stem}-审计${qualifier}.json`,
+    metrics: `${stem}-指标${qualifier}.json`,
+  };
+}
+
 export interface LosslessBookAuditReport {
   schema: "v5-book-store-audit-1";
   runId: string;
@@ -496,8 +522,11 @@ function lineageFileName(artifactFileName: string): string {
 export function losslessBookArtifactPaths(
   outputDirectory: string,
   complete: boolean,
+  fileStem?: string,
 ): LosslessBookArtifactPaths {
-  const names = bookArtifactFileNames(complete);
+  const names = fileStem === undefined
+    ? bookArtifactFileNames(complete)
+    : friendlyBookArtifactFileNames(complete, fileStem);
   return {
     translation: join(outputDirectory, names.translation),
     bilingual: join(outputDirectory, names.bilingual),
@@ -536,11 +565,16 @@ export function losslessBookTranslations(
     });
 }
 
+export interface WriteLosslessBookArtifactsOptions {
+  allowIncomplete?: boolean;
+  fileStem?: string;
+}
+
 export function writeLosslessBookArtifacts(
   store: LosslessBookStore,
   runId: string,
   outputDirectory: string,
-  options: { allowIncomplete?: boolean } = {},
+  options: WriteLosslessBookArtifactsOptions = {},
 ): LosslessBookArtifactPaths {
   const audit = auditLosslessBookStore(store, runId);
   if (audit.incidentCodes.length > 0) {
@@ -553,7 +587,7 @@ export function writeLosslessBookArtifacts(
   }
   const translations = losslessBookTranslations(store, runId);
   mkdirSync(outputDirectory, { recursive: true });
-  const paths = losslessBookArtifactPaths(outputDirectory, audit.complete);
+  const paths = losslessBookArtifactPaths(outputDirectory, audit.complete, options.fileStem);
   writeFileSync(paths.translation, renderTranslation(translations, {
     includeChapterMetadata: false,
   }), "utf8");

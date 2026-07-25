@@ -251,6 +251,46 @@ export interface DesktopFullBookProgress {
   progress: DesktopFullBookWindowProgress;
 }
 
+export type DesktopExportFormat =
+  | "translation_txt"
+  | "bilingual_txt"
+  | "epub";
+
+export interface DesktopExportCandidate {
+  runId: string;
+  modelId: string;
+  status: "ready" | "incomplete" | "blocked";
+  completedWindows: number;
+  totalWindows: number;
+  blockers: readonly string[];
+}
+
+export interface DesktopExportDestination {
+  destinationId: string;
+  displayPath: string;
+}
+
+export interface DesktopExportSnapshot {
+  candidates: readonly DesktopExportCandidate[];
+  defaultDestination?: DesktopExportDestination;
+}
+
+export interface DesktopExportRequest {
+  runId: string;
+  destinationId: string;
+  formats: readonly DesktopExportFormat[];
+}
+
+export interface DesktopExportResult {
+  exportId: string;
+  runId: string;
+  directory: string;
+  files: readonly {
+    format: DesktopExportFormat | "audit" | "metrics";
+    fileName: string;
+  }[];
+}
+
 export type {
   DesktopAttachGlobalKnowledgeRequest,
   DesktopGlobalKnowledgeListRequest,
