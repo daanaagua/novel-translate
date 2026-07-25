@@ -58,7 +58,7 @@
 - 修改：`translator-v5/src/desktop/desktop-trial-service.ts`
 - 测试：`translator-v5/test/desktop-trial-service.test.ts`
 
-- [ ] **步骤 1：编写失败测试，锁定质量/快速模式和稳定指纹**
+- [x] **步骤 1：编写失败测试，锁定质量/快速模式和稳定指纹**
 
 测试必须构造一个支持 `off/high/max` 的假运行时，并断言：
 
@@ -78,7 +78,7 @@ assert.equal(
 
 同时断言模型对象与 profile model id 不一致、非法 effort 集合和错误的派生 runtime 均抛出 `DESKTOP_RUNTIME_MISMATCH`。
 
-- [ ] **步骤 2：运行测试确认失败**
+- [x] **步骤 2：运行测试确认失败**
 
 运行：
 
@@ -88,7 +88,7 @@ node --test --import tsx test/desktop-runtime-plan.test.ts
 
 预期：FAIL，模块 `desktop-runtime-plan.js` 尚不存在。
 
-- [ ] **步骤 3：实现共享类型和纯函数**
+- [x] **步骤 3：实现共享类型和纯函数**
 
 核心公开形状固定为：
 
@@ -129,7 +129,7 @@ export function serializeDesktopRuntimeFingerprint(
 
 迁移 `desktop-trial-service.ts` 中的 profile 校验、effort 降档、派生 runtime 和指纹逻辑；原文件用类型别名继续导出 `DesktopTrialRuntime`，避免 main 和既有测试回归。
 
-- [ ] **步骤 4：运行共享方案和试译回归**
+- [x] **步骤 4：运行共享方案和试译回归**
 
 运行：
 
@@ -139,7 +139,7 @@ node --test --import tsx test/desktop-runtime-plan.test.ts test/desktop-trial-se
 
 预期：全部 PASS。
 
-- [ ] **步骤 5：提交**
+- [x] **步骤 5：提交**
 
 ```powershell
 git add translator-v5/src/desktop/desktop-runtime-plan.ts translator-v5/src/desktop/desktop-trial-service.ts translator-v5/test/desktop-runtime-plan.test.ts translator-v5/test/desktop-trial-service.test.ts

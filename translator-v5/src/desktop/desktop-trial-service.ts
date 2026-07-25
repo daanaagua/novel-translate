@@ -2,17 +2,12 @@ import { randomUUID } from "node:crypto";
 import { existsSync, mkdirSync } from "node:fs";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 
-import type { StreamFn } from "@earendil-works/pi-agent-core";
-import type { Model } from "@earendil-works/pi-ai";
-
 import {
   LOSSLESS_BOOK_PROTOCOL_VERSION,
   runBook,
   type LosslessBookRunOptions,
   type LosslessBookRunResult,
 } from "../fullbook/book-runner.js";
-import type { TranslationRuntime, TranslationRuntimeSet } from "../fullbook/types.js";
-import type { ModelProfile, ProviderEffort } from "../providers/types.js";
 import { SourceLedger } from "../source/source-ledger.js";
 import {
   LosslessBookStore,
@@ -21,10 +16,14 @@ import {
 } from "../storage/lossless-book-store.js";
 import type { DesktopTrialMode } from "./contracts.js";
 import {
-  explicitThinkingLevel,
-  isProviderEffort,
-  lowestLegalFastEffort,
-} from "./trial-runtime-policy.js";
+  buildDesktopRuntimePlan,
+  DesktopRuntimePlanError,
+  serializeDesktopRuntimeFingerprint,
+  type DesktopRuntimeFingerprint,
+  type DesktopRuntimePlan,
+  type DesktopRuntimeResolver,
+  type DesktopTranslationRuntime,
+} from "./desktop-runtime-plan.js";
 
 const TRIAL_SCHEMA = "folioloom-desktop-trial-2";
 
@@ -49,19 +48,8 @@ export class DesktopTrialError extends Error {
  * tested active model without exposing a credential, provider URL, or runtime
  * implementation to the renderer-facing service contract.
  */
-export interface DesktopTrialRuntime {
-  profile: ModelProfile;
-  model: Model<any>;
-  streamFn: StreamFn;
-  /** Efforts the selected provider has declared legal for this profile. */
-  supportedEfforts: readonly ProviderEffort[];
-  /** Create an isolated runtime projection without exposing credentials. */
-  createWithProfile(profile: ModelProfile): DesktopTrialRuntime;
-}
-
-export interface DesktopTrialRuntimeResolver {
-  resolve(): Promise<DesktopTrialRuntime | undefined>;
-}
+export type DesktopTrialRuntime = DesktopTranslationRuntime;
+export type DesktopTrialRuntimeResolver = DesktopRuntimeResolver;
 
 export interface DesktopTrialStartRequest {
   manifestPath: string;
@@ -97,32 +85,7 @@ interface ActiveTrial {
   settled: Promise<void>;
 }
 
-interface NormalizedTrialProfile {
-  providerId: string;
-  modelId: string;
-  reasoningEffort?: string;
-  customBaseUrl?: string;
-}
-
-interface TrialRuntimeFingerprint {
-  mode: DesktopTrialMode;
-  primary: NormalizedTrialProfile;
-  escalation: NormalizedTrialProfile;
-}
-
-interface TrialRuntimePlan {
-  runtimeSet: TranslationRuntimeSet;
-  fingerprint: TrialRuntimeFingerprint;
-}
-
 const ACTIVE_TRIALS = new Map<string, ActiveTrial>();
-
-function nonempty(value: unknown, label: string): string {
-  if (typeof value !== "string" || value.trim().length === 0) {
-    throw new DesktopTrialError("DESKTOP_TRIAL_RUNTIME_MISMATCH", `${label} must be non-empty`);
-  }
-  return value.trim();
-}
 
 function record(value: unknown): Record<string, unknown> | undefined {
   return typeof value === "object" && value !== null && !Array.isArray(value)
@@ -157,145 +120,10 @@ function manifestAndProject(request: DesktopTrialStartRequest): {
   return { manifestPath, projectDirectory: resolve(dirname(manifestPath)), mode: request.mode };
 }
 
-function normalizedModelProfile(
-  raw: ModelProfile,
-  label = "active",
-): NormalizedTrialProfile {
-  return {
-    providerId: nonempty(raw?.providerId, `${label} provider id`),
-    modelId: nonempty(raw?.modelId, `${label} model id`),
-    ...(raw?.reasoningEffort === undefined ? {} : {
-      reasoningEffort: nonempty(raw.reasoningEffort, `${label} reasoning effort`),
-    }),
-    ...(raw?.customBaseUrl === undefined ? {} : {
-      customBaseUrl: nonempty(raw.customBaseUrl, `${label} custom base URL`),
-    }),
-  };
-}
-
-function normalizedProfile(runtime: DesktopTrialRuntime): NormalizedTrialProfile {
-  const profile = normalizedModelProfile(runtime.profile);
-  if (runtime.model === undefined || runtime.model.id !== profile.modelId) {
-    throw new DesktopTrialError(
-      "DESKTOP_TRIAL_RUNTIME_MISMATCH",
-      "active model profile does not match the resolved translation runtime",
-    );
-  }
-  if (typeof runtime.streamFn !== "function") {
-    throw new DesktopTrialError(
-      "DESKTOP_TRIAL_RUNTIME_MISMATCH",
-      "active translation runtime has no stream function",
-    );
-  }
-  return profile;
-}
-
-function profileWithEffort(
-  profile: ModelProfile,
-  effort: ProviderEffort | undefined,
-): ModelProfile {
-  return {
-    providerId: profile.providerId,
-    modelId: profile.modelId,
-    ...(effort === undefined ? {} : { reasoningEffort: effort }),
-    ...(profile.customBaseUrl === undefined ? {} : { customBaseUrl: profile.customBaseUrl }),
-  };
-}
-
-function sameProfile(left: NormalizedTrialProfile, right: NormalizedTrialProfile): boolean {
-  return left.providerId === right.providerId
-    && left.modelId === right.modelId
-    && left.reasoningEffort === right.reasoningEffort
-    && left.customBaseUrl === right.customBaseUrl;
-}
-
-function translationRuntime(runtime: DesktopTrialRuntime): TranslationRuntime {
-  return {
-    model: runtime.model,
-    streamFn: runtime.streamFn,
-    ...(runtime.profile.reasoningEffort === undefined ? {} : {
-      effort: runtime.profile.reasoningEffort,
-    }),
-    thinkingLevel: explicitThinkingLevel(runtime.profile.reasoningEffort),
-  };
-}
-
-function runtimeFingerprint(fingerprint: TrialRuntimeFingerprint): string {
-  return JSON.stringify(fingerprint);
-}
-
-function requireSupportedEfforts(runtime: DesktopTrialRuntime): readonly ProviderEffort[] {
-  if (!Array.isArray(runtime.supportedEfforts)
-    || runtime.supportedEfforts.some((effort) => !isProviderEffort(effort))) {
-    throw new DesktopTrialError(
-      "DESKTOP_TRIAL_RUNTIME_MISMATCH",
-      "active translation runtime has invalid provider effort capabilities",
-    );
-  }
-  return runtime.supportedEfforts;
-}
-
-function derivedRuntime(
-  qualityRuntime: DesktopTrialRuntime,
-  profile: ModelProfile,
-): DesktopTrialRuntime {
-  if (typeof qualityRuntime.createWithProfile !== "function") {
-    throw new DesktopTrialError(
-      "DESKTOP_TRIAL_RUNTIME_MISMATCH",
-      "active translation runtime cannot derive a provider-safe effort projection",
-    );
-  }
-  const derived = qualityRuntime.createWithProfile(profile);
-  const expected = normalizedModelProfile(profile, "derived");
-  const actual = normalizedProfile(derived);
-  if (!sameProfile(actual, expected)) {
-    throw new DesktopTrialError(
-      "DESKTOP_TRIAL_RUNTIME_MISMATCH",
-      "derived translation runtime does not match the requested provider profile",
-    );
-  }
-  return derived;
-}
-
-function buildRuntimePlan(
-  mode: DesktopTrialMode,
-  qualityRuntime: DesktopTrialRuntime,
-): TrialRuntimePlan {
-  const qualityProfile = normalizedProfile(qualityRuntime);
-  const quality = translationRuntime(qualityRuntime);
-  if (mode === "quality") {
-    const fingerprint: TrialRuntimeFingerprint = {
-      mode,
-      primary: qualityProfile,
-      escalation: qualityProfile,
-    };
-    return {
-      runtimeSet: { mode, primary: quality, escalation: quality },
-      fingerprint,
-    };
-  }
-
-  const primaryEffort = lowestLegalFastEffort(requireSupportedEfforts(qualityRuntime));
-  const primaryProfile = profileWithEffort(qualityRuntime.profile, primaryEffort);
-  const primaryRuntime = primaryEffort === qualityRuntime.profile.reasoningEffort
-    ? qualityRuntime
-    : derivedRuntime(qualityRuntime, primaryProfile);
-  const primary = translationRuntime(primaryRuntime);
-  const fingerprint: TrialRuntimeFingerprint = {
-    mode,
-    primary: normalizedProfile(primaryRuntime),
-    escalation: qualityProfile,
-  };
-  return {
-    runtimeSet: { mode, primary, escalation: quality },
-    fingerprint,
-  };
-}
-
 function isCompletedTrial(
   run: StoredTranslationRun,
   sourceVersion: string,
-  fingerprint: TrialRuntimeFingerprint,
+  fingerprint: DesktopRuntimeFingerprint,
 ): boolean {
   if (run.sourceVersion !== sourceVersion || run.modelId !== fingerprint.primary.modelId) {
     return false;
@@ -303,7 +131,7 @@ function isCompletedTrial(
   const metadata = record(run.metadata);
   const trial = record(metadata?.desktopTrial);
   return trial?.schema === TRIAL_SCHEMA
-    && trial.runtimeFingerprint === runtimeFingerprint(fingerprint);
+    && trial.runtimeFingerprint === serializeDesktopRuntimeFingerprint(fingerprint);
 }
 
 function projectResult(state: LosslessAuditState): DesktopTrialResult | undefined {
@@ -325,7 +153,7 @@ function projectResult(state: LosslessAuditState): DesktopTrialResult | undefine
 function storedTrialResult(
   storePath: string,
   sourceVersion: string,
-  fingerprint: TrialRuntimeFingerprint,
+  fingerprint: DesktopRuntimeFingerprint,
 ): DesktopTrialResult | undefined {
   if (!existsSync(storePath)) {
     return undefined;
@@ -435,7 +263,15 @@ export class DesktopTrialService {
         "a successfully tested model is required before starting a desktop trial",
       );
     }
-    const plan = buildRuntimePlan(mode, runtime);
+    let plan: DesktopRuntimePlan;
+    try {
+      plan = buildDesktopRuntimePlan(mode, runtime);
+    } catch (error) {
+      if (error instanceof DesktopRuntimePlanError) {
+        throw new DesktopTrialError("DESKTOP_TRIAL_RUNTIME_MISMATCH", error.message);
+      }
+      throw error;
+    }
     const afterRuntime = SourceLedger.open(manifestPath);
     if (beforeRuntime.sourceVersion !== afterRuntime.sourceVersion) {
       throw new DesktopTrialError(
@@ -468,7 +304,7 @@ export class DesktopTrialService {
         metadata: {
           desktopTrial: {
             schema: TRIAL_SCHEMA,
-            runtimeFingerprint: runtimeFingerprint(plan.fingerprint),
+            runtimeFingerprint: serializeDesktopRuntimeFingerprint(plan.fingerprint),
           },
         },
       },
