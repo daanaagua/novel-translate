@@ -1051,6 +1051,45 @@ test("revalidation noop advances the binding without creating a translation vers
   store.close();
 });
 
+test("revalidation claims an exact planned task with compare-and-swap attempts", () => {
+  const store = new LosslessBookStore(fixturePath());
+  const fixture = createStaleConceptTask(store);
+  const pending = store.revalidationTasks(fixture.runId)[0];
+  assert.ok(pending);
+
+  assert.equal(
+    store.claimRevalidationTask(fixture.runId, "missing-task", 2),
+    undefined,
+  );
+  const claimed = store.claimRevalidationTask(
+    fixture.runId,
+    pending.taskId,
+    2,
+    pending.attempts,
+  );
+  assert.equal(claimed?.taskId, pending.taskId);
+  assert.equal(claimed?.attempts, 1);
+  assert.equal(
+    store.claimRevalidationTask(
+      fixture.runId,
+      pending.taskId,
+      2,
+      pending.attempts,
+    ),
+    undefined,
+  );
+  assert.equal(
+    store.claimRevalidationTask(
+      fixture.runId,
+      pending.taskId,
+      1,
+      claimed.attempts,
+    ),
+    undefined,
+  );
+  store.close();
+});
+
 test("metadata-only lexical revisions advance active bindings without scheduling work", () => {
   const store = new LosslessBookStore(fixturePath());
   const current = reviseConcept(alphaConcept(), { confidence: 0.99 });

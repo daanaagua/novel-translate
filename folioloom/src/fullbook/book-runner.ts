@@ -51,10 +51,6 @@ import {
   conceptFromAnchor,
   type LexicalSemanticClass,
 } from "../knowledge/lexical-concept.js";
-import {
-  evaluateRevalidationBindings,
-  type RevalidationBindingDecision,
-} from "../knowledge/sparse-revalidation.js";
 import { conceptsFromStableTerms } from "../knowledge/term-usage.js";
 import { createKnowledgeSnapshot } from "../knowledge/snapshot.js";
 import { SourceLedger } from "../source/source-ledger.js";
@@ -77,10 +73,8 @@ import {
 import {
   LosslessBookStore,
   type ConceptCoverageRevalidationReport,
-  type KnowledgeRevalidationTask,
   type LosslessBookStatusSummary,
   type PersistedLosslessWindow,
-  type RevalidationReplacementInput,
   type RevalidationWorkItem,
 } from "../storage/lossless-book-store.js";
 import type { RuntimeProfileStore } from "../storage/runtime-profile-store.js";
@@ -137,6 +131,15 @@ import {
 } from "./runtime-telemetry.js";
 import { buildTaskGraph, type SchedulerTask } from "./task-graph.js";
 import { assessTaskRisk } from "./task-risk.js";
+import {
+  drainKnowledgeRevalidationTasks,
+  emptyRevalidationDrainReport,
+  executeRevalidationTasks,
+  mergeRevalidationDrainReports,
+  type RevalidationDrainReport,
+  type RevalidationModelTelemetry,
+  type RevalidationTranslationOutput,
+} from "./revalidation-executor.js";
 import type { WindowExecutionSummary } from "./types.js";
 import type {
   PhysicalRequestPlan,
@@ -156,6 +159,14 @@ import {
 } from "./window-planner.js";
 
 export const LOSSLESS_BOOK_PROTOCOL_VERSION = "v5-book-3";
+export { drainKnowledgeRevalidationTasks };
+export type {
+  RevalidationDrainOptions,
+  RevalidationDrainReport,
+  RevalidationModelTelemetry,
+  RevalidationTranslationOutput,
+} from "./revalidation-executor.js";
+
 const DEFAULT_PROTOCOL_VERSION = LOSSLESS_BOOK_PROTOCOL_VERSION;
 const DEFAULT_MAX_ATTEMPTS = 2;
 const DEFAULT_MAX_CONCURRENCY = 2;
@@ -430,222 +441,6 @@ export interface LosslessBookRunResult {
   scheduler: SchedulerRunReport;
   leaseReleased: boolean;
   artifacts: null;
-}
-
-type RevalidationQueueStore = Pick<
-  LosslessBookStore,
-  | "claimNextRevalidationTask"
-  | "revalidationWorkItem"
-  | "resolveRevalidationNoop"
-  | "replaceTranslationForRevalidation"
-  | "completeRevalidationWithWarning"
->;
-
-export interface RevalidationTranslationOutput
-  extends Omit<
-    RevalidationReplacementInput,
-    "runId" | "taskId" | "action"
-  > {
-  readonly telemetry?: RevalidationModelTelemetry;
-}
-
-export interface RevalidationModelTelemetry {
-  readonly modelCalls: number;
-  readonly modelDurationMs: number;
-  readonly inputTokens: number;
-  readonly outputTokens: number;
-  readonly cacheReadTokens: number;
-  readonly cacheWriteTokens: number;
-  readonly reasoningTokens: number;
-  readonly totalTokens: number;
-}
-
-export interface RevalidationDrainReport {
-  readonly claimed: number;
-  readonly noop: number;
-  readonly repaired: number;
-  readonly retranslated: number;
-  readonly warning: number;
-  readonly modelCalls: number;
-  readonly modelDurationMs: number;
-  readonly inputTokens: number;
-  readonly outputTokens: number;
-  readonly cacheReadTokens: number;
-  readonly cacheWriteTokens: number;
-  readonly reasoningTokens: number;
-  readonly totalTokens: number;
-  readonly tokenUsageComplete: boolean;
-  readonly wallTimeMs: number;
-}
-
-export interface RevalidationDrainOptions {
-  readonly store: RevalidationQueueStore;
-  readonly runId: string;
-  readonly maxAttempts: number;
-  readonly translate: (
-    work: RevalidationWorkItem,
-    action: Exclude<RevalidationBindingDecision["action"], "noop">,
-  ) => Promise<RevalidationTranslationOutput>;
-  readonly isExpectedFailure: (error: unknown) => boolean;
-  readonly shouldRetryFailure?: (
-    error: unknown,
-    task: KnowledgeRevalidationTask,
-  ) => boolean;
-}
-
-function revalidationFailureCode(error: unknown): string {
-  if (error instanceof ModelProviderError) {
-    return `PROVIDER_${error.kind.toUpperCase()}`;
-  }
-  if (error instanceof BudgetExceeded) {
-    return "BUDGET_EXCEEDED";
-  }
-  if (error instanceof BookRequestCapacityError) {
-    return error.code;
-  }
-  return "REVALIDATION_FAILED";
-}
-
-/**
- * Drain only the durable task set that already exists. Translation-generated
- * knowledge is intentionally absent from this loop, so one revalidation wave
- * cannot recursively schedule itself.
- */
-export async function drainKnowledgeRevalidationTasks(
-  options: RevalidationDrainOptions,
-): Promise<RevalidationDrainReport> {
-  positiveInteger(options.maxAttempts, "revalidation maxAttempts");
-  const startedAt = performance.now();
-  const report = {
-    claimed: 0,
-    noop: 0,
-    repaired: 0,
-    retranslated: 0,
-    warning: 0,
-    modelCalls: 0,
-    modelDurationMs: 0,
-    inputTokens: 0,
-    outputTokens: 0,
-    cacheReadTokens: 0,
-    cacheWriteTokens: 0,
-    reasoningTokens: 0,
-    totalTokens: 0,
-    tokenUsageComplete: true,
-  };
-  while (true) {
-    const task = options.store.claimNextRevalidationTask(
-      options.runId,
-      options.maxAttempts,
-    );
-    if (task === undefined) break;
-    report.claimed += 1;
-    const work = options.store.revalidationWorkItem(
-      options.runId,
-      task.taskId,
-    );
-    const decision = evaluateRevalidationBindings(work.concepts);
-    if (decision.action === "noop") {
-      options.store.resolveRevalidationNoop(
-        options.runId,
-        task.taskId,
-        { reason: "recorded_surfaces_remain_allowed" },
-      );
-      report.noop += 1;
-      continue;
-    }
-    try {
-      report.modelCalls += 1;
-      const modelStartedAt = performance.now();
-      const output = await options.translate(work, decision.action);
-      if (output.telemetry === undefined) {
-        report.modelDurationMs += performance.now() - modelStartedAt;
-        report.tokenUsageComplete = false;
-      } else {
-        report.modelCalls += output.telemetry.modelCalls - 1;
-        report.modelDurationMs += output.telemetry.modelDurationMs;
-        report.inputTokens += output.telemetry.inputTokens;
-        report.outputTokens += output.telemetry.outputTokens;
-        report.cacheReadTokens += output.telemetry.cacheReadTokens;
-        report.cacheWriteTokens += output.telemetry.cacheWriteTokens;
-        report.reasoningTokens += output.telemetry.reasoningTokens;
-        report.totalTokens += output.telemetry.totalTokens;
-      }
-      options.store.replaceTranslationForRevalidation({
-        ...output,
-        runId: options.runId,
-        taskId: task.taskId,
-        action: decision.action,
-      });
-      if (decision.action === "repair") {
-        report.repaired += 1;
-      } else {
-        report.retranslated += 1;
-      }
-    } catch (error) {
-      report.tokenUsageComplete = false;
-      if (!options.isExpectedFailure(error)) {
-        throw error;
-      }
-      const retryable = options.shouldRetryFailure?.(error, task) ?? true;
-      if (retryable && task.attempts < options.maxAttempts) {
-        continue;
-      }
-      options.store.completeRevalidationWithWarning(
-        options.runId,
-        task.taskId,
-        { code: revalidationFailureCode(error) },
-      );
-      report.warning += 1;
-    }
-  }
-  return {
-    ...report,
-    wallTimeMs: performance.now() - startedAt,
-  };
-}
-
-function emptyRevalidationDrainReport(): RevalidationDrainReport {
-  return {
-    claimed: 0,
-    noop: 0,
-    repaired: 0,
-    retranslated: 0,
-    warning: 0,
-    modelCalls: 0,
-    modelDurationMs: 0,
-    inputTokens: 0,
-    outputTokens: 0,
-    cacheReadTokens: 0,
-    cacheWriteTokens: 0,
-    reasoningTokens: 0,
-    totalTokens: 0,
-    tokenUsageComplete: true,
-    wallTimeMs: 0,
-  };
-}
-
-function mergeRevalidationDrainReports(
-  left: RevalidationDrainReport,
-  right: RevalidationDrainReport,
-): RevalidationDrainReport {
-  return {
-    claimed: left.claimed + right.claimed,
-    noop: left.noop + right.noop,
-    repaired: left.repaired + right.repaired,
-    retranslated: left.retranslated + right.retranslated,
-    warning: left.warning + right.warning,
-    modelCalls: left.modelCalls + right.modelCalls,
-    modelDurationMs: left.modelDurationMs + right.modelDurationMs,
-    inputTokens: left.inputTokens + right.inputTokens,
-    outputTokens: left.outputTokens + right.outputTokens,
-    cacheReadTokens: left.cacheReadTokens + right.cacheReadTokens,
-    cacheWriteTokens: left.cacheWriteTokens + right.cacheWriteTokens,
-    reasoningTokens: left.reasoningTokens + right.reasoningTokens,
-    totalTokens: left.totalTokens + right.totalTokens,
-    tokenUsageComplete:
-      left.tokenUsageComplete && right.tokenUsageComplete,
-    wallTimeMs: left.wallTimeMs + right.wallTimeMs,
-  };
 }
 
 interface AttemptResult {
@@ -2382,20 +2177,28 @@ async function runLosslessBook(
       // window is claimed, so the next request sees the newest durable user
       // knowledge without ever changing a running/staged wave.
       store.syncScopedKnowledge(runId);
-      const drainedRevalidation = await drainKnowledgeRevalidationTasks({
+      const revalidationOptions = {
         store,
         runId,
         maxAttempts,
         translate: translateRevalidation,
-        isExpectedFailure: (error) =>
+        isExpectedFailure: (error: unknown) =>
           error instanceof ModelProviderError
           || error instanceof BudgetExceeded
           || error instanceof BookRequestCapacityError
           || error instanceof RevalidationOutputError,
-        shouldRetryFailure: (error) =>
+        shouldRetryFailure: (error: unknown) =>
           error instanceof RevalidationOutputError
           || (error instanceof ModelProviderError && error.retryable),
-      });
+      };
+      const drainedRevalidation = schedulerMode === "active"
+        ? await executeRevalidationTasks({
+          ...revalidationOptions,
+          maxConcurrency,
+          maxInFlightTokens,
+          profile: optimizationProfile,
+        })
+        : await drainKnowledgeRevalidationTasks(revalidationOptions);
       revalidationDrain = mergeRevalidationDrainReports(
         revalidationDrain,
         drainedRevalidation,

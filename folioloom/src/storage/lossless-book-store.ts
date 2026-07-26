@@ -2897,6 +2897,83 @@ export class LosslessBookStore {
     `), runId).map(revalidationTaskFromRow);
   }
 
+  claimRevalidationTask(
+    runId: string,
+    taskId: string,
+    maxAttempts = DEFAULT_MAX_REVALIDATION_ATTEMPTS,
+    expectedAttempts = 0,
+  ): KnowledgeRevalidationTask | undefined {
+    if (this.#schemaVersion !== LOSSLESS_BOOK_SCHEMA_VERSION) return undefined;
+    this.#run(runId);
+    requireNonempty(taskId, "taskId");
+    requireSafeInteger(maxAttempts, "maxAttempts", 1);
+    requireSafeInteger(expectedAttempts, "expectedAttempts");
+    return this.#transaction(() => {
+      const row = one<KnowledgeRevalidationTaskRow & { translation_active: number }>(
+        this.#database.prepare(`
+          SELECT task.*, translation.active AS translation_active
+          FROM knowledge_revalidation_tasks AS task
+          JOIN translations AS translation
+            ON translation.translation_id=task.translation_id
+          WHERE task.run_id=? AND task.task_id=?
+        `),
+        runId,
+        taskId,
+      );
+      if (row === undefined
+        || row.attempts !== expectedAttempts
+        || (row.status !== "pending" && row.status !== "validating")) {
+        return undefined;
+      }
+      const task = revalidationTaskFromRow(row);
+      if (row.translation_active === 0) {
+        this.#finishRevalidationTask(
+          task,
+          "resolved_noop",
+          { reason: "translation_superseded" },
+          null,
+          "clean",
+        );
+        return undefined;
+      }
+      if (row.attempts >= maxAttempts) {
+        if (row.status === "validating") {
+          this.#finishRevalidationTask(
+            task,
+            "completed_with_warning",
+            { code: "REVALIDATION_ATTEMPTS_EXHAUSTED" },
+            null,
+            "warning_stale",
+          );
+        }
+        return undefined;
+      }
+      const claimed = this.#database.prepare(`
+        UPDATE knowledge_revalidation_tasks
+        SET status='validating', attempts=attempts+1
+        WHERE run_id=? AND task_id=?
+          AND status IN ('pending','validating') AND attempts=?
+      `).run(runId, taskId, row.attempts);
+      if (Number(claimed.changes) !== 1) {
+        return undefined;
+      }
+      const result = this.#revalidationTask(runId, taskId);
+      for (const conceptId of result.conceptIds) {
+        this.#database.prepare(`
+          UPDATE translation_concept_bindings
+          SET validation_status='validating', updated_at=datetime('now')
+          WHERE translation_id=? AND concept_id=?
+        `).run(result.translationId, conceptId);
+      }
+      this.#appendEvent(runId, "sparse_revalidation_claimed", {
+        runId,
+        taskId: result.taskId,
+        attempt: result.attempts,
+      });
+      return result;
+    });
+  }
+
   claimNextRevalidationTask(
     runId: string,
     maxAttempts = DEFAULT_MAX_REVALIDATION_ATTEMPTS,
