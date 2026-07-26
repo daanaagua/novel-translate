@@ -18,6 +18,7 @@ export interface TranslationRuntimeSet {
   mode: TranslationRunMode;
   primary: TranslationRuntime;
   escalation: TranslationRuntime;
+  variants?: readonly TranslationRuntime[];
 }
 
 export type BookWindowStatus =

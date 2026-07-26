@@ -2,6 +2,7 @@ import type { StreamFn } from "@earendil-works/pi-agent-core";
 import type { Model } from "@earendil-works/pi-ai";
 
 import type { TranslationRuntime, TranslationRuntimeSet } from "../fullbook/types.js";
+import { validateRuntimeVariants } from "../fullbook/optimization-policy.js";
 import type { ModelProfile, ProviderEffort } from "../providers/types.js";
 import type { DesktopTrialMode } from "./contracts.js";
 import {
@@ -170,7 +171,12 @@ export function buildDesktopRuntimePlan(
   const quality = translationRuntime(qualityRuntime);
   if (mode === "quality") {
     return {
-      runtimeSet: { mode, primary: quality, escalation: quality },
+      runtimeSet: {
+        mode,
+        primary: quality,
+        escalation: quality,
+        variants: validateRuntimeVariants([quality]),
+      },
       fingerprint: {
         schema: "folioloom-desktop-runtime-1",
         mode,
@@ -185,11 +191,13 @@ export function buildDesktopRuntimePlan(
   const primaryRuntime = primaryEffort === qualityRuntime.profile.reasoningEffort
     ? qualityRuntime
     : derivedRuntime(qualityRuntime, primaryProfile);
+  const primary = translationRuntime(primaryRuntime);
   return {
     runtimeSet: {
       mode,
-      primary: translationRuntime(primaryRuntime),
+      primary,
       escalation: quality,
+      variants: validateRuntimeVariants([primary, quality]),
     },
     fingerprint: {
       schema: "folioloom-desktop-runtime-1",
