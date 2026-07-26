@@ -329,7 +329,7 @@ test("running reservations keep their slots and unlock successors by event", () 
     ],
     runningReservedTokens: 90,
     maxConcurrency: 2,
-    maxInFlightTokens: 190,
+    maxInFlightTokens: 200,
     runBaselineTotalTokens: 400,
   };
 
@@ -341,7 +341,8 @@ test("running reservations keep their slots and unlock successors by event", () 
   }]);
   assert.ok(result.actions.some((action) =>
     action.dispatch.some((item) => item.taskId === "successor")
-    && action.startOffsetMs >= 60));
+    && action.startOffsetMs === 60));
+  assert.equal(result.predictedWallTimeMs, 110);
 });
 
 test("a full initial reservation produces no immediate dispatch", () => {
@@ -376,6 +377,30 @@ test("planner output is deterministic", () => {
       variants: [...fixture.variants].reverse(),
     }),
   );
+});
+
+test("horizon planning reads direct edges without rescanning the full frontier", () => {
+  const tasks = Array.from({ length: 12 }, (_, index) =>
+    task(`edge-${index}`, index, index === 0 ? [] : [`edge-${index - 1}`]));
+  const baseGraph = buildTaskGraph(tasks);
+  let readyScans = 0;
+  const graph = {
+    ...baseGraph,
+    readyTaskIds(completedTaskIds: readonly string[]) {
+      readyScans += 1;
+      return baseGraph.readyTaskIds(completedTaskIds);
+    },
+  };
+  const fixture = plannerFixture(12);
+
+  planRollingHorizon({
+    ...fixture,
+    graph,
+    variants: tasks.map((item) =>
+      variant(item.taskId, `variant-${item.taskId}`)),
+  });
+
+  assert.equal(readyScans, 0);
 });
 
 test("deadline returns a bounded feasible first action", () => {
@@ -419,6 +444,39 @@ test("no legal hard-gated variant returns fallback", () => {
 
   assert.equal(result.planningStatus, "fallback");
   assert.deepEqual(result.firstDispatch, []);
+});
+
+test("a legal first action remains bounded when a later task has no variant", () => {
+  const highRisk = assessTaskRisk({
+    sourceTokens: 100,
+    entityMentions: 2,
+    pronounMentions: 0,
+    relationKinds: ["timeline"],
+    remoteEvidenceDistance: 0,
+    lockedTermOccurrences: 0,
+    needsRevalidate: false,
+    priorRepairs: 0,
+    sourceAnomalies: 0,
+  });
+  const tasks = [
+    task("legal", 0),
+    task("blocked", 1, [], highRisk),
+  ];
+  const fixture = plannerFixture(2);
+  const result = planRollingHorizon({
+    ...fixture,
+    graph: buildTaskGraph(tasks),
+    variants: [
+      variant("legal", "legal-variant"),
+      variant("blocked", "blocked-lean"),
+    ],
+  });
+
+  assert.equal(result.planningStatus, "bounded");
+  assert.deepEqual(result.firstDispatch, [{
+    taskId: "legal",
+    variantId: "legal-variant",
+  }]);
 });
 
 test("twelve-task planning stays below fifty milliseconds", () => {

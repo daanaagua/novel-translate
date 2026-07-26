@@ -97,6 +97,7 @@ test("write-read conflicts order tasks while shared reads remain compatible", ()
     graph.tasksCompatible("other-reader", "second-reader"),
     true,
   );
+  assert.deepEqual(graph.predecessorTaskIds("reader"), ["writer"]);
 });
 
 test("explicit ancestors are incompatible without a shared resource", () => {

@@ -24,6 +24,7 @@ export interface SchedulerTaskGraph {
     completedTaskIds: readonly string[],
     limit?: number,
   ): readonly SchedulerTask[];
+  predecessorTaskIds(taskId: string): readonly string[];
   tasksCompatible(leftTaskId: string, rightTaskId: string): boolean;
 }
 
@@ -346,6 +347,19 @@ export function buildTaskGraph(
         completed.add(next.taskId);
       }
       return Object.freeze(selected);
+    },
+    predecessorTaskIds(taskId: string): readonly string[] {
+      if (!taskById.has(taskId)) {
+        throw new TaskGraphIntegrityError(
+          `predecessors reference unknown task ${taskId}`,
+        );
+      }
+      return Object.freeze(
+        [...(incoming.get(taskId) ?? [])]
+          .map((predecessorId) => taskById.get(predecessorId)!)
+          .sort(compareTask)
+          .map((task) => task.taskId),
+      );
     },
     tasksCompatible(leftTaskId: string, rightTaskId: string): boolean {
       const left = taskById.get(leftTaskId);

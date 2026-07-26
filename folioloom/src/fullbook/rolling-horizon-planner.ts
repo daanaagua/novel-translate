@@ -570,17 +570,7 @@ function directPredecessorIds(
   graph: SchedulerTaskGraph,
   taskId: string,
 ): readonly string[] {
-  const allTaskIds = graph.tasks.map((task) => task.taskId);
-  const result: string[] = [];
-  for (const candidateId of allTaskIds) {
-    if (candidateId === taskId) continue;
-    const completedWithoutCandidate = allTaskIds.filter((currentId) =>
-      currentId !== taskId && currentId !== candidateId);
-    if (!graph.readyTaskIds(completedWithoutCandidate).includes(taskId)) {
-      result.push(candidateId);
-    }
-  }
-  return result;
+  return graph.predecessorTaskIds(taskId);
 }
 
 function taskPrerequisites(
@@ -888,6 +878,108 @@ function actionsForLabel(label: Label): readonly RollingPlannerAction[] {
   return reversed;
 }
 
+function scheduleAroundReservations(
+  actions: readonly RollingPlannerAction[],
+  input: ValidatedInput,
+): readonly RollingPlannerAction[] {
+  if (input.running.length === 0 || actions.length === 0) {
+    return actions;
+  }
+  const completionByTaskId = new Map<string, number>(
+    input.completedTaskIds.map((taskId) => [taskId, 0]),
+  );
+  const occupancies: Array<{
+    readonly endMs: number;
+    readonly slots: number;
+    readonly tokens: number;
+  }> = input.running.map((reservation) => {
+    completionByTaskId.set(
+      reservation.taskId,
+      reservation.remainingP90DurationMs,
+    );
+    return {
+      endMs: reservation.remainingP90DurationMs,
+      slots: 1,
+      tokens: reservation.reservedTokens,
+    };
+  });
+  const scheduled: RollingPlannerAction[] = [];
+  let priorStartMs = 0;
+  for (const action of actions) {
+    let earliestStartMs = priorStartMs;
+    let dependenciesKnown = true;
+    for (const dispatch of action.dispatch) {
+      for (const predecessorId of input.graph.predecessorTaskIds(
+        dispatch.taskId,
+      )) {
+        const completedAt = completionByTaskId.get(predecessorId);
+        if (completedAt === undefined) {
+          dependenciesKnown = false;
+          break;
+        }
+        earliestStartMs = Math.max(earliestStartMs, completedAt);
+      }
+    }
+    if (!dependenciesKnown) {
+      earliestStartMs = Math.max(earliestStartMs, action.startOffsetMs);
+    }
+    const eventTimes = [...new Set([
+      earliestStartMs,
+      ...occupancies
+        .map((occupancy) => occupancy.endMs)
+        .filter((endMs) => endMs >= earliestStartMs),
+    ])].sort((left, right) => left - right);
+    let startOffsetMs = eventTimes.at(-1) ?? earliestStartMs;
+    for (const eventTime of eventTimes) {
+      const active = occupancies.filter((occupancy) =>
+        occupancy.endMs > eventTime);
+      const occupiedSlots = active.reduce(
+        (total, occupancy) => total + occupancy.slots,
+        0,
+      );
+      const occupiedTokens = active.reduce(
+        (total, occupancy) => total + occupancy.tokens,
+        0,
+      );
+      if (occupiedSlots + action.dispatch.length <= input.maxConcurrency
+        && occupiedTokens + action.totalTokens
+          <= input.maxInFlightTokens) {
+        startOffsetMs = eventTime;
+        break;
+      }
+    }
+    const endMs = startOffsetMs + action.p90DurationMs;
+    occupancies.push({
+      endMs,
+      slots: action.dispatch.length,
+      tokens: action.totalTokens,
+    });
+    for (const dispatch of action.dispatch) {
+      completionByTaskId.set(dispatch.taskId, endMs);
+    }
+    scheduled.push({ ...action, startOffsetMs });
+    priorStartMs = startOffsetMs;
+  }
+  return scheduled;
+}
+
+function scheduledWallTime(
+  label: Label,
+  input: ValidatedInput,
+): number {
+  const actions = scheduleAroundReservations(actionsForLabel(label), input);
+  const actionCompletion = actions.reduce(
+    (maximum, action) =>
+      Math.max(maximum, action.startOffsetMs + action.p90DurationMs),
+    0,
+  );
+  return input.running.reduce(
+    (maximum, reservation) =>
+      Math.max(maximum, reservation.remainingP90DurationMs),
+    actionCompletion,
+  );
+}
+
 function resultFromLabel(
   status: RollingPlannerResult["planningStatus"],
   label: Label,
@@ -897,16 +989,22 @@ function resultFromLabel(
   horizonTaskIds: readonly string[],
   transitionCount: number,
 ): RollingPlannerResult {
-  const lastReservationCompletion = input.running.reduce(
+  const actions = scheduleAroundReservations(
+    actionsForLabel(label),
+    input,
+  );
+  const predictedWallTimeMs = input.running.reduce(
     (maximum, reservation) =>
       Math.max(maximum, reservation.remainingP90DurationMs),
-    0,
+    actions.reduce(
+      (maximum, action) =>
+        Math.max(
+          maximum,
+          action.startOffsetMs + action.p90DurationMs,
+        ),
+      0,
+    ),
   );
-  const predictedWallTimeMs = Math.max(
-    label.elapsedMs,
-    lastReservationCompletion,
-  );
-  const actions = actionsForLabel(label);
   const firstAction = actions[0];
   const firstDispatch = firstAction?.startOffsetMs === 0
     ? firstAction.dispatch
@@ -1146,14 +1244,7 @@ export function planRollingHorizon(
     const completed = completeLabels
       .map((label) => ({
         ...label,
-        elapsedMs: Math.max(
-          label.elapsedMs,
-          input.running.reduce(
-            (maximum, reservation) =>
-              Math.max(maximum, reservation.remainingP90DurationMs),
-            0,
-          ),
-        ),
+        elapsedMs: scheduledWallTime(label, input),
       }))
       .sort((left, right) =>
         compareLabels(
@@ -1172,7 +1263,7 @@ export function planRollingHorizon(
       transitionCount,
     );
   }
-  if (deadlineReached && bestPartial !== undefined) {
+  if (bestPartial !== undefined) {
     return resultFromLabel(
       "bounded",
       bestPartial,
