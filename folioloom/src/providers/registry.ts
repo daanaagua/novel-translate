@@ -9,7 +9,10 @@ import type {
   ResolvedProviderProfile,
   SecretCredential,
 } from "./types.js";
-import { PROVIDER_PRESETS } from "./presets.js";
+import {
+  PROVIDER_PRESETS,
+  isCurrentDeepSeekModelId,
+} from "./presets.js";
 
 const MAX_DISCOVERED_MODELS = 500;
 
@@ -94,6 +97,19 @@ export interface DiscoverModelsRequest {
   signal?: AbortSignal;
 }
 
+export class ProviderModelConfigurationError extends Error {
+  readonly code: "DEEPSEEK_MODEL_RETIRED";
+
+  constructor(
+    code: "DEEPSEEK_MODEL_RETIRED",
+    message: string,
+  ) {
+    super(`${code}: ${message}`);
+    this.name = "ProviderModelConfigurationError";
+    this.code = code;
+  }
+}
+
 export class ProviderRegistry {
   readonly #definitions: readonly ProviderDefinition[];
   readonly #byId: ReadonlyMap<ProviderId, ProviderDefinition>;
@@ -129,6 +145,12 @@ export class ProviderRegistry {
   resolve(profile: ModelProfile): ResolvedProviderProfile {
     const definition = this.get(profile.providerId);
     const modelId = requireText(profile.modelId, "modelId");
+    if (definition.id === "deepseek" && !isCurrentDeepSeekModelId(modelId)) {
+      throw new ProviderModelConfigurationError(
+        "DEEPSEEK_MODEL_RETIRED",
+        "DeepSeek 已停用旧模型路由，请选择 deepseek-v4-flash 或 deepseek-v4-pro",
+      );
+    }
     const reasoningEffort = profile.reasoningEffort;
     if (reasoningEffort !== undefined && !definition.capabilities.efforts.includes(reasoningEffort)) {
       throw new TypeError(`provider ${definition.id} does not support reasoning effort: ${reasoningEffort}`);

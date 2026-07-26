@@ -34,7 +34,7 @@ test("provider runtime maps DeepSeek raw max without serializing the credential"
   const credential = "provider-runtime-fixture-secret";
   const runtime = createProviderRuntime({
     providerId: "deepseek",
-    modelId: "deepseek-reasoner",
+    modelId: "deepseek-v4-pro",
     reasoningEffort: "max",
   }, credential);
 

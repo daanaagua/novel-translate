@@ -74,3 +74,14 @@ test("known knowledge import failures remain actionable across the IPC boundary"
     },
   );
 });
+
+test("retired DeepSeek routes receive a current-model recovery action", () => {
+  const error = Object.assign(new Error("DEEPSEEK_MODEL_RETIRED"), {
+    code: "DEEPSEEK_MODEL_RETIRED",
+  });
+  const result = toDesktopError(error);
+  assert.equal(result.code, "DEEPSEEK_MODEL_RETIRED");
+  assert.match(result.message, /旧模型路由/u);
+  assert.match(result.nextAction ?? "", /deepseek-v4-flash/u);
+  assert.match(result.nextAction ?? "", /deepseek-v4-pro/u);
+});

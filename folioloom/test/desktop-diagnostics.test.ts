@@ -7,6 +7,7 @@ import { afterEach, test } from "node:test";
 import {
   DesktopDiagnosticLogger,
   assertDiagnosticReportSafe,
+  formatDesktopDiagnosticSummary,
   writeDesktopDiagnosticReport,
   type DesktopDiagnosticContext,
 } from "../src/desktop/desktop-diagnostics.js";
@@ -206,4 +207,27 @@ test("exported diagnostics are valid UTF-8 JSON and contain no manuscript payloa
     JSON.stringify(parsed),
     /"(?:sourceText|translationText|prompt|rawResponse)"\s*:/u,
   );
+});
+
+test("diagnostic summary stays short, useful, and privacy-safe", () => {
+  const root = temporaryDirectory("diagnostic-summary");
+  const logger = new DesktopDiagnosticLogger({
+    directory: root,
+    appVersion: "1.4.0",
+    now: () => "2026-07-26T08:00:00.000Z",
+  });
+  logger.record({
+    event: "desktop.ipc",
+    operationId: "op-summary",
+    channel: "folioloom:start-trial",
+    phase: "translating",
+    outcome: "failed",
+    errorCode: "MODEL_TIMEOUT",
+  });
+  const summary = formatDesktopDiagnosticSummary(logger.buildReport(context()));
+  assert.match(summary, /deepseek-v4-flash/u);
+  assert.match(summary, /MODEL_TIMEOUT/u);
+  assert.match(summary, /translating/u);
+  assert.doesNotMatch(summary, /source paragraph|translation paragraph|api[-_]?key/iu);
+  assert.ok(summary.length < 1_000);
 });

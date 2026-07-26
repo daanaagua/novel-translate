@@ -30,14 +30,14 @@ function registry(status: "ready" | "limited" = "ready"): DesktopProviderRegistr
         displayName: "DeepSeek",
         keyPlaceholder: "DeepSeek API Key",
         efforts: ["off", "medium", "max"],
-        fallbackModelIds: ["deepseek-chat", "deepseek-reasoner"],
-        allowManualModel: true,
+        fallbackModelIds: ["deepseek-v4-flash", "deepseek-v4-pro"],
+        allowManualModel: false,
         allowCustomBaseUrl: false,
       }];
     },
     async discoverModels(_request, credential) {
       seenCredentials.push(credential);
-      return [{ id: "deepseek-reasoner", displayName: "DeepSeek Reasoner" }];
+      return [{ id: "deepseek-v4-pro", displayName: "DeepSeek V4 Pro" }];
     },
     async probe(_profile, credential) {
       seenCredentials.push(credential);
@@ -67,41 +67,79 @@ test("model service persists only ready non-secret model settings and never retu
       displayName: "DeepSeek",
       keyPlaceholder: "DeepSeek API Key",
       efforts: ["off", "medium", "max"],
-      fallbackModelIds: ["deepseek-chat", "deepseek-reasoner"],
-      allowManualModel: true,
+      fallbackModelIds: ["deepseek-v4-flash", "deepseek-v4-pro"],
+      allowManualModel: false,
       allowCustomBaseUrl: false,
       credentialStatus: "missing",
     }]);
 
     const result = await service.testAndSave({
       providerId: "deepseek",
-      modelId: "deepseek-reasoner",
+      modelId: "deepseek-v4-pro",
       reasoningEffort: "max",
       apiKey,
     });
 
     assert.equal(result.report.status, "ready");
     assert.equal(result.report.providerId, "deepseek");
-    assert.equal(result.report.modelId, "deepseek-reasoner");
+    assert.equal(result.report.modelId, "deepseek-v4-pro");
     assert.deepEqual(preferences.loadState().activeModelProfile, {
       providerId: "deepseek",
-      modelId: "deepseek-reasoner",
+      modelId: "deepseek-v4-pro",
       reasoningEffort: "max",
     });
     assert.equal(preferences.loadState().latestProbe?.providerId, "deepseek");
-    assert.equal(preferences.loadState().latestProbe?.modelId, "deepseek-reasoner");
+    assert.equal(preferences.loadState().latestProbe?.modelId, "deepseek-v4-pro");
     assert.deepEqual(providers.seenCredentials, [apiKey]);
     assert.doesNotMatch(JSON.stringify(result), new RegExp(apiKey));
     assert.doesNotMatch(readFileSync(preferencesPath, "utf8"), new RegExp(apiKey));
     assert.doesNotMatch(JSON.stringify(service.snapshot()), new RegExp(apiKey));
 
     const discovered = await service.discoverModels({ providerId: "deepseek" });
-    assert.deepEqual(discovered, [{ id: "deepseek-reasoner", displayName: "DeepSeek Reasoner" }]);
+    assert.deepEqual(discovered, [{ id: "deepseek-v4-pro", displayName: "DeepSeek V4 Pro" }]);
     assert.deepEqual(providers.seenCredentials, [apiKey, apiKey]);
 
     service.forgetCredential("deepseek");
     assert.equal(credentials.read("deepseek").status, "missing");
     assert.equal(preferences.loadState().activeModelProfile, undefined);
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("snapshot invalidates a retired persisted DeepSeek model without deleting its credential", () => {
+  const directory = mkdtempSync(join(tmpdir(), "folioloom-model-service-"));
+  try {
+    const preferences = new DesktopPreferences(join(directory, "preferences.json"));
+    const credentials = new DesktopCredentialStore({
+      path: join(directory, "credentials.json"),
+      secretBox: secretBox(),
+    });
+    credentials.save("deepseek", "keep-this-credential");
+    preferences.saveState({
+      activeModelProfile: {
+        providerId: "deepseek",
+        modelId: "deepseek-chat",
+      },
+      latestProbe: {
+        status: "ready",
+        providerId: "deepseek",
+        modelId: "deepseek-chat",
+        code: "READY",
+      },
+    });
+    const service = new DesktopModelService({
+      providers: registry(),
+      preferences,
+      credentials,
+    });
+
+    const snapshot = service.snapshot();
+    assert.equal(snapshot.activeModelProfile, undefined);
+    assert.equal(snapshot.latestProbe, undefined);
+    assert.equal(credentials.read("deepseek").status, "available");
+    assert.equal(preferences.loadState().activeModelProfile, undefined);
+    assert.equal(preferences.loadState().latestProbe, undefined);
   } finally {
     rmSync(directory, { recursive: true, force: true });
   }
@@ -166,7 +204,7 @@ test("preset providers reject custom endpoints before saving a model profile", a
     await assert.rejects(
       service.testAndSave({
         providerId: "deepseek",
-        modelId: "deepseek-reasoner",
+        modelId: "deepseek-v4-pro",
         customBaseUrl: "https://example.invalid/v1",
         apiKey: "preset-provider-secret",
       }),
@@ -193,7 +231,7 @@ test("limited probes do not save a key or active model profile", async () => {
 
     const result = await service.testAndSave({
       providerId: "deepseek",
-      modelId: "deepseek-reasoner",
+      modelId: "deepseek-v4-pro",
       apiKey: "limited-model-secret",
     });
 

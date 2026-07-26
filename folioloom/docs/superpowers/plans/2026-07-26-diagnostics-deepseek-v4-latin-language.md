@@ -242,7 +242,7 @@ git commit -m "feat: expose private diagnostic export in desktop app"
 - 修改：`src/desktop/renderer/src/App.test.tsx`
 - 修改：`test/fixtures/config.yaml`
 
-- [ ] **步骤 1：编写白名单、旧配置失效和 CLI 共同拒绝测试**
+- [x] **步骤 1：编写白名单、旧配置失效和 CLI 共同拒绝测试**
 
 ```ts
 test("DeepSeek exposes only V4 Flash and Pro as curated models", () => {
@@ -267,13 +267,13 @@ test("desktop snapshot invalidates a persisted retired DeepSeek profile and prob
 });
 ```
 
-- [ ] **步骤 2：运行测试确认旧模型仍可解析**
+- [x] **步骤 2：运行测试确认旧模型仍可解析**
 
 运行：`node --test --import tsx test/provider-registry.test.ts test/desktop-model-service.test.ts test/desktop-provider-adapter.test.ts`
 
 预期：FAIL，DeepSeek 仍是动态发现且 registry 接受旧模型。
 
-- [ ] **步骤 3：实现集中模型策略**
+- [x] **步骤 3：实现集中模型策略**
 
 ```ts
 export const DEEPSEEK_V4_MODEL_IDS = Object.freeze([
@@ -290,7 +290,7 @@ export class ProviderModelConfigurationError extends Error {
 
 在 `ProviderRegistry.resolve()` 中验证 DeepSeek 白名单；preset 使用 curated 且禁止手工模型。`DesktopModelService.snapshot()` 在发现旧持久化配置时原子清除 active profile/latest probe，不删除密钥。`toDesktopError()` 增加中文指引。
 
-- [ ] **步骤 4：验证 desktop、CLI 和 GUI**
+- [x] **步骤 4：验证 desktop、CLI 和 GUI**
 
 运行：
 
@@ -301,7 +301,7 @@ npx vitest run --config vitest.desktop.config.ts src/desktop/renderer/src/App.te
 
 预期：PASS；renderer 的 DeepSeek 下拉框只出现两个 V4 ID，且没有手工模型输入框。
 
-- [ ] **步骤 5：提交模型策略**
+- [x] **步骤 5：提交模型策略**
 
 ```bash
 git add src/providers src/desktop test src/desktop/renderer/src/components/ProviderSetup.tsx

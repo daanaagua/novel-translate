@@ -28,8 +28,8 @@ const providers: DesktopOnboardingState["providers"] = [
     displayName: "DeepSeek",
     keyPlaceholder: "DeepSeek API Key",
     efforts: ["off", "high", "max"],
-    fallbackModelIds: ["deepseek-chat", "deepseek-reasoner"],
-    allowManualModel: true,
+    fallbackModelIds: ["deepseek-v4-flash", "deepseek-v4-pro"],
+    allowManualModel: false,
     allowCustomBaseUrl: false,
     credentialStatus: "missing",
   },
@@ -147,7 +147,7 @@ const readyOnboarding: DesktopOnboardingState = {
   project,
   activeModel: {
     providerId: "deepseek",
-    modelId: "deepseek-reasoner",
+    modelId: "deepseek-v4-pro",
     reasoningEffort: "max",
     capability: "ready",
   },
@@ -652,6 +652,19 @@ describe("FolioLoom desktop onboarding", () => {
     expect(screen.queryByRole("button", { name: "最大" })).toBeNull();
   });
 
+  it("offers only current DeepSeek V4 choices without a manual model field", async () => {
+    render(<App api={createApi({
+      getOnboardingState: vi.fn().mockResolvedValue(ok(sourceOnlyOnboarding)),
+    })} />);
+
+    const select = await screen.findByLabelText("模型") as HTMLSelectElement;
+    expect([...select.options].map((option) => option.value)).toEqual([
+      "deepseek-v4-flash",
+      "deepseek-v4-pro",
+    ]);
+    expect(screen.queryByText("或填写模型名称")).toBeNull();
+  });
+
   it("starts the provider form from the saved active model", async () => {
     const savedKimi: DesktopOnboardingState = {
       ...readyOnboarding,
@@ -789,7 +802,7 @@ describe("FolioLoom desktop onboarding", () => {
       latestProbe: {
         status: "failed",
         providerId: "deepseek",
-        modelId: "deepseek-reasoner",
+        modelId: "deepseek-v4-pro",
         message: "matching active-model probe failed",
         retryable: true,
       },
@@ -910,7 +923,7 @@ describe("FolioLoom desktop onboarding", () => {
     expect(screen.queryByText("连接成功，API Key 已安全保存。")).toBeNull();
     expect((screen.getByLabelText("API Key") as HTMLInputElement).placeholder).toBe("DeepSeek API Key");
     expect((screen.getByRole("button", { name: "开始试译" }) as HTMLButtonElement).disabled).toBe(true);
-    expect(screen.queryByText("当前已选择 deepseek-reasoner")).toBeNull();
+    expect(screen.queryByText("当前已选择 deepseek-v4-pro")).toBeNull();
   });
 
   it("keeps the trial action disabled until the model is ready", async () => {
@@ -920,7 +933,7 @@ describe("FolioLoom desktop onboarding", () => {
       readiness: { source: true, model: false, trial: false },
       activeModel: {
         providerId: "deepseek",
-        modelId: "deepseek-reasoner",
+        modelId: "deepseek-v4-pro",
         capability: "limited",
       },
       latestProbe: { status: "limited", message: "这个模型还不能用于完整翻译流程" },

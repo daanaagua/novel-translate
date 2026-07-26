@@ -29,6 +29,11 @@ const PUBLIC_ERRORS: Readonly<Record<string, PublicErrorDefinition>> = Object.fr
     nextAction: "请核对模型 ID，或重新获取模型列表。",
     retryable: false,
   },
+  DEEPSEEK_MODEL_RETIRED: {
+    message: "DeepSeek 旧模型路由已经停用",
+    nextAction: "请选择 deepseek-v4-flash 或 deepseek-v4-pro 后重新测试连接。",
+    retryable: false,
+  },
   QUOTA_EXHAUSTED: {
     message: "账户额度不足",
     nextAction: "请在服务商控制台检查余额或配额。",

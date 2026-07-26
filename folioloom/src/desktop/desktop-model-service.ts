@@ -1,4 +1,5 @@
 import type { ProviderEffort, ProviderId } from "../providers/types.js";
+import { isCurrentDeepSeekModelId } from "../providers/presets.js";
 import {
   DesktopCredentialStore,
   type DesktopCredentialReadResult,
@@ -265,7 +266,20 @@ export class DesktopModelService {
   }
 
   snapshot(): DesktopModelServiceSnapshot {
-    const state = this.#preferences.loadState();
+    let state = this.#preferences.loadState();
+    const retiredActive = state.activeModelProfile?.providerId === "deepseek"
+      && !isCurrentDeepSeekModelId(state.activeModelProfile.modelId);
+    const retiredProbe = state.latestProbe?.providerId === "deepseek"
+      && typeof state.latestProbe.modelId === "string"
+      && !isCurrentDeepSeekModelId(state.latestProbe.modelId);
+    if (retiredActive || retiredProbe) {
+      state = {
+        ...state,
+        ...(retiredActive ? { activeModelProfile: undefined } : {}),
+        ...((retiredActive || retiredProbe) ? { latestProbe: undefined } : {}),
+      };
+      this.#preferences.saveState(state);
+    }
     return {
       providers: this.listProviders(),
       ...(state.activeModelProfile === undefined ? {} : { activeModelProfile: state.activeModelProfile }),

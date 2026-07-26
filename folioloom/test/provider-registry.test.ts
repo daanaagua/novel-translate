@@ -23,10 +23,40 @@ test("provider registry exposes the supported first-party order", () => {
   ]);
 });
 
+test("DeepSeek exposes only the current V4 Flash and Pro models", () => {
+  const definition = providerRegistry.get("deepseek");
+  assert.equal(definition.modelDiscovery, "curated");
+  assert.deepEqual(definition.fallbackModels, [
+    "deepseek-v4-flash",
+    "deepseek-v4-pro",
+  ]);
+  assert.equal(definition.allowManualModel, false);
+  assert.equal(
+    providerRegistry.resolve({
+      providerId: "deepseek",
+      modelId: "deepseek-v4-flash",
+    }).profile.modelId,
+    "deepseek-v4-flash",
+  );
+});
+
+test("retired DeepSeek aliases fail with a stable public error code", () => {
+  for (const modelId of ["deepseek-chat", "deepseek-reasoner"]) {
+    assert.throws(
+      () => providerRegistry.resolve({ providerId: "deepseek", modelId }),
+      (error: unknown) => (
+        error instanceof Error
+        && "code" in error
+        && error.code === "DEEPSEEK_MODEL_RETIRED"
+      ),
+    );
+  }
+});
+
 test("preset provider base URLs cannot be overridden by a profile", () => {
   const resolved = providerRegistry.resolve({
     providerId: "deepseek",
-    modelId: "deepseek-chat",
+    modelId: "deepseek-v4-flash",
     customBaseUrl: "https://untrusted.example/v1",
   });
 
@@ -61,7 +91,7 @@ test("custom provider URL accepts HTTPS and loopback HTTP only", () => {
 test("raw max effort stays max after the internal xhigh mapping", () => {
   const profile = {
     providerId: "deepseek" as const,
-    modelId: "deepseek-reasoner",
+    modelId: "deepseek-v4-pro",
     reasoningEffort: "max",
   } satisfies ModelProfile;
 
@@ -85,10 +115,10 @@ test("Bailian exposes its Qwen reasoning control as an honest on/off toggle", ()
   );
 });
 
-test("provider model discovery de-duplicates live ids and labels a fallback honestly", async () => {
+test("dynamic provider model discovery de-duplicates live ids and labels a fallback honestly", async () => {
   const registry = new ProviderRegistry(PROVIDER_PRESETS);
   const live = await registry.discoverModels({
-    profile: { providerId: "deepseek", modelId: "deepseek-chat" },
+    profile: { providerId: "kimi-cn", modelId: "moonshot-v1-8k" },
     credential: "credential-never-serialized",
     fetch: async () => new Response(JSON.stringify({
       data: [{ id: "z-model" }, { id: "a-model" }, { id: "a-model" }, { id: 42 }],
@@ -100,7 +130,7 @@ test("provider model discovery de-duplicates live ids and labels a fallback hone
   ]);
 
   const fallback = await registry.discoverModels({
-    profile: { providerId: "deepseek", modelId: "deepseek-chat" },
+    profile: { providerId: "kimi-cn", modelId: "moonshot-v1-8k" },
     credential: "credential-never-serialized",
     fetch: async () => {
       throw new Error("offline fixture");
@@ -108,7 +138,7 @@ test("provider model discovery de-duplicates live ids and labels a fallback hone
   });
   assert.equal(fallback[0]?.source, "fallback");
   assert.deepEqual(fallback.slice(0, 2), [
-    { id: "deepseek-v4-flash", source: "fallback" },
-    { id: "deepseek-v4-pro", source: "fallback" },
+    { id: "moonshot-v1-8k", source: "fallback" },
+    { id: "moonshot-v1-32k", source: "fallback" },
   ]);
 });

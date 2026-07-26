@@ -215,8 +215,8 @@ function registerFixtureHandlers(options: IpcFixtureOptions = {}): IpcFixture {
       displayName: "DeepSeek",
       keyPlaceholder: "DeepSeek API Key",
       efforts: ["off", "high", "max"],
-      fallbackModelIds: ["deepseek-chat"],
-      allowManualModel: true,
+      fallbackModelIds: ["deepseek-v4-flash", "deepseek-v4-pro"],
+      allowManualModel: false,
       allowCustomBaseUrl: false,
       credentialStatus: activeModelProfile === undefined ? "missing" as const : "available" as const,
       ...(activeModelProfile === undefined ? {} : { credentialPersistence: "encrypted" as const }),
@@ -325,7 +325,7 @@ function registerFixtureHandlers(options: IpcFixtureOptions = {}): IpcFixture {
       snapshot: modelSnapshot,
       async discoverModels(request) {
         discoveries.push(request);
-        return [{ id: "deepseek-chat", displayName: "DeepSeek Chat" }];
+        return [{ id: "deepseek-v4-flash", displayName: "DeepSeek V4 Flash" }];
       },
       async testAndSave(request): Promise<DesktopIpcModelTestResult> {
         tests.push(request);
@@ -1189,7 +1189,7 @@ test("onboarding IPC projects source/model readiness and never returns the submi
   try {
     const testResult = await handler(fixture, "folioloom:test-model")(fixture.trustedEvent, {
       providerId: "deepseek",
-      modelId: "deepseek-chat",
+      modelId: "deepseek-v4-flash",
       reasoningEffort: "max",
       apiKey,
     }) as DesktopResult<unknown>;
@@ -1209,7 +1209,7 @@ test("onboarding IPC projects source/model readiness and never returns the submi
     assert.deepEqual(onboarding.value.readiness, { source: true, model: true, trial: true });
     assert.deepEqual(onboarding.value.activeModel, {
       providerId: "deepseek",
-      modelId: "deepseek-chat",
+      modelId: "deepseek-v4-flash",
       reasoningEffort: "max",
       capability: "ready",
     });
@@ -1254,7 +1254,7 @@ test("model IPC validates exact payloads before reaching services", async () => 
   try {
     const malformedTest = await handler(fixture, "folioloom:test-model")(fixture.trustedEvent, {
       providerId: "deepseek",
-      modelId: "deepseek-chat",
+      modelId: "deepseek-v4-flash",
       apiKey: 42,
     }) as DesktopResult<unknown>;
     const malformedDiscovery = await handler(fixture, "folioloom:discover-models")(fixture.trustedEvent, {

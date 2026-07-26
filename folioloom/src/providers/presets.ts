@@ -5,6 +5,15 @@ const COMMON_LIMITS = {
   maxTokens: 37_200,
 } as const;
 
+export const DEEPSEEK_V4_MODEL_IDS = Object.freeze([
+  "deepseek-v4-flash",
+  "deepseek-v4-pro",
+] as const);
+
+export function isCurrentDeepSeekModelId(modelId: string): boolean {
+  return (DEEPSEEK_V4_MODEL_IDS as readonly string[]).includes(modelId);
+}
+
 export const PROVIDER_PRESETS: readonly ProviderDefinition[] = Object.freeze([
   {
     id: "deepseek",
@@ -12,9 +21,9 @@ export const PROVIDER_PRESETS: readonly ProviderDefinition[] = Object.freeze([
     apiFamily: "openai-chat",
     defaultBaseUrl: "https://api.deepseek.com/v1",
     keyPlaceholder: "DeepSeek API Key",
-    modelDiscovery: "standard-models",
-    fallbackModels: ["deepseek-v4-flash", "deepseek-v4-pro"],
-    allowManualModel: true,
+    modelDiscovery: "curated",
+    fallbackModels: DEEPSEEK_V4_MODEL_IDS,
+    allowManualModel: false,
     allowCustomBaseUrl: false,
     capabilities: {
       ...COMMON_LIMITS,
