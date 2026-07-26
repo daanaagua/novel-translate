@@ -354,7 +354,7 @@ git commit -m "feat: project contextual role concepts"
 - 修改：`folioloom/test/translation-request.test.ts`
 - 修改：`folioloom/test/translation-batch.test.ts`
 
-- [ ] **步骤 1：编写回执校验失败测试**
+- [x] **步骤 1：编写回执校验失败测试**
 
 ```ts
 const expected = expectedTermOccurrences(blocks, [prokuristConcept], profile);
@@ -378,7 +378,7 @@ assert.deepEqual(validateTermUsages(expected, [{
 同时测试合法的“主事”“主事先生”、伪造偏移、译文中不存在的
 `targetSurface`、遗漏 occurrence 和重复回执。
 
-- [ ] **步骤 2：运行测试确认失败**
+- [x] **步骤 2：运行测试确认失败**
 
 ```powershell
 npm test -- --test-name-pattern="term usage"
@@ -386,7 +386,7 @@ npm test -- --test-name-pattern="term usage"
 
 预期：FAIL，模块不存在。
 
-- [ ] **步骤 3：实现预期 occurrence 与校验器**
+- [x] **步骤 3：实现预期 occurrence 与校验器**
 
 模型回执结构：
 
@@ -406,7 +406,7 @@ export interface TermUsageSubmission {
 occurrence ID 由 block ID、concept ID、start/end 哈希生成。所有偏移、
 source form 和目标表面形式由 harness 复核。
 
-- [ ] **步骤 4：扩充翻译工具 schema**
+- [x] **步骤 4：扩充翻译工具 schema**
 
 每个 window 增加：
 
@@ -431,12 +431,12 @@ termUsages: Type.Optional(Type.Array(Type.Object({
 请求的 terms section 同时投影 occurrence IDs。没有命中概念的窗口允许
 省略 `termUsages`；命中时遗漏必须触发一次既有 targeted repair。
 
-- [ ] **步骤 5：把回执纳入 batch 验证和修复**
+- [x] **步骤 5：把回执纳入 batch 验证和修复**
 
 `TranslationBatchWindowResult` 保存 `termUsages`。第一次修复只发送失败
 block、预期 occurrence 和错误代码；修复后重新验证完整块。
 
-- [ ] **步骤 6：验证并提交**
+- [x] **步骤 6：验证并提交**
 
 ```powershell
 npm test -- --test-name-pattern="term usage|translation request|batch"

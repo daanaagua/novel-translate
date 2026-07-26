@@ -16,6 +16,7 @@ import {
 import { prepareTranslationRequest } from "../src/agents/translation-request.js";
 import type { PhysicalRequestPlan } from "../src/fullbook/types.js";
 import { BudgetLedger } from "../src/kernel/budget.js";
+import { conceptFromAnchor } from "../src/knowledge/lexical-concept.js";
 import { getSourceLanguageProfile } from "../src/language/profiles.js";
 import type { LosslessBlock } from "../src/source/types.js";
 import { createBookStyleConstitution, composeEffectiveStyle } from "../src/style/effective-style.js";
@@ -785,6 +786,95 @@ test("batch validation repairs only the invalid block once and preserves its val
     repairSystemPrompts[0] ?? "",
     /adjacent short display-only lines clearly form one title or heading/u,
   );
+});
+
+test("batch repairs a disallowed contextual term surface and binds the repaired usage", async () => {
+  const sourceBlocks = [block(
+    "block-role",
+    0,
+    "Der Prokurist trat ein und erklärte Gregor ruhig, warum er am frühen Morgen gekommen war.",
+  )];
+  const sourceRequest = singleWindowRequest(sourceBlocks);
+  const concept = conceptFromAnchor({
+    sourceForm: "Prokurist",
+    target: "主事",
+    mode: "contextual",
+    semanticClass: "role",
+    confidence: 0.95,
+  });
+  const stableTerms = [{
+    conceptId: concept.conceptId,
+    lexemeId: `${concept.conceptId}-lexeme`,
+    sourceForm: concept.sourceForms[0]!,
+    canonicalSource: concept.normalizedSubject,
+    target: concept.canonicalTarget,
+    locked: false,
+    policy: concept.policy,
+    semanticClass: concept.semanticClass,
+    allowedTargets: concept.allowedRealizations,
+    revisionId: concept.revisionId,
+    renderFingerprint: concept.renderFingerprint,
+  }];
+  const prepared = prepareTranslationRequest({
+    request: sourceRequest,
+    blocks: sourceBlocks,
+    stableTerms,
+    snapshot: { id: "snapshot-role", revisions: [] },
+    sourceLanguageProfile: getSourceLanguageProfile("de"),
+  });
+  const occurrence = prepared.expectedTermOccurrences[0]!;
+  const repairPrompts: string[] = [];
+  const faux = fauxProvider();
+  faux.setResponses([
+    fauxAssistantMessage(fauxToolCall("finalize_translation_batch", {
+      windows: [{
+        windowId: sourceRequest.windows[0]!.windowId,
+        translations: [{
+          blockId: sourceBlocks[0]!.id,
+          text: "秘书主任走进屋来，平静地向格里高尔说明自己为何一大早赶到。",
+        }],
+        termUsages: [{
+          occurrenceId: occurrence.occurrenceId,
+          blockId: occurrence.blockId,
+          conceptId: occurrence.conceptId,
+          sourceForm: occurrence.sourceForm,
+          sourceStart: occurrence.sourceStart,
+          sourceEnd: occurrence.sourceEnd,
+          discourseRole: "narrative",
+          targetSurface: "秘书主任",
+        }],
+        notes: [],
+      }],
+    }), { stopReason: "toolUse" }),
+    (context) => {
+      repairPrompts.push(promptText(context));
+      return fauxAssistantMessage(fauxToolCall("submit_repaired_translation", {
+        translations: [{
+          blockId: sourceBlocks[0]!.id,
+          text: "主事走进屋来，平静地向格里高尔说明自己为何一大早赶到。",
+        }],
+        notes: [],
+      }), { stopReason: "toolUse" });
+    },
+  ]);
+
+  const result = await runTranslationBatch({
+    request: sourceRequest,
+    blocks: sourceBlocks,
+    stableTerms,
+    snapshot: { id: "snapshot-role", revisions: [] },
+    sourceLanguageProfile: getSourceLanguageProfile("de"),
+    model: faux.getModel(),
+    streamFn: faux.provider.streamSimple.bind(faux.provider),
+    budget: new BudgetLedger(),
+  });
+
+  assert.equal(faux.state.callCount, 2);
+  assert.equal(result.windows[0]?.status, "completed");
+  assert.equal(result.windows[0]?.termUsages[0]?.occurrenceId, occurrence.occurrenceId);
+  assert.equal(result.windows[0]?.termUsages[0]?.targetSurface, "主事");
+  assert.match(repairPrompts[0] ?? "", /TERM_USAGE_TARGET_NOT_ALLOWED/u);
+  assert.match(repairPrompts[0] ?? "", /block-role/u);
 });
 
 test("batch normalizes a targeted repair before its final validation", async () => {

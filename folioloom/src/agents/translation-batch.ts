@@ -3,6 +3,15 @@ import type { Model } from "@earendil-works/pi-ai";
 
 import type { V4Block } from "../domain/types.js";
 import type { BudgetLedger } from "../kernel/budget.js";
+import {
+  conceptsFromStableTerms,
+  expectedTermOccurrences,
+  inferTermUsages,
+  validateTermUsages,
+  type ExpectedTermOccurrence,
+  type TermUsageSubmission,
+} from "../knowledge/term-usage.js";
+import { getSourceLanguageProfile } from "../language/profiles.js";
 import type { LosslessBlock } from "../source/types.js";
 import { normalizeTranslatedSceneSeparators } from "../source/layout-separators.js";
 import { hasSemanticText } from "../text/semantic-text.js";
@@ -53,6 +62,7 @@ export interface TranslationBatchWindowResult {
   ordinal: number;
   status: "completed" | "completed_with_warnings" | "failed";
   translations: Array<{ blockId: string; text: string }>;
+  termUsages: TermUsageSubmission[];
   notes: string[];
   memoryCandidates: TranslationMemoryCandidate[];
   styleObservation?: StyleObservationSubmission;
@@ -82,6 +92,12 @@ function copyMemories(
     ...candidate,
     subjectForms: [...candidate.subjectForms],
   }));
+}
+
+function copyTermUsages(
+  values: readonly TermUsageSubmission[] | undefined,
+): TermUsageSubmission[] {
+  return (values ?? []).map((usage) => ({ ...usage }));
 }
 
 const CANONICAL_BLOCK_ID = /^block-[0-9a-f]{20}$/u;
@@ -183,6 +199,7 @@ function validateSubmission(
       ordinal: window.ordinal,
       status: "failed",
       translations: [],
+      termUsages: [],
       notes: [],
       memoryCandidates: [],
       error,
@@ -232,6 +249,7 @@ function validateSubmission(
       ordinal: window.ordinal,
       status: candidate.notes.length > 0 ? "completed_with_warnings" : "completed",
       translations,
+      termUsages: copyTermUsages(candidate.termUsages),
       notes: [...candidate.notes],
       memoryCandidates: copyMemories(candidate.memoryCandidates),
       ...(candidate.styleObservation === undefined
@@ -239,12 +257,27 @@ function validateSubmission(
         : { styleObservation: structuredClone(candidate.styleObservation) }),
     };
   });
+  const normalized = normalizeWindowTypography(
+    windows,
+    input.stableTerms.filter((term) => term.locked).map((term) => term.target),
+    new Map(input.blocks.map((block) => [block.id, block.sourceText])),
+  );
+  const expectedOccurrences = termOccurrencesForInput(input);
   return {
-    windows: normalizeWindowTypography(
-      windows,
-      input.stableTerms.filter((term) => term.locked).map((term) => term.target),
-      new Map(input.blocks.map((block) => [block.id, block.sourceText])),
-    ),
+    windows: input.responseProtocol === "framed_text"
+      ? normalized.map((window) => ({
+          ...window,
+          termUsages: inferTermUsages(
+            expectedOccurrences.filter((occurrence) =>
+              window.translations.some((translation) =>
+                translation.blockId === occurrence.blockId)),
+            new Map(window.translations.map((translation) => [
+              translation.blockId,
+              translation.text,
+            ])),
+          ),
+        }))
+      : normalized,
     responseErrors,
   };
 }
@@ -270,6 +303,58 @@ function candidateFor(window: TranslationBatchWindowResult): TranslationCandidat
     memoryCandidates: copyMemories(window.memoryCandidates),
     repaired: false,
   };
+}
+
+function termOccurrencesForInput(
+  input: TranslationBatchInput,
+): ExpectedTermOccurrence[] {
+  const requested = new Set(input.request.windows.flatMap((window) => window.blockIds));
+  return expectedTermOccurrences(
+    input.blocks.filter((block) => requested.has(block.id)),
+    conceptsFromStableTerms(input.stableTerms),
+    input.sourceLanguageProfile ?? getSourceLanguageProfile("en"),
+  );
+}
+
+function termFailuresForWindow(
+  window: TranslationBatchWindowResult,
+  expected: readonly ExpectedTermOccurrence[],
+): ValidationFailure[] {
+  const expectedForWindow = expected.filter((occurrence) =>
+    window.translations.some((translation) =>
+      translation.blockId === occurrence.blockId));
+  const targetByBlock = new Map(window.translations.map((translation) => [
+    translation.blockId,
+    translation.text,
+  ]));
+  const expectedById = new Map(expectedForWindow.map((occurrence) => [
+    occurrence.occurrenceId,
+    occurrence,
+  ]));
+  const submittedById = new Map(window.termUsages.map((usage) => [
+    usage.occurrenceId,
+    usage,
+  ]));
+  return validateTermUsages(
+    expectedForWindow,
+    window.termUsages,
+    targetByBlock,
+  ).map((failure) => {
+    const occurrence = expectedById.get(failure.occurrenceId);
+    const submitted = submittedById.get(failure.occurrenceId);
+    return {
+      code: failure.code,
+      blockId: occurrence?.blockId ?? submitted?.blockId,
+      message: [
+        failure.code,
+        `occurrence=${failure.occurrenceId}`,
+        occurrence === undefined
+          ? "the submitted occurrence is not in the harness projection"
+          : `expected=${JSON.stringify(occurrence)}`,
+      ].join("; "),
+      repairable: true,
+    };
+  });
 }
 
 function normalizeWindowTypography(
@@ -298,6 +383,13 @@ function normalizeWindowTypography(
         ...translation,
         text: simplifyChineseTranslation(
           normalizedTexts[index] ?? translation.text,
+          preservedTargetForms,
+        ),
+      })),
+      termUsages: window.termUsages.map((usage) => ({
+        ...usage,
+        targetSurface: simplifyChineseTranslation(
+          usage.targetSurface,
           preservedTargetForms,
         ),
       })),
@@ -376,6 +468,7 @@ async function validateAndRepair(
       .filter((block): block is V4Block => block !== undefined),
   ]));
   const invalidByWindowId = new Map<string, InvalidWindow>();
+  const expectedOccurrences = termOccurrencesForInput(input);
   const addFailures = (
     window: TranslationBatchWindowResult,
     failures: readonly ValidationFailure[],
@@ -401,7 +494,10 @@ async function validateAndRepair(
     }
     const blocks = blocksByWindowId.get(window.windowId) ?? [];
     const validation = validator.validate(blocks, candidateFor(window), validationPolicy);
-    addFailures(window, validation.failures);
+    addFailures(window, [
+      ...validation.failures,
+      ...termFailuresForWindow(window, expectedOccurrences),
+    ]);
   }
   const successfulWindows = initial.windows.filter((window) => window.status !== "failed");
   const successfulBlocks = successfulWindows.flatMap((window) =>
@@ -475,6 +571,7 @@ async function validateAndRepair(
           ...window,
           status: "failed" as const,
           translations: [],
+          termUsages: [],
           memoryCandidates: [],
           error: `targeted repair failed: ${message}`,
         }
@@ -497,6 +594,18 @@ async function validateAndRepair(
         ...(patchById.get(translation.blockId) ?? translation),
       })),
     };
+    const repairedBlockIds = new Set(repairBlocks.map((block) => block.id));
+    repairedWindow.termUsages = [
+      ...window.termUsages.filter((usage) => !repairedBlockIds.has(usage.blockId)),
+      ...inferTermUsages(
+        expectedOccurrences.filter((occurrence) =>
+          repairedBlockIds.has(occurrence.blockId)),
+        new Map(repairedWindow.translations.map((translation) => [
+          translation.blockId,
+          translation.text,
+        ])),
+      ),
+    ];
     delete repairedWindow.styleObservation;
     return repairedWindow;
   });
@@ -515,15 +624,19 @@ async function validateAndRepair(
       candidateFor(window),
       validationPolicy,
     );
-    if (validation.valid) {
+    const termFailures = termFailuresForWindow(window, expectedOccurrences);
+    if (validation.valid && termFailures.length === 0) {
       return window;
     }
     return {
       ...window,
       status: "failed",
       translations: [],
+      termUsages: [],
       memoryCandidates: [],
-      error: `validation failed after one targeted repair: ${failureMessage(validation.failures)}`,
+      error: `validation failed after one targeted repair: ${
+        failureMessage([...validation.failures, ...termFailures])
+      }`,
     };
   });
   const postRepairWindows = validatedWindows.filter((window) => window.status !== "failed");
@@ -551,6 +664,7 @@ async function validateAndRepair(
       ...window,
       status: "failed",
       translations: [],
+      termUsages: [],
       memoryCandidates: [],
       error: `cross-block validation failed after one targeted repair: ${failureMessage(failures)}`,
     };

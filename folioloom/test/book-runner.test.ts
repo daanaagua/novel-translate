@@ -511,6 +511,16 @@ function losslessBatchResponse(context: Context) {
     sourceForm: string;
     target: string;
   }>;
+  const occurrenceMatch = /TERM OCCURRENCES\n\n(\[[^\n]*\])/u.exec(prompt);
+  const occurrences = JSON.parse(occurrenceMatch?.[1] ?? "[]") as Array<{
+    occurrenceId: string;
+    blockId: string;
+    conceptId: string;
+    sourceForm: string;
+    sourceStart: number;
+    sourceEnd: number;
+    canonicalTarget: string;
+  }>;
   const submission = {
     windows: windows.map((window) => ({
       windowId: window.windowId,
@@ -535,6 +545,19 @@ function losslessBatchResponse(context: Context) {
             )}。`).join("\n\n"),
         };
       }),
+      termUsages: occurrences
+        .filter((occurrence) => window.blocks.some((block) =>
+          block.blockId === occurrence.blockId))
+        .map((occurrence) => ({
+          occurrenceId: occurrence.occurrenceId,
+          blockId: occurrence.blockId,
+          conceptId: occurrence.conceptId,
+          sourceForm: occurrence.sourceForm,
+          sourceStart: occurrence.sourceStart,
+          sourceEnd: occurrence.sourceEnd,
+          discourseRole: "other",
+          targetSurface: occurrence.canonicalTarget,
+        })),
       notes: [],
     })),
   };

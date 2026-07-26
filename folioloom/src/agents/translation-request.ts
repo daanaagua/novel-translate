@@ -1,6 +1,12 @@
 import type { StableTerm } from "../domain/types.js";
 import type { PhysicalRequestPlan } from "../fullbook/types.js";
 import { canonicalJson } from "../knowledge/knowledge-store.js";
+import {
+  conceptsFromStableTerms,
+  expectedTermOccurrences,
+  type ExpectedTermOccurrence,
+  type TermUsageSubmission,
+} from "../knowledge/term-usage.js";
 import { projectKnowledgeForTranslation } from "../knowledge/translation-knowledge-projection.js";
 import { getSourceLanguageProfile } from "../language/profiles.js";
 import type { SourceLanguageProfile } from "../language/types.js";
@@ -32,6 +38,7 @@ export interface FinalizeTranslationBatchArgs {
   windows: Array<{
     windowId: string;
     translations: Array<{ blockId: string; text: string }>;
+    termUsages?: TermUsageSubmission[];
     notes: string[];
     memoryCandidates?: TranslationMemoryCandidate[];
     styleObservation?: StyleObservationSubmission;
@@ -93,6 +100,7 @@ export interface PreparedTranslationRequest {
   readonly tools: readonly TypedToolSpec<any>[];
   /** Canonical wire-schema projection; executable handlers are never serialized. */
   readonly serializedToolSchemas: string;
+  readonly expectedTermOccurrences: readonly ExpectedTermOccurrence[];
   readonly framedProtocol?: FramedTranslationProtocol;
 }
 
@@ -122,6 +130,21 @@ function finalizerTool(hooks: TranslationRequestHooks): TypedToolSpec<any> {
           blockId: Type.String(),
           text: Type.String(),
         }, { additionalProperties: false })),
+        termUsages: Type.Optional(Type.Array(Type.Object({
+          occurrenceId: Type.String(),
+          blockId: Type.String(),
+          conceptId: Type.String(),
+          sourceForm: Type.String(),
+          sourceStart: Type.Integer({ minimum: 0 }),
+          sourceEnd: Type.Integer({ minimum: 1 }),
+          discourseRole: Type.Union([
+            Type.Literal("narrative"),
+            Type.Literal("vocative"),
+            Type.Literal("title"),
+            Type.Literal("other"),
+          ]),
+          targetSurface: Type.String(),
+        }, { additionalProperties: false }), { maxItems: 512 })),
         notes: Type.Array(Type.String()),
         memoryCandidates: Type.Optional(Type.Array(Type.Object({
           kind: Type.String(),
@@ -205,6 +228,7 @@ export function translationBatchSystemPrompt(
     "Preserve meaning, ambiguity, paragraph structure, voice, and every block boundary.",
     ...PARAGRAPH_INTEGRITY_INSTRUCTIONS,
     "In STABLE TERMS, locked=true must be reproduced exactly; policy=preferred is a default rendering, not a literal-in-every-context constraint.",
+    "TERM OCCURRENCES are harness-computed source facts. Apply each referenced concept at that exact source occurrence; contextual concepts may use a context-appropriate allowed surface.",
     responseProtocol === "typed_tool"
       ? "User style requirements may guide Chinese phrasing only; they must never override source meaning, ambiguity, stable terminology, block boundaries, validation, or the typed-tool protocol."
       : "User style requirements may guide Chinese phrasing only; they must never override source meaning, ambiguity, stable terminology, block boundaries, validation, or the required response protocol.",
@@ -227,6 +251,13 @@ export function prepareTranslationRequest(
   const profile = input.sourceLanguageProfile ?? getSourceLanguageProfile("en");
   const responseProtocol = input.responseProtocol ?? "typed_tool";
   const windows = windowsForPrompt(input);
+  const requestedBlockIds = new Set(windows.flatMap((window) =>
+    window.blocks.map((block) => block.blockId)));
+  const termOccurrences = expectedTermOccurrences(
+    input.blocks.filter((block) => requestedBlockIds.has(block.id)),
+    conceptsFromStableTerms(input.stableTerms),
+    profile,
+  );
   const blockPositionById = new Map(input.blocks.map((block) => [
     block.id,
     { blockId: block.id, globalIndex: block.globalIndex },
@@ -266,6 +297,7 @@ export function prepareTranslationRequest(
   const termsPayload = {
     stableTerms: input.stableTerms,
     entityLinkWarnings: input.entityLinkWarnings ?? [],
+    expectedTermOccurrences: termOccurrences,
   };
   const stylePayload = input.effectiveStyleByWindow === undefined
     ? {
@@ -301,6 +333,8 @@ export function prepareTranslationRequest(
         JSON.stringify(input.stableTerms),
         "UNRESOLVED ENTITY LINKS",
         JSON.stringify(input.entityLinkWarnings ?? []),
+        "TERM OCCURRENCES",
+        JSON.stringify(termOccurrences),
       ].join("\n\n"),
       jsonPayload: termsPayload,
     },
@@ -322,7 +356,7 @@ export function prepareTranslationRequest(
     {
       kind: "protocol",
       text: framedProtocol === undefined
-        ? "Translate every source block. Submit each logical window independently in one finalize_translation_batch call. Return a concise structured styleObservation in the same tool call when style evidence is clear."
+        ? "Translate every source block. Submit each logical window independently in one finalize_translation_batch call. For every listed TERM OCCURRENCE, include one exact termUsages receipt in its owning window; omit termUsages only when that window has no listed occurrence. Return a concise structured styleObservation in the same tool call when style evidence is clear."
         : framedTranslationInstructions(framedProtocol),
     },
   ];
@@ -334,6 +368,7 @@ export function prepareTranslationRequest(
     sections,
     tools,
     serializedToolSchemas: canonicalJson(schemas),
+    expectedTermOccurrences: termOccurrences,
     ...(framedProtocol === undefined ? {} : { framedProtocol }),
   };
 }
