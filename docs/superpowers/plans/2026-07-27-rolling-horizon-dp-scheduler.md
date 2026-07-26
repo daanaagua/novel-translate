@@ -681,6 +681,7 @@ export interface ContextProfile {
 
 ```ts
 interface ContextState {
+  readonly tokenCost: number;
   readonly tokenBucket: number;
   readonly coverageMask: number;
   readonly selected: readonly string[];
@@ -688,15 +689,20 @@ interface ContextState {
 }
 ```
 
-先闭包展开 `requires`，再按 32-token 桶求解。重复组第二项效用乘 0.35，
-第三项及以后乘 0.15。最终只接受覆盖 required mask 的状态；同成本同效用
+先验证重复 ID、未知依赖、自依赖和依赖环，再闭包展开 `requires`。全部
+`mandatory=true` 的 bundle 及其依赖必须进入每个可行解。状态保存精确
+`tokenCost`，32-token 桶仅用于索引和合并候选，不能把 `100 + 120 = 220`
+误判成 256 token。重复组先按基础效用、成本和 ID 稳定排序，再静态赋予
+第一项 1、第二项 0.35、第三项及以后 0.15 的衰减，确保 DP 状态仍然闭合。
+最终只接受覆盖 required mask 且包含全部 mandatory ID 的状态；同成本同效用
 时选择字典序最小的 bundle ID 序列。
 
 - [ ] **步骤 5：实现帕累托档案生成**
 
-分别用三个预算求解；如果两个档案选集相同，只保留较小名称并让外层规划器
-复用同一候选，避免伪造差异。档案 payload 在最终 prompt 组装时才读取，
-规划器只处理 ID、数字和风险 bitmask。
+分别用三个预算求解。即使两个档案选集相同，也保留三个可行档名，因为
+`minimumContextProfile="rich"` 是质量合同；执行变体生成阶段可以按 bundle
+ID 复用成本预测，但不能删除档名语义。档案 payload 在最终 prompt 组装时
+才读取，规划器只处理 ID、数字和风险 bitmask。
 
 - [ ] **步骤 6：运行测试和性能样本**
 
@@ -732,7 +738,10 @@ test("knowledge candidates expose atomic relation bundles", () => {
     revisions(),
     ["current source"],
     getSourceLanguageProfile("en"),
-    positions(),
+    {
+      corpusBlocks: positions().corpusBlocks,
+      currentBlocks: positions().currentBlocks,
+    },
   );
   const relation = candidates.find((item) => item.kind === "relation");
   assert.ok(relation);
@@ -788,14 +797,20 @@ export interface TranslationKnowledgeCandidate {
 不复制原文；payload 只引用原有 revision payload。
 `tokenCost` 使用将该候选序列化为动态 memory section 后的确定性 token 估算；
 `utility` 由来源强度、位置距离、revision 置信度和重复衰减组成，不调用模型
-打分。相同输入必须产生相同数值。
+打分。token 估算复用 `WeightedTokenEstimator.estimateJson()`，不得把
+UTF-8 字节数直接冒充 token。相同输入必须产生相同数值。
+
+coverage 只从明确 kind 和结构字段映射；不得通过关键词猜测任意自然语言
+`fact`。无法证明 `control/causality/timeline` 的候选保持空 coverage，
+从而不能虚假满足质量硬门。
 
 - [ ] **步骤 4：让投影器接受已选 revision**
 
 在 `TranslationKnowledgeProjectionOptions` 增加
 `selectedRevisionIds?: ReadonlySet<string>`。若提供，投影器只能序列化该集合，
-但仍执行 byte 上限和 positioned memory 窗口过滤；发现所选 revision
-不适用于当前窗口时抛出确定性错误。
+并按原候选稳定顺序输出。发现所选 revision 不存在、不适用于当前窗口、
+超过 entry/byte 上限时抛出确定性错误，不能静默省略。fragment 拆分后必须
+针对实际 fragment 重新规划选集，不能原样沿用父请求的 positioned memory。
 
 - [ ] **步骤 5：扩展 TranslationRequestInput**
 
@@ -893,21 +908,27 @@ export interface SchedulerTaskGraph {
     completedTaskIds: readonly string[],
     limit?: number,
   ): readonly SchedulerTask[];
+  tasksCompatible(leftTaskId: string, rightTaskId: string): boolean;
 }
 ```
 
 资源键固定使用 `window:<id>`、`concept:<id>`、`snapshot:<id>`。输入先稳定
-排序；显式依赖和写资源冲突共同产生边。
+排序；显式依赖和写资源冲突共同产生边。资源冲突按 `(ordinal, taskId)`
+稳定定向；若显式依赖要求相反方向，交给 Kahn 检测为循环事故。首版只校验
+task ID、dependency ID、资源键格式和 DAG；没有实体 registry 时不得声称
+验证了 window/concept/snapshot 是否真实存在。
 
 - [ ] **步骤 4：实现 Kahn 拓扑验证与滚动 horizon**
 
-`readyTaskIds(completedIds)` 返回所有前置已完成的任务；`horizon()` 从 ready
-集合按关键路径长度、ordinal 和 task ID 稳定选择 12–16 项。检测到环时
+`readyTaskIds(completedIds)` 返回所有前置已完成的任务；运行中 task 由调用方
+显式排除。`horizon()` 从 ready frontier 出发，按关键路径长度、ordinal 和
+task ID 稳定扩展 12–16 项，并包含在局部完成后会解锁的后继任务。检测到环时
 抛出带涉及 task ID 的 `TaskGraphIntegrityError`。
 
 - [ ] **步骤 5：实现并发兼容判断**
 
-`tasksCompatible(left,right)` 在以下任一情况返回 false：
+`graph.tasksCompatible(leftTaskId,rightTaskId)` 使用依赖闭包，在以下任一情况
+返回 false：
 
 - 写资源相交；
 - 一方写资源与另一方读资源相交；
@@ -972,6 +993,7 @@ export interface TaskExecutionVariant {
   readonly taskId: string;
   readonly contextProfile: "lean" | "balanced" | "rich";
   readonly effort: string;
+  readonly effortRank: number;
   readonly protocol: "typed_tool" | "framed_text" | "local";
   readonly validators: readonly string[];
   readonly predicted: RuntimePrediction;
@@ -990,11 +1012,13 @@ export interface RollingPlannerInput {
   readonly running: readonly RunningTaskReservation[];
   readonly variants: readonly TaskExecutionVariant[];
   readonly policy: OptimizationPolicy;
-  readonly baselineTokens: number;
-  readonly actualTokens: number;
+  readonly runBaselineTotalTokens: number;
+  readonly actualRunTokens: number;
+  readonly runningReservedTokens: number;
+  readonly horizonBaselineTokens: number;
   readonly maxConcurrency: number;
   readonly maxInFlightTokens: number;
-  readonly nowMs: number;
+  readonly clock?: () => number;
 }
 ```
 
@@ -1002,7 +1026,8 @@ export interface RollingPlannerInput {
 
 先删除低于 task risk 硬门的候选，再删除时间、token、失败概率均被支配的
 variant。批次只从 ready tasks 组合，最大不超过空闲并发槽和 24 个候选；
-使用 `tasksCompatible()` 验证资源。
+使用 `graph.tasksCompatible()` 验证资源。effort 硬门使用统一数值
+`effortRank`，不得用字符串字典序判断。
 
 批次时间：
 
@@ -1038,6 +1063,8 @@ const objective =
 ```
 
 质量风险不进入该加权和；它已经在 variant 生成阶段作为硬门删除。
+`validators` 仅声明该变体包含的校验集合，不能关闭现有结构、术语、跨块或
+修复校验；speed 档也不得跳过这些既有质量门。
 
 - [ ] **步骤 6：实现 subset DP 与 epsilon-Pareto frontier**
 
@@ -1054,18 +1081,23 @@ const next = {
 };
 ```
 
-超过累计 token 包络的标签删除；epsilon 为时间 1%、token 0.5%。每个状态
-最多保留 8 个标签，排序规则为 objective、tokens、动作 ID。
+全运行 token 硬门按
+`actualRunTokens + runningReservedTokens + label.tokens`
+与 `runBaselineTotalTokens × (1 + cap)` 比较；目标函数的 token 归一化使用
+局部 `horizonBaselineTokens`。超过累计包络的标签删除；epsilon 为时间 1%、
+token 0.5%。每个状态最多保留 8 个标签，排序规则为 objective、tokens、
+动作 ID。
 
 - [ ] **步骤 7：纳入已经运行的固定 reservation**
 
 运行中任务先按预计剩余时间排序，占用对应并发槽和 in-flight token。第一批
-只能使用剩余槽；后续 DP 转移把最早结束 reservation 的时间作为下一可用
-时点。任何重规划都不得改变或取消这些 reservation。
+只能使用剩余槽；后续 DP 把 reservation 完成建模为确定性事件，只有事件发生
+后才释放槽位并解锁其后继。任何重规划都不得改变或取消这些 reservation。
 
 - [ ] **步骤 8：实现 deadline 与可行回退**
 
-每 128 次转移检查 `performance.now()`。达到 deadline 时返回当前最优完整
+每 128 次转移检查注入的 `clock()`，生产默认 `performance.now()`，测试使用
+确定性递增时钟。达到 deadline 时返回当前最优完整
 标签；若没有完整标签，返回当前最优第一批可行动作并标记
 `planningStatus="bounded"`。只有完全没有合法动作才返回
 `planningStatus="fallback"`。
