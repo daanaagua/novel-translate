@@ -1,69 +1,52 @@
-# FolioLoom 滚动调度器状态
+# FolioLoom 滚动调度器最终状态
 
 - 日期：2026-07-27
 - 分支：`fix/german-100k-gate`
-- 已验证实现提交：`3d3388b`
-- 当前阶段：任务 1–12 已完成；下一步执行任务 13。
+- 已验证实现提交：`aed8992`
+- 状态：计划任务 1–13 的确定性实现和离线验证已完成，并已推送到
+  `origin/fix/german-100k-gate`。
+- 不变量：逻辑窗口保持不可变，`CommitCoordinator` 顺序未改变，
+  `book.db` schema 未改变，质量门和 token 阈值未降低。
 
-## 已完成
+## 主要提交
 
-- 完整读取交接、设计和 13 项实施计划；确认分支包含 `9f7ccce`，未修改 `book.db` schema。
-- 对 `b05ca5f`、`4e402e1`、`3212d43`、`6338556` 完成一次轻量综合审查。
-- 以失败回归测试修复两项 Important：
-  - 越界 token ratio 快照现在确定性回退为 `snapshotStatus="invalid"` 的保守冷启动模型，不再产生 0-token 预测。
-  - scheduler decision 只持久化明确的数值和受限 task ID 字段，未知正文或敏感字符串字段不会进入 runtime profile DB。
-- 原审查代理定向复核：两项均关闭，无新增 Critical/Important。
-- 任务 5：实现确定性上下文 evidence bundle 动态规划、依赖闭包、强制证据、
-  风险覆盖、重复衰减与三档预算。
-- 任务 6：公开结构化知识候选，按明确结构字段映射风险，支持请求级 revision
-  精确选择，并按明确块距离衰减 utility；系统提示词和工具 schema 保持不变。
-- 任务 7：实现统一任务 DAG、稳定资源冲突边、Kahn 完整性检查、滚动 horizon、
-  直接 predecessor 查询和并发兼容判断。
-- 任务 8：实现质量硬门、累计 token 包络、epsilon-Pareto subset DP、固定
-  reservation、deadline/bounded/fallback 与三档外层滚动规划。
-- 独立复核发现并以失败回归测试关闭 3 项 Important：reservation 完成事件
-  不再延迟后继；存在合法部分计划时返回 bounded；前置关系读取不再执行
-  `O(H × N²)` 的 ready-frontier 反推。
-- 任务 9：实现 off/shadow/active 动态调度适配器和结构化回退；runner 的
-  shadow 模式保持既有派发和调用次数，写入纯数值决策、观察与运行汇总；
-  partial metrics 只投影聚合调度字段。
-- 任务 10：提取共享单任务回溯状态机；active 模式按概念和翻译资源冲突
-  建图，使用精确 CAS 领取、并发与在途 token permit、`allSettled` 独立提交
-  和求解失败串行回退；off/shadow 保持原领取顺序。
-- 任务 11：普通翻译 active 模式按 physical request 建图并生成合法的上下文、
-  runtime 和协议变体；每个请求完成后立即写观察、更新成本模型并重规划，
-  同时保留无损窗口、顺序提交、预算和既有恢复语义。
-- 独立复核发现并以失败回归测试关闭 3 项 Important：重试不再扩大累计静态
-  token 基线；校验失败不再作为成功样本学习；距离至少 24 块的可靠证据强制
-  使用 rich 上下文。恢复失败和后续成功的 token 观察已分离。
-- 任务 12：CLI 支持三种优化档位、off/shadow/active 和独立 profile store；
-  桌面主进程拥有共享 store 生命周期，新运行启用动态调度，旧运行按固定
-  runtime 恢复；GUI 提供经济、均衡、极速入口以及 ETA、token 区间、偏差和
-  限流/恢复状态。CLI 与桌面 runtime set 均包含同一模型的全部合法 effort。
-- 以失败回归测试关闭 3 项 Task 12 兼容性问题：quality/economy 组合现在视为
-  一致映射；quality 新运行也会生成合法 effort variants；不一致的持久化
-  mode/profile metadata 会被拒绝。另修正两项既有 IPC 路径断言的跨平台语义。
+- `03ae3e4`：修复成本快照和调度遥测输入。
+- `2fb8a59`、`6c9c47b`：完成任务 5–6 的上下文规划和请求投影。
+- `a932b97`、`f6e8843`、`2de3d1d`、`701c367`：完成任务 7–8 的任务图、
+  滚动规划及复核修复。
+- `669d496`：完成任务 9 的 off、shadow、active 调度适配。
+- `d009539`：完成任务 10 的受控并行知识回溯。
+- `2bb450e`：完成任务 11 的普通翻译滚动调度。
+- `3d3388b`、`824a83e`：完成任务 12 的 CLI、桌面端和合法 effort 修复。
+- `aed8992`：完成任务 13 的 metrics、离线回放、多语言一致性、
+  benchmark 副本准备器、README 和验证报告。
 
 ## 验证证据
 
-- Node 24.18.0 任务 1–4 定向测试：39 通过、0 失败。
-- Node 24.18.0 TypeScript：`tsc --noEmit` 通过。
-- Node 24.18.0 任务 1–8 组合测试：82 通过、0 失败。
-- Node 24.18.0 任务 9 的 runner、adapter、report 与 desktop fixture
-  组合测试：70 通过、0 失败。
-- Node 24.18.0 任务 10 定向回溯、store、知识收敛与 Kafka 重放：
-  15 通过、0 失败；executor 与完整 store 组合：44 通过、0 失败。
-- Node 24.18.0 任务 11 定向测试：10 通过、0 失败；runner、planner、
-  fault injection、store、report 与 desktop 组合：186 通过、0 失败。
-- 任务 11 后 `tsc --noEmit` 与 `git diff --check` 均通过。
-- 任务 12：CLI 28 通过、0 失败；desktop Node 109 通过、0 失败；renderer
-  66 通过、0 失败；核心与桌面 TypeScript、`git diff --check` 均通过。
-- 500 bundle 上下文规划样本：17.4 ms（预热后，要求低于 50 ms）。
-- 12 项与 16 项滚动规划性能门分别通过 `<50 ms` 与 `<250 ms` 断言。
+- `npm test`：825 通过、0 失败、1 跳过。
+- `npm run typecheck`：通过。
+- `npm run desktop:test`：desktop Node 109 通过、renderer 66 通过。
+- `npm run desktop:typecheck`：通过。
+- `npm run desktop:build`：main、preload、renderer 和产物校验通过。
 - `git diff --check`：通过。
+- 任务 13 组合测试：116 通过、0 失败；benchmark 准备器：4 通过、0 失败。
+- 英语、德语、韩语、日语短样本的 off/shadow 提示覆盖、输出摘要和校验结果
+  一致；临时数据库均已删除。
+- Kafka 五任务离线回放：静态串行基线 492,000 ms，动态预测 213,000 ms，
+  降幅 56.7%；token 为 227,700/273,240，资源冲突为 0，规划耗时
+  12.823 ms。
 
-## 阻塞与下一步
+完整证据见
+`docs/superpowers/reports/2026-07-27-rolling-horizon-scheduler-validation.md`。
 
-- 外部阻塞：无。
-- 下一步：按严格 TDD 完成任务 13 的影子 metrics、离线回放、只读源库的
-  benchmark 副本准备器、README、验证报告和全部质量门。
+## 外部验证限制
+
+本机没有可用的 DeepSeek 凭据，也没有可复制的真实 `book.db`，因此未执行
+真实《变形记》五块 active/balanced 回溯，未产生真实 provider 的墙钟、
+usage、缓存、限流及 `coverageMissing=0`、`knowledgeConverged=true`、
+0 incident 审计证据。这不影响确定性实现和离线质量门结论。
+
+获得源数据库和原模型凭据后，唯一剩余步骤是关闭源库写入者，使用
+`folioloom/scripts/prepare-revalidation-benchmark.ts` 创建并校验 SHA-256
+不变的副本，
+再只对副本执行五块回溯；不得修改源库、阈值或质量门。
