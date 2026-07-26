@@ -734,6 +734,7 @@ test("batch projects bounded structured style and returns the same-call style ob
 test("batch validation repairs only the invalid block once and preserves its valid sibling", async () => {
   const faux = fauxProvider();
   const repairPrompts: string[] = [];
+  const repairSystemPrompts: string[] = [];
   faux.setResponses([
     fauxAssistantMessage(fauxToolCall("finalize_translation_batch", {
       windows: [{
@@ -747,6 +748,7 @@ test("batch validation repairs only the invalid block once and preserves its val
       }],
     }), { stopReason: "toolUse" }),
     (context) => {
+      repairSystemPrompts.push(context.systemPrompt ?? "");
       repairPrompts.push(promptText(context));
       return fauxAssistantMessage(fauxToolCall("submit_repaired_translation", {
         translations: [{ blockId: "block-0", text: "阿尔法。" }],
@@ -779,6 +781,10 @@ test("batch validation repairs only the invalid block once and preserves its val
   assert.match(repairPrompts[0] ?? "", /stable_term_mismatch/);
   assert.match(repairPrompts[0] ?? "", /block-0/);
   assert.doesNotMatch(repairPrompts[0] ?? "", /\[block-1\]/);
+  assert.match(
+    repairSystemPrompts[0] ?? "",
+    /adjacent short display-only lines clearly form one title or heading/u,
+  );
 });
 
 test("batch normalizes a targeted repair before its final validation", async () => {

@@ -13,6 +13,7 @@ import {
   RepairTools,
   type ValidationFailure,
 } from "../tools/repair-tools.js";
+import { PARAGRAPH_INTEGRITY_INSTRUCTIONS } from "./paragraph-integrity.js";
 import { PiRuntime, type PiRunResult } from "./pi-runtime.js";
 
 interface RepairInput {
@@ -77,8 +78,7 @@ export class Repairer {
       systemPrompt: [
         "Repair a Chinese literary translation only for the typed validation failures.",
         "Preserve all unaffected meaning and paragraph structure.",
-        "Return exactly one target paragraph for each source paragraph, in the same order.",
-        "Never move, duplicate, merge, or split content across paragraphs or blocks.",
+        ...PARAGRAPH_INTEGRITY_INSTRUCTIONS,
         "Do not explain. Call submit_repaired_translation exactly once with the smallest sufficient block patch.",
       ].join("\n"),
       prompt,

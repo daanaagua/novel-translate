@@ -34,7 +34,7 @@
 - 修改：`folioloom/test/translation-agent.test.ts:82-126`
 - 修改：`folioloom/test/translation-batch.test.ts:734-781`
 
-- [ ] **步骤 1：为正式批量翻译提示增加失败断言**
+- [x] **步骤 1：为正式批量翻译提示增加失败断言**
 
 在 `one request builder serializes all translator-visible projections and one tool schema` 中增加：
 
@@ -53,7 +53,7 @@ assert.match(
 );
 ```
 
-- [ ] **步骤 2：为兼容 Translator 的实际系统提示增加失败断言**
+- [x] **步骤 2：为兼容 Translator 的实际系统提示增加失败断言**
 
 把该测试的首个 faux 响应改为响应工厂，以记录 `context.systemPrompt`：
 
@@ -91,7 +91,7 @@ assert.match(
 );
 ```
 
-- [ ] **步骤 3：为 Repairer 的实际系统提示增加失败断言**
+- [x] **步骤 3：为 Repairer 的实际系统提示增加失败断言**
 
 在 `batch validation repairs only the invalid block once and preserves its valid sibling` 中增加数组，并在修复响应工厂中记录系统提示：
 
@@ -119,7 +119,7 @@ assert.match(
 );
 ```
 
-- [ ] **步骤 4：运行三个目标测试并确认正确失败**
+- [x] **步骤 4：运行三个目标测试并确认正确失败**
 
 在 `folioloom/` 目录运行：
 
@@ -140,7 +140,7 @@ node --test --import tsx `
 - 修改：`folioloom/src/agents/translator.ts:239-250`
 - 修改：`folioloom/src/agents/repairer.ts:76-84`
 
-- [ ] **步骤 1：创建共享提示规则**
+- [x] **步骤 1：创建共享提示规则**
 
 创建 `folioloom/src/agents/paragraph-integrity.ts`：
 
@@ -153,7 +153,7 @@ export const PARAGRAPH_INTEGRITY_INSTRUCTIONS = Object.freeze([
 ] as const);
 ```
 
-- [ ] **步骤 2：正式批量翻译使用共享规则**
+- [x] **步骤 2：正式批量翻译使用共享规则**
 
 在 `translation-request.ts` 中导入：
 
@@ -169,7 +169,7 @@ import { PARAGRAPH_INTEGRITY_INSTRUCTIONS } from "./paragraph-integrity.js";
 
 保留其前面的 `Preserve meaning, ambiguity, paragraph structure, voice, and every block boundary.`。
 
-- [ ] **步骤 3：兼容 Translator 使用共享规则**
+- [x] **步骤 3：兼容 Translator 使用共享规则**
 
 在 `translator.ts` 中导入：
 
@@ -183,7 +183,7 @@ import { PARAGRAPH_INTEGRITY_INSTRUCTIONS } from "./paragraph-integrity.js";
 ...PARAGRAPH_INTEGRITY_INSTRUCTIONS,
 ```
 
-- [ ] **步骤 4：Repairer 使用共享规则**
+- [x] **步骤 4：Repairer 使用共享规则**
 
 在 `repairer.ts` 中导入：
 
@@ -199,7 +199,7 @@ import { PARAGRAPH_INTEGRITY_INSTRUCTIONS } from "./paragraph-integrity.js";
 
 保留 `Preserve all unaffected meaning and paragraph structure.` 和最小补丁要求。
 
-- [ ] **步骤 5：运行目标测试确认转绿**
+- [x] **步骤 5：运行目标测试确认转绿**
 
 运行：
 
@@ -217,7 +217,7 @@ node --test --import tsx `
 **文件：**
 - 修改：`folioloom/test/translation-agent.test.ts:632-657`
 
-- [ ] **步骤 1：增加多行标题验证器回归测试**
+- [x] **步骤 1：增加多行标题验证器回归测试**
 
 在现有逐段边界测试附近增加：
 
@@ -250,7 +250,7 @@ test("multiline display titles may redistribute wording without losing paragraph
 });
 ```
 
-- [ ] **步骤 2：运行翻译相关测试**
+- [x] **步骤 2：运行翻译相关测试**
 
 运行：
 
@@ -263,7 +263,7 @@ node --test --import tsx `
 
 预期：全部通过，0 failed。
 
-- [ ] **步骤 3：检查补丁并提交**
+- [x] **步骤 3：检查补丁并提交**
 
 运行：
 

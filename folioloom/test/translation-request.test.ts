@@ -81,6 +81,18 @@ test("one request builder serializes all translator-visible projections and one 
   assert.match(prepared.systemPrompt, /Simplified Chinese \(zh-Hans\)/u);
   assert.match(prepared.systemPrompt, /locked=true must be reproduced exactly/u);
   assert.match(prepared.systemPrompt, /policy=preferred is a default rendering, not a literal-in-every-context constraint/u);
+  assert.match(
+    prepared.systemPrompt,
+    /adjacent short display-only lines clearly form one title or heading/u,
+  );
+  assert.match(
+    prepared.systemPrompt,
+    /redistribute wording only within those same target paragraph slots/u,
+  );
+  assert.match(
+    prepared.systemPrompt,
+    /never apply this exception to ordinary prose/u,
+  );
   assert.match(prepared.prompt, /KNOWLEDGE SNAPSHOT PROJECTION/u);
   assert.match(prepared.prompt, /Opening source paragraph/u);
   assert.match(prepared.prompt, /STABLE TERMS/u);

@@ -87,13 +87,17 @@ test("translation agent receives minimal context and may retrieve evidence", asy
   const island = splitIntoChapterIslands(blocks)[0];
   assert.ok(island);
   const faux = fauxProvider();
+  const translationSystemPrompts: string[] = [];
   faux.setResponses([
-    fauxAssistantMessage(
-      fauxToolCall("retrieve_resolved_evidence", {
-        questionIds: ["q-typhon-piaton"],
-      }),
-      { stopReason: "toolUse" },
-    ),
+    (context) => {
+      translationSystemPrompts.push(context.systemPrompt ?? "");
+      return fauxAssistantMessage(
+        fauxToolCall("retrieve_resolved_evidence", {
+          questionIds: ["q-typhon-piaton"],
+        }),
+        { stopReason: "toolUse" },
+      );
+    },
     fauxAssistantMessage(
       fauxToolCall("finalize_translation", {
         translations: [
@@ -122,6 +126,10 @@ test("translation agent receives minimal context and may retrieve evidence", asy
   assert.equal(outcome.initialPrompt.includes("all narrative memories"), false);
   assert.equal(outcome.validation.valid, true);
   assert.equal(outcome.humanRequired, false);
+  assert.match(
+    translationSystemPrompts[0] ?? "",
+    /adjacent short display-only lines clearly form one title or heading/u,
+  );
 });
 
 test("translator validates every locked glossary or legacy term", async () => {
@@ -652,6 +660,33 @@ test("paragraph boundaries remain one-to-one across a translated block", () => {
 
   assert.ok(validation.failures.some((failure) =>
     failure.code === "paragraph_count_incompatible" && failure.blockId === source.id));
+});
+
+test("multiline display titles may redistribute wording without losing paragraph slots", () => {
+  const source = chapterBlock(0, "CHILDREN\n\nOF TIME");
+  const validator = new TranslationValidator();
+  const redistributed = validator.validate(
+    [source],
+    {
+      translations: [{ blockId: source.id, text: "时间\n\n之子" }],
+      notes: [],
+      repaired: false,
+    },
+    { sourceLanguageProfile: getSourceLanguageProfile("en") },
+  );
+  const merged = validator.validate(
+    [source],
+    {
+      translations: [{ blockId: source.id, text: "时间之子" }],
+      notes: [],
+      repaired: false,
+    },
+    { sourceLanguageProfile: getSourceLanguageProfile("en") },
+  );
+
+  assert.equal(redistributed.valid, true);
+  assert.ok(merged.failures.some((failure) =>
+    failure.code === "paragraph_count_incompatible"));
 });
 
 test("paragraph-level length checks catch a shifted passage hidden by a healthy block total", () => {

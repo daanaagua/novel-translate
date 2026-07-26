@@ -34,6 +34,7 @@ import {
   TranslationValidator,
   type TranslationValidation,
 } from "../validators/translation-validator.js";
+import { PARAGRAPH_INTEGRITY_INSTRUCTIONS } from "./paragraph-integrity.js";
 import type { PiRunResult } from "./pi-runtime.js";
 import { PiRuntime } from "./pi-runtime.js";
 import { Repairer } from "./repairer.js";
@@ -241,8 +242,7 @@ export class Translator {
         `The source language is ${sourceLanguageProfile.displayName} (${sourceLanguageProfile.id}); the target language is ${targetLanguageLabel()}.`,
         SIMPLIFIED_CHINESE_SCRIPT_REQUIREMENT,
         "Preserve meaning, ambiguity, paragraph structure, voice, and all block boundaries.",
-        "Return exactly one target paragraph for each source paragraph, in the same order.",
-        "Never move, duplicate, merge, or split content across paragraphs or blocks.",
+        ...PARAGRAPH_INTEGRITY_INSTRUCTIONS,
         "For supplied terms, locked=true must be reproduced exactly; policy=preferred is a default rendering, not a literal-in-every-context constraint.",
         "Use translator-global facts only to disambiguate wording; do not add facts unavailable to the narrator.",
         "Do not leave ordinary source-language prose words untranslated unless the stable terminology explicitly preserves them.",

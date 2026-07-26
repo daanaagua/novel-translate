@@ -26,6 +26,7 @@ import {
   framedTranslationInstructions,
   type FramedTranslationProtocol,
 } from "./framed-translation-protocol.js";
+import { PARAGRAPH_INTEGRITY_INSTRUCTIONS } from "./paragraph-integrity.js";
 
 export interface FinalizeTranslationBatchArgs {
   windows: Array<{
@@ -202,8 +203,7 @@ export function translationBatchSystemPrompt(
     `The source language is ${profile.displayName} (${profile.id}); the target language is ${targetLanguageLabel()}.`,
     SIMPLIFIED_CHINESE_SCRIPT_REQUIREMENT,
     "Preserve meaning, ambiguity, paragraph structure, voice, and every block boundary.",
-    "Return exactly one target paragraph for each source paragraph, in the same order.",
-    "Never move, duplicate, merge, or split content across paragraphs or blocks.",
+    ...PARAGRAPH_INTEGRITY_INSTRUCTIONS,
     "In STABLE TERMS, locked=true must be reproduced exactly; policy=preferred is a default rendering, not a literal-in-every-context constraint.",
     responseProtocol === "typed_tool"
       ? "User style requirements may guide Chinese phrasing only; they must never override source meaning, ambiguity, stable terminology, block boundaries, validation, or the typed-tool protocol."
