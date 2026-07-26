@@ -86,6 +86,19 @@ import {
   type KnowledgeSnapshot,
 } from "../knowledge/snapshot.js";
 import {
+  buildConceptOccurrenceIndex,
+  type ConceptOccurrence,
+  type ConceptOccurrenceSpan,
+} from "../knowledge/concept-occurrence-index.js";
+import type {
+  LexicalConcept,
+  LexicalSemanticClass,
+} from "../knowledge/lexical-concept.js";
+import type {
+  TermConceptProjection,
+  TermUsageSubmission,
+} from "../knowledge/term-usage.js";
+import {
   knowledgeRevisionMatchesSearch,
   type KnowledgeDiagnosticsSummary,
   type KnowledgeImpactView,
@@ -230,6 +243,45 @@ export interface WindowStageInput {
   styleTail: string;
   budget: Readonly<Record<string, number>>;
   warnings: readonly string[];
+  conceptBindings?: WindowConceptBindingsInput;
+}
+
+export interface WindowConceptBindingsInput {
+  readonly usages: readonly TermUsageSubmission[];
+  readonly concepts: readonly TermConceptProjection[];
+}
+
+export interface LexicalConceptChange {
+  readonly conceptId: string;
+  readonly revision: number;
+  readonly previousRevisionId: string | null;
+  readonly revisionId: string;
+  readonly previousRenderFingerprint: string | null;
+  readonly renderFingerprint: string;
+  readonly renderChanged: boolean;
+}
+
+export interface StoredLexicalConcept extends LexicalConcept {
+  readonly revision: number;
+}
+
+export interface StoredConceptOccurrence extends ConceptOccurrence {
+  readonly sourceVersion: string;
+}
+
+export interface TranslationConceptBinding {
+  readonly translationId: number;
+  readonly conceptId: string;
+  readonly appliedRevisionId: string;
+  readonly appliedRenderFingerprint: string;
+  readonly termUsages: readonly TermUsageSubmission[];
+  readonly validationStatus:
+    | "clean"
+    | "pending"
+    | "validating"
+    | "stale"
+    | "warning_stale";
+  readonly validatedRevisionId: string;
 }
 
 export interface WindowFailureInput {
@@ -674,6 +726,33 @@ interface LogicalBlockRow {
   token_count: number;
 }
 
+interface LexicalConceptRow {
+  run_id: string;
+  concept_id: string;
+  revision: number;
+  revision_id: string;
+  normalized_subject: string;
+  source_forms_json: string;
+  semantic_class: string;
+  canonical_target: string;
+  policy: string;
+  allowed_realizations_json: string;
+  visibility: string;
+  confidence: number;
+  render_fingerprint: string;
+  active: number;
+}
+
+interface TranslationConceptBindingRow {
+  translation_id: number;
+  concept_id: string;
+  applied_revision_id: string;
+  applied_render_fingerprint: string;
+  term_usages_json: string;
+  validation_status: TranslationConceptBinding["validationStatus"];
+  validated_revision_id: string;
+}
+
 function all<T>(statement: StatementSync, ...values: any[]): T[] {
   return statement.all(...values) as unknown as T[];
 }
@@ -1038,6 +1117,113 @@ function validateWarnings(warnings: readonly string[]): string {
     throw new TypeError("warnings must be an array of strings");
   }
   return jsonText(warnings, "warnings");
+}
+
+function lexicalConceptFromRow(row: LexicalConceptRow): StoredLexicalConcept {
+  const semanticClasses = new Set<LexicalSemanticClass>([
+    "proper_name",
+    "unique_title",
+    "technical_term",
+    "role",
+  ]);
+  if (!semanticClasses.has(row.semantic_class as LexicalSemanticClass)
+    || !["locked", "preferred", "contextual"].includes(row.policy)
+    || !["translator_global", "narrative_before_target"].includes(row.visibility)) {
+    throw new Error(`corrupt lexical concept ${row.concept_id}`);
+  }
+  return {
+    conceptId: row.concept_id,
+    revision: requireSafeInteger(row.revision, "lexical concept revision", 1),
+    revisionId: row.revision_id,
+    normalizedSubject: row.normalized_subject,
+    sourceForms: stringArrayFromJson(
+      row.source_forms_json,
+      "lexical source forms",
+    ),
+    semanticClass: row.semantic_class as LexicalSemanticClass,
+    canonicalTarget: row.canonical_target,
+    policy: row.policy as LexicalConcept["policy"],
+    allowedRealizations: stringArrayFromJson(
+      row.allowed_realizations_json,
+      "lexical allowed realizations",
+    ),
+    visibility: row.visibility as LexicalConcept["visibility"],
+    confidence: row.confidence,
+    renderFingerprint: row.render_fingerprint,
+  };
+}
+
+function lexicalConceptFromPayload(value: unknown): LexicalConcept {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error("corrupt lexical concept knowledge payload");
+  }
+  const payload = value as Partial<LexicalConcept>;
+  if (typeof payload.conceptId !== "string"
+    || typeof payload.revisionId !== "string"
+    || typeof payload.normalizedSubject !== "string"
+    || !Array.isArray(payload.sourceForms)
+    || payload.sourceForms.length === 0
+    || payload.sourceForms.some((item: unknown) =>
+      typeof item !== "string" || item.trim().length === 0)
+    || !["proper_name", "unique_title", "technical_term", "role"].includes(
+      payload.semanticClass ?? "",
+    )
+    || typeof payload.canonicalTarget !== "string"
+    || !["locked", "preferred", "contextual"].includes(payload.policy ?? "")
+    || !Array.isArray(payload.allowedRealizations)
+    || payload.allowedRealizations.length === 0
+    || payload.allowedRealizations.some((item: unknown) =>
+      typeof item !== "string" || item.trim().length === 0)
+    || typeof payload.confidence !== "number"
+    || !Number.isFinite(payload.confidence)
+    || payload.confidence < 0
+    || payload.confidence > 1
+    || !["translator_global", "narrative_before_target"].includes(
+      payload.visibility ?? "",
+    )
+    || typeof payload.renderFingerprint !== "string"
+    || !/^[a-f0-9]{64}$/u.test(payload.renderFingerprint)) {
+    throw new Error("corrupt lexical concept knowledge payload");
+  }
+  return {
+    conceptId: payload.conceptId,
+    revisionId: payload.revisionId,
+    normalizedSubject: payload.normalizedSubject,
+    sourceForms: [...payload.sourceForms] as string[],
+    semanticClass: payload.semanticClass as LexicalConcept["semanticClass"],
+    canonicalTarget: payload.canonicalTarget,
+    policy: payload.policy as LexicalConcept["policy"],
+    allowedRealizations: [...payload.allowedRealizations] as string[],
+    confidence: payload.confidence,
+    visibility: payload.visibility as LexicalConcept["visibility"],
+    renderFingerprint: payload.renderFingerprint,
+  };
+}
+
+function termUsagesFromJson(value: string): TermUsageSubmission[] {
+  const parsed = JSON.parse(value) as unknown;
+  if (!Array.isArray(parsed)) {
+    throw new Error("corrupt term usages JSON");
+  }
+  for (const item of parsed) {
+    if (item === null || typeof item !== "object" || Array.isArray(item)) {
+      throw new Error("corrupt term usages JSON");
+    }
+    const usage = item as Partial<TermUsageSubmission>;
+    if (typeof usage.occurrenceId !== "string"
+      || typeof usage.blockId !== "string"
+      || typeof usage.conceptId !== "string"
+      || typeof usage.sourceForm !== "string"
+      || !Number.isSafeInteger(usage.sourceStart)
+      || !Number.isSafeInteger(usage.sourceEnd)
+      || typeof usage.targetSurface !== "string"
+      || !["narrative", "vocative", "title", "other"].includes(
+        usage.discourseRole ?? "",
+      )) {
+      throw new Error("corrupt term usages JSON");
+    }
+  }
+  return parsed as TermUsageSubmission[];
 }
 
 function windowFromRow(row: WindowRow, blockIds: string[]): PersistedLosslessWindow {
@@ -1677,6 +1863,14 @@ export class LosslessBookStore {
           input.snapshotId,
         );
       }
+      if (input.conceptBindings !== undefined) {
+        this.#writeWindowConceptBindings(
+          input.runId,
+          input.windowId,
+          input.conceptBindings.usages,
+          input.conceptBindings.concepts,
+        );
+      }
 
       const insertKnowledgeCandidate = this.#database.prepare(`
         INSERT INTO knowledge_candidates(
@@ -1995,6 +2189,7 @@ export class LosslessBookStore {
           undefined,
         );
       }
+      this.#projectLexicalConceptRevisions(runId, appendedRevisions);
       if (appendedRevisions.length > 0) {
         const updatedKnowledgeState = this.#database.prepare(`
           UPDATE knowledge_state
@@ -2241,6 +2436,229 @@ export class LosslessBookStore {
 
   pendingWindows(runId: string): PersistedLosslessWindow[] {
     return this.allWindows(runId).filter((window) => window.status === "pending");
+  }
+
+  upsertLexicalConcepts(
+    runId: string,
+    concepts: readonly LexicalConcept[],
+  ): LexicalConceptChange[] {
+    if (this.#schemaVersion !== LOSSLESS_BOOK_SCHEMA_VERSION) {
+      throw new Error("schema v4 write upgrade required");
+    }
+    this.#run(runId);
+    if (!Array.isArray(concepts)) {
+      throw new TypeError("concepts must be an array");
+    }
+    const seen = new Set<string>();
+    for (const concept of concepts) {
+      requireNonempty(concept.conceptId, "conceptId");
+      requireNonempty(concept.revisionId, "concept revisionId");
+      requireNonempty(concept.normalizedSubject, "concept normalizedSubject");
+      requireNonempty(concept.canonicalTarget, "concept canonicalTarget");
+      if (seen.has(concept.conceptId)) {
+        throw new Error(`duplicate lexical concept ${concept.conceptId}`);
+      }
+      seen.add(concept.conceptId);
+      if (!/^[0-9a-f]{64}$/u.test(concept.renderFingerprint)) {
+        throw new TypeError("concept renderFingerprint must be a SHA-256 hash");
+      }
+      if (!Array.isArray(concept.sourceForms)
+        || concept.sourceForms.length === 0
+        || concept.sourceForms.some((form: unknown) =>
+          typeof form !== "string" || form.trim().length === 0)) {
+        throw new TypeError("concept sourceForms must contain nonempty strings");
+      }
+      if (!Array.isArray(concept.allowedRealizations)
+        || concept.allowedRealizations.length === 0
+        || concept.allowedRealizations.some((surface: unknown) =>
+          typeof surface !== "string" || surface.trim().length === 0)) {
+        throw new TypeError(
+          "concept allowedRealizations must contain nonempty strings",
+        );
+      }
+    }
+    return this.#transaction(() =>
+      this.#upsertLexicalConceptRows(runId, concepts));
+  }
+
+  activeLexicalConcept(
+    runId: string,
+    conceptId: string,
+  ): StoredLexicalConcept | undefined {
+    if (this.#schemaVersion !== LOSSLESS_BOOK_SCHEMA_VERSION) return undefined;
+    this.#run(runId);
+    requireNonempty(conceptId, "conceptId");
+    const row = one<LexicalConceptRow>(this.#database.prepare(`
+      SELECT * FROM lexical_concepts
+      WHERE run_id=? AND concept_id=? AND active=1
+    `), runId, conceptId);
+    return row === undefined ? undefined : lexicalConceptFromRow(row);
+  }
+
+  replaceConceptOccurrences(
+    runId: string,
+    conceptId: string,
+    occurrences: readonly ConceptOccurrence[],
+  ): void {
+    if (this.#schemaVersion !== LOSSLESS_BOOK_SCHEMA_VERSION) {
+      throw new Error("schema v4 write upgrade required");
+    }
+    const run = this.#run(runId);
+    requireNonempty(conceptId, "conceptId");
+    if (!Array.isArray(occurrences)) {
+      throw new TypeError("occurrences must be an array");
+    }
+    if (this.activeLexicalConcept(runId, conceptId) === undefined) {
+      throw new Error(`unknown active lexical concept ${conceptId}`);
+    }
+    const normalized = occurrences.map((occurrence) => {
+      if (occurrence.conceptId !== conceptId) {
+        throw new Error(`occurrence concept mismatch for ${occurrence.blockId}`);
+      }
+      const blockIdValue = requireNonempty(occurrence.blockId, "occurrence blockId");
+      const block = one<{ source_text: string }>(this.#database.prepare(`
+        SELECT source_text FROM logical_blocks
+        WHERE source_version=? AND block_id=?
+      `), run.source_version, blockIdValue);
+      if (block === undefined) {
+        throw new Error(`unknown occurrence block ${blockIdValue}`);
+      }
+      if (!Array.isArray(occurrence.sourceSpans)
+        || occurrence.sourceSpans.length === 0) {
+        throw new Error(`occurrence ${blockIdValue} must contain source spans`);
+      }
+      const sourceScalars = Array.from(block.source_text);
+      const spanKeys = new Set<string>();
+      const spans = occurrence.sourceSpans.map((span: ConceptOccurrenceSpan) => {
+        requireSafeInteger(span.start, "occurrence start");
+        requireSafeInteger(span.end, "occurrence end", 1);
+        if (span.end <= span.start || span.end > sourceScalars.length) {
+          throw new Error(`invalid occurrence span in block ${blockIdValue}`);
+        }
+        const sourceForm = requireNonempty(
+          span.sourceForm,
+          "occurrence sourceForm",
+        );
+        if (sourceScalars.slice(span.start, span.end).join("") !== sourceForm) {
+          throw new Error(`occurrence source form mismatch in block ${blockIdValue}`);
+        }
+        const key = `${span.start}\0${span.end}`;
+        if (spanKeys.has(key)) {
+          throw new Error(`duplicate occurrence span in block ${blockIdValue}`);
+        }
+        spanKeys.add(key);
+        return { start: span.start, end: span.end, sourceForm };
+      }).sort((
+        left: ConceptOccurrenceSpan,
+        right: ConceptOccurrenceSpan,
+      ) => left.start - right.start || left.end - right.end);
+      return {
+        conceptId,
+        blockId: blockIdValue,
+        sourceVersion: run.source_version,
+        sourceSpans: spans,
+      };
+    });
+    if (new Set(normalized.map((item) => item.blockId)).size !== normalized.length) {
+      throw new Error(`duplicate occurrence block for ${conceptId}`);
+    }
+    this.#transaction(() => {
+      this.#database.prepare(`
+        DELETE FROM concept_occurrences WHERE run_id=? AND concept_id=?
+      `).run(runId, conceptId);
+      const insert = this.#database.prepare(`
+        INSERT INTO concept_occurrences(
+          run_id, concept_id, source_version, block_id,
+          occurrence_count, source_spans_json
+        ) VALUES(?, ?, ?, ?, ?, ?)
+      `);
+      for (const occurrence of normalized) {
+        insert.run(
+          runId,
+          conceptId,
+          occurrence.sourceVersion,
+          occurrence.blockId,
+          occurrence.sourceSpans.length,
+          jsonText(occurrence.sourceSpans, "concept occurrence spans"),
+        );
+      }
+    });
+  }
+
+  conceptOccurrences(
+    runId: string,
+    conceptId: string,
+  ): StoredConceptOccurrence[] {
+    if (this.#schemaVersion !== LOSSLESS_BOOK_SCHEMA_VERSION) return [];
+    this.#run(runId);
+    requireNonempty(conceptId, "conceptId");
+    return all<{
+      source_version: string;
+      block_id: string;
+      occurrence_count: number;
+      source_spans_json: string;
+    }>(this.#database.prepare(`
+      SELECT source_version, block_id, occurrence_count, source_spans_json
+      FROM concept_occurrences
+      WHERE run_id=? AND concept_id=?
+      ORDER BY block_id
+    `), runId, conceptId).map((row) => {
+      const spans = JSON.parse(row.source_spans_json) as ConceptOccurrenceSpan[];
+      if (!Array.isArray(spans) || spans.length !== row.occurrence_count) {
+        throw new Error(`corrupt concept occurrences for ${conceptId}`);
+      }
+      return {
+        conceptId,
+        blockId: row.block_id,
+        sourceVersion: row.source_version,
+        sourceSpans: spans,
+      };
+    });
+  }
+
+  stageWindowConceptBindings(
+    runId: string,
+    windowId: string,
+    usages: readonly TermUsageSubmission[],
+    concepts: readonly TermConceptProjection[],
+  ): void {
+    if (this.#schemaVersion !== LOSSLESS_BOOK_SCHEMA_VERSION) {
+      throw new Error("schema v4 write upgrade required");
+    }
+    this.#run(runId);
+    requireNonempty(windowId, "windowId");
+    this.#transaction(() => {
+      const window = this.#window(runId, windowId);
+      if (window === undefined || window.status !== "staged") {
+        throw new Error(`window is not staged: ${runId}/${windowId}`);
+      }
+      this.#writeWindowConceptBindings(runId, windowId, usages, concepts);
+    });
+  }
+
+  activeTranslationBindings(
+    runId: string,
+    blockId: string,
+  ): TranslationConceptBinding[] {
+    if (this.#schemaVersion !== LOSSLESS_BOOK_SCHEMA_VERSION) return [];
+    this.#run(runId);
+    requireNonempty(blockId, "blockId");
+    return all<TranslationConceptBindingRow>(this.#database.prepare(`
+      SELECT b.*
+      FROM translations AS t
+      JOIN translation_concept_bindings AS b
+        ON b.translation_id=t.translation_id
+      WHERE t.run_id=? AND t.block_id=? AND t.active=1
+      ORDER BY b.concept_id
+    `), runId, blockId).map((row) => ({
+      translationId: row.translation_id,
+      conceptId: row.concept_id,
+      appliedRevisionId: row.applied_revision_id,
+      appliedRenderFingerprint: row.applied_render_fingerprint,
+      termUsages: termUsagesFromJson(row.term_usages_json),
+      validationStatus: row.validation_status,
+      validatedRevisionId: row.validated_revision_id,
+    }));
   }
 
   knowledgeState(runId: string): KnowledgeStateView {
@@ -4717,6 +5135,297 @@ export class LosslessBookStore {
     }
     if (seen.size !== expected.size) {
       throw new Error(`window requires ${expected.size} translations but received ${seen.size}`);
+    }
+  }
+
+  #projectLexicalConceptRevisions(
+    runId: string,
+    revisions: readonly KnowledgeRevision[],
+  ): void {
+    const concepts = revisions
+      .filter((revision) =>
+        revision.kind === "lexical_concept" && revision.status === "active")
+      .map((revision) => lexicalConceptFromPayload(revision.payload));
+    if (concepts.length === 0) return;
+    const changes = this.#upsertLexicalConceptRows(runId, concepts);
+    const renderChanged = new Set(changes
+      .filter((change) => change.renderChanged)
+      .map((change) => change.conceptId));
+    if (renderChanged.size === 0) return;
+    const changedConcepts = concepts.filter((concept) =>
+      renderChanged.has(concept.conceptId));
+    const run = this.#run(runId);
+    const source = this.#source(run.source_version);
+    const sourcePayload = JSON.parse(source.source_payload_json) as {
+      sourceLanguage?: unknown;
+    };
+    const profile = getSourceLanguageProfile(
+      typeof sourcePayload.sourceLanguage === "string"
+        ? sourcePayload.sourceLanguage
+        : undefined,
+    );
+    const blocks = all<{ block_id: string; source_text: string }>(
+      this.#database.prepare(`
+        SELECT block_id, source_text FROM logical_blocks
+        WHERE source_version=? ORDER BY global_index
+      `),
+      run.source_version,
+    ).map((block) => ({
+      blockId: block.block_id,
+      sourceText: block.source_text,
+    }));
+    const occurrences = buildConceptOccurrenceIndex(
+      blocks,
+      changedConcepts,
+      profile,
+    );
+    const insert = this.#database.prepare(`
+      INSERT INTO concept_occurrences(
+        run_id, concept_id, source_version, block_id,
+        occurrence_count, source_spans_json
+      ) VALUES(?, ?, ?, ?, ?, ?)
+    `);
+    for (const concept of changedConcepts) {
+      this.#database.prepare(`
+        DELETE FROM concept_occurrences WHERE run_id=? AND concept_id=?
+      `).run(runId, concept.conceptId);
+    }
+    for (const occurrence of occurrences) {
+      insert.run(
+        runId,
+        occurrence.conceptId,
+        run.source_version,
+        occurrence.blockId,
+        occurrence.sourceSpans.length,
+        jsonText(occurrence.sourceSpans, "concept occurrence spans"),
+      );
+    }
+  }
+
+  #upsertLexicalConceptRows(
+    runId: string,
+    concepts: readonly LexicalConcept[],
+  ): LexicalConceptChange[] {
+    const changes: LexicalConceptChange[] = [];
+    for (const concept of [...concepts].sort((left, right) =>
+      compareText(left.conceptId, right.conceptId))) {
+      const active = one<LexicalConceptRow>(this.#database.prepare(`
+        SELECT * FROM lexical_concepts
+        WHERE run_id=? AND concept_id=? AND active=1
+      `), runId, concept.conceptId);
+      if (active?.revision_id === concept.revisionId) {
+        continue;
+      }
+      const stored = one<LexicalConceptRow>(this.#database.prepare(`
+        SELECT * FROM lexical_concepts
+        WHERE run_id=? AND revision_id=?
+      `), runId, concept.revisionId);
+      if (stored !== undefined && stored.concept_id !== concept.conceptId) {
+        throw new Error(
+          `lexical revision ${concept.revisionId} belongs to another concept`,
+        );
+      }
+      this.#database.prepare(`
+        UPDATE lexical_concepts SET active=0
+        WHERE run_id=? AND concept_id=? AND active=1
+      `).run(runId, concept.conceptId);
+      let revision: number;
+      if (stored !== undefined) {
+        revision = stored.revision;
+        const activated = this.#database.prepare(`
+          UPDATE lexical_concepts SET active=1
+          WHERE run_id=? AND concept_id=? AND revision=?
+        `).run(runId, concept.conceptId, revision);
+        if (Number(activated.changes) !== 1) {
+          throw new Error(`failed to reactivate lexical concept ${concept.conceptId}`);
+        }
+      } else {
+        revision = (one<{ next_revision: number }>(this.#database.prepare(`
+          SELECT COALESCE(MAX(revision), 0) + 1 AS next_revision
+          FROM lexical_concepts WHERE run_id=? AND concept_id=?
+        `), runId, concept.conceptId)?.next_revision) ?? 1;
+        this.#database.prepare(`
+          INSERT INTO lexical_concepts(
+            run_id, concept_id, revision, revision_id, normalized_subject,
+            source_forms_json, semantic_class, canonical_target, policy,
+            allowed_realizations_json, visibility, confidence,
+            render_fingerprint, active
+          ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
+        `).run(
+          runId,
+          concept.conceptId,
+          revision,
+          concept.revisionId,
+          concept.normalizedSubject,
+          jsonText(concept.sourceForms, "concept source forms"),
+          concept.semanticClass,
+          concept.canonicalTarget,
+          concept.policy,
+          jsonText(
+            concept.allowedRealizations,
+            "concept allowed realizations",
+          ),
+          concept.visibility,
+          concept.confidence,
+          concept.renderFingerprint,
+        );
+      }
+      changes.push({
+        conceptId: concept.conceptId,
+        revision,
+        previousRevisionId: active?.revision_id ?? null,
+        revisionId: concept.revisionId,
+        previousRenderFingerprint: active?.render_fingerprint ?? null,
+        renderFingerprint: concept.renderFingerprint,
+        renderChanged: active?.render_fingerprint !== concept.renderFingerprint,
+      });
+    }
+    return changes;
+  }
+
+  #writeWindowConceptBindings(
+    runId: string,
+    windowId: string,
+    usages: readonly TermUsageSubmission[],
+    concepts: readonly TermConceptProjection[],
+  ): void {
+    if (!Array.isArray(usages) || !Array.isArray(concepts)) {
+      throw new TypeError("concept bindings must contain usage and concept arrays");
+    }
+    const conceptById = new Map<string, TermConceptProjection>();
+    for (const concept of concepts) {
+      const conceptId = requireNonempty(concept.conceptId, "binding conceptId");
+      requireNonempty(concept.revisionId, "binding revisionId");
+      if (!/^[0-9a-f]{64}$/u.test(concept.renderFingerprint)) {
+        throw new TypeError(
+          `binding renderFingerprint for ${conceptId} must be a SHA-256 hash`,
+        );
+      }
+      const previous = conceptById.get(conceptId);
+      if (previous !== undefined) {
+        if (previous.revisionId !== concept.revisionId
+          || previous.renderFingerprint !== concept.renderFingerprint) {
+          throw new Error(`conflicting binding concept ${conceptId}`);
+        }
+        continue;
+      }
+      conceptById.set(conceptId, concept);
+    }
+    const translations = all<{
+      translation_id: number;
+      block_id: string;
+      text: string;
+    }>(this.#database.prepare(`
+      SELECT translation_id, block_id, text
+      FROM translations
+      WHERE run_id=? AND window_id=? AND stage_state='staged' AND active=0
+      ORDER BY translation_id
+    `), runId, windowId);
+    const translationByBlock = new Map(translations.map((translation) => [
+      translation.block_id,
+      translation,
+    ]));
+    if (translationByBlock.size !== translations.length) {
+      throw new Error(`duplicate staged translation block in ${runId}/${windowId}`);
+    }
+    const membership = this.#membership(runId, windowId);
+    const seenOccurrenceIds = new Set<string>();
+    const grouped = new Map<string, {
+      translationId: number;
+      concept: TermConceptProjection;
+      usages: TermUsageSubmission[];
+    }>();
+    for (const usage of usages) {
+      const occurrenceId = requireNonempty(
+        usage.occurrenceId,
+        "term usage occurrenceId",
+      );
+      if (seenOccurrenceIds.has(occurrenceId)) {
+        throw new Error(`duplicate term usage ${occurrenceId}`);
+      }
+      seenOccurrenceIds.add(occurrenceId);
+      const concept = conceptById.get(
+        requireNonempty(usage.conceptId, "term usage conceptId"),
+      );
+      if (concept === undefined) {
+        throw new Error(`term usage references unknown concept ${usage.conceptId}`);
+      }
+      const translation = translationByBlock.get(
+        requireNonempty(usage.blockId, "term usage blockId"),
+      );
+      const block = membership.get(usage.blockId);
+      if (translation === undefined || block === undefined) {
+        throw new Error(
+          `term usage references a block outside ${runId}/${windowId}`,
+        );
+      }
+      requireSafeInteger(usage.sourceStart, "term usage sourceStart");
+      requireSafeInteger(usage.sourceEnd, "term usage sourceEnd", 1);
+      if (usage.sourceEnd <= usage.sourceStart) {
+        throw new Error(`invalid term usage source span ${occurrenceId}`);
+      }
+      const source = one<{ source_text: string }>(this.#database.prepare(`
+        SELECT source_text FROM logical_blocks
+        WHERE source_version=? AND block_id=?
+      `), block.source_version, block.block_id);
+      const sourceScalars = Array.from(source?.source_text ?? "");
+      if (usage.sourceEnd > sourceScalars.length
+        || sourceScalars.slice(usage.sourceStart, usage.sourceEnd).join("")
+          !== usage.sourceForm) {
+        throw new Error(`term usage source mismatch ${occurrenceId}`);
+      }
+      const targetSurface = requireNonempty(
+        usage.targetSurface,
+        "term usage targetSurface",
+      );
+      if (!translation.text.includes(targetSurface)) {
+        throw new Error(`term usage target missing from translation ${occurrenceId}`);
+      }
+      if (!["narrative", "vocative", "title", "other"].includes(
+        usage.discourseRole,
+      )) {
+        throw new Error(`invalid term usage discourse role ${occurrenceId}`);
+      }
+      const key = `${usage.blockId}\0${usage.conceptId}`;
+      const item = grouped.get(key) ?? {
+        translationId: translation.translation_id,
+        concept,
+        usages: [],
+      };
+      item.usages.push({ ...usage, targetSurface });
+      grouped.set(key, item);
+    }
+    if (translations.length > 0) {
+      this.#database.prepare(`
+        DELETE FROM translation_concept_bindings
+        WHERE translation_id IN (
+          SELECT translation_id FROM translations
+          WHERE run_id=? AND window_id=? AND stage_state='staged' AND active=0
+        )
+      `).run(runId, windowId);
+    }
+    const insert = this.#database.prepare(`
+      INSERT INTO translation_concept_bindings(
+        translation_id, concept_id, applied_revision_id,
+        applied_render_fingerprint, term_usages_json, validation_status,
+        validated_revision_id
+      ) VALUES(?, ?, ?, ?, ?, 'clean', ?)
+    `);
+    for (const item of [...grouped.values()].sort((left, right) =>
+      left.translationId - right.translationId
+      || compareText(left.concept.conceptId, right.concept.conceptId))) {
+      const orderedUsages = item.usages.sort((left, right) =>
+        left.sourceStart - right.sourceStart
+        || left.sourceEnd - right.sourceEnd
+        || compareText(left.occurrenceId, right.occurrenceId));
+      insert.run(
+        item.translationId,
+        item.concept.conceptId,
+        item.concept.revisionId,
+        item.concept.renderFingerprint,
+        jsonText(orderedUsages, "term usages"),
+        item.concept.revisionId,
+      );
     }
   }
 

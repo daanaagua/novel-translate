@@ -453,7 +453,7 @@ git commit -m "feat: validate contextual term usages"
 - 修改：`folioloom/src/storage/lossless-book-store.ts`
 - 修改：`folioloom/test/lossless-book-store.test.ts`
 
-- [ ] **步骤 1：编写一次扫描与幂等测试**
+- [x] **步骤 1：编写一次扫描与幂等测试**
 
 使用 100 个概念、25 个块，包装语言 profile 计数，断言所有概念批量
 建立 occurrence 时每个块只归一化和分词一次。重复写入同一概念修订后：
@@ -465,13 +465,13 @@ assert.equal(store.activeLexicalConcept(runId, conceptId)?.revision, 2);
 
 并验证一个 translation version 的 term usages 原子写入 bindings。
 
-- [ ] **步骤 2：运行测试确认失败**
+- [x] **步骤 2：运行测试确认失败**
 
 ```powershell
 npm test -- --test-name-pattern="concept occurrence|translation concept binding"
 ```
 
-- [ ] **步骤 3：实现批量 occurrence 构建**
+- [x] **步骤 3：实现批量 occurrence 构建**
 
 复用现有 Aho–Corasick 思路，但输出精确 source spans：
 
@@ -485,7 +485,7 @@ export interface ConceptOccurrence {
 
 一个 batch 中每个 block 只扫描一次。
 
-- [ ] **步骤 4：增加 store 事务 API**
+- [x] **步骤 4：增加 store 事务 API**
 
 实现：
 

@@ -771,6 +771,28 @@ test("completed waves persist a contextual role as one closed lexical concept", 
       (prokurist[0]?.payload as { canonicalTarget?: string }).canonicalTarget,
       "主事",
     );
+    const conceptId = (prokurist[0]?.payload as { conceptId?: string }).conceptId;
+    assert.ok(conceptId);
+    assert.equal(
+      store.activeLexicalConcept("run-lossless", conceptId)?.canonicalTarget,
+      "主事",
+    );
+    assert.equal(
+      store.conceptOccurrences("run-lossless", conceptId)
+        .reduce((total, occurrence) =>
+          total + occurrence.sourceSpans.length, 0),
+      3,
+    );
+    const bindings = store.activeTranslations("run-lossless")
+      .flatMap((translation) =>
+        store.activeTranslationBindings("run-lossless", translation.blockId))
+      .filter((binding) => binding.conceptId === conceptId);
+    assert.ok(bindings.length > 0);
+    assert.equal(
+      bindings.reduce((total, binding) =>
+        total + binding.termUsages.length, 0),
+      3,
+    );
   } finally {
     store.close();
   }

@@ -44,6 +44,7 @@ import {
   conceptFromAnchor,
   type LexicalSemanticClass,
 } from "../knowledge/lexical-concept.js";
+import { conceptsFromStableTerms } from "../knowledge/term-usage.js";
 import { createKnowledgeSnapshot } from "../knowledge/snapshot.js";
 import { SourceLedger } from "../source/source-ledger.js";
 import type { LosslessBlock } from "../source/types.js";
@@ -2450,6 +2451,10 @@ async function runLosslessBook(
                 completed.request.windows[0]?.windowId === window.windowId,
               ),
               warnings,
+              conceptBindings: {
+                usages: windowResult.termUsages,
+                concepts: conceptsFromStableTerms(activeTerms),
+              },
             });
             coordinator.stage({
               runId,

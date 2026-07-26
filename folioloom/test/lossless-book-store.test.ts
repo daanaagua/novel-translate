@@ -8,8 +8,17 @@ import test from "node:test";
 
 import type { BookWindowPlan } from "../src/fullbook/types.js";
 import { CommitCoordinator } from "../src/fullbook/commit-coordinator.js";
+import {
+  conceptFromAnchor,
+  reviseConcept,
+} from "../src/knowledge/lexical-concept.js";
 import { KnowledgeStore } from "../src/knowledge/knowledge-store.js";
 import { createKnowledgeSnapshot } from "../src/knowledge/snapshot.js";
+import {
+  expectedTermOccurrences,
+  type TermUsageSubmission,
+} from "../src/knowledge/term-usage.js";
+import { getSourceLanguageProfile } from "../src/language/profiles.js";
 import { blockId } from "../src/source/block-builder.js";
 import type { LosslessBlock } from "../src/source/types.js";
 import { BookStore } from "../src/storage/book-store.js";
@@ -201,6 +210,36 @@ function validStage(
     styleTail: "阿尔法。贝塔。",
     budget: { modelCalls: 1 },
     warnings: [],
+  };
+}
+
+function alphaConcept() {
+  return conceptFromAnchor({
+    sourceForm: "Alpha",
+    target: "阿尔法",
+    mode: "contextual",
+    semanticClass: "technical_term",
+    confidence: 0.95,
+  });
+}
+
+function alphaUsage(): TermUsageSubmission {
+  const [first] = blocks();
+  const concept = alphaConcept();
+  const occurrence = expectedTermOccurrences(
+    [{ id: first!.id, sourceText: first!.sourceText }],
+    [concept],
+    getSourceLanguageProfile("en"),
+  )[0]!;
+  return {
+    occurrenceId: occurrence.occurrenceId,
+    blockId: occurrence.blockId,
+    conceptId: occurrence.conceptId,
+    sourceForm: occurrence.sourceForm,
+    sourceStart: occurrence.sourceStart,
+    sourceEnd: occurrence.sourceEnd,
+    discourseRole: "narrative",
+    targetSurface: "阿尔法",
   };
 }
 
@@ -544,6 +583,147 @@ test("stage writes only inactive rows and promote commits the complete window at
   assert.equal(store.knowledgeHistory("run-a").length, 0);
   assert.equal(store.auditRows("run-a").windows[0]?.status, "completed");
   store.close();
+});
+
+test("lexical concept revisions and occurrence replacement are idempotent", () => {
+  const store = new LosslessBookStore(fixturePath());
+  const runId = initialize(store);
+  const concept = alphaConcept();
+  const firstChanges = store.upsertLexicalConcepts(runId, [concept]);
+  assert.deepEqual(firstChanges.map((change) => ({
+    revision: change.revision,
+    renderChanged: change.renderChanged,
+  })), [{ revision: 1, renderChanged: true }]);
+
+  const [first] = blocks();
+  const occurrence = {
+    conceptId: concept.conceptId,
+    blockId: first!.id,
+    sourceSpans: [{
+      start: 0,
+      end: 5,
+      sourceForm: "Alpha",
+    }],
+  };
+  store.replaceConceptOccurrences(runId, concept.conceptId, [occurrence]);
+  store.replaceConceptOccurrences(runId, concept.conceptId, [occurrence]);
+  assert.deepEqual(store.conceptOccurrences(runId, concept.conceptId), [{
+    ...occurrence,
+    sourceVersion: "source-v1",
+  }]);
+
+  const confidenceOnly = reviseConcept(concept, { confidence: 0.99 });
+  const secondChanges = store.upsertLexicalConcepts(runId, [confidenceOnly]);
+  assert.deepEqual(secondChanges.map((change) => ({
+    revision: change.revision,
+    renderChanged: change.renderChanged,
+  })), [{ revision: 2, renderChanged: false }]);
+  assert.deepEqual(store.upsertLexicalConcepts(runId, [confidenceOnly]), []);
+  assert.equal(
+    store.activeLexicalConcept(runId, concept.conceptId)?.revision,
+    2,
+  );
+  assert.equal(
+    store.conceptOccurrences(runId, concept.conceptId).length,
+    1,
+  );
+  store.close();
+});
+
+test("translation concept bindings follow the staged translation version", () => {
+  const store = new LosslessBookStore(fixturePath());
+  const runId = initialize(store);
+  const concept = alphaConcept();
+  store.upsertLexicalConcepts(runId, [concept]);
+  store.claimWindow(runId, "window-0");
+  const [first, second] = blocks();
+  store.stageWindow({
+    ...validStage(),
+    translations: [
+      {
+        blockId: first!.id,
+        sourceHash: first!.sourceHash,
+        text: "阿尔法。",
+      },
+      {
+        blockId: second!.id,
+        sourceHash: second!.sourceHash,
+        text: "贝塔。",
+      },
+    ],
+    knowledgeCandidates: [],
+    conceptBindings: {
+      usages: [alphaUsage()],
+      concepts: [concept],
+    },
+  });
+  assert.deepEqual(
+    store.activeTranslationBindings(runId, first!.id),
+    [],
+  );
+
+  store.promoteStagedWindow(runId, "window-0");
+  const bindings = store.activeTranslationBindings(runId, first!.id);
+  assert.equal(bindings.length, 1);
+  assert.equal(bindings[0]?.conceptId, concept.conceptId);
+  assert.equal(bindings[0]?.appliedRevisionId, concept.revisionId);
+  assert.equal(bindings[0]?.validationStatus, "clean");
+  assert.deepEqual(bindings[0]?.termUsages, [alphaUsage()]);
+  assert.deepEqual(
+    store.activeTranslationBindings(runId, second!.id),
+    [],
+  );
+  store.close();
+});
+
+test("staging translations and concept bindings rolls back as one transaction", () => {
+  const path = fixturePath();
+  let armed = false;
+  const store = new LosslessBookStore(path, {
+    checkpoint(name) {
+      if (armed && name === "before_commit") {
+        throw new Error("injected before_commit");
+      }
+    },
+  });
+  const runId = initialize(store);
+  const concept = alphaConcept();
+  store.upsertLexicalConcepts(runId, [concept]);
+  store.claimWindow(runId, "window-0");
+  const [first, second] = blocks();
+  armed = true;
+  assert.throws(() => store.stageWindow({
+    ...validStage(),
+    translations: [
+      {
+        blockId: first!.id,
+        sourceHash: first!.sourceHash,
+        text: "阿尔法。",
+      },
+      {
+        blockId: second!.id,
+        sourceHash: second!.sourceHash,
+        text: "贝塔。",
+      },
+    ],
+    knowledgeCandidates: [],
+    conceptBindings: {
+      usages: [alphaUsage()],
+      concepts: [concept],
+    },
+  }), /injected before_commit/u);
+  armed = false;
+  assert.equal(store.auditRows(runId).windows[0]?.status, "running");
+  store.close();
+
+  const database = new DatabaseSync(path);
+  assert.equal((database.prepare(
+    "SELECT COUNT(*) AS count FROM translations",
+  ).get() as { count: number }).count, 0);
+  assert.equal((database.prepare(
+    "SELECT COUNT(*) AS count FROM translation_concept_bindings",
+  ).get() as { count: number }).count, 0);
+  database.close();
 });
 
 test("conflicting staged candidates persist as two domain revisions while raw candidates stay separate", () => {
