@@ -294,7 +294,7 @@ git commit -m "fix: preserve Chinese order in multiline headings"
   - `projects/children_of_time/artifacts/folioloom/heading-fix.db`
   - `projects/children_of_time/exports/heading-fix/`
 
-- [ ] **步骤 1：运行完整单元测试**
+- [x] **步骤 1：运行完整单元测试**
 
 在 `folioloom/` 目录运行：
 
@@ -304,7 +304,7 @@ npm.cmd test
 
 预期：0 failed。
 
-- [ ] **步骤 2：运行类型检查**
+- [x] **步骤 2：运行类型检查**
 
 运行：
 
@@ -315,7 +315,7 @@ npm.cmd run desktop:typecheck
 
 预期：两个命令退出码均为 0。
 
-- [ ] **步骤 3：用新状态库执行首窗口真实试译**
+- [x] **步骤 3：用新状态库执行首窗口真实试译**
 
 运行：
 
@@ -332,7 +332,7 @@ npm.cmd run folioloom -- book run `
 
 预期：处理首个窗口，译文数据库没有失败窗口，并生成 partial TXT。
 
-- [ ] **步骤 4：核对真实标题输出**
+- [x] **步骤 4：核对真实标题输出**
 
 运行：
 
@@ -345,7 +345,7 @@ Get-Content -LiteralPath `
 
 预期：标题按自然中文顺序出现，例如 `时间 / 之子` 或其他保持两个段落槽位的等价自然译法；不得再次出现 `子 / 时间之`。
 
-- [ ] **步骤 5：运行最终工作树核对**
+- [x] **步骤 5：运行最终工作树核对**
 
 运行：
 
