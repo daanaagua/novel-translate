@@ -49,7 +49,7 @@
 - 创建：`folioloom/test/book-schema-v4.test.ts`
 - 修改：`folioloom/src/storage/lossless-book-store.ts`
 
-- [ ] **步骤 1：编写 v3→v4 迁移失败测试**
+- [x] **步骤 1：编写 v3→v4 迁移失败测试**
 
 测试必须建立真实 v3 数据库，写入一条活动译文和知识修订，读写打开后断言：
 
@@ -66,7 +66,7 @@ assert.equal(database.prepare(
 
 同时加入只读不迁移、故障注入完整回滚和第二次打开幂等测试。
 
-- [ ] **步骤 2：运行测试确认失败**
+- [x] **步骤 2：运行测试确认失败**
 
 运行：
 
@@ -76,7 +76,7 @@ npm test -- --test-name-pattern="schema v4"
 
 预期：FAIL，缺少 `book-schema-v4.ts` 或 `user_version` 仍为 3。
 
-- [ ] **步骤 3：定义 schema v4**
+- [x] **步骤 3：定义 schema v4**
 
 `book-schema-v4.ts` 必须从 v3 追加以下表：
 
@@ -150,7 +150,7 @@ CREATE TABLE knowledge_revalidation_tasks(
 
 添加 active concept、occurrence 查询、binding 状态和任务状态索引。
 
-- [ ] **步骤 4：实现迁移**
+- [x] **步骤 4：实现迁移**
 
 在 `LosslessBookStore` 打开逻辑中：
 
@@ -169,7 +169,7 @@ if (userVersion === LOSSLESS_BOOK_SCHEMA_V3_VERSION) {
 写 v4 marker/fingerprint 和 `PRAGMA user_version=4`。任何 checkpoint
 异常必须回滚。
 
-- [ ] **步骤 5：运行测试验证通过**
+- [x] **步骤 5：运行测试验证通过**
 
 ```powershell
 npm test -- --test-name-pattern="schema v4"

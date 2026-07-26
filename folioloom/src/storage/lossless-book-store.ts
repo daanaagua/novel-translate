@@ -108,14 +108,22 @@ import {
   LOSSLESS_BOOK_SCHEMA_VERSION as LOSSLESS_BOOK_SCHEMA_V2_VERSION,
 } from "./book-schema-v2.js";
 import {
-  LOSSLESS_BOOK_SCHEMA_FINGERPRINT,
-  LOSSLESS_BOOK_SCHEMA_MARKER,
-  LOSSLESS_BOOK_SCHEMA_TABLES,
+  LOSSLESS_BOOK_SCHEMA_FINGERPRINT as LOSSLESS_BOOK_SCHEMA_V3_FINGERPRINT,
+  LOSSLESS_BOOK_SCHEMA_MARKER as LOSSLESS_BOOK_SCHEMA_V3_MARKER,
+  LOSSLESS_BOOK_SCHEMA_TABLES as LOSSLESS_BOOK_SCHEMA_V3_TABLES,
   LOSSLESS_BOOK_SCHEMA_V3,
   LOSSLESS_BOOK_SCHEMA_V3_EXTENSION,
   LOSSLESS_BOOK_SCHEMA_V3_KNOWLEDGE_RECORDS,
-  LOSSLESS_BOOK_SCHEMA_VERSION,
+  LOSSLESS_BOOK_SCHEMA_VERSION as LOSSLESS_BOOK_SCHEMA_V3_VERSION,
 } from "./book-schema-v3.js";
+import {
+  LOSSLESS_BOOK_SCHEMA_FINGERPRINT,
+  LOSSLESS_BOOK_SCHEMA_MARKER,
+  LOSSLESS_BOOK_SCHEMA_TABLES,
+  LOSSLESS_BOOK_SCHEMA_V4,
+  LOSSLESS_BOOK_SCHEMA_V4_EXTENSION,
+  LOSSLESS_BOOK_SCHEMA_VERSION,
+} from "./book-schema-v4.js";
 
 export interface CertifiedSourceRange {
   rangeId: string;
@@ -240,7 +248,8 @@ export type FaultCheckpoint =
   | "knowledge_import_stage_before_commit"
   | "knowledge_import_before_commit"
   | "knowledge_import_rollback_before_commit"
-  | "schema_v3_before_commit";
+  | "schema_v3_before_commit"
+  | "schema_v4_before_commit";
 
 export interface FaultInjector {
   checkpoint(name: FaultCheckpoint): void;
@@ -1103,12 +1112,21 @@ export class LosslessBookStore {
         this.#verifyV2Schema(tables);
         if (mode === "read-write") {
           this.#migrateV2ToV3();
+          this.#migrateV3ToV4();
           this.#schemaVersion = LOSSLESS_BOOK_SCHEMA_VERSION;
         } else {
           this.#schemaVersion = LOSSLESS_BOOK_SCHEMA_V2_VERSION;
         }
-      } else {
+      } else if (userVersion === LOSSLESS_BOOK_SCHEMA_V3_VERSION) {
         this.#verifyV3Schema(userVersion, tables);
+        if (mode === "read-write") {
+          this.#migrateV3ToV4();
+          this.#schemaVersion = LOSSLESS_BOOK_SCHEMA_VERSION;
+        } else {
+          this.#schemaVersion = LOSSLESS_BOOK_SCHEMA_V3_VERSION;
+        }
+      } else {
+        this.#verifyV4Schema(userVersion, tables);
         this.#schemaVersion = LOSSLESS_BOOK_SCHEMA_VERSION;
       }
       if (mode === "read-write") {
@@ -4218,7 +4236,7 @@ export class LosslessBookStore {
   #initializeSchema(): void {
     this.#database.exec("BEGIN IMMEDIATE");
     try {
-      this.#database.exec(LOSSLESS_BOOK_SCHEMA_V3);
+      this.#database.exec(LOSSLESS_BOOK_SCHEMA_V4);
       this.#database.prepare(`
         INSERT INTO project_knowledge_state(singleton, generation) VALUES(1, 0)
       `).run();
@@ -4265,12 +4283,12 @@ export class LosslessBookStore {
 
   #verifyV3Schema(userVersion: number, tables: readonly string[]): void {
     this.#verifyNoLegacySchema(tables);
-    if (userVersion !== LOSSLESS_BOOK_SCHEMA_VERSION) {
+    if (userVersion !== LOSSLESS_BOOK_SCHEMA_V3_VERSION) {
       throw new Error(
-        `unsupported schema user_version ${userVersion}; expected ${LOSSLESS_BOOK_SCHEMA_VERSION}`,
+        `unsupported schema user_version ${userVersion}; expected ${LOSSLESS_BOOK_SCHEMA_V3_VERSION}`,
       );
     }
-    const expected = [...LOSSLESS_BOOK_SCHEMA_TABLES];
+    const expected = [...LOSSLESS_BOOK_SCHEMA_V3_TABLES];
     if (tables.length !== expected.length
       || tables.some((table, index) => table !== expected[index])) {
       throw new Error("schema v3 table set is incomplete or contains unknown tables");
@@ -4281,9 +4299,33 @@ export class LosslessBookStore {
         WHERE key IN ('marker', 'fingerprint')
       `),
     ).map((row) => [row.key, row.value]));
+    if (markers.get("marker") !== LOSSLESS_BOOK_SCHEMA_V3_MARKER
+      || markers.get("fingerprint") !== LOSSLESS_BOOK_SCHEMA_V3_FINGERPRINT) {
+      throw new Error("schema v3 marker or fingerprint mismatch");
+    }
+  }
+
+  #verifyV4Schema(userVersion: number, tables: readonly string[]): void {
+    this.#verifyNoLegacySchema(tables);
+    if (userVersion !== LOSSLESS_BOOK_SCHEMA_VERSION) {
+      throw new Error(
+        `unsupported schema user_version ${userVersion}; expected ${LOSSLESS_BOOK_SCHEMA_VERSION}`,
+      );
+    }
+    const expected = [...LOSSLESS_BOOK_SCHEMA_TABLES];
+    if (tables.length !== expected.length
+      || tables.some((table, index) => table !== expected[index])) {
+      throw new Error("schema v4 table set is incomplete or contains unknown tables");
+    }
+    const markers = new Map(all<{ key: string; value: string }>(
+      this.#database.prepare(`
+        SELECT key, value FROM lossless_schema_meta
+        WHERE key IN ('marker', 'fingerprint')
+      `),
+    ).map((row) => [row.key, row.value]));
     if (markers.get("marker") !== LOSSLESS_BOOK_SCHEMA_MARKER
       || markers.get("fingerprint") !== LOSSLESS_BOOK_SCHEMA_FINGERPRINT) {
-      throw new Error("schema v3 marker or fingerprint mismatch");
+      throw new Error("schema v4 marker or fingerprint mismatch");
     }
   }
 
@@ -4319,10 +4361,28 @@ export class LosslessBookStore {
       const updateMarker = this.#database.prepare(`
         UPDATE lossless_schema_meta SET value=? WHERE key=?
       `);
+      updateMarker.run(LOSSLESS_BOOK_SCHEMA_V3_MARKER, "marker");
+      updateMarker.run(LOSSLESS_BOOK_SCHEMA_V3_FINGERPRINT, "fingerprint");
+      this.#database.exec(`PRAGMA user_version=${LOSSLESS_BOOK_SCHEMA_V3_VERSION}`);
+      this.#faultInjector?.checkpoint("schema_v3_before_commit");
+      this.#database.exec("COMMIT");
+    } catch (error) {
+      this.#database.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
+  #migrateV3ToV4(): void {
+    this.#database.exec("BEGIN IMMEDIATE");
+    try {
+      this.#database.exec(LOSSLESS_BOOK_SCHEMA_V4_EXTENSION);
+      const updateMarker = this.#database.prepare(`
+        UPDATE lossless_schema_meta SET value=? WHERE key=?
+      `);
       updateMarker.run(LOSSLESS_BOOK_SCHEMA_MARKER, "marker");
       updateMarker.run(LOSSLESS_BOOK_SCHEMA_FINGERPRINT, "fingerprint");
       this.#database.exec(`PRAGMA user_version=${LOSSLESS_BOOK_SCHEMA_VERSION}`);
-      this.#faultInjector?.checkpoint("schema_v3_before_commit");
+      this.#faultInjector?.checkpoint("schema_v4_before_commit");
       this.#database.exec("COMMIT");
     } catch (error) {
       this.#database.exec("ROLLBACK");

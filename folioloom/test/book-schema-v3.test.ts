@@ -139,12 +139,12 @@ function queryPlan(path: string, sql: string): string[] {
   return rows.map((row) => row.detail);
 }
 
-test("creates a fresh schema v3 store", () => {
+test("creates a fresh current store with every v3 knowledge table", () => {
   const path = fixturePath();
   const store = new LosslessBookStore(path);
   store.close();
 
-  assert.equal(userVersion(path), 3);
+  assert.equal(userVersion(path), 4);
   assert.deepEqual(requiredTables(path), [
     "book_knowledge_revisions",
     "book_knowledge_state",
@@ -171,7 +171,7 @@ test("indexes active run knowledge by stable record identity", () => {
   );
 });
 
-test("opens a v2 store as v3 without changing knowledge identities", () => {
+test("opens a v2 store at the current schema without changing knowledge identities", () => {
   const path = fixturePath();
   createV2Fixture(path);
   const before = readKnowledgeRows(path);
@@ -179,7 +179,7 @@ test("opens a v2 store as v3 without changing knowledge identities", () => {
   const store = new LosslessBookStore(path);
   store.close();
 
-  assert.equal(userVersion(path), 3);
+  assert.equal(userVersion(path), 4);
   assert.deepEqual(readKnowledgeRows(path), before);
   assert.deepEqual(requiredTables(path), [
     "book_knowledge_revisions",
