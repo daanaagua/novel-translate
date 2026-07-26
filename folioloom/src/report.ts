@@ -117,10 +117,10 @@ export interface LosslessBookLineage {
 export function bookArtifactFileNames(complete: boolean): BookArtifactPaths {
   const qualifier = complete ? "" : ".partial";
   return {
-    translation: `v5_book_translation${qualifier}.txt`,
-    bilingual: `v5_book_bilingual${qualifier}.txt`,
-    audit: `v5_book_audit${qualifier}.json`,
-    metrics: `v5_book_metrics${qualifier}.json`,
+    translation: `folioloom_book_translation${qualifier}.txt`,
+    bilingual: `folioloom_book_bilingual${qualifier}.txt`,
+    audit: `folioloom_book_audit${qualifier}.json`,
+    metrics: `folioloom_book_metrics${qualifier}.json`,
   };
 }
 

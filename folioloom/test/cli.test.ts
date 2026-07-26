@@ -418,8 +418,10 @@ test("run omission creates with zero, resumes one unfinished run, and rejects ma
 
 test("incomplete book artifacts use explicit partial names", () => {
   const partial = bookArtifactFileNames(false);
+  assert.ok(Object.values(partial).every((name) => name.startsWith("folioloom_book_")));
   assert.ok(Object.values(partial).every((name) => name.includes(".partial.")));
   const complete = bookArtifactFileNames(true);
+  assert.ok(Object.values(complete).every((name) => name.startsWith("folioloom_book_")));
   assert.ok(Object.values(complete).every((name) => !name.includes(".partial.")));
 });
 
