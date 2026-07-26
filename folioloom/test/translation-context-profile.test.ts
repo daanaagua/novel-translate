@@ -129,6 +129,45 @@ test("candidate coverage never guesses risk from arbitrary fact prose", () => {
   assert.deepEqual(candidates[0]?.coverage, []);
 });
 
+test("position-scoped candidate utility decays with explicit block distance", () => {
+  const candidates = collectTranslationKnowledgeCandidates(
+    [
+      revision("revision-near", "near-memory", "narrative_memory", {
+        startBlockId: "block-current",
+        endBlockId: "block-end",
+        confidence: 0.8,
+      }),
+      revision("revision-far", "far-memory", "narrative_memory", {
+        startBlockId: "block-start",
+        endBlockId: "block-end",
+        confidence: 0.8,
+      }),
+    ],
+    ["Synthetic current text."],
+    getSourceLanguageProfile("en"),
+    {
+      corpusBlocks: [
+        { blockId: "block-start", globalIndex: 0 },
+        { blockId: "block-current", globalIndex: 10 },
+        { blockId: "block-end", globalIndex: 20 },
+      ],
+      currentBlocks: [{
+        blockId: "block-current",
+        globalIndex: 10,
+        windowId: "window-current",
+      }],
+    },
+  );
+  const utilityById = new Map(candidates.map((candidate) => [
+    candidate.revisionIds[0],
+    candidate.utility,
+  ]));
+
+  assert.ok(
+    utilityById.get("revision-near")! > utilityById.get("revision-far")!,
+  );
+});
+
 test("prepared requests serialize only selected revision ids after the stable prefix", () => {
   const sourceBlock = block(
     "block-context-profile",

@@ -117,6 +117,7 @@ interface Candidate {
   readonly revision: ParsedRevision;
   readonly scope: ProjectedKnowledgeRevision["scope"];
   readonly appliesToWindowIds?: readonly string[];
+  readonly evidenceDistance?: number;
 }
 
 interface CandidateGroups {
@@ -141,6 +142,7 @@ interface PositionContext {
 interface PositionedMemoryMatch {
   readonly positioned: boolean;
   readonly windowIds: readonly string[];
+  readonly distance?: number;
 }
 
 const KNOWLEDGE_TOKEN_ESTIMATOR = new WeightedTokenEstimator();
@@ -364,11 +366,23 @@ function positionedMemoryMatch(
   if (start === undefined || end === undefined || start > end) {
     return { positioned: true, windowIds: [] };
   }
-  const windowIds = [...positions.currentIndexesByWindow.entries()]
-    .filter(([, indexes]) =>
-      [...indexes].some((current) => current >= start && current <= end))
-    .map(([windowId]) => windowId);
-  return { positioned: true, windowIds };
+  const windowIds: string[] = [];
+  let distance = Number.POSITIVE_INFINITY;
+  for (const [windowId, indexes] of positions.currentIndexesByWindow) {
+    let applies = false;
+    for (const current of indexes) {
+      if (current >= start && current <= end) {
+        applies = true;
+        distance = Math.min(distance, current - start);
+      }
+    }
+    if (applies) windowIds.push(windowId);
+  }
+  return {
+    positioned: true,
+    windowIds,
+    ...(Number.isFinite(distance) ? { distance } : {}),
+  };
 }
 
 function isGlobalFallback(revision: ParsedRevision): boolean {
@@ -482,8 +496,13 @@ function candidateGroups(
         revision,
         scope: positionMatch.positioned ? "position_matched" : "source_matched",
         ...(positionMatch.positioned
-          ? { appliesToWindowIds: positionMatch.windowIds }
-          : {}),
+          ? {
+            appliesToWindowIds: positionMatch.windowIds,
+            ...(positionMatch.distance === undefined
+              ? {}
+              : { evidenceDistance: positionMatch.distance }),
+          }
+          : { evidenceDistance: 0 }),
       };
       if (revision.status === "needs_revalidate") {
         matchingNeedsRevalidate.push(candidate);
@@ -612,7 +631,13 @@ function candidateUtility(candidate: Candidate): number {
     && Number.isFinite(payload.confidence)
     ? Math.min(1, Math.max(0, payload.confidence))
     : 0;
-  return scopeUtility + statusUtility + confidence * 2;
+  const distanceUtility = candidate.evidenceDistance === undefined
+    ? 0
+    : 2 * Math.exp(-candidate.evidenceDistance / 12);
+  return Math.round(
+    (scopeUtility + statusUtility + confidence * 2 + distanceUtility)
+      * 1_000_000,
+  ) / 1_000_000;
 }
 
 function translationKnowledgeCandidate(
