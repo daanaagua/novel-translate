@@ -192,6 +192,11 @@ export interface DesktopTestModelResult {
 
 export type DesktopTrialMode = "quality" | "fast";
 
+export type DesktopOptimizationProfile =
+  | "economy"
+  | "balanced"
+  | "speed";
+
 /** Renderer-controlled choice; project identity remains in the main process. */
 export interface DesktopStartTrialRequest {
   mode: DesktopTrialMode;
@@ -236,8 +241,19 @@ export interface DesktopFullBookRunSnapshot {
   sourceVersion: string;
   modelId: string;
   mode: DesktopTrialMode;
+  optimizationProfile: DesktopOptimizationProfile;
   phase: DesktopFullBookPhase;
   progress: DesktopFullBookWindowProgress;
+  scheduler?: {
+    estimatedRemainingMs?: number;
+    predictedTokenRange?: {
+      lower: number;
+      upper: number;
+    };
+    wallTimeDeviationPercent?: number;
+    tokenDeviationPercent?: number;
+    adjustment: "planning" | "steady" | "throttled" | "recovering";
+  };
   canPause: boolean;
   canResume: boolean;
   canExport: boolean;
@@ -250,7 +266,7 @@ export interface DesktopFullBookSnapshot {
 }
 
 export interface DesktopStartFullBookRequest {
-  mode: DesktopTrialMode;
+  optimizationProfile: DesktopOptimizationProfile;
 }
 
 export interface DesktopResumeFullBookRequest {

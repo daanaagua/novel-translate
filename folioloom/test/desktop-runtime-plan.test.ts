@@ -46,7 +46,7 @@ test("desktop runtime plan keeps quality effort and lowers only the fast primary
   assert.equal(quality.runtimeSet.escalation.effort, "high");
   assert.deepEqual(
     quality.runtimeSet.variants?.map((candidate) => candidate.effort),
-    ["high"],
+    ["off", "high", "max"],
   );
   assert.equal(quality.fingerprint.mode, "quality");
 
@@ -56,7 +56,7 @@ test("desktop runtime plan keeps quality effort and lowers only the fast primary
   assert.equal(fast.runtimeSet.escalation.effort, "high");
   assert.deepEqual(
     fast.runtimeSet.variants?.map((candidate) => candidate.effort),
-    ["off", "high"],
+    ["off", "high", "max"],
   );
   assert.equal(fast.fingerprint.primary.reasoningEffort, "off");
   assert.equal(

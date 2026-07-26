@@ -4,7 +4,7 @@ import type {
   DesktopError,
   DesktopFullBookRunSnapshot,
   DesktopFullBookSnapshot,
-  DesktopTrialMode,
+  DesktopOptimizationProfile,
 } from "../../../contracts.js";
 import { TechnicalDetails, redactTechnicalDetails } from "./TechnicalDetails.js";
 
@@ -14,7 +14,7 @@ interface RunWorkspaceProps {
   snapshot: DesktopFullBookSnapshot;
   busy: boolean;
   error?: DesktopError;
-  onStart(mode: DesktopTrialMode): void;
+  onStart(profile: DesktopOptimizationProfile): void;
   onPause(): void;
   onResume(runId: string): void;
 }
@@ -41,6 +41,58 @@ const phaseBadge: Readonly<Record<DesktopFullBookRunSnapshot["phase"], string>> 
   failed: "已中断",
 };
 
+const profileCopy: Readonly<Record<DesktopOptimizationProfile, {
+  label: string;
+  detail: string;
+}>> = {
+  economy: {
+    label: "经济",
+    detail: "优先控制 token 与调用成本",
+  },
+  balanced: {
+    label: "均衡",
+    detail: "兼顾速度、成本与恢复余量",
+  },
+  speed: {
+    label: "极速",
+    detail: "在质量门内优先缩短完成时间",
+  },
+};
+
+function estimatedTime(milliseconds: number | undefined): string {
+  if (milliseconds === undefined) return "计算中";
+  if (milliseconds < 60_000) {
+    return `${Math.max(0, Math.ceil(milliseconds / 1_000))} 秒`;
+  }
+  return `${Math.ceil(milliseconds / 60_000)} 分钟`;
+}
+
+function tokenRange(
+  range: NonNullable<DesktopFullBookRunSnapshot["scheduler"]>["predictedTokenRange"],
+): string {
+  if (range === undefined) return "计算中";
+  return `${range.lower.toLocaleString("zh-CN")}–${range.upper.toLocaleString("zh-CN")}`;
+}
+
+function signedPercent(value: number | undefined): string {
+  if (value === undefined) return "计算中";
+  return `${value > 0 ? "+" : ""}${value.toFixed(1)}%`;
+}
+
+function schedulerStatus(run: DesktopFullBookRunSnapshot): string {
+  switch (run.scheduler?.adjustment) {
+    case "throttled":
+      return "正在因限流调整并发";
+    case "recovering":
+      return "正在根据失败恢复结果调整计划";
+    case "steady":
+      return "当前计划运行稳定";
+    case "planning":
+    default:
+      return run.phase === "completed" ? "计划执行完成" : "正在生成调度估算";
+  }
+}
+
 function currentRun(snapshot: DesktopFullBookSnapshot): DesktopFullBookRunSnapshot | undefined {
   return snapshot.runs.find((run) => run.runId === snapshot.activeRunId)
     ?? snapshot.runs.at(-1);
@@ -56,7 +108,8 @@ export function RunWorkspace({
   onPause,
   onResume,
 }: RunWorkspaceProps): JSX.Element {
-  const [mode, setMode] = useState<DesktopTrialMode>("quality");
+  const [selectedProfile, setSelectedProfile] =
+    useState<DesktopOptimizationProfile>("balanced");
   const run = useMemo(() => currentRun(snapshot), [snapshot]);
   const completed = run === undefined
     ? 0
@@ -82,34 +135,30 @@ export function RunWorkspace({
                 系统会保存每个文本块的结果，关闭程序前暂停即可在下次继续。
               </p>
             </div>
-            <fieldset className="mode-choice" disabled={busy}>
-              <legend>翻译模式</legend>
-              <label>
-                <input
-                  type="radio"
-                  aria-label="质量模式"
-                  name="fullbook-mode"
-                  checked={mode === "quality"}
-                  onChange={() => setMode("quality")}
-                />
-                <span><strong>质量模式</strong><small>优先保留复杂语境与叙事连续性</small></span>
-              </label>
-              <label>
-                <input
-                  type="radio"
-                  aria-label="快速模式"
-                  name="fullbook-mode"
-                  checked={mode === "fast"}
-                  onChange={() => setMode("fast")}
-                />
-                <span><strong>快速模式</strong><small>减少推理开销，适合先生成可读初稿</small></span>
-              </label>
-            </fieldset>
+            <div
+              className="profile-choice"
+              role="group"
+              aria-label="优化档案"
+            >
+              {(["economy", "balanced", "speed"] as const).map((profile) => (
+                <button
+                  key={profile}
+                  type="button"
+                  aria-label={profileCopy[profile].label}
+                  aria-pressed={selectedProfile === profile}
+                  disabled={busy}
+                  onClick={() => setSelectedProfile(profile)}
+                >
+                  <strong>{profileCopy[profile].label}</strong>
+                  <small>{profileCopy[profile].detail}</small>
+                </button>
+              ))}
+            </div>
             <button
               className="primary-button"
               type="button"
               disabled={!modelReady || busy}
-              onClick={() => onStart(mode)}
+              onClick={() => onStart(selectedProfile)}
             >
               {busy ? "正在启动" : "开始整本翻译"}
             </button>
@@ -144,6 +193,26 @@ export function RunWorkspace({
               <article><span>警告</span><strong>{run.progress.warningWindows}</strong></article>
               <article><span>需要处理</span><strong>{run.progress.humanRequiredWindows}</strong></article>
             </div>
+
+            <div className="scheduler-metrics">
+              <article>
+                <span>预计剩余时间</span>
+                <strong>{estimatedTime(run.scheduler?.estimatedRemainingMs)}</strong>
+              </article>
+              <article>
+                <span>预计 token 区间</span>
+                <strong>{tokenRange(run.scheduler?.predictedTokenRange)}</strong>
+              </article>
+              <article>
+                <span>实际与预计偏差</span>
+                <strong>
+                  耗时 {signedPercent(run.scheduler?.wallTimeDeviationPercent)}
+                  {" · "}
+                  Token {signedPercent(run.scheduler?.tokenDeviationPercent)}
+                </strong>
+              </article>
+            </div>
+            <p className="scheduler-status">{schedulerStatus(run)}</p>
 
             {run.phase === "needs_attention" ? (
               <div className="workspace-notice is-warning">

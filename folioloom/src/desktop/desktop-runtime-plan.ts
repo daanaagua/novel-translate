@@ -169,13 +169,27 @@ export function buildDesktopRuntimePlan(
   }
   const qualityProfile = normalizedProfile(qualityRuntime);
   const quality = translationRuntime(qualityRuntime);
+  const supportedEfforts = requireSupportedEfforts(qualityRuntime);
+  const candidateEfforts = new Set<ProviderEffort | undefined>([
+    ...supportedEfforts,
+    qualityRuntime.profile.reasoningEffort,
+  ]);
+  const variants = validateRuntimeVariants([...candidateEfforts].map((effort) => {
+    if (effort === qualityRuntime.profile.reasoningEffort) {
+      return quality;
+    }
+    return translationRuntime(derivedRuntime(
+      qualityRuntime,
+      profileWithEffort(qualityRuntime.profile, effort),
+    ));
+  }));
   if (mode === "quality") {
     return {
       runtimeSet: {
         mode,
         primary: quality,
         escalation: quality,
-        variants: validateRuntimeVariants([quality]),
+        variants,
       },
       fingerprint: {
         schema: "folioloom-desktop-runtime-1",
@@ -186,7 +200,7 @@ export function buildDesktopRuntimePlan(
     };
   }
 
-  const primaryEffort = lowestLegalFastEffort(requireSupportedEfforts(qualityRuntime));
+  const primaryEffort = lowestLegalFastEffort(supportedEfforts);
   const primaryProfile = profileWithEffort(qualityRuntime.profile, primaryEffort);
   const primaryRuntime = primaryEffort === qualityRuntime.profile.reasoningEffort
     ? qualityRuntime
@@ -197,7 +211,7 @@ export function buildDesktopRuntimePlan(
       mode,
       primary,
       escalation: quality,
-      variants: validateRuntimeVariants([primary, quality]),
+      variants,
     },
     fingerprint: {
       schema: "folioloom-desktop-runtime-1",

@@ -258,7 +258,9 @@ test("desktop imports, pauses, resumes, strictly exports, and verifies a Unicode
       pollIntervalMs: 10,
     });
     const running = firstPhases.waitFor("running");
-    const started = await firstService.start(project, { mode: "fast" });
+    const started = await firstService.start(project, {
+      optimizationProfile: "speed",
+    });
     await running;
     await withDeadline(
       firstEntered,

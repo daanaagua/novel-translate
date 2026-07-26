@@ -362,6 +362,7 @@ describe("FolioLoom desktop onboarding", () => {
         sourceVersion: project.sourceVersion,
         modelId: "deepseek-v4",
         mode: "quality",
+        optimizationProfile: "balanced",
         phase: "running",
         progress: {
           totalWindows: 100,

@@ -1019,12 +1019,23 @@ function startTrialRequest(value: unknown): DesktopStartTrialRequest {
 }
 
 function startFullBookRequest(value: unknown): DesktopStartFullBookRequest {
-  const input = exactRecord(value, "start-fullbook payload", ["mode"]);
-  const mode = requiredText(input.mode, "mode");
-  if (mode !== "quality" && mode !== "fast") {
-    return inputError("mode must be quality or fast");
+  const input = exactRecord(
+    value,
+    "start-fullbook payload",
+    ["optimizationProfile"],
+  );
+  const optimizationProfile = requiredText(
+    input.optimizationProfile,
+    "optimizationProfile",
+  );
+  if (optimizationProfile !== "economy"
+    && optimizationProfile !== "balanced"
+    && optimizationProfile !== "speed") {
+    return inputError(
+      "optimizationProfile must be economy, balanced, or speed",
+    );
   }
-  return { mode };
+  return { optimizationProfile };
 }
 
 function resumeFullBookRequest(value: unknown): DesktopResumeFullBookRequest {

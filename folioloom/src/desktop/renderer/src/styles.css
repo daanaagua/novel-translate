@@ -568,6 +568,30 @@ h2 {
 .mode-choice small,
 .format-choice small { color: var(--faint); font-size: 10px; line-height: 1.5; }
 
+.profile-choice {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 10px;
+  margin-top: 24px;
+}
+.profile-choice button {
+  display: grid;
+  min-width: 0;
+  gap: 6px;
+  padding: 14px;
+  border: 1px solid var(--line-soft);
+  border-radius: 11px;
+  background: rgb(255 255 255 / 1.5%);
+  color: var(--ink);
+  text-align: left;
+}
+.profile-choice button[aria-pressed="true"] {
+  border-color: rgb(116 212 192 / 48%);
+  background: rgb(116 212 192 / 6%);
+}
+.profile-choice strong { font-size: 12px; }
+.profile-choice small { color: var(--faint); font-size: 10px; line-height: 1.5; }
+
 .run-progress-header,
 .export-candidate-summary,
 .destination-row {
@@ -640,6 +664,24 @@ h2 {
 }
 .run-metrics span { color: var(--faint); font-size: 9px; }
 .run-metrics strong { font-size: 18px; font-weight: 550; }
+
+.scheduler-metrics {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 9px;
+  margin-top: 9px;
+}
+.scheduler-metrics article {
+  display: grid;
+  min-width: 0;
+  gap: 6px;
+  padding: 12px;
+  border: 1px solid var(--line-soft);
+  border-radius: 10px;
+}
+.scheduler-metrics span { color: var(--faint); font-size: 9px; }
+.scheduler-metrics strong { font-size: 12px; font-weight: 550; line-height: 1.5; }
+.scheduler-status { margin: 12px 0 0; color: var(--muted); font-size: 11px; }
 
 .workspace-actions { display: flex; align-items: center; gap: 12px; margin-top: 22px; }
 .workspace-actions .primary-button { margin-top: 0; }

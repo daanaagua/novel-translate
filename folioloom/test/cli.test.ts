@@ -199,6 +199,53 @@ test("CLI parses and validates dual-runtime book-run controls", () => {
   );
 });
 
+test("book run accepts optimization profile and scheduler mode", () => {
+  const parsed = parseArgs([
+    "book", "run",
+    "--manifest", "source_manifest.json",
+    "--store", "state.db",
+    "--config", "config.yaml",
+    "--optimization-profile", "balanced",
+    "--scheduler-mode", "active",
+    "--runtime-profile-store", "profiles.db",
+  ]);
+
+  assert.equal(parsed.optimizationProfile, "balanced");
+  assert.equal(parsed.schedulerMode, "active");
+  assert.equal(parsed.runtimeProfileStore, resolve("profiles.db"));
+});
+
+test("legacy quality mode maps to balanced when no profile is supplied", () => {
+  const parsed = parseArgs([
+    "book", "run",
+    "--manifest", "source_manifest.json",
+    "--store", "state.db",
+    "--config", "config.yaml",
+  ]);
+
+  assert.equal(parsed.runMode, "quality");
+  assert.equal(parsed.optimizationProfile, "balanced");
+  assert.equal(parseArgs([
+    "book", "run",
+    "--manifest", "source_manifest.json",
+    "--store", "state.db",
+    "--config", "config.yaml",
+    "--run-mode", "quality",
+    "--optimization-profile", "economy",
+  ]).optimizationProfile, "economy");
+  assert.throws(
+    () => parseArgs([
+      "book", "run",
+      "--manifest", "source_manifest.json",
+      "--store", "state.db",
+      "--config", "config.yaml",
+      "--run-mode", "quality",
+      "--optimization-profile", "speed",
+    ]),
+    /optimization profile speed conflicts with run mode quality/u,
+  );
+});
+
 test("dual runtime keeps quality effort and creates a non-thinking fast primary", () => {
   const source: PilotModelConfig = {
     provider: "deepseek",
@@ -213,14 +260,17 @@ test("dual runtime keeps quality effort and creates a non-thinking fast primary"
   const factories = {
     createModel: (config: PilotModelConfig) => {
       createdEfforts.push(config.reasoningEffort);
-      return { id: `model-${config.reasoningEffort}` } as never;
+      return { id: source.model } as never;
     },
     createStreamFn: () => (() => {
       throw new Error("stream is not used by this unit test");
     }) as never,
   };
   const fast = buildTranslationRuntimeSet(source, "fast", factories);
-  assert.deepEqual(createdEfforts, ["off", "high"]);
+  assert.deepEqual(
+    createdEfforts,
+    ["off", "minimal", "low", "medium", "high", "xhigh", "max"],
+  );
   assert.equal(fast.mode, "fast");
   assert.equal(fast.primary.effort, "off");
   assert.equal(fast.primary.thinkingLevel, "off");
@@ -230,15 +280,26 @@ test("dual runtime keeps quality effort and creates a non-thinking fast primary"
 
   createdEfforts.length = 0;
   const quality = buildTranslationRuntimeSet(source, "quality", factories);
-  assert.deepEqual(createdEfforts, ["high"]);
+  assert.deepEqual(
+    createdEfforts,
+    ["off", "minimal", "low", "medium", "high", "xhigh", "max"],
+  );
   assert.equal(quality.mode, "quality");
   assert.equal(quality.primary, quality.escalation);
   assert.equal(quality.primary.effort, "high");
+  assert.deepEqual(
+    quality.variants?.map((candidate) => candidate.effort),
+    ["off", "minimal", "low", "medium", "high", "xhigh", "max"],
+  );
 });
 
 test("book run passes the selected runtime set and in-flight token cap to the runner", async () => {
   const manifest = sourceManifest("Runtime wiring source.");
   const storePath = join(dirname(manifest), "runtime-wiring.db");
+  const runtimeProfileStorePath = join(
+    dirname(manifest),
+    "runtime-profiles.db",
+  );
   const configPath = resolve("test/fixtures/config.yaml");
   const createdEfforts: string[] = [];
   let received: Record<string, unknown> | undefined;
@@ -251,12 +312,14 @@ test("book run passes the selected runtime set and in-flight token cap to the ru
       "--manifest", manifest,
       "--store", storePath,
       "--config", configPath,
-      "--run-mode", "fast",
+      "--optimization-profile", "speed",
+      "--scheduler-mode", "active",
+      "--runtime-profile-store", runtimeProfileStorePath,
       "--max-in-flight-tokens", "4096",
     ], {
       createModel: (config: PilotModelConfig) => {
         createdEfforts.push(config.reasoningEffort);
-        return { id: `model-${config.reasoningEffort}` } as never;
+        return { id: config.model } as never;
       },
       createStreamFn: () => (() => {
         throw new Error("stream is not used by this wiring test");
@@ -269,8 +332,13 @@ test("book run passes the selected runtime set and in-flight token cap to the ru
   } finally {
     console.log = originalLog;
   }
-  assert.deepEqual(createdEfforts, ["off", "high"]);
+  assert.deepEqual(
+    createdEfforts,
+    ["off", "minimal", "low", "medium", "high", "xhigh", "max"],
+  );
   assert.equal(received?.maxInFlightTokens, 4_096);
+  assert.equal(received?.optimizationProfile, "speed");
+  assert.equal(received?.schedulerMode, "active");
   const runtimeSet = received?.runtimeSet as {
     mode?: string;
     primary?: { effort?: string; thinkingLevel?: string; model?: { id?: string } };
@@ -279,10 +347,10 @@ test("book run passes the selected runtime set and in-flight token cap to the ru
   assert.equal(runtimeSet.mode, "fast");
   assert.equal(runtimeSet.primary?.effort, "off");
   assert.equal(runtimeSet.primary?.thinkingLevel, "off");
-  assert.equal(runtimeSet.primary?.model?.id, "model-off");
+  assert.equal(runtimeSet.primary?.model?.id, "deepseek-v4-flash");
   assert.equal(runtimeSet.escalation?.effort, "high");
   assert.equal(runtimeSet.escalation?.thinkingLevel, "high");
-  assert.equal(runtimeSet.escalation?.model?.id, "model-high");
+  assert.equal(runtimeSet.escalation?.model?.id, "deepseek-v4-flash");
   assert.equal(output.join("\n").includes("secret-test-key"), false);
 });
 

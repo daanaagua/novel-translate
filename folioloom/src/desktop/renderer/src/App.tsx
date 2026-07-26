@@ -13,6 +13,7 @@ import type {
   DesktopExportSnapshot,
   DesktopFullBookProgress,
   DesktopFullBookSnapshot,
+  DesktopOptimizationProfile,
   DesktopModelOption,
   DesktopOnboardingState,
   DesktopResult,
@@ -468,11 +469,13 @@ export function App({ api }: AppProps): JSX.Element {
     }
   }
 
-  async function startFullBook(mode: DesktopTrialMode): Promise<void> {
+  async function startFullBook(
+    optimizationProfile: DesktopOptimizationProfile,
+  ): Promise<void> {
     setBusyAction("start-fullbook");
     setFullBookError(undefined);
     try {
-      const result = await desktopApi.startFullBook({ mode });
+      const result = await desktopApi.startFullBook({ optimizationProfile });
       if (!result.ok) {
         setFullBookError(result.error);
         return;
@@ -643,7 +646,7 @@ export function App({ api }: AppProps): JSX.Element {
               || busyAction === "pause-fullbook"
               || busyAction === "resume-fullbook"}
             error={fullBookError}
-            onStart={(mode) => { void startFullBook(mode); }}
+            onStart={(profile) => { void startFullBook(profile); }}
             onPause={() => { void pauseFullBook(); }}
             onResume={(runId) => { void resumeFullBook(runId); }}
           />
