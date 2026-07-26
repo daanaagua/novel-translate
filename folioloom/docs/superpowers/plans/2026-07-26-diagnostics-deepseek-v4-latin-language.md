@@ -497,7 +497,7 @@ npm run desktop:dist
 
 检查 `release/win-unpacked/FolioLoom.exe` 可启动；在打包应用中走通选择书稿、选择 DeepSeek V4、模拟试译失败、复制摘要、导出诊断、正常试译和译文导出。确认 `release/FolioLoom-portable-win-x64.zip` 可解压并运行。
 
-- [ ] **步骤 6：完成分支、合并和 GitHub Release**
+- [x] **步骤 6：完成分支、合并和 GitHub Release**
 
 ```bash
 git add package.json package-lock.json desktop/resources/app-info.json README.md docs
