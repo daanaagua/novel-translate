@@ -54,6 +54,38 @@ npm.cmd run desktop:dev
   `FolioLoom.exe`；旁边的 DLL、`resources` 和 `locales` 都是运行所需内容，不能只把 EXE
   单独移动出去。
 
+## 动态调度档位
+
+整本运行可以在不改变逻辑窗口、提交顺序、质量校验或数据库结构的前提下，动态选择同一模型的上下文档案、合法 effort、响应协议和并发批次。三个档位使用同一套质量硬门：
+
+- `economy`（经济）：优先控制 token，计划 token 上限为静态基线的 105%；
+- `balanced`（均衡）：同时权衡时间、token 和返工风险，上限为静态基线的 110%；
+- `speed`（极速）：优先缩短墙钟时间，上限为静态基线的 120%。
+
+桌面端在“翻译运行”中提供“经济”“均衡”“极速”三个按钮。开始后界面显示预计剩余时间、预计 token 区间、实际与预计偏差，以及因限流而调整并发或进入恢复的状态。旧的进行中运行仍按其持久化策略恢复，不会在升级后自动切换为动态调度。
+
+命令行可以明确选择档位和调度模式：
+
+```powershell
+npm.cmd run folioloom -- book run `
+  --manifest ..\projects\my_book\source_manifest.json `
+  --store ..\projects\my_book\artifacts\folioloom\book.db `
+  --config ..\config\config.yaml `
+  --optimization-profile balanced `
+  --scheduler-mode active `
+  --runtime-profile-store "$HOME\.folioloom\runtime-profiles.db"
+```
+
+`--scheduler-mode` 支持：
+
+- `active`：执行滚动计划选出的合法方案；
+- `shadow`：计算并记录计划，但仍按旧派发顺序和旧 runtime 执行，用于上线前对比；
+- `off`：关闭滚动规划，完整回退到旧派发路径。
+
+旧参数继续兼容：`--run-mode quality` 映射到 `balanced`，`--run-mode fast` 映射到 `speed`；若同时给出互相冲突的旧模式和新档位，命令会直接拒绝。CLI 未指定 profile store 时使用用户目录下的 `.folioloom/runtime-profiles.db`；桌面端使用 Electron `userData` 下独立的 `runtime-profiles.db`。该库只保存模型、语言、任务 ID 和聚合数值观察，不保存 API Key、原文、译文、提示词或模型原始响应。
+
+调度性能数据只代表对应硬件、模型、供应商状态和样本下的实测结果，不是跨模型或跨供应商的速度承诺。遇到供应商限流、usage 不完整或成本模型冷启动时，运行器会保守估算、降低并发或回退，不会跳过完整性与知识收敛门。
+
 ## 术语与记忆工作台
 
 打开一本已经完成试译或建立翻译运行的书，在左侧进入“术语与记忆”。工作台读取的是当前项目实际使用的知识版本，不是另一份只供界面展示的词表。

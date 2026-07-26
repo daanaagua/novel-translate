@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { mkdtempSync, writeFileSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import test from "node:test";
@@ -121,6 +121,12 @@ function losslessFixture(source: string, sourceLanguage = "en") {
       hardDeadlineMs: 30_000,
     },
   };
+}
+
+function privateDigest(value: unknown): string {
+  return createHash("sha256")
+    .update(JSON.stringify(value), "utf8")
+    .digest("hex");
 }
 
 test("fast mode uses larger bounded windows unless the caller supplies tighter limits", () => {
@@ -1422,18 +1428,123 @@ test("lossless runner reports shadow scheduler metrics without changing legacy d
   assert.equal(result.status.completedWindows, 2);
   assert.equal(result.scheduler.mode, "shadow");
   assert.equal(result.scheduler.profile, "balanced");
+  assert.equal(result.scheduler.planningStatus, "shadow");
   assert.equal(result.scheduler.decisions, 1);
   assert.equal(result.scheduler.fallbacks, 0);
+  assert.ok(result.scheduler.baselineWallTimeMs > 0);
+  assert.ok(result.scheduler.baselineTokens > 0);
+  assert.equal(
+    result.scheduler.allowedTokens,
+    Math.floor(result.scheduler.baselineTokens * 1.1),
+  );
   assert.ok(result.scheduler.predictedWallTimeMs > 0);
   assert.ok(result.scheduler.actualWallTimeMs >= 0);
   assert.ok(result.scheduler.predictedTokens > 0);
   assert.ok(result.scheduler.actualTokens >= 0);
   assert.equal(typeof result.scheduler.tokenUsageComplete, "boolean");
+  assert.deepEqual(result.scheduler.effortCounts, { high: 1 });
+  assert.deepEqual(result.scheduler.protocolCounts, {
+    typed_tool: 1,
+    framed_text: 0,
+    local: 0,
+  });
+  assert.equal(result.scheduler.plannerDeadlines, 0);
+  assert.equal(result.scheduler.throttles, 0);
+  assert.equal(result.scheduler.recoveries, 0);
   assert.equal(
     runtimeProfiles.observationsForProfile("faux-1:en").length,
     1,
   );
   runtimeProfiles.close();
+});
+
+test("off and shadow preserve multilingual prompts, outputs, and validation", async (t) => {
+  const fixtures = [
+    ["en", "Same source."],
+    ["de", "Das Fenster war offen."],
+    ["ko", "\uccab \ubb38\uc7a5\uc774\ub2e4. \ub2e4\uc74c \ubb38\uc7a5\uc774\ub2e4."],
+    ["ja", "\u5f7c\u306f\u7b11\u3063\u305f\u3002\u305d\u3057\u3066\u53bb\u3063\u305f\u3002"],
+  ] as const;
+
+  for (const [language, source] of fixtures) {
+    await t.test(language, async () => {
+      const run = async (schedulerMode: "off" | "shadow") => {
+        const fixture = losslessFixture(source, language);
+        const promptDigests: string[] = [];
+        const promptCoverage: string[][] = [];
+        fixture.faux.setResponses([(context) => {
+          promptDigests.push(privateDigest(userText(context)));
+          promptCoverage.push(promptBatchWindows(context).flatMap((window) =>
+            window.blocks.map((block) => block.blockId)));
+          return losslessBatchResponse(context);
+        }]);
+        try {
+          const result = await runBook({
+            ...fixture.options,
+            schedulerMode,
+            optimizationProfile: "balanced",
+          });
+          const store = new LosslessBookStore(fixture.options.storePath);
+          try {
+            const translations = store.activeTranslations(result.runId)
+              .map((translation) => ({
+                blockId: translation.blockId,
+                text: translation.text,
+                status: translation.status,
+                version: translation.version,
+              }));
+            return {
+              promptDigests,
+              promptCoverage,
+              translationDigest: privateDigest(translations),
+              validation: {
+                outcome: result.outcome,
+                status: result.status,
+                windows: result.windows.map((window) => ({
+                  windowId: window.windowId,
+                  blockIds: window.blockIds,
+                  status: window.status,
+                  warnings: window.warnings,
+                  lastError: window.lastError,
+                })),
+              },
+              scheduler: result.scheduler,
+            };
+          } finally {
+            store.close();
+          }
+        } finally {
+          rmSync(dirname(fixture.options.storePath), {
+            recursive: true,
+            force: true,
+          });
+        }
+      };
+
+      const off = await run("off");
+      const shadow = await run("shadow");
+      assert.deepEqual(shadow.promptCoverage, off.promptCoverage);
+      assert.deepEqual(shadow.promptDigests, off.promptDigests);
+      assert.equal(shadow.translationDigest, off.translationDigest);
+      assert.deepEqual(shadow.validation, off.validation);
+      assert.deepEqual(shadow.scheduler.contextProfiles, off.scheduler.contextProfiles);
+      assert.equal(shadow.scheduler.actualTokens, off.scheduler.actualTokens);
+      assert.equal(shadow.scheduler.baselineTokens, off.scheduler.baselineTokens);
+      const offPredictionError = Math.abs(
+        off.scheduler.baselineTokens - off.scheduler.actualTokens,
+      );
+      const shadowPredictionError = Math.abs(
+        shadow.scheduler.predictedTokens - shadow.scheduler.actualTokens,
+      );
+      assert.ok(Number.isFinite(offPredictionError));
+      assert.ok(Number.isFinite(shadowPredictionError));
+      assert.equal(off.scheduler.mode, "off");
+      assert.equal(off.scheduler.planningStatus, "disabled");
+      assert.equal(shadow.scheduler.mode, "shadow");
+      assert.equal(shadow.scheduler.planningStatus, "shadow");
+      assert.ok(shadow.scheduler.decisions > 0);
+    });
+  }
 });
 
 test("low-risk windows use lean context while high-risk windows keep rich evidence", async () => {
@@ -2054,6 +2165,7 @@ test("failed low effort retries only its task with the legal escalation runtime"
   assert.equal(high.state.callCount, 1);
   assert.equal(result.status.completedWindows, 1);
   assert.deepEqual(Object.values(result.scheduler.contextProfiles), ["rich"]);
+  assert.equal(result.scheduler.recoveries, 1);
   assert.deepEqual(
     runtimeProfiles.observationsForProfile("faux-1:en")
       .map((observation) => observation.status),

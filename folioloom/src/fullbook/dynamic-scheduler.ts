@@ -40,6 +40,7 @@ export interface SchedulerDispatchReport {
     | "optimal"
     | "bounded"
     | "fallback";
+  readonly plannerDeadlineReached: boolean;
   readonly dispatchedTaskIds: readonly string[];
   readonly dispatchedVariants: readonly PlannedTaskDispatch[];
   readonly predictedWallTimeMs: number;
@@ -56,10 +57,14 @@ export interface SchedulerDispatchReport {
 export interface SchedulerRunReport {
   readonly mode: SchedulerMode;
   readonly profile: OptimizationProfile;
+  readonly planningStatus: SchedulerDispatchReport["planningStatus"];
   readonly decisions: number;
   readonly fallbacks: number;
+  readonly baselineWallTimeMs: number;
   readonly predictedWallTimeMs: number;
   readonly actualWallTimeMs: number;
+  readonly baselineTokens: number;
+  readonly allowedTokens: number;
   readonly predictedTokens: number;
   readonly actualTokens: number;
   readonly tokenUsageComplete: boolean;
@@ -67,6 +72,14 @@ export interface SchedulerRunReport {
     string,
     "lean" | "balanced" | "rich"
   >>;
+  readonly effortCounts: Readonly<Record<string, number>>;
+  readonly protocolCounts: Readonly<Record<
+    "typed_tool" | "framed_text" | "local",
+    number
+  >>;
+  readonly plannerDeadlines: number;
+  readonly throttles: number;
+  readonly recoveries: number;
 }
 
 function variantsById(
@@ -168,6 +181,7 @@ export class DynamicScheduler {
       return Object.freeze({
         mode: this.mode,
         planningStatus: "disabled",
+        plannerDeadlineReached: false,
         dispatchedTaskIds: Object.freeze([...options.legacyTaskIds]),
         dispatchedVariants: Object.freeze(legacy),
         predictedWallTimeMs: legacyPrediction.wallTimeMs,
@@ -188,6 +202,7 @@ export class DynamicScheduler {
         planningStatus: this.mode === "shadow"
           ? "shadow"
           : decision.planningStatus,
+        plannerDeadlineReached: decision.deadlineReached,
         dispatchedTaskIds: Object.freeze(
           selectedDispatch.map((item) => item.taskId),
         ),
@@ -213,6 +228,7 @@ export class DynamicScheduler {
       const report: SchedulerDispatchReport = Object.freeze({
         mode: this.mode,
         planningStatus: "fallback",
+        plannerDeadlineReached: false,
         dispatchedTaskIds: Object.freeze([...options.legacyTaskIds]),
         dispatchedVariants: Object.freeze(legacy),
         predictedWallTimeMs: legacyPrediction.wallTimeMs,

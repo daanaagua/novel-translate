@@ -17,6 +17,7 @@ import { planBookWindows } from "../src/fullbook/window-planner.js";
 import { createKnowledgeSnapshot } from "../src/knowledge/snapshot.js";
 import {
   renderTranslation,
+  schedulerMetrics,
   writeLosslessBookArtifacts,
   type LosslessBookArtifactPaths,
 } from "../src/report.js";
@@ -216,14 +217,27 @@ test("partial scheduler report contains only aggregate execution metrics", () =>
     const scheduler = {
       mode: "shadow" as const,
       profile: "balanced" as const,
+      planningStatus: "shadow" as const,
       decisions: 2,
       fallbacks: 0,
+      baselineWallTimeMs: 2_400,
       predictedWallTimeMs: 1_200,
       actualWallTimeMs: 1_350,
+      baselineTokens: 780,
+      allowedTokens: 858,
       predictedTokens: 800,
       actualTokens: 820,
       tokenUsageComplete: true,
       contextProfiles: { "window-a": "lean" as const },
+      effortCounts: { high: 1 },
+      protocolCounts: {
+        typed_tool: 1,
+        framed_text: 0,
+        local: 0,
+      },
+      plannerDeadlines: 0,
+      throttles: 0,
+      recoveries: 0,
     };
     const paths = writeLosslessBookArtifacts(
       item.store,
@@ -235,7 +249,7 @@ test("partial scheduler report contains only aggregate execution metrics", () =>
     const metrics = JSON.parse(readFileSync(paths.metrics, "utf8")) as {
       scheduler?: unknown;
     };
-    assert.deepEqual(metrics.scheduler, scheduler);
+    assert.deepEqual(metrics.scheduler, schedulerMetrics(scheduler));
     assert.doesNotMatch(
       JSON.stringify(metrics.scheduler),
       /sourceText|prompt|translation/u,

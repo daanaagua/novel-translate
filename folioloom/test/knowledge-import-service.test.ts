@@ -270,16 +270,17 @@ test("keeps absolute paths private while inspecting and suggesting a JSON mappin
 test("expires pending IDs and enforces the four-file cap without evicting live entries", async () => {
   let now = 1_000;
   const service = new KnowledgeImportService({ now: () => now });
+  const fixtureRoot = join(tmpdir(), "folioloom-knowledge-import-cap");
   const ids = Array.from({ length: 4 }, (_item, index) =>
-    service.registerPending(`C:\\imports\\terms-${index}.json`).pendingImportId);
+    service.registerPending(join(fixtureRoot, `terms-${index}.json`)).pendingImportId);
   assert.equal(new Set(ids).size, 4);
   assert.throws(
-    () => service.registerPending("C:\\imports\\terms-4.json"),
+    () => service.registerPending(join(fixtureRoot, "terms-4.json")),
     /KNOWLEDGE_IMPORT_PENDING_LIMIT/u,
   );
 
   now += 15 * 60 * 1_000 + 1;
-  const replacement = service.registerPending("C:\\imports\\replacement.json");
+  const replacement = service.registerPending(join(fixtureRoot, "replacement.json"));
   await assert.rejects(
     () => service.inspect({
       pendingImportId: ids[0] as string,

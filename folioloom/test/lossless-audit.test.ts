@@ -14,9 +14,62 @@ import { conceptFromAnchor } from "../src/knowledge/lexical-concept.js";
 import { createKnowledgeSnapshot } from "../src/knowledge/snapshot.js";
 import {
   auditLosslessBookStore,
+  schedulerMetrics,
   writeLosslessBookArtifacts,
 } from "../src/report.js";
 import { LosslessBookStore } from "../src/storage/lossless-book-store.js";
+
+test("scheduler metrics compare legacy, predicted, and actual execution", () => {
+  const report = schedulerMetrics({
+    mode: "active",
+    profile: "balanced",
+    planningStatus: "optimal",
+    decisions: 5,
+    fallbacks: 0,
+    baselineWallTimeMs: 492_000,
+    predictedWallTimeMs: 240_000,
+    actualWallTimeMs: 238_000,
+    baselineTokens: 100_000,
+    allowedTokens: 110_000,
+    predictedTokens: 104_000,
+    actualTokens: 103_000,
+    tokenUsageComplete: true,
+    contextProfiles: {
+      "window-1": "lean",
+      "window-2": "balanced",
+      "window-3": "rich",
+    },
+    effortCounts: { low: 2, high: 3 },
+    protocolCounts: { typed_tool: 4, framed_text: 1, local: 0 },
+    plannerDeadlines: 0,
+    throttles: 0,
+    recoveries: 1,
+  });
+
+  assert.deepEqual(report.wallTime, {
+    legacyEstimateMs: 492_000,
+    plannedEstimateMs: 240_000,
+    actualMs: 238_000,
+  });
+  assert.deepEqual(report.tokenEnvelope, {
+    baselineTokens: 100_000,
+    allowedTokens: 110_000,
+    predictedTokens: 104_000,
+    actualTokens: 103_000,
+    exceeded: false,
+  });
+  assert.deepEqual(report.selections, {
+    contextProfiles: { lean: 1, balanced: 1, rich: 1 },
+    efforts: { high: 3, low: 2 },
+    protocols: { framed_text: 1, typed_tool: 4 },
+  });
+  assert.deepEqual(report.events, {
+    plannerDeadlines: 0,
+    fallbacks: 0,
+    throttles: 0,
+    recoveries: 1,
+  });
+});
 
 function sourceManifest(source: string): string {
   const directory = mkdtempSync(join(tmpdir(), "v5-lossless-audit-"));

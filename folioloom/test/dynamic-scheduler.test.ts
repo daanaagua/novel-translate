@@ -75,6 +75,7 @@ function plannerInput(): RollingPlannerInput {
 function plannedResult(): RollingPlannerResult {
   return {
     planningStatus: "optimal",
+    deadlineReached: false,
     firstDispatch: [{
       taskId: "task-b",
       variantId: "variant-task-b",

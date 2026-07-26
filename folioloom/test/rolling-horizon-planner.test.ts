@@ -419,6 +419,7 @@ test("deadline returns a bounded feasible first action", () => {
   });
 
   assert.equal(result.planningStatus, "bounded");
+  assert.equal(result.deadlineReached, true);
   assert.ok(result.firstDispatch.length > 0);
 });
 
@@ -473,6 +474,7 @@ test("a legal first action remains bounded when a later task has no variant", ()
   });
 
   assert.equal(result.planningStatus, "bounded");
+  assert.equal(result.deadlineReached, false);
   assert.deepEqual(result.firstDispatch, [{
     taskId: "legal",
     variantId: "legal-variant",

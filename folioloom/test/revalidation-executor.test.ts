@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
+import { performance } from "node:perf_hooks";
 import test from "node:test";
 
 import { BudgetExceeded } from "../src/kernel/budget.js";
@@ -339,6 +340,7 @@ test("Kafka scheduler replay beats half the serial baseline within the speed tok
     0,
   );
 
+  const planningStartedAt = performance.now();
   const { result } = planRevalidationTasks(tasks, {
     profile: "speed",
     maxConcurrency: replay.maxConcurrency,
@@ -357,8 +359,33 @@ test("Kafka scheduler replay beats half the serial baseline within the speed tok
       };
     },
   });
+  const planningWallTimeMs = performance.now() - planningStartedAt;
 
+  assert.ok(result.predictedWallTimeMs <= 246_000);
   assert.ok(result.predictedWallTimeMs < replay.serialBaselineMs / 2);
+  assert.equal(result.horizonTaskIds.length, 5);
+  const plannedTaskIds = result.actions.flatMap((action) =>
+    action.dispatch.map((dispatch) => dispatch.taskId));
+  assert.deepEqual(
+    [...new Set(plannedTaskIds)].sort(),
+    tasks.map((task) => task.taskId).sort(),
+  );
+  const taskById = new Map(tasks.map((task) => [task.taskId, task]));
+  for (const action of result.actions) {
+    const writeResources = action.dispatch.flatMap((dispatch) => {
+      const task = taskById.get(dispatch.taskId)!;
+      return [
+        `window:translation-${task.translationId}`,
+        ...task.conceptIds.map((conceptId) => `concept:${conceptId}`),
+      ];
+    });
+    assert.equal(
+      new Set(writeResources).size,
+      writeResources.length,
+      `resource conflict in ${action.actionId}`,
+    );
+  }
   assert.ok(result.predictedTotalTokens <= result.allowedTotalTokens);
   assert.equal(result.allowedTotalTokens, Math.floor(baselineTokens * 1.2));
+  assert.ok(planningWallTimeMs < 50, `planning took ${planningWallTimeMs} ms`);
 });

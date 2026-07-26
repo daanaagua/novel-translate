@@ -622,22 +622,126 @@ export interface WriteLosslessBookArtifactsOptions {
   scheduler?: SchedulerRunReport;
 }
 
-function schedulerMetricsProjection(
-  scheduler: SchedulerRunReport | undefined,
-): SchedulerRunReport | null {
-  if (scheduler === undefined) return null;
+export interface SchedulerMetricsReport {
+  readonly schema: "v5-book-scheduler-metrics-1";
+  readonly mode: SchedulerRunReport["mode"];
+  readonly profile: SchedulerRunReport["profile"];
+  readonly plannerStatus: SchedulerRunReport["planningStatus"];
+  readonly wallTime: {
+    readonly legacyEstimateMs: number;
+    readonly plannedEstimateMs: number;
+    readonly actualMs: number;
+  };
+  readonly tokenEnvelope: {
+    readonly baselineTokens: number;
+    readonly allowedTokens: number;
+    readonly predictedTokens: number;
+    readonly actualTokens: number;
+    readonly exceeded: boolean;
+  };
+  readonly selections: {
+    readonly contextProfiles: Readonly<Record<string, number>>;
+    readonly efforts: Readonly<Record<string, number>>;
+    readonly protocols: Readonly<Record<string, number>>;
+  };
+  readonly events: {
+    readonly plannerDeadlines: number;
+    readonly fallbacks: number;
+    readonly throttles: number;
+    readonly recoveries: number;
+  };
+  readonly decisions: number;
+  readonly tokenUsageComplete: boolean;
+}
+
+const METRIC_EFFORTS = new Set([
+  "off",
+  "on",
+  "minimal",
+  "low",
+  "medium",
+  "high",
+  "xhigh",
+  "max",
+]);
+
+function sortedPositiveCounts(
+  counts: Readonly<Record<string, number>>,
+  allowedKeys?: ReadonlySet<string>,
+): Record<string, number> {
+  const result: Record<string, number> = {};
+  for (const key of Object.keys(counts).sort((left, right) =>
+    left.localeCompare(right, "en"))) {
+    const count = counts[key] ?? 0;
+    if (!Number.isSafeInteger(count) || count < 0) {
+      throw new TypeError(`scheduler metric count must be non-negative: ${key}`);
+    }
+    if (count === 0) continue;
+    const safeKey = allowedKeys === undefined || allowedKeys.has(key)
+      ? key
+      : "unknown";
+    result[safeKey] = (result[safeKey] ?? 0) + count;
+  }
+  return result;
+}
+
+export function schedulerMetrics(
+  scheduler: SchedulerRunReport,
+): SchedulerMetricsReport {
+  const contextProfiles = { lean: 0, balanced: 0, rich: 0 };
+  for (const profile of Object.values(scheduler.contextProfiles)) {
+    contextProfiles[profile] += 1;
+  }
+  const selectedContextProfiles = sortedPositiveCounts(contextProfiles);
+  const efforts = sortedPositiveCounts(
+    scheduler.effortCounts,
+    METRIC_EFFORTS,
+  );
+  const protocols = sortedPositiveCounts(
+    scheduler.protocolCounts,
+    new Set(["typed_tool", "framed_text", "local"]),
+  );
   return {
+    schema: "v5-book-scheduler-metrics-1",
     mode: scheduler.mode,
     profile: scheduler.profile,
+    plannerStatus: scheduler.planningStatus,
+    wallTime: {
+      legacyEstimateMs: scheduler.baselineWallTimeMs,
+      plannedEstimateMs: scheduler.predictedWallTimeMs,
+      actualMs: scheduler.actualWallTimeMs,
+    },
+    tokenEnvelope: {
+      baselineTokens: scheduler.baselineTokens,
+      allowedTokens: scheduler.allowedTokens,
+      predictedTokens: scheduler.predictedTokens,
+      actualTokens: scheduler.actualTokens,
+      exceeded: Math.max(
+        scheduler.predictedTokens,
+        scheduler.actualTokens,
+      ) > scheduler.allowedTokens,
+    },
+    selections: {
+      contextProfiles: selectedContextProfiles,
+      efforts,
+      protocols,
+    },
+    events: {
+      plannerDeadlines: scheduler.plannerDeadlines,
+      fallbacks: scheduler.fallbacks,
+      throttles: scheduler.throttles,
+      recoveries: scheduler.recoveries,
+    },
     decisions: scheduler.decisions,
-    fallbacks: scheduler.fallbacks,
-    predictedWallTimeMs: scheduler.predictedWallTimeMs,
-    actualWallTimeMs: scheduler.actualWallTimeMs,
-    predictedTokens: scheduler.predictedTokens,
-    actualTokens: scheduler.actualTokens,
     tokenUsageComplete: scheduler.tokenUsageComplete,
-    contextProfiles: { ...scheduler.contextProfiles },
   };
+}
+
+function schedulerMetricsProjection(
+  scheduler: SchedulerRunReport | undefined,
+): SchedulerMetricsReport | null {
+  if (scheduler === undefined) return null;
+  return schedulerMetrics(scheduler);
 }
 
 export function writeLosslessBookArtifacts(

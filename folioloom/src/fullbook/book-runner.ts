@@ -1309,6 +1309,7 @@ interface DynamicRequestPlanning {
     PlannedTranslationExecution
   >;
   readonly legacyByTaskId: ReadonlyMap<string, PlannedTranslationExecution>;
+  readonly baselineWallTimeMs: number;
   readonly baselineTokens: number;
 }
 
@@ -1848,6 +1849,10 @@ function dynamicRequestPlanning(
     (total, variant) => total + variant.predicted.totalTokens,
     0,
   );
+  const baselineWallTimeMs = baselineVariants.reduce(
+    (total, variant) => total + variant.predicted.p90DurationMs,
+    0,
+  );
   return {
     input: {
       graph: buildTaskGraph(tasks),
@@ -1866,6 +1871,7 @@ function dynamicRequestPlanning(
     },
     executionsByVariantId,
     legacyByTaskId,
+    baselineWallTimeMs,
     baselineTokens: horizonBaselineTokens,
   };
 }
@@ -2466,7 +2472,9 @@ async function runLosslessBook(
   }
   const optimizationProfile = options.optimizationProfile
     ?? profileFromLegacyRunMode(runtimeSet.mode);
-  optimizationPolicy(optimizationProfile);
+  const selectedOptimizationPolicy = optimizationPolicy(
+    optimizationProfile,
+  );
   const maxWindows = nonNegativeInteger(
     options.maxWindows ?? Number.MAX_SAFE_INTEGER,
     "maxWindows",
@@ -2556,10 +2564,20 @@ async function runLosslessBook(
   const schedulerMetrics = {
     mode: schedulerMode,
     profile: optimizationProfile,
+    planningStatus: (
+      schedulerMode === "off"
+        ? "disabled"
+        : schedulerMode === "shadow"
+          ? "shadow"
+          : "optimal"
+    ) as SchedulerRunReport["planningStatus"],
     decisions: 0,
     fallbacks: 0,
+    baselineWallTimeMs: 0,
     predictedWallTimeMs: 0,
     actualWallTimeMs: 0,
+    baselineTokens: 0,
+    allowedTokens: 0,
     predictedTokens: 0,
     actualTokens: 0,
     tokenUsageComplete: true,
@@ -2567,6 +2585,15 @@ async function runLosslessBook(
       string,
       "lean" | "balanced" | "rich"
     >,
+    effortCounts: {} as Record<string, number>,
+    protocolCounts: {
+      typed_tool: 0,
+      framed_text: 0,
+      local: 0,
+    },
+    plannerDeadlines: 0,
+    throttles: 0,
+    recoveries: 0,
   };
 
   try {
@@ -3210,8 +3237,18 @@ async function runLosslessBook(
         });
         if (retryRound === 0) {
           cumulativeBaselineTokens += requestPlanning.baselineTokens;
+          schedulerMetrics.baselineWallTimeMs +=
+            requestPlanning.baselineWallTimeMs;
+          schedulerMetrics.baselineTokens = cumulativeBaselineTokens;
+          schedulerMetrics.allowedTokens = Math.floor(
+            cumulativeBaselineTokens
+              * (1 + selectedOptimizationPolicy.tokenIncreaseCap),
+          );
+        } else {
+          schedulerMetrics.recoveries += requestInputs.length;
         }
         const decisionOrdinal = schedulerMetrics.decisions;
+        let initialPlanningEstimateRecorded = false;
         const decisionMetadata = () => ({
           decisionId: `decision-${createHash("sha256")
             .update([
@@ -3231,19 +3268,33 @@ async function runLosslessBook(
         ): void => {
           if (schedulerMode === "off") return;
           schedulerMetrics.decisions += 1;
+          if (schedulerMode === "active") {
+            if (dispatchReport.planningStatus === "fallback") {
+              schedulerMetrics.planningStatus = "fallback";
+            } else if (dispatchReport.planningStatus === "bounded"
+              && schedulerMetrics.planningStatus !== "fallback") {
+              schedulerMetrics.planningStatus = "bounded";
+            }
+          }
+          if (dispatchReport.plannerDeadlineReached) {
+            schedulerMetrics.plannerDeadlines += 1;
+          }
           if (dispatchReport.planningStatus === "fallback"
             || dispatchReport.fallbackReason !== undefined) {
             schedulerMetrics.fallbacks += 1;
           }
-          schedulerMetrics.predictedWallTimeMs +=
-            dispatchReport.predictedWallTimeMs;
-          schedulerMetrics.predictedTokens += Math.max(
-            0,
-            dispatchReport.predictedTokens
-              - (dispatchReport.fallbackReason === "PLANNER_FAILED"
-                ? 0
-                : schedulerMetrics.actualTokens),
-          );
+          if (!initialPlanningEstimateRecorded) {
+            initialPlanningEstimateRecorded = true;
+            schedulerMetrics.predictedWallTimeMs +=
+              dispatchReport.predictedWallTimeMs;
+            schedulerMetrics.predictedTokens += Math.max(
+              0,
+              dispatchReport.predictedTokens
+                - (dispatchReport.fallbackReason === "PLANNER_FAILED"
+                  ? 0
+                  : schedulerMetrics.actualTokens),
+            );
+          }
         };
         if (schedulerMode !== "active") {
           const dispatchReport = dynamicScheduler.dispatch(
@@ -3629,6 +3680,11 @@ async function runLosslessBook(
         };
         const observeCompletedRequest = (completed: CompletedRequest): void => {
           const telemetry = completed.runtime;
+          schedulerMetrics.recoveries += telemetry.recoveries.length;
+          schedulerMetrics.throttles += [
+            ...telemetry.recoveries.map((recovery) => recovery.status),
+            telemetry.status,
+          ].filter((status) => status === "throttled").length;
           schedulerMetrics.tokenUsageComplete =
             schedulerMetrics.tokenUsageComplete && telemetry.usage.complete;
           schedulerMetrics.actualTokens += telemetry.usage.complete
@@ -3705,13 +3761,16 @@ async function runLosslessBook(
               : "typed_tool",
           }, telemetry.recoveries.length);
         };
-        const recordContextProfile = (
+        const recordSelectedVariant = (
           execution: PlannedTranslationExecution,
         ): void => {
           for (const window of execution.admitted.request.windows) {
             schedulerMetrics.contextProfiles[window.windowId] =
               execution.variant.contextProfile;
           }
+          schedulerMetrics.effortCounts[execution.variant.effort] =
+            (schedulerMetrics.effortCounts[execution.variant.effort] ?? 0) + 1;
+          schedulerMetrics.protocolCounts[execution.variant.protocol] += 1;
         };
         let completionOrder: CompletedRequest[];
         if (schedulerMode === "active") {
@@ -3724,7 +3783,7 @@ async function runLosslessBook(
               actualRunTokens: () => schedulerMetrics.actualTokens,
               decision: decisionMetadata,
               onDecision: recordDispatchReport,
-              onLaunch: recordContextProfile,
+              onLaunch: recordSelectedVariant,
               onComplete: observeCompletedRequest,
               ...(options.signal === undefined
                 ? {}
@@ -3734,7 +3793,7 @@ async function runLosslessBook(
         } else {
           const legacyExecutionByTaskId = requestPlanning.legacyByTaskId;
           for (const execution of legacyExecutionByTaskId.values()) {
-            recordContextProfile(execution);
+            recordSelectedVariant(execution);
           }
           completionOrder = await runWithAdaptiveScheduler(
             requestInputs,

@@ -56,6 +56,7 @@ export interface RollingPlannerAction {
 
 export interface RollingPlannerResult {
   readonly planningStatus: "optimal" | "bounded" | "fallback";
+  readonly deadlineReached: boolean;
   readonly firstDispatch: readonly PlannedTaskDispatch[];
   readonly actions: readonly RollingPlannerAction[];
   readonly objective: number;
@@ -988,6 +989,7 @@ function resultFromLabel(
   allowedTokens: number,
   horizonTaskIds: readonly string[],
   transitionCount: number,
+  deadlineReached = false,
 ): RollingPlannerResult {
   const actions = scheduleAroundReservations(
     actionsForLabel(label),
@@ -1011,6 +1013,7 @@ function resultFromLabel(
     : [];
   return Object.freeze({
     planningStatus: status,
+    deadlineReached,
     firstDispatch: Object.freeze([...firstDispatch]),
     actions: Object.freeze(actions.map((action) => Object.freeze(action))),
     objective: labelObjective(
@@ -1261,6 +1264,7 @@ export function planRollingHorizon(
       allowedTokens,
       horizonTaskIds,
       transitionCount,
+      deadlineReached,
     );
   }
   if (bestPartial !== undefined) {
@@ -1272,6 +1276,7 @@ export function planRollingHorizon(
       allowedTokens,
       horizonTaskIds,
       transitionCount,
+      deadlineReached,
     );
   }
   return fallbackResult(
