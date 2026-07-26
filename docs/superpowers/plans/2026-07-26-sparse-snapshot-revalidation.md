@@ -648,7 +648,7 @@ git commit -m "feat: converge stale translations incrementally"
 - 修改：`folioloom/src/style/chinese-script-normalization.ts`
 - 修改：`folioloom/test/chinese-script-normalization.test.ts`
 
-- [ ] **步骤 1：编写通用正字失败测试**
+- [x] **步骤 1：编写通用正字失败测试**
 
 ```ts
 assert.equal(
@@ -659,13 +659,13 @@ assert.equal(
 
 测试 glossary 锁定目标仍逐字节保留，不能被兼容转换改写。
 
-- [ ] **步骤 2：运行测试确认失败**
+- [x] **步骤 2：运行测试确认失败**
 
 ```powershell
 npm test -- --test-name-pattern="Chinese script|orthography"
 ```
 
-- [ ] **步骤 3：扩充版本化通用映射**
+- [x] **步骤 3：扩充版本化通用映射**
 
 在 `compatibilityToChinese` 增加跨作品通用兼容/异体映射：
 
@@ -677,7 +677,7 @@ npm test -- --test-name-pattern="Chinese script|orthography"
 
 保持顺序：日文兼容 → 通用异体 → 繁体到简体；受保护术语继续绕过转换。
 
-- [ ] **步骤 4：验证并提交**
+- [x] **步骤 4：验证并提交**
 
 ```powershell
 npm test -- --test-name-pattern="Chinese script|orthography"
