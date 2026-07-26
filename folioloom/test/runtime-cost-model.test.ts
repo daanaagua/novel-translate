@@ -157,6 +157,31 @@ test("runtime cost model persists and invalid snapshots fall back deterministica
   store.close();
 });
 
+test("runtime cost model rejects token ratios outside its learned bounds", () => {
+  const store = new RuntimeProfileStore(join(
+    mkdtempSync(join(tmpdir(), "folioloom-cost-model-ratio-")),
+    "profiles.db",
+  ));
+  const profileKey = "deepseek-v4-flash:de";
+  const snapshot = OnlineRuntimeCostModel.coldStart(profileKey).snapshot();
+  store.saveModelSnapshot(
+    profileKey,
+    {
+      ...snapshot,
+      inputTokenRatio: 0,
+      outputTokenRatio: 0,
+      totalTokenRatio: 0,
+    },
+    "2026-07-27T00:00:00Z",
+  );
+
+  const restored = loadRuntimeCostModel(store, profileKey);
+
+  assert.equal(restored.snapshotStatus, "invalid");
+  assert.ok(restored.predict(features()).totalTokens > 0);
+  store.close();
+});
+
 test("runtime features reject negative and non-finite values", () => {
   const model = OnlineRuntimeCostModel.coldStart("deepseek-v4-flash:de");
   assert.throws(

@@ -14,6 +14,8 @@ const FAILURE_PRIOR_SAMPLES = 20;
 const MIN_FAILURE_PROBABILITY = 0.001;
 const MAX_FAILURE_PROBABILITY = 0.95;
 const MAX_DURATION_MS = 6 * 60 * 60 * 1_000;
+const MIN_TOKEN_RATIO = 0.1;
+const MAX_TOKEN_RATIO = 10;
 
 export interface RuntimeFeatures {
   readonly inputTokens: number;
@@ -84,6 +86,17 @@ interface RuntimeCostModelState {
 function finiteNonnegative(value: number, label: string): number {
   if (!Number.isFinite(value) || value < 0) {
     throw new TypeError(`${label} must be a non-negative finite number`);
+  }
+  return value;
+}
+
+function tokenRatio(value: number, label: string): number {
+  if (!Number.isFinite(value)
+    || value < MIN_TOKEN_RATIO
+    || value > MAX_TOKEN_RATIO) {
+    throw new TypeError(
+      `${label} must be between ${MIN_TOKEN_RATIO} and ${MAX_TOKEN_RATIO}`,
+    );
   }
   return value;
 }
@@ -348,15 +361,15 @@ function stateFromSnapshot(snapshot: unknown): RuntimeCostModelState {
       raw.residualAbsoluteEma as number,
       "residual absolute EMA",
     ),
-    inputTokenRatio: finiteNonnegative(
+    inputTokenRatio: tokenRatio(
       raw.inputTokenRatio as number,
       "input token ratio",
     ),
-    outputTokenRatio: finiteNonnegative(
+    outputTokenRatio: tokenRatio(
       raw.outputTokenRatio as number,
       "output token ratio",
     ),
-    totalTokenRatio: finiteNonnegative(
+    totalTokenRatio: tokenRatio(
       raw.totalTokenRatio as number,
       "total token ratio",
     ),
@@ -571,18 +584,18 @@ export class OnlineRuntimeCostModel {
     const alpha = clamp(1 - (0.8 ** elapsedUnits), 0.05, 0.8);
     this.#state.inputTokenRatio = clamp(
       (1 - alpha) * this.#state.inputTokenRatio + alpha * inputRatio,
-      0.1,
-      10,
+      MIN_TOKEN_RATIO,
+      MAX_TOKEN_RATIO,
     );
     this.#state.outputTokenRatio = clamp(
       (1 - alpha) * this.#state.outputTokenRatio + alpha * outputRatio,
-      0.1,
-      10,
+      MIN_TOKEN_RATIO,
+      MAX_TOKEN_RATIO,
     );
     this.#state.totalTokenRatio = clamp(
       (1 - alpha) * this.#state.totalTokenRatio + alpha * totalRatio,
-      0.1,
-      10,
+      MIN_TOKEN_RATIO,
+      MAX_TOKEN_RATIO,
     );
     this.#state.tokenSamples += 1;
   }

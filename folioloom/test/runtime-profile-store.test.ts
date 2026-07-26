@@ -12,6 +12,7 @@ import {
 import {
   RuntimeProfileStore,
   RuntimeProfileStoreCorruptError,
+  type SchedulerDecisionRecord,
 } from "../src/storage/runtime-profile-store.js";
 
 function fixturePath(): string {
@@ -172,4 +173,33 @@ test("scheduler decisions accept bounded structured projections", () => {
   `).get() as { count: number };
   assert.equal(row.count, 1);
   database.close();
+});
+
+test("scheduler decisions never persist unknown prose fields", () => {
+  const path = fixturePath();
+  const store = new RuntimeProfileStore(path);
+  const decision = {
+    decisionId: "decision-private",
+    runId: "run-1",
+    mode: "shadow",
+    profile: "balanced",
+    predicted: {
+      durationMs: 1_200,
+      totalTokens: 800,
+      unsafe: "SECRET_SENTINEL",
+    },
+    selected: {
+      taskIds: ["task-1"],
+      concurrency: 2,
+      unsafe: "SOURCE_SENTINEL",
+    },
+    createdAt: "2026-07-27T00:00:00.000Z",
+  } as unknown as SchedulerDecisionRecord;
+
+  store.appendDecision(decision);
+  store.close();
+
+  const bytes = readFileSync(path);
+  assert.equal(bytes.includes(Buffer.from("SECRET_SENTINEL", "utf8")), false);
+  assert.equal(bytes.includes(Buffer.from("SOURCE_SENTINEL", "utf8")), false);
 });

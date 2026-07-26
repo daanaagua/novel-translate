@@ -23,13 +23,23 @@ export type StructuredValue =
   | readonly StructuredValue[]
   | { readonly [key: string]: StructuredValue };
 
+export interface SchedulerDecisionPrediction {
+  readonly durationMs: number;
+  readonly totalTokens: number;
+}
+
+export interface SchedulerDecisionSelection {
+  readonly taskIds: readonly string[];
+  readonly concurrency: number;
+}
+
 export interface SchedulerDecisionRecord {
   readonly decisionId: string;
   readonly runId: string;
   readonly mode: SchedulerMode;
   readonly profile: OptimizationProfile;
-  readonly predicted: Readonly<Record<string, StructuredValue>>;
-  readonly selected: Readonly<Record<string, StructuredValue>>;
+  readonly predicted: SchedulerDecisionPrediction;
+  readonly selected: SchedulerDecisionSelection;
   readonly createdAt: string;
 }
 
@@ -109,6 +119,15 @@ function positiveSafeInteger(value: number, label: string): number {
     throw new TypeError(`${label} must be a positive safe integer`);
   }
   return value;
+}
+
+function decisionIdentifier(value: string, label: string): string {
+  const normalized = nonempty(value, label);
+  if (normalized.length > 256
+    || !/^[a-z0-9][a-z0-9._:/-]*$/u.test(normalized)) {
+    throw new TypeError(`${label} must be a bounded scheduler identifier`);
+  }
+  return normalized;
 }
 
 function timestamp(value: string, label: string): string {
@@ -420,15 +439,31 @@ export class RuntimeProfileStore {
   }
 
   appendDecision(decision: SchedulerDecisionRecord): void {
-    const decisionId = nonempty(decision.decisionId, "decision id");
-    const runId = nonempty(decision.runId, "run id");
+    const decisionId = decisionIdentifier(decision.decisionId, "decision id");
+    const runId = decisionIdentifier(decision.runId, "run id");
     const createdAt = timestamp(decision.createdAt, "decision created at");
     const predictedJson = stringifyStructuredValue(
-      decision.predicted,
+      {
+        durationMs: nonnegativeFinite(
+          decision.predicted.durationMs,
+          "predicted scheduler duration",
+        ),
+        totalTokens: nonnegativeSafeInteger(
+          decision.predicted.totalTokens,
+          "predicted scheduler tokens",
+        ),
+      },
       "predicted scheduler projection",
     );
     const selectedJson = stringifyStructuredValue(
-      decision.selected,
+      {
+        taskIds: decision.selected.taskIds.map((taskId, index) =>
+          decisionIdentifier(taskId, `selected task id ${index}`)),
+        concurrency: positiveSafeInteger(
+          decision.selected.concurrency,
+          "selected scheduler concurrency",
+        ),
+      },
       "selected scheduler projection",
     );
     this.#transaction(() => {
