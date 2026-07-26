@@ -58,6 +58,7 @@ test("desktop package scripts and portable metadata stay explicit", () => {
 
   const resource = JSON.parse(readText(join(projectRoot, "desktop", "resources", "app-info.json"))) as {
     schema: string;
+    version: string;
     apiKeyPolicy: string;
     projectDataPolicy: string;
     translationWritePolicy: string;
@@ -65,6 +66,7 @@ test("desktop package scripts and portable metadata stay explicit", () => {
   };
   assert.deepEqual(resource, {
     schema: "folioloom-desktop-resource-1",
+    version: "1.4.0",
     apiKeyPolicy: "never-packaged",
     projectDataPolicy: "user-selected",
     translationWritePolicy: "single-window-trial-and-durable-fullbook",

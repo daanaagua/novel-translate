@@ -4,9 +4,9 @@
 
 FolioLoom 是一个面向长篇小说的开源 AI 翻译引擎。它把原文完整性、叙事记忆、实体别名、术语连续性、局部风格和失败恢复作为同一条可审计流水线处理，目标是让复杂小说在分块、并行和长时间运行后仍保持可追溯的一致性。
 
-当前版本为 **FolioLoom v1.3.1**。正式内核位于 [`folioloom/`](folioloom/)，以 TypeScript 编写；仓库根目录的 Python 代码主要承担 TXT、Markdown、DOCX、EPUB 输入适配，并保留 V1–V4 的研究历史。
+当前版本为 **FolioLoom v1.4.0**。正式内核位于 [`folioloom/`](folioloom/)，以 TypeScript 编写；仓库根目录的 Python 代码主要承担 TXT、Markdown、DOCX、EPUB 输入适配，并保留 V1–V4 的研究历史。
 
-## V1.3 能做什么
+## V1.4 能做什么
 
 - 为原始文本建立带哈希和位置映射的无损账本；
 - 按逻辑窗口串行或有限并行翻译，并在中断后恢复；
@@ -17,15 +17,17 @@ FolioLoom 是一个面向长篇小说的开源 AI 翻译引擎。它把原文完
 - 从 SQLite 状态库导出中文 TXT、双语 TXT、EPUB 和审计报告；
 - 通过 Electron 桌面端完成书稿导入、模型连接、试译、整本运行、暂停恢复、导出、术语与叙事记忆维护；
 - 导入 JSON、YAML、CSV 或 XLSX 术语数据，并在写入前处理字段映射和冲突；
-- 针对英语、日语和韩语提供编码识别、token 估算及长篇调度策略。
+- 针对英语、德语、法语、西班牙语、俄语、日语和韩语提供语言画像，并支持常见 Unicode、Windows-1252 及日韩传统编码；
+- 一键导出不含密钥、书稿、译文和完整私人路径的诊断 JSON，便于定位导入、连接、试译、校验或提交阶段的失败；
+- DeepSeek 固定提供 `deepseek-v4-flash` 和 `deepseek-v4-pro`，旧模型名会被明确拒绝而不会进入翻译。
 
 ## 当前限制
 
 - 当前发布 Windows x64 单文件便携版和目录便携 ZIP，尚未提供代码签名；
-- V4 的本地裁决页和旧 Streamlit 页面仍保留，但不是 V1.3 主入口；
+- V4 的本地裁决页和旧 Streamlit 页面仍保留，但不是 V1.4 主入口；
 - 已完成离线回归和真实模型的一窗口、三窗口门禁，尚未发布最新版架构的全书质量基准；
 - 桌面端已接通书稿导入、模型兼容性检查、单片段试译、整本开始、暂停、恢复和严格导出；批量审阅队列仍是后续工作；
-- 桌面端内置 DeepSeek、Kimi、阿里云百炼、火山方舟、OpenAI、硅基流动及自定义 OpenAI-compatible 接口入口；各模型仍须通过真实兼容性检查。
+- 桌面端内置 DeepSeek、Kimi、阿里云百炼、火山方舟、OpenAI、硅基流动及自定义 OpenAI-compatible 接口入口；DeepSeek 只接受 V4 Flash/Pro，各模型仍须通过真实兼容性检查。
 
 ## 安装
 
@@ -43,7 +45,7 @@ npm.cmd ci
 Set-Location ..
 ```
 
-复制示例配置。V1.3 可以把真实 API Key 写入不会被 Git 跟踪的 `config/config.yaml`，也可以在运行命令中使用 `--opencode-auth` 从本机 OpenCode 的认证文件读取：
+复制示例配置。V1.4 可以把真实 API Key 写入不会被 Git 跟踪的 `config/config.yaml`，也可以在运行命令中使用 `--opencode-auth` 从本机 OpenCode 的认证文件读取：
 
 ```powershell
 Copy-Item config\config.example.yaml config\config.yaml
@@ -103,6 +105,8 @@ npm.cmd run desktop:dev
 5. 翻译完整且审计通过后，在“导出”中选择中文 TXT、双语 TXT、EPUB 或三者全部。
 
 API Key 不会进入项目、日志、界面返回值或安装包。Windows 系统加密可用时，密钥以 Electron `safeStorage` 密文保存；不可用时只保留到当前应用会话结束。试译固定为一个串行窗口；整本运行把进度和译文提交到该书稿自己的 SQLite 状态库，不改写原始文件。暂停或关闭应用会先取消当前模型请求并等待持久状态落稳；恢复时沿用原运行的模型策略。导出只接受已完整翻译且严格校验通过的运行，并为 TXT 与 EPUB 保留可追溯谱系。
+
+遇到试译失败时，可以从错误面板或左侧常驻入口导出诊断 JSON。严格隐私模式只保留版本、运行阶段、状态、计数、错误码和已经脱敏的错误链，不保存 API Key、Authorization、原文、译文、提示词、模型原始响应或完整私人路径。
 
 `npm.cmd run desktop:dist` 可在本机生成 Windows x64 portable 构建；普通用户也可以从 [GitHub Releases](https://github.com/daanaagua/novel-translate/releases/latest) 下载目录便携 ZIP。桌面端的开发与安全边界见 [`folioloom/README.md`](folioloom/README.md)。
 

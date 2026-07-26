@@ -429,7 +429,7 @@ test("lexical negative cache suppresses reconsideration without entering transla
 
 预期：PASS，且现有锚点和实体关系测试不回退。
 
-- [ ] **步骤 5：提交负缓存**
+- [x] **步骤 5：提交负缓存**
 
 ```bash
 git add src/knowledge src/fullbook/book-runner.ts test
@@ -446,13 +446,13 @@ git commit -m "perf: keep ordinary lexical decisions out of prompts"
 - 修改：`docs/superpowers/specs/2026-07-26-diagnostics-deepseek-v4-latin-language-design.md`
 - 修改：`docs/superpowers/plans/2026-07-26-diagnostics-deepseek-v4-latin-language.md`
 
-- [ ] **步骤 1：统一版本与文档**
+- [x] **步骤 1：统一版本与文档**
 
 运行：`npm version 1.4.0 --no-git-tag-version`
 
 更新 README：DeepSeek 只列 V4 Flash/Pro；说明诊断包的导出入口和隐私排除项；德语标注真实门禁，法语/西班牙语标注工程回归；不把旧模型名作为正常配置示例。
 
-- [ ] **步骤 2：运行全量自动化门禁**
+- [x] **步骤 2：运行全量自动化门禁**
 
 运行：
 
@@ -466,7 +466,7 @@ npm run desktop:build
 
 预期：全部 exit 0，node:test 失败数为 0，Vitest 失败数为 0。
 
-- [ ] **步骤 3：运行真实德语单窗口门禁**
+- [x] **步骤 3：运行真实德语单窗口门禁**
 
 使用未跟踪的 Project Gutenberg《变形记》样本建立全新项目，运行：
 
@@ -483,11 +483,11 @@ npm run folioloom -- book run --manifest "<german-project>/source_manifest.json"
 - `ordinary_word` 裁决不成为 active 锚点且不进入翻译知识投影；
 - 记录耗时、模型调用数、状态和 warning 代码，不提交正文、译文、私有配置或数据库。
 
-- [ ] **步骤 4：生成并检查隐私诊断样本**
+- [x] **步骤 4：生成并检查隐私诊断样本**
 
 用模拟 auth、私人路径、原文和译文构造失败事件，导出诊断 JSON；递归扫描不得出现模拟秘密、源/译文或盘符用户路径。对生成 JSON 执行 `JSON.parse()` 并核对 schema、环境、模型、source 摘要、最近失败阶段和事件顺序。
 
-- [ ] **步骤 5：生成 Windows 发布产物并做便携目录冒烟**
+- [x] **步骤 5：生成 Windows 发布产物并做便携目录冒烟**
 
 运行：
 

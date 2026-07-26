@@ -233,7 +233,11 @@ async function probe(
 ) {
   return probeProviderCapabilities({
     registry: localRegistry(providerId, provider.baseUrl),
-    profile: { providerId, modelId: "fixture-model", reasoningEffort },
+    profile: {
+      providerId,
+      modelId: providerId === "deepseek" ? "deepseek-v4-flash" : "fixture-model",
+      reasoningEffort,
+    },
     credential: "probe-fixture-secret",
     ...(timeoutMs === undefined ? {} : { timeoutMs }),
   });
