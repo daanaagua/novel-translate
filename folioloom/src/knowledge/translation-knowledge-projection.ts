@@ -60,6 +60,7 @@ export interface TranslationKnowledgeCandidate {
   readonly bundleId: string;
   readonly revisionIds: readonly string[];
   readonly kind: ContextEvidenceBundle["kind"];
+  readonly evidenceDistance?: number;
   readonly tokenCost: number;
   readonly utility: number;
   readonly coverage: readonly RiskDimension[];
@@ -649,6 +650,9 @@ function translationKnowledgeCandidate(
     bundleId: `knowledge:${candidate.revision.revisionId}`,
     revisionIds: [candidate.revision.revisionId],
     kind: contextBundleKind(candidate.revision.kind),
+    ...(candidate.evidenceDistance === undefined
+      ? {}
+      : { evidenceDistance: candidate.evidenceDistance }),
     tokenCost: KNOWLEDGE_TOKEN_ESTIMATOR.estimateJson(
       payload,
       profile,

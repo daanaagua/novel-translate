@@ -171,6 +171,7 @@ function runResult(
       predictedTokens: 0,
       actualTokens: 0,
       tokenUsageComplete: true,
+      contextProfiles: {},
     },
     leaseReleased: true,
     artifacts: null,

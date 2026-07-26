@@ -636,6 +636,7 @@ function schedulerMetricsProjection(
     predictedTokens: scheduler.predictedTokens,
     actualTokens: scheduler.actualTokens,
     tokenUsageComplete: scheduler.tokenUsageComplete,
+    contextProfiles: { ...scheduler.contextProfiles },
   };
 }
 

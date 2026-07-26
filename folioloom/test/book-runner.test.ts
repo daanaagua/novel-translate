@@ -1436,6 +1436,84 @@ test("lossless runner reports shadow scheduler metrics without changing legacy d
   runtimeProfiles.close();
 });
 
+test("low-risk windows use lean context while high-risk windows keep rich evidence", async () => {
+  const fixture = losslessFixture("a quiet room.[[]]a damaged \uFFFD line.");
+  fixture.faux.setResponses([
+    losslessBatchResponse,
+    losslessBatchResponse,
+  ]);
+
+  const result = await runBook({
+    ...fixture.options,
+    schedulerMode: "active",
+    optimizationProfile: "balanced",
+    tinyWindowTokens: 1,
+    maxWindowsPerRequest: 1,
+    maxConcurrency: 2,
+  });
+
+  const orderedWindows = [...result.windows].sort(
+    (left, right) => left.ordinal - right.ordinal,
+  );
+  assert.deepEqual(result.scheduler.contextProfiles, {
+    [orderedWindows[0]!.windowId]: "lean",
+    [orderedWindows[1]!.windowId]: "rich",
+  });
+});
+
+test("evidence at least twenty-four blocks away forces rich context", async () => {
+  const fixture = losslessFixture(
+    Array.from(
+      { length: 25 },
+      (_, index) => `plain segment ${index}.`,
+    ).join("[[]]"),
+  );
+  fixture.faux.setResponses([losslessBatchResponse]);
+  const first = await runBook({
+    ...fixture.options,
+    schedulerMode: "active",
+    optimizationProfile: "balanced",
+    maxWindows: 24,
+    maxConcurrency: 1,
+    tinyWindowTokens: 100,
+    maxRequestTokens: 1_000,
+    maxWindowsPerRequest: 24,
+  });
+  const ordered = [...first.windows].sort(
+    (left, right) => left.ordinal - right.ordinal,
+  );
+  const firstBlockId = ordered[0]?.blockIds[0];
+  const remoteBlockId = ordered[24]?.blockIds[0];
+  assert.ok(firstBlockId && remoteBlockId);
+  commitManualKnowledge(
+    fixture.options.storePath,
+    "memory",
+    "remote-memory",
+    "narrative_memory",
+    {
+      summary: "synthetic prior state",
+      startBlockId: firstBlockId,
+      endBlockId: remoteBlockId,
+    },
+  );
+
+  fixture.faux.setResponses([losslessBatchResponse]);
+  const resumed = await runBook({
+    ...fixture.options,
+    schedulerMode: "active",
+    optimizationProfile: "balanced",
+    maxConcurrency: 1,
+    tinyWindowTokens: 100,
+    maxRequestTokens: 1_000,
+    maxWindowsPerRequest: 24,
+  });
+
+  assert.deepEqual(
+    Object.values(resumed.scheduler.contextProfiles),
+    ["rich"],
+  );
+});
+
 test("failed lossless doctor blocks every model call", async () => {
   const fixture = losslessFixture("Alpha.");
   writeFileSync(fixture.canonicalPath, "Corrupt.", "utf8");
@@ -1851,6 +1929,133 @@ test("fast mode retries an invalid physical request with only the escalation run
   assert.equal(result.status.completedWindows, 2);
 });
 
+test("fast mode rejects a lower-effort escalation runtime", async () => {
+  const fixture = losslessFixture("the quiet room remained empty.");
+  fixture.faux.setResponses([losslessBatchResponse]);
+  const model = fixture.faux.getModel();
+  const streamFn = fixture.faux.provider.streamSimple.bind(
+    fixture.faux.provider,
+  );
+
+  await assert.rejects(
+    runBook({
+      ...fixture.options,
+      model,
+      streamFn,
+      runtimeSet: {
+        mode: "fast",
+        primary: {
+          model,
+          streamFn,
+          effort: "high",
+          thinkingLevel: "high",
+        },
+        escalation: {
+          model,
+          streamFn,
+          effort: "low",
+          thinkingLevel: "low",
+        },
+      },
+    }),
+    /escalation runtime cannot use lower effort/u,
+  );
+  assert.equal(fixture.faux.state.callCount, 0);
+});
+
+test("failed low effort retries only its task with the legal escalation runtime", async () => {
+  const fixture = losslessFixture("the quiet room remained empty.");
+  const low = fauxProvider();
+  const high = fauxProvider();
+  const runtimeProfiles = new RuntimeProfileStore(join(
+    dirname(fixture.options.storePath),
+    "runtime-profiles.db",
+  ));
+  low.setResponses([fauxAssistantMessage(fauxToolCall(
+    "finalize_translation_batch",
+    { windows: [] },
+  ), { stopReason: "toolUse" })]);
+  high.setResponses([losslessBatchResponse]);
+  const model = low.getModel();
+
+  const result = await runBook({
+    ...fixture.options,
+    model,
+    streamFn: low.provider.streamSimple.bind(low.provider),
+    schedulerMode: "active",
+    optimizationProfile: "speed",
+    runtimeProfileStore: runtimeProfiles,
+    runtimeSet: {
+      mode: "fast",
+      primary: {
+        model,
+        streamFn: low.provider.streamSimple.bind(low.provider),
+        effort: "low",
+        thinkingLevel: "low",
+      },
+      escalation: {
+        model: high.getModel(),
+        streamFn: high.provider.streamSimple.bind(high.provider),
+        effort: "high",
+        thinkingLevel: "high",
+      },
+    },
+  });
+
+  assert.equal(low.state.callCount, 1);
+  assert.equal(high.state.callCount, 1);
+  assert.equal(result.status.completedWindows, 1);
+  assert.deepEqual(Object.values(result.scheduler.contextProfiles), ["rich"]);
+  assert.deepEqual(
+    runtimeProfiles.observationsForProfile("faux-1:en")
+      .map((observation) => observation.status),
+    ["failed", "success"],
+  );
+  runtimeProfiles.close();
+});
+
+test("retry rounds do not manufacture a larger cumulative token envelope", async () => {
+  const fixture = losslessFixture("the quiet room remained empty.");
+  const low = fauxProvider();
+  const high = fauxProvider();
+  const invalid = fauxAssistantMessage(fauxToolCall(
+    "finalize_translation_batch",
+    { windows: [] },
+  ), { stopReason: "toolUse" });
+  low.setResponses([invalid]);
+  high.setResponses([invalid, losslessBatchResponse]);
+  const model = low.getModel();
+
+  const result = await runBook({
+    ...fixture.options,
+    model,
+    streamFn: low.provider.streamSimple.bind(low.provider),
+    schedulerMode: "active",
+    optimizationProfile: "balanced",
+    maxAttempts: 3,
+    runtimeSet: {
+      mode: "fast",
+      primary: {
+        model,
+        streamFn: low.provider.streamSimple.bind(low.provider),
+        effort: "low",
+        thinkingLevel: "low",
+      },
+      escalation: {
+        model: high.getModel(),
+        streamFn: high.provider.streamSimple.bind(high.provider),
+        effort: "high",
+        thinkingLevel: "high",
+      },
+    },
+  });
+
+  assert.equal(low.state.callCount, 1);
+  assert.equal(high.state.callCount, 2);
+  assert.equal(result.status.completedWindows, 1);
+  assert.equal(result.scheduler.fallbacks, 2);
+});
+
 test("quality mode falls back from a malformed typed payload to framed text before human review", async () => {
   const fixture = losslessFixture("One complete source paragraph without named entities.");
   const primary = fauxProvider();
@@ -1882,6 +2087,74 @@ test("quality mode falls back from a malformed typed payload to framed text befo
   assert.equal(primary.state.callCount, 2);
   assert.equal(result.status.humanRequiredWindows, 0);
   assert.equal(result.status.completedWindows, result.status.totalWindows);
+});
+
+test("provider protocol errors switch only the failed request to framed text", async () => {
+  const fixture = losslessFixture("one quiet source paragraph.");
+  const runtimeProfiles = new RuntimeProfileStore(join(
+    dirname(fixture.options.storePath),
+    "runtime-profiles.db",
+  ));
+  fixture.faux.setResponses([
+    fauxAssistantMessage([], {
+      stopReason: "error",
+      errorMessage: "malformed tool-call stream",
+    }),
+    losslessBatchResponse,
+  ]);
+
+  const result = await runBook({
+    ...fixture.options,
+    maxAttempts: 1,
+    runtimeProfileStore: runtimeProfiles,
+  });
+
+  assert.equal(fixture.faux.state.callCount, 2);
+  assert.equal(result.status.completedWindows, 1);
+  assert.equal(result.status.humanRequiredWindows, 0);
+  assert.deepEqual(
+    runtimeProfiles.observationsForProfile("faux-1:en")
+      .map((observation) => observation.status),
+    ["protocol", "success"],
+  );
+  assert.equal(result.scheduler.tokenUsageComplete, false);
+  runtimeProfiles.close();
+});
+
+test("recovered request observations partition failure and success token usage", async () => {
+  const fixture = losslessFixture("one quiet source paragraph.");
+  const runtimeProfiles = new RuntimeProfileStore(join(
+    dirname(fixture.options.storePath),
+    "runtime-profiles.db",
+  ));
+  fixture.faux.setResponses([
+    fauxAssistantMessage(fauxToolCall(
+      "finalize_translation_batch",
+      { windows: [] },
+    ), { stopReason: "toolUse" }),
+    losslessBatchResponse,
+  ]);
+
+  const result = await runBook({
+    ...fixture.options,
+    maxAttempts: 1,
+    runtimeProfileStore: runtimeProfiles,
+  });
+  const observations = runtimeProfiles.observationsForProfile("faux-1:en");
+
+  assert.deepEqual(
+    observations.map((observation) => observation.status),
+    ["protocol", "success"],
+  );
+  assert.ok(observations.every((observation) => observation.usage.complete));
+  assert.equal(
+    observations.reduce(
+      (total, observation) => total + observation.usage.totalTokens,
+      0,
+    ),
+    result.scheduler.actualTokens,
+  );
+  runtimeProfiles.close();
 });
 
 test("fast mode resolves lexical anchors with one framed primary call and leaves high effort for escalation", async () => {
@@ -2122,7 +2395,7 @@ test("lossless resume synchronizes newer book knowledge before the next wave", a
 
 function commitManualKnowledge(
   storePath: string,
-  objectType: "term" | "style",
+  objectType: "term" | "memory" | "style",
   normalizedSubject: string,
   kind: string,
   fieldPatch: Record<string, string | boolean>,
@@ -2432,6 +2705,62 @@ test("reverse physical completion still promotes lossless windows in ordinal ord
   const styleStore = new LosslessBookStore(fixture.options.storePath);
   assert.deepEqual(styleStore.styleObservations("run-lossless").map((item) => item.ordinal), [0, 1]);
   styleStore.close();
+});
+
+test("dynamic completion order never changes promotion order", async () => {
+  const fixture = losslessFixture("a quiet room.[[]]the empty court.");
+  const completionOrder: number[] = [];
+  fixture.faux.setResponses([
+    async (context) => {
+      await new Promise((resolveDelay) => setTimeout(resolveDelay, 25));
+      completionOrder.push(0);
+      return losslessBatchResponse(context);
+    },
+    async (context) => {
+      completionOrder.push(1);
+      return losslessBatchResponse(context);
+    },
+  ]);
+
+  const result = await runBook({
+    ...fixture.options,
+    schedulerMode: "active",
+    optimizationProfile: "speed",
+    tinyWindowTokens: 1,
+    maxWindowsPerRequest: 1,
+    maxConcurrency: 2,
+  });
+
+  assert.deepEqual(completionOrder, [1, 0]);
+  const database = new DatabaseSync(fixture.options.storePath);
+  const promoted = (database.prepare(`
+    SELECT payload_json FROM events WHERE kind='window_promoted' ORDER BY sequence
+  `).all() as unknown as Array<{ payload_json: string }>).map((row) =>
+    (JSON.parse(row.payload_json) as { windowId: string }).windowId);
+  database.close();
+  assert.deepEqual(promoted, result.windows.map((window) => window.windowId));
+  assert.equal(Object.keys(result.scheduler.contextProfiles).length, 2);
+});
+
+test("active scheduling replans after each physical request completes", async () => {
+  const fixture = losslessFixture("a quiet room.[[]]the empty court.");
+  fixture.faux.setResponses([
+    losslessBatchResponse,
+    losslessBatchResponse,
+  ]);
+
+  const result = await runBook({
+    ...fixture.options,
+    schedulerMode: "active",
+    optimizationProfile: "balanced",
+    tinyWindowTokens: 1,
+    maxWindowsPerRequest: 1,
+    maxConcurrency: 1,
+  });
+
+  assert.equal(result.status.completedWindows, 2);
+  assert.equal(result.scheduler.decisions, 2);
+  assert.equal(result.scheduler.fallbacks, 0);
 });
 
 test("book runner warms up, runs a parallel wave, and resumes without model calls", async () => {

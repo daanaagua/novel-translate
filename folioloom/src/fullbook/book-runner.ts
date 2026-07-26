@@ -43,6 +43,10 @@ import {
   type KnowledgeRevision,
 } from "../knowledge/knowledge-store.js";
 import {
+  collectTranslationKnowledgeCandidates,
+  type TranslationKnowledgeCandidate,
+} from "../knowledge/translation-knowledge-projection.js";
+import {
   mergeStyleState,
   persistedStyleFromKnowledge,
 } from "../knowledge/persisted-style.js";
@@ -59,7 +63,10 @@ import {
   WeightedTokenEstimator,
   type UsageObservation,
 } from "../source/token-estimator.js";
-import { analyzeSourceAnomalies } from "../source/anomaly-report.js";
+import {
+  analyzeSourceAnomalies,
+  type SourceAnomalyReport,
+} from "../source/anomaly-report.js";
 import {
   runTranslationWindow,
   type PilotResult,
@@ -100,7 +107,13 @@ import {
 } from "./adaptive-scheduler.js";
 import { CommitCoordinator } from "./commit-coordinator.js";
 import {
+  planContextProfiles,
+  type ContextProfile,
+  type ContextProfileName,
+} from "./context-profile-planner.js";
+import {
   DynamicScheduler,
+  type SchedulerDispatchReport,
   type SchedulerRunReport,
 } from "./dynamic-scheduler.js";
 import {
@@ -110,11 +123,14 @@ import {
 import {
   optimizationPolicy,
   profileFromLegacyRunMode,
+  validateRuntimeVariants,
   type OptimizationProfile,
   type SchedulerMode,
 } from "./optimization-policy.js";
 import {
   planRollingHorizon,
+  type PlannedTaskDispatch,
+  type RunningTaskReservation,
   type RollingPlannerInput,
   type TaskExecutionVariant,
 } from "./rolling-horizon-planner.js";
@@ -130,7 +146,11 @@ import {
   type RuntimeObservationStatus,
 } from "./runtime-telemetry.js";
 import { buildTaskGraph, type SchedulerTask } from "./task-graph.js";
-import { assessTaskRisk } from "./task-risk.js";
+import {
+  assessTaskRisk,
+  type TaskRelationKind,
+  type TaskRiskAssessment,
+} from "./task-risk.js";
 import {
   drainKnowledgeRevalidationTasks,
   emptyRevalidationDrainReport,
@@ -1174,6 +1194,13 @@ function normalizeRuntimeSet(options: LosslessBookRunOptions): TranslationRuntim
       || runtimeSet.primary.streamFn !== runtimeSet.escalation.streamFn)) {
     throw new TypeError("quality mode cannot change effort during retries or repair");
   }
+  if (runtimeSet.mode === "fast"
+    && runtimeEffortRank(runtimeSet.escalation)
+      < runtimeEffortRank(runtimeSet.primary)) {
+    throw new TypeError(
+      "fast mode escalation runtime cannot use lower effort than primary",
+    );
+  }
   return runtimeSet;
 }
 
@@ -1253,10 +1280,35 @@ const RUNTIME_EFFORT_RANK = new Map<string, number>([
   ["max", 6],
 ]);
 
+const CONTEXT_PROFILE_ORDER = [
+  "lean",
+  "balanced",
+  "rich",
+] as const satisfies readonly ContextProfileName[];
+const TRANSLATION_VALIDATORS = [
+  "structure",
+  "terminology",
+  "cross_block",
+  "knowledge_coverage",
+] as const;
+
+interface PlannedTranslationExecution {
+  readonly admitted: AdmittedRequest<TranslationRequestInput>;
+  readonly runtime: TranslationRuntime;
+  readonly buildInput: (
+    request: PhysicalRequestPlan,
+  ) => TranslationRequestInput;
+  readonly features: RuntimeFeatures;
+  readonly variant: TaskExecutionVariant;
+}
+
 interface DynamicRequestPlanning {
   readonly input: RollingPlannerInput;
-  readonly featuresByTaskId: ReadonlyMap<string, RuntimeFeatures>;
-  readonly variantsByTaskId: ReadonlyMap<string, TaskExecutionVariant>;
+  readonly executionsByVariantId: ReadonlyMap<
+    string,
+    PlannedTranslationExecution
+  >;
+  readonly legacyByTaskId: ReadonlyMap<string, PlannedTranslationExecution>;
   readonly baselineTokens: number;
 }
 
@@ -1268,10 +1320,333 @@ function runtimeEffortRank(runtime: TranslationRuntime): number {
   return RUNTIME_EFFORT_RANK.get(runtimeEffort(runtime)) ?? 4;
 }
 
-function dynamicRequestPlanning<TInput extends TranslationRequestInput>(
-  requests: readonly AdmittedRequest<TInput>[],
+function contextProfileRank(profile: ContextProfileName): number {
+  return CONTEXT_PROFILE_ORDER.indexOf(profile);
+}
+
+function requestBlocks(
+  request: PhysicalRequestPlan,
+  blockById: ReadonlyMap<string, LosslessBlock>,
+): readonly LosslessBlock[] {
+  return request.windows.flatMap((window) => window.blockIds.map((blockId) => {
+    const block = blockById.get(blockId);
+    if (block === undefined) {
+      throw new Error(`translation request references unknown block ${blockId}`);
+    }
+    return block;
+  }));
+}
+
+function sourceAnomaliesForRequest(
+  request: PhysicalRequestPlan,
+  report: SourceAnomalyReport,
+  blockById: ReadonlyMap<string, LosslessBlock>,
+): number {
+  const blocks = requestBlocks(request, blockById);
+  const sampledGlobalCount = report.findings.flatMap((finding) =>
+    finding.samples)
+    .filter((sample) => blocks.some((block) =>
+      sample.scalarStart < block.canonicalEnd
+      && sample.scalarEnd > block.canonicalStart))
+    .length;
+  const localReport = analyzeSourceAnomalies(
+    blocks.map((block) => block.sourceText).join("\n"),
+  );
+  const localCount = Object.values(localReport.counts).reduce(
+    (total, count) => total + count,
+    0,
+  );
+  return Math.max(sampledGlobalCount, localCount);
+}
+
+function countLiteralOccurrences(haystack: string, needle: string): number {
+  if (needle.length === 0) return 0;
+  let count = 0;
+  let offset = 0;
+  while (offset < haystack.length) {
+    const found = haystack.indexOf(needle, offset);
+    if (found < 0) break;
+    count += 1;
+    offset = found + needle.length;
+  }
+  return count;
+}
+
+function lockedTermOccurrences(
+  sourceTexts: readonly string[],
+  terms: readonly StableTerm[],
+): number {
+  const source = sourceTexts.join("\n").toLocaleLowerCase("und");
+  return terms
+    .filter((term) => term.locked)
+    .reduce((total, term) =>
+      total + countLiteralOccurrences(
+        source,
+        term.sourceForm.toLocaleLowerCase("und"),
+      ), 0);
+}
+
+function relationKindsForCandidates(
+  candidates: readonly TranslationKnowledgeCandidate[],
+): readonly TaskRelationKind[] {
+  const result = new Set<TaskRelationKind>();
+  for (const dimension of candidates.flatMap((candidate) =>
+    candidate.coverage)) {
+    switch (dimension) {
+      case "entity_identity":
+        result.add("identity");
+        break;
+      case "part_whole":
+        result.add("part_of");
+        break;
+      case "control":
+      case "causality":
+      case "timeline":
+      case "viewpoint":
+      case "character_knowledge":
+        result.add(dimension);
+        break;
+      case "pronoun_resolution":
+        break;
+    }
+  }
+  return [...result];
+}
+
+function contextBudgets(
+  candidates: readonly TranslationKnowledgeCandidate[],
+): Readonly<Record<ContextProfileName, number>> {
+  const total = candidates.reduce(
+    (sum, candidate) => sum + candidate.tokenCost,
+    0,
+  );
+  const mandatory = candidates
+    .filter((candidate) => candidate.mandatory)
+    .reduce((sum, candidate) => sum + candidate.tokenCost, 0);
+  const optional = Math.max(0, total - mandatory);
+  return {
+    lean: mandatory + Math.floor(optional * 0.25),
+    balanced: mandatory + Math.floor(optional * 0.6),
+    rich: total,
+  };
+}
+
+interface TranslationContextPlan {
+  readonly candidates: readonly TranslationKnowledgeCandidate[];
+  readonly profiles: Readonly<Record<
+    ContextProfileName,
+    ContextProfile | undefined
+  >>;
+  readonly risk: TaskRiskAssessment;
+}
+
+function translationContextPlan(
+  request: PhysicalRequestPlan,
+  baseInput: TranslationRequestInput,
+  priorRepairs: number,
+  sourceAnomalyReport: SourceAnomalyReport,
+  blockById: ReadonlyMap<string, LosslessBlock>,
+): TranslationContextPlan {
+  const blocks = requestBlocks(request, blockById);
+  const sourceTexts = blocks.map((block) => block.sourceText);
+  const profile = baseInput.sourceLanguageProfile;
+  if (profile === undefined) {
+    throw new TypeError("dynamic translation planning requires a language profile");
+  }
+  const windowByBlockId = new Map(request.windows.flatMap((window) =>
+    window.blockIds.map((blockId) => [blockId, window.windowId] as const)));
+  const candidates = collectTranslationKnowledgeCandidates(
+    baseInput.snapshot.revisions,
+    sourceTexts,
+    profile,
+    {
+      corpusBlocks: baseInput.blocks.map((block) => ({
+        blockId: block.id,
+        globalIndex: block.globalIndex,
+      })),
+      currentBlocks: blocks.map((block) => ({
+        blockId: block.id,
+        globalIndex: block.globalIndex,
+        windowId: windowByBlockId.get(block.id) as string,
+      })),
+    },
+  );
+  const risk = assessTaskRisk({
+    sourceTokens: request.sourceTokens,
+    entityMentions: candidates.filter((candidate) =>
+      candidate.kind === "entity").length,
+    pronounMentions: candidates.some((candidate) =>
+      candidate.coverage.includes("pronoun_resolution")) ? 4 : 0,
+    relationKinds: relationKindsForCandidates(candidates),
+    remoteEvidenceDistance: candidates.reduce(
+      (maximum, candidate) =>
+        Math.max(maximum, candidate.evidenceDistance ?? 0),
+      0,
+    ),
+    lockedTermOccurrences: lockedTermOccurrences(
+      sourceTexts,
+      baseInput.stableTerms,
+    ),
+    needsRevalidate: candidates.some((candidate) => candidate.mandatory),
+    priorRepairs,
+    sourceAnomalies: sourceAnomaliesForRequest(
+      request,
+      sourceAnomalyReport,
+      blockById,
+    ),
+  });
+  return {
+    candidates,
+    profiles: planContextProfiles({
+      bundles: candidates,
+      requiredCoverage: risk.requiredCoverage,
+      budgets: contextBudgets(candidates),
+    }),
+    risk,
+  };
+}
+
+function revisionIdsForProfile(
+  profile: ContextProfile,
+  candidates: readonly TranslationKnowledgeCandidate[],
+): readonly string[] {
+  const byBundleId = new Map(candidates.map((candidate) => [
+    candidate.bundleId,
+    candidate,
+  ]));
+  return [...new Set(profile.bundleIds.flatMap((bundleId) => {
+    const candidate = byBundleId.get(bundleId);
+    if (candidate === undefined) {
+      throw new Error(`context profile references unknown bundle ${bundleId}`);
+    }
+    return candidate.revisionIds;
+  }))].sort((left, right) => left.localeCompare(right, "en"));
+}
+
+function baselineVariantForTask(
+  item: AdmittedRequest<TranslationRequestInput>,
   options: {
     readonly runtime: TranslationRuntime;
+    readonly risk: TaskRiskAssessment;
+    readonly costModel: OnlineRuntimeCostModel;
+    readonly maxConcurrency: number;
+  },
+): {
+  readonly features: RuntimeFeatures;
+  readonly variant: TaskExecutionVariant;
+} {
+  const protocol = item.fragments[0]?.input.responseProtocol ?? "typed_tool";
+  const features: RuntimeFeatures = {
+    inputTokens: item.fragments.reduce(
+      (total, fragment) => total + fragment.assessment.inputTokens,
+      0,
+    ),
+    outputTokens: item.fragments.reduce(
+      (total, fragment) => total + fragment.assessment.outputTokens,
+      0,
+    ),
+    sourceTokens: item.request.sourceTokens,
+    effortRank: runtimeEffortRank(options.runtime),
+    cacheHitRatio: 0,
+    concurrency: options.maxConcurrency,
+    batchWindows: item.request.windows.length,
+    riskScore: options.risk.score,
+    protocolRank: protocol === "typed_tool" ? 1 : 0,
+  };
+  const fragmentPredictions = item.fragments.map((fragment) => {
+    const predicted = options.costModel.predict({
+      ...features,
+      inputTokens: fragment.assessment.inputTokens,
+      outputTokens: fragment.assessment.outputTokens,
+      sourceTokens: fragment.request.sourceTokens,
+      batchWindows: fragment.request.windows.length,
+    });
+    return {
+      ...predicted,
+      totalTokens: Math.max(
+        predicted.totalTokens,
+        fragment.assessment.totalReserved,
+      ),
+    };
+  });
+  const predicted = {
+    p50DurationMs: fragmentPredictions.reduce(
+      (total, prediction) => total + prediction.p50DurationMs,
+      0,
+    ),
+    p90DurationMs: fragmentPredictions.reduce(
+      (total, prediction) => total + prediction.p90DurationMs,
+      0,
+    ),
+    inputTokens: fragmentPredictions.reduce(
+      (total, prediction) => total + prediction.inputTokens,
+      0,
+    ),
+    outputTokens: fragmentPredictions.reduce(
+      (total, prediction) => total + prediction.outputTokens,
+      0,
+    ),
+    totalTokens: fragmentPredictions.reduce(
+      (total, prediction) => total + prediction.totalTokens,
+      0,
+    ),
+    failureProbability: 1 - fragmentPredictions.reduce(
+      (success, prediction) =>
+        success * (1 - prediction.failureProbability),
+      1,
+    ),
+    confidence: fragmentPredictions.reduce(
+      (minimum, prediction) => Math.min(minimum, prediction.confidence),
+      1,
+    ),
+  };
+  return {
+    features,
+    variant: {
+      variantId: `${item.request.requestId}:baseline`,
+      taskId: item.request.requestId,
+      contextProfile: "rich",
+      effort: runtimeEffort(options.runtime),
+      effortRank: features.effortRank,
+      protocol,
+      validators: TRANSLATION_VALIDATORS,
+      predicted,
+    },
+  };
+}
+
+function planningRuntimes(
+  runtimeSet: TranslationRuntimeSet,
+  executionRuntime: TranslationRuntime,
+  retryRound: number,
+): readonly TranslationRuntime[] {
+  if (runtimeSet.mode === "quality") {
+    return [executionRuntime];
+  }
+  const variants = validateRuntimeVariants([
+    executionRuntime,
+    ...(runtimeSet.variants ?? []),
+    runtimeSet.escalation,
+  ]);
+  if (retryRound === 0) return variants;
+  const minimumRank = runtimeEffortRank(executionRuntime);
+  return variants.filter((runtime) =>
+    runtimeEffortRank(runtime) >= minimumRank);
+}
+
+function dynamicRequestPlanning(
+  requests: readonly PhysicalRequestPlan[],
+  legacyRequests: readonly AdmittedRequest<TranslationRequestInput>[],
+  options: {
+    readonly runtimeSet: TranslationRuntimeSet;
+    readonly executionRuntime: TranslationRuntime;
+    readonly mode: SchedulerMode;
+    readonly buildBaseInput: (
+      request: PhysicalRequestPlan,
+    ) => TranslationRequestInput;
+    readonly estimator: WeightedTokenEstimator;
+    readonly sourceAnomalyReport: SourceAnomalyReport;
+    readonly blockById: ReadonlyMap<string, LosslessBlock>;
     readonly snapshotId: string;
     readonly retryRound: number;
     readonly costModel: OnlineRuntimeCostModel;
@@ -1282,71 +1657,197 @@ function dynamicRequestPlanning<TInput extends TranslationRequestInput>(
     readonly maxInFlightTokens: number;
   },
 ): DynamicRequestPlanning {
-  const protocol = requests[0]?.fragments[0]?.input.responseProtocol
-    ?? "typed_tool";
-  const featuresByTaskId = new Map<string, RuntimeFeatures>();
-  const variantsByTaskId = new Map<string, TaskExecutionVariant>();
-  const tasks: SchedulerTask[] = requests.map((item, ordinal) => {
-    const risk = assessTaskRisk({
-      sourceTokens: item.request.sourceTokens,
-      entityMentions: 0,
-      pronounMentions: 0,
-      relationKinds: [],
-      remoteEvidenceDistance: 0,
-      lockedTermOccurrences: 0,
-      needsRevalidate: false,
-      priorRepairs: options.retryRound,
-      sourceAnomalies: 0,
+  const legacyByTaskId = new Map<string, PlannedTranslationExecution>();
+  const executionsByVariantId = new Map<string, PlannedTranslationExecution>();
+  const variants: TaskExecutionVariant[] = [];
+  const baselineVariants: TaskExecutionVariant[] = [];
+  const legacyRequestById = new Map(legacyRequests.map((item) => [
+    item.request.requestId,
+    item,
+  ]));
+  const runtimes = options.mode === "off"
+    ? [options.executionRuntime]
+    : planningRuntimes(
+      options.runtimeSet,
+      options.executionRuntime,
+      options.retryRound,
+    );
+
+  const tasks: SchedulerTask[] = requests.map((request, ordinal) => {
+    const baseInput = options.buildBaseInput(request);
+    const contextPlan = options.mode === "off"
+      ? undefined
+      : translationContextPlan(
+        request,
+        baseInput,
+        options.retryRound,
+        options.sourceAnomalyReport,
+        options.blockById,
+      );
+    const risk = contextPlan === undefined
+      ? assessTaskRisk({
+        sourceTokens: request.sourceTokens,
+        entityMentions: 0,
+        pronounMentions: 0,
+        relationKinds: [],
+        remoteEvidenceDistance: 0,
+        lockedTermOccurrences: 0,
+        needsRevalidate: false,
+        priorRepairs: options.retryRound,
+        sourceAnomalies: 0,
+      })
+      : contextPlan.risk;
+    const legacy = legacyRequestById.get(request.requestId);
+    if (legacy === undefined) {
+      throw new Error(`missing baseline admission for ${request.requestId}`);
+    }
+    const baseline = baselineVariantForTask(legacy, {
+      runtime: options.executionRuntime,
+      risk,
+      costModel: options.costModel,
+      maxConcurrency: options.maxConcurrency,
     });
-    const features: RuntimeFeatures = {
-      inputTokens: item.assessment.inputTokens,
-      outputTokens: item.assessment.outputTokens,
-      sourceTokens: item.request.sourceTokens,
-      effortRank: runtimeEffortRank(options.runtime),
-      cacheHitRatio: 0,
-      concurrency: options.maxConcurrency,
-      batchWindows: item.request.windows.length,
-      riskScore: risk.score,
-      protocolRank: protocol === "typed_tool" ? 1 : 0,
-    };
-    const rawPrediction = options.costModel.predict(features);
-    const variant: TaskExecutionVariant = {
-      variantId: `${item.request.requestId}:legacy`,
-      taskId: item.request.requestId,
-      contextProfile: "rich",
-      effort: runtimeEffort(options.runtime),
-      effortRank: features.effortRank,
-      protocol,
-      validators: [
-        "structure",
-        "terminology",
-        "cross_block",
-        "knowledge_coverage",
-      ],
-      predicted: {
-        ...rawPrediction,
-        totalTokens: Math.max(
-          rawPrediction.totalTokens,
-          item.assessment.totalReserved,
-        ),
-      },
-    };
-    featuresByTaskId.set(item.request.requestId, features);
-    variantsByTaskId.set(item.request.requestId, variant);
+    baselineVariants.push(baseline.variant);
+    legacyByTaskId.set(request.requestId, {
+      admitted: legacy,
+      runtime: options.executionRuntime,
+      buildInput: options.buildBaseInput,
+      features: baseline.features,
+      variant: baseline.variant,
+    });
+
+    if (contextPlan === undefined) {
+      return {
+        taskId: request.requestId,
+        type: "translate",
+        ordinal: request.windows[0]?.ordinal ?? ordinal,
+        dependencyIds: [],
+        readResources: [`snapshot:${options.snapshotId}`],
+        writeResources: request.windows.map((window) =>
+          `window:${window.windowId}`),
+        sourceTokens: request.sourceTokens,
+        risk,
+      };
+    }
+
+    const originalProtocol = baseInput.responseProtocol ?? "typed_tool";
+    const protocols = originalProtocol === "typed_tool"
+      ? ["typed_tool", "framed_text"] as const
+      : ["framed_text"] as const;
+    for (const profileName of CONTEXT_PROFILE_ORDER) {
+      const selectedProfile = contextPlan.profiles[profileName];
+      if (selectedProfile === undefined
+        || contextProfileRank(profileName)
+          < contextProfileRank(risk.minimumContextProfile)) {
+        continue;
+      }
+      const buildSelectedInput = (
+        selectedRequest: PhysicalRequestPlan,
+        protocol: "typed_tool" | "framed_text",
+      ): TranslationRequestInput => {
+        const selectedBase = options.buildBaseInput(selectedRequest);
+        const selectedPlan = selectedRequest === request
+          ? contextPlan
+          : translationContextPlan(
+            selectedRequest,
+            selectedBase,
+            options.retryRound,
+            options.sourceAnomalyReport,
+            options.blockById,
+          );
+        const profile = selectedPlan.profiles[profileName];
+        if (profile === undefined) {
+          throw new RangeError(
+            `${profileName} context is infeasible for ${selectedRequest.requestId}`,
+          );
+        }
+        return {
+          ...selectedBase,
+          selectedKnowledgeRevisionIds: revisionIdsForProfile(
+            profile,
+            selectedPlan.candidates,
+          ),
+          contextProfileName: profileName,
+          responseProtocol: protocol,
+        };
+      };
+      for (const [runtimeIndex, runtime] of runtimes.entries()) {
+        for (const protocol of protocols) {
+          const buildInput = (selectedRequest: PhysicalRequestPlan) =>
+            buildSelectedInput(selectedRequest, protocol);
+          const fragment = assessTranslationFragment(
+            request,
+            runtime,
+            options.estimator,
+            buildInput,
+          );
+          if (!fragment.assessment.fits
+            || fragment.assessment.totalReserved > options.maxInFlightTokens) {
+            continue;
+          }
+          const features: RuntimeFeatures = {
+            inputTokens: fragment.assessment.inputTokens,
+            outputTokens: fragment.assessment.outputTokens,
+            sourceTokens: request.sourceTokens,
+            effortRank: runtimeEffortRank(runtime),
+            cacheHitRatio: 0,
+            concurrency: options.maxConcurrency,
+            batchWindows: request.windows.length,
+            riskScore: risk.score,
+            protocolRank: protocol === "typed_tool" ? 1 : 0,
+          };
+          const rawPrediction = options.costModel.predict(features);
+          const variant: TaskExecutionVariant = {
+            variantId: [
+              request.requestId,
+              `context-${profileName}`,
+              `runtime-${runtimeIndex}`,
+              `effort-${String(features.effortRank).padStart(2, "0")}`,
+              `protocol-${protocol}`,
+            ].join(":"),
+            taskId: request.requestId,
+            contextProfile: profileName,
+            effort: runtimeEffort(runtime),
+            effortRank: features.effortRank,
+            protocol,
+            validators: TRANSLATION_VALIDATORS,
+            predicted: {
+              ...rawPrediction,
+              totalTokens: Math.max(
+                rawPrediction.totalTokens,
+                fragment.assessment.totalReserved,
+              ),
+            },
+          };
+          const execution: PlannedTranslationExecution = {
+            admitted: {
+              request,
+              fragments: [fragment],
+              assessment: fragment.assessment,
+            },
+            runtime,
+            buildInput,
+            features,
+            variant,
+          };
+          variants.push(variant);
+          executionsByVariantId.set(variant.variantId, execution);
+        }
+      }
+    }
     return {
-      taskId: item.request.requestId,
+      taskId: request.requestId,
       type: "translate",
-      ordinal: item.request.windows[0]?.ordinal ?? ordinal,
+      ordinal: request.windows[0]?.ordinal ?? ordinal,
       dependencyIds: [],
       readResources: [`snapshot:${options.snapshotId}`],
-      writeResources: item.request.windows.map((window) =>
+      writeResources: request.windows.map((window) =>
         `window:${window.windowId}`),
-      sourceTokens: item.request.sourceTokens,
+      sourceTokens: request.sourceTokens,
       risk,
     };
   });
-  const variants = [...variantsByTaskId.values()];
-  const horizonBaselineTokens = variants.reduce(
+  const horizonBaselineTokens = baselineVariants.reduce(
     (total, variant) => total + variant.predicted.totalTokens,
     0,
   );
@@ -1358,15 +1859,16 @@ function dynamicRequestPlanning<TInput extends TranslationRequestInput>(
       variants,
       policy: optimizationPolicy(options.profile),
       runBaselineTotalTokens:
-        options.cumulativeBaselineTokens + horizonBaselineTokens,
+        options.cumulativeBaselineTokens
+        + (options.retryRound === 0 ? horizonBaselineTokens : 0),
       actualRunTokens: options.actualRunTokens,
       runningReservedTokens: 0,
       horizonBaselineTokens,
       maxConcurrency: options.maxConcurrency,
       maxInFlightTokens: options.maxInFlightTokens,
     },
-    featuresByTaskId,
-    variantsByTaskId,
+    executionsByVariantId,
+    legacyByTaskId,
     baselineTokens: horizonBaselineTokens,
   };
 }
@@ -1786,6 +2288,174 @@ async function runWithAdaptiveScheduler<TInput, TOutput>(
   return completed;
 }
 
+interface RunningTranslation<T> {
+  readonly execution: PlannedTranslationExecution;
+  readonly promise: Promise<void>;
+  readonly startedAt: number;
+  readonly reservedTokens: number;
+}
+
+async function runWithDynamicScheduler<T>(
+  planning: DynamicRequestPlanning,
+  scheduler: AdaptiveScheduler,
+  dynamicScheduler: DynamicScheduler,
+  worker: (
+    execution: PlannedTranslationExecution,
+  ) => Promise<ScheduledResult<T>>,
+  options: {
+    readonly actualRunTokens: () => number;
+    readonly decision: () => {
+      readonly decisionId: string;
+      readonly runId: string;
+      readonly createdAt: string;
+    };
+    readonly onDecision: (report: SchedulerDispatchReport) => void;
+    readonly onLaunch: (execution: PlannedTranslationExecution) => void;
+    readonly onComplete: (
+      value: T,
+      execution: PlannedTranslationExecution,
+    ) => void;
+    readonly signal?: AbortSignal;
+  },
+): Promise<T[]> {
+  const taskOrder = planning.input.graph.tasks.map((task) => task.taskId);
+  const pending = new Set(taskOrder);
+  const completedTaskIds = new Set<string>();
+  const running = new Map<string, RunningTranslation<T>>();
+  const completed: T[] = [];
+
+  while (pending.size > 0 || running.size > 0) {
+    throwIfAborted(options.signal);
+    if (pending.size > 0) {
+      const now = performance.now();
+      const reservations: RunningTaskReservation[] = [...running.entries()]
+        .map(([taskId, item]) => ({
+          taskId,
+          variantId: item.execution.variant.variantId,
+          remainingP90DurationMs: Math.max(
+            0,
+            item.execution.variant.predicted.p90DurationMs
+              - (now - item.startedAt),
+          ),
+          reservedTokens: item.reservedTokens,
+        }));
+      const runningReservedTokens = reservations.reduce(
+        (total, reservation) => total + reservation.reservedTokens,
+        0,
+      );
+      const horizonBaselineTokens = [...pending].reduce((total, taskId) =>
+        total + (
+          planning.legacyByTaskId.get(taskId)?.variant.predicted.totalTokens
+            ?? 0
+        ), 0);
+      const refreshedExecutions = new Map(
+        [...planning.executionsByVariantId].map(([variantId, execution]) => {
+          const predicted = dynamicScheduler.costModel.predict(
+            execution.features,
+          );
+          return [variantId, {
+            ...execution,
+            variant: {
+              ...execution.variant,
+              predicted: {
+                ...predicted,
+                totalTokens: Math.max(
+                  predicted.totalTokens,
+                  execution.admitted.assessment.totalReserved,
+                ),
+              },
+            },
+          }] as const;
+        }),
+      );
+      const adaptiveConcurrency = scheduler.snapshot().concurrency;
+      const report = dynamicScheduler.dispatch(
+        {
+          ...planning.input,
+          variants: [...refreshedExecutions.values()].map((execution) =>
+            execution.variant),
+          completedTaskIds: [...completedTaskIds],
+          running: reservations,
+          actualRunTokens: options.actualRunTokens(),
+          runningReservedTokens,
+          horizonBaselineTokens,
+          maxConcurrency: Math.max(adaptiveConcurrency, reservations.length),
+        },
+        {
+          legacyTaskIds: taskOrder.filter((taskId) => pending.has(taskId)),
+          decision: options.decision(),
+        },
+      );
+      options.onDecision(report);
+
+      const dispatches: readonly PlannedTaskDispatch[] =
+        report.planningStatus === "fallback"
+          ? report.dispatchedTaskIds.map((taskId) => ({
+            taskId,
+            variantId: "",
+          }))
+          : report.dispatchedVariants;
+      let launched = 0;
+      for (const dispatch of dispatches) {
+        if (!pending.has(dispatch.taskId)) continue;
+        const execution = report.planningStatus === "fallback"
+          ? planning.legacyByTaskId.get(dispatch.taskId)
+          : refreshedExecutions.get(dispatch.variantId);
+        if (execution === undefined) {
+          throw new Error(
+            `scheduler selected unknown translation variant ${dispatch.variantId}`,
+          );
+        }
+        const permit = scheduler.tryAcquire(
+          execution.admitted.assessment.totalReserved,
+        );
+        if (permit === undefined) continue;
+
+        pending.delete(dispatch.taskId);
+        options.onLaunch(execution);
+        const startedAt = performance.now();
+        let promise: Promise<void>;
+        promise = (async () => {
+          const result = await worker(execution);
+          completed.push(result.value);
+          completedTaskIds.add(dispatch.taskId);
+          scheduler.observe({
+            status: result.status,
+            durationMs: performance.now() - startedAt,
+            estimatedTokens: execution.admitted.assessment.totalReserved,
+          });
+          options.onComplete(result.value, execution);
+        })().finally(() => {
+          permit.release();
+          running.delete(dispatch.taskId);
+        });
+        running.set(dispatch.taskId, {
+          execution,
+          promise,
+          startedAt,
+          reservedTokens: execution.variant.predicted.totalTokens,
+        });
+        launched += 1;
+      }
+      if (launched > 0) {
+        await Promise.race([...running.values()].map((item) => item.promise));
+        continue;
+      }
+    }
+
+    if (running.size === 0) {
+      const smallest = Math.min(...[...pending].map((taskId) =>
+        planning.legacyByTaskId.get(taskId)?.admitted.assessment.totalReserved
+          ?? Number.POSITIVE_INFINITY));
+      throw new RangeError(
+        `maxInFlightTokens cannot admit the smallest request reservation (${smallest})`,
+      );
+    }
+    await Promise.race([...running.values()].map((item) => item.promise));
+  }
+  return completed;
+}
+
 async function runLosslessBook(
   options: LosslessBookRunOptions,
 ): Promise<LosslessBookRunResult> {
@@ -1847,6 +2517,9 @@ async function runLosslessBook(
       ? {}
       : { legacyV4DbPath: options.legacyV4DbPath }),
   });
+  const sourceAnomalyReport = analyzeSourceAnomalies(
+    context.sourceLedger.sourceText,
+  );
   const glossaryExpectedSourceVersion = context.sourceLedger.sourceVersion;
   if (options.glossary?.sourceVersion !== undefined
     && options.glossary.sourceVersion !== glossaryExpectedSourceVersion) {
@@ -1893,6 +2566,10 @@ async function runLosslessBook(
     predictedTokens: 0,
     actualTokens: 0,
     tokenUsageComplete: true,
+    contextProfiles: {} as Record<
+      string,
+      "lean" | "balanced" | "rich"
+    >,
   };
 
   try {
@@ -2517,8 +3194,14 @@ async function runLosslessBook(
             + `(${oversizedReservation.assessment.totalReserved} tokens)`,
           );
         }
-        const requestPlanning = dynamicRequestPlanning(requestInputs, {
-          runtime: executionRuntime,
+        const requestPlanning = dynamicRequestPlanning(requests, requestInputs, {
+          runtimeSet,
+          executionRuntime,
+          mode: schedulerMode,
+          buildBaseInput: buildTranslationInput,
+          estimator,
+          sourceAnomalyReport,
+          blockById,
           snapshotId: snapshot.id,
           retryRound,
           costModel: runtimeCostModel,
@@ -2528,30 +3211,28 @@ async function runLosslessBook(
           maxConcurrency,
           maxInFlightTokens,
         });
-        cumulativeBaselineTokens += requestPlanning.baselineTokens;
+        if (retryRound === 0) {
+          cumulativeBaselineTokens += requestPlanning.baselineTokens;
+        }
         const decisionOrdinal = schedulerMetrics.decisions;
-        const dispatchReport = dynamicScheduler.dispatch(
-          requestPlanning.input,
-          {
-            legacyTaskIds: requestInputs.map((item) =>
-              item.request.requestId),
-            decision: {
-              decisionId: `decision-${createHash("sha256")
-                .update([
-                  runId,
-                  String(waves.length),
-                  String(retryRound),
-                  String(decisionOrdinal),
-                  ...requestInputs.map((item) => item.request.requestId),
-                ].join("\0"), "utf8")
-                .digest("hex")
-                .slice(0, 24)}`,
+        const decisionMetadata = () => ({
+          decisionId: `decision-${createHash("sha256")
+            .update([
               runId,
-              createdAt: new Date().toISOString(),
-            },
-          },
-        );
-        if (schedulerMode !== "off") {
+              String(waves.length),
+              String(retryRound),
+              String(schedulerMetrics.decisions),
+              ...requestInputs.map((item) => item.request.requestId),
+            ].join("\0"), "utf8")
+            .digest("hex")
+            .slice(0, 24)}`,
+          runId,
+          createdAt: new Date().toISOString(),
+        });
+        const recordDispatchReport = (
+          dispatchReport: SchedulerDispatchReport,
+        ): void => {
+          if (schedulerMode === "off") return;
           schedulerMetrics.decisions += 1;
           if (dispatchReport.planningStatus === "fallback"
             || dispatchReport.fallbackReason !== undefined) {
@@ -2566,6 +3247,17 @@ async function runLosslessBook(
                 ? 0
                 : schedulerMetrics.actualTokens),
           );
+        };
+        if (schedulerMode !== "active") {
+          const dispatchReport = dynamicScheduler.dispatch(
+            requestPlanning.input,
+            {
+              legacyTaskIds: requestInputs.map((item) =>
+                item.request.requestId),
+              decision: decisionMetadata(),
+            },
+          );
+          recordDispatchReport(dispatchReport);
         }
         const claimed = new Map<string, PersistedLosslessWindow>();
         throwIfAborted(options.signal);
@@ -2585,24 +3277,39 @@ async function runLosslessBook(
           runtime: {
             readonly durationMs: number;
             readonly usage: NormalizedRuntimeUsage;
+            readonly observationDurationMs: number;
+            readonly observationUsage: NormalizedRuntimeUsage;
             readonly status: RuntimeObservationStatus;
             readonly features: RuntimeFeatures;
             readonly variant: TaskExecutionVariant;
+            readonly recoveries: readonly {
+              readonly durationMs: number;
+              readonly usage: NormalizedRuntimeUsage;
+              readonly status: Exclude<RuntimeObservationStatus, "success">;
+              readonly protocol: "typed_tool" | "framed_text";
+            }[];
           };
         };
         const dynamicExecutionStartedAt = performance.now();
-        const completionOrder = await runWithAdaptiveScheduler(
-          requestInputs,
-          scheduler,
-          async ({ request, fragments }): Promise<ScheduledResult<CompletedRequest>> => {
+        const executePlannedRequest = async (
+          execution: PlannedTranslationExecution,
+        ): Promise<ScheduledResult<CompletedRequest>> => {
+            const {
+              admitted: { request, fragments },
+              runtime: selectedRuntime,
+              buildInput: selectedBuildInput,
+              features,
+              variant,
+            } = execution;
             const requestStartedAt = performance.now();
             const observedRuns: PiRunResult[] = [];
-            const features = requestPlanning.featuresByTaskId.get(
-              request.requestId,
-            ) as RuntimeFeatures;
-            const variant = requestPlanning.variantsByTaskId.get(
-              request.requestId,
-            ) as TaskExecutionVariant;
+            const recoveryRuns = new Set<PiRunResult>();
+            const recoveries: Array<{
+              durationMs: number;
+              usage: NormalizedRuntimeUsage;
+              status: Exclude<RuntimeObservationStatus, "success">;
+              protocol: "typed_tool" | "framed_text";
+            }> = [];
             // Fragments are one logical provider operation. Reusing the ledger
             // preserves the original hard ceilings instead of multiplying every
             // budget limit by the number of context-recovery fragments.
@@ -2612,11 +3319,12 @@ async function runLosslessBook(
             let protocolSplitAttempts = 0;
             const executeFragments = async (
               pendingFragments: readonly AdmittedRequestFragment<TranslationRequestInput>[],
-              activeRuntime: TranslationRuntime = executionRuntime,
+              activeRuntime: TranslationRuntime = selectedRuntime,
               retryingLocally = false,
             ): Promise<FragmentTranslationExecution[]> => {
               const completed: FragmentTranslationExecution[] = [];
               for (const fragment of pendingFragments) {
+                const fragmentStartedAt = performance.now();
                 try {
                   throwIfAborted(options.signal);
                   const result = await runTranslationBatch({
@@ -2665,6 +3373,17 @@ async function runLosslessBook(
                       recoverableWindowIds,
                     );
                     if (failedRequest.windows.length > 0) {
+                      const failedRuns = [
+                        result.run,
+                        ...result.repairRuns,
+                      ];
+                      failedRuns.forEach((run) => recoveryRuns.add(run));
+                      recoveries.push({
+                        durationMs: performance.now() - fragmentStartedAt,
+                        usage: runtimeUsageForRuns(failedRuns),
+                        status: "protocol",
+                        protocol: "typed_tool",
+                      });
                       protocolSplitAttempts += 1;
                       const validWindows = result.windows.filter((window) =>
                         !recoverableWindowIds.has(window.windowId));
@@ -2677,7 +3396,7 @@ async function runLosslessBook(
                       const buildFramedTranslationInput = (
                         request: PhysicalRequestPlan,
                       ): TranslationRequestInput => ({
-                        ...buildTranslationInput(request),
+                        ...selectedBuildInput(request),
                         responseProtocol: "framed_text",
                       });
                       const admittedFallback = admitTranslationFragments(
@@ -2710,6 +3429,20 @@ async function runLosslessBook(
                       blockById,
                     );
                     if (children.length > 0) {
+                      const failedRuns = [
+                        result.run,
+                        ...result.repairRuns,
+                      ];
+                      failedRuns.forEach((run) => recoveryRuns.add(run));
+                      recoveries.push({
+                        durationMs: performance.now() - fragmentStartedAt,
+                        usage: runtimeUsageForRuns(failedRuns),
+                        status: structuralWindowIds.size > 0
+                          ? "protocol"
+                          : "failed",
+                        protocol: fragment.input.responseProtocol
+                          ?? "typed_tool",
+                      });
                       protocolSplitAttempts += 1;
                       const validWindows = result.windows.filter((window) =>
                         !recoverableWindowIds.has(window.windowId));
@@ -2724,7 +3457,7 @@ async function runLosslessBook(
                         runtimeSet.escalation,
                         estimator,
                         blockById,
-                        buildTranslationInput,
+                        selectedBuildInput,
                         fragment.depth + 1,
                       );
                       completed.push(...await executeFragments(
@@ -2737,10 +3470,48 @@ async function runLosslessBook(
                   }
                   completed.push({ fragment, result });
                 } catch (error) {
+                  if (error instanceof ModelProviderError
+                    && error.kind === "protocol"
+                    && fragment.input.responseProtocol === "typed_tool"
+                    && protocolSplitAttempts < MAX_PROTOCOL_SPLIT_ATTEMPTS) {
+                    recoveries.push({
+                      durationMs: performance.now() - fragmentStartedAt,
+                      usage: runtimeUsageForRuns([]),
+                      status: "protocol",
+                      protocol: "typed_tool",
+                    });
+                    protocolSplitAttempts += 1;
+                    const buildFramedTranslationInput = (
+                      request: PhysicalRequestPlan,
+                    ): TranslationRequestInput => ({
+                      ...selectedBuildInput(request),
+                      responseProtocol: "framed_text",
+                    });
+                    const admittedFallback = admitTranslationFragments(
+                      [fragment.request],
+                      activeRuntime,
+                      estimator,
+                      blockById,
+                      buildFramedTranslationInput,
+                      fragment.depth,
+                    );
+                    completed.push(...await executeFragments(
+                      admittedFallback,
+                      activeRuntime,
+                      false,
+                    ));
+                    continue;
+                  }
                   if (!(error instanceof ModelProviderError) || error.kind !== "context") {
                     throw error;
                   }
                   observedContextOverflow = true;
+                  recoveries.push({
+                    durationMs: performance.now() - fragmentStartedAt,
+                    usage: runtimeUsageForRuns([]),
+                    status: "context",
+                    protocol: fragment.input.responseProtocol ?? "typed_tool",
+                  });
                   contextSplitAttempts += 1;
                   const children = splitPhysicalRequestAtBoundaries(
                     fragment.request,
@@ -2764,7 +3535,7 @@ async function runLosslessBook(
                     activeRuntime,
                     estimator,
                     blockById,
-                    buildTranslationInput,
+                    selectedBuildInput,
                     fragment.depth + 1,
                   );
                   completed.push(...await executeFragments(
@@ -2776,23 +3547,50 @@ async function runLosslessBook(
               }
               return completed;
             };
+            const successfulObservationUsage = (): NormalizedRuntimeUsage =>
+              runtimeUsageForRuns(observedRuns.filter((run) =>
+                !recoveryRuns.has(run)));
+            const successfulObservationDuration = (
+              totalDurationMs: number,
+            ): number => Math.max(
+              0,
+              totalDurationMs - recoveries.reduce(
+                (total, recovery) => total + recovery.durationMs,
+                0,
+              ),
+            );
             try {
               const executions = await executeFragments(fragments);
-              const status = observedContextOverflow ? "context" : "success";
+              const result = mergeFragmentTranslationResults(request, executions);
+              const failed = result.windows.some((window) =>
+                window.status === "failed");
+              const schedulerStatus: SchedulerObservationStatus = failed
+                ? "failed"
+                : observedContextOverflow ? "context" : "success";
+              const durationMs = performance.now() - requestStartedAt;
+              const observedUsage = runtimeUsageForRuns(observedRuns);
+              const usage = recoveries.some((recovery) =>
+                !recovery.usage.complete)
+                ? { ...observedUsage, complete: false }
+                : observedUsage;
               return {
                 value: {
                   request,
                   budget: budget.snapshot(),
-                  result: mergeFragmentTranslationResults(request, executions),
+                  result,
                   runtime: {
-                    durationMs: performance.now() - requestStartedAt,
-                    usage: runtimeUsageForRuns(observedRuns),
-                    status,
+                    durationMs,
+                    usage,
+                    observationDurationMs:
+                      successfulObservationDuration(durationMs),
+                    observationUsage: successfulObservationUsage(),
+                    status: failed ? "failed" : "success",
                     features,
                     variant,
+                    recoveries,
                   },
                 },
-                status,
+                status: schedulerStatus,
               };
             } catch (error) {
               const status: SchedulerObservationStatus = error instanceof ModelProviderError
@@ -2802,28 +3600,37 @@ async function runLosslessBook(
                   || error.kind === "context")
                 ? error.kind
                 : "failed";
+              const observedUsage = runtimeUsageForRuns(observedRuns);
+              const usage = error instanceof ModelProviderError
+                || recoveries.some((recovery) => !recovery.usage.complete)
+                ? { ...observedUsage, complete: false }
+                : observedUsage;
+              const durationMs = performance.now() - requestStartedAt;
+              const observationUsage = successfulObservationUsage();
               return {
                 value: {
                   request,
                   budget: budget.snapshot(),
                   error,
                   runtime: {
-                    durationMs: performance.now() - requestStartedAt,
-                    usage: runtimeUsageForRuns(observedRuns),
+                    durationMs,
+                    usage,
+                    observationDurationMs:
+                      successfulObservationDuration(durationMs),
+                    observationUsage: error instanceof ModelProviderError
+                      ? { ...observationUsage, complete: false }
+                      : observationUsage,
                     status: runtimeObservationStatus(status),
                     features,
                     variant,
+                    recoveries,
                   },
                 },
                 status,
               };
             }
-          },
-          options.signal,
-        );
-        schedulerMetrics.actualWallTimeMs +=
-          performance.now() - dynamicExecutionStartedAt;
-        for (const completed of completionOrder) {
+        };
+        const observeCompletedRequest = (completed: CompletedRequest): void => {
           const telemetry = completed.runtime;
           schedulerMetrics.tokenUsageComplete =
             schedulerMetrics.tokenUsageComplete && telemetry.usage.complete;
@@ -2833,44 +3640,127 @@ async function runLosslessBook(
               telemetry.usage.totalTokens,
               telemetry.variant.predicted.totalTokens,
             );
-          const observedAt = new Date().toISOString();
-          runtimeCostModel.observe({
-            features: telemetry.features,
-            durationMs: telemetry.durationMs,
-            usage: telemetry.usage,
-            status: telemetry.status,
-            observedAt,
+          const observationStartedAt = Date.now();
+          const recordRuntimeObservation = (
+            observation: {
+              readonly durationMs: number;
+              readonly usage: NormalizedRuntimeUsage;
+              readonly status: RuntimeObservationStatus;
+              readonly protocol: "typed_tool" | "framed_text";
+            },
+            observationOrdinal: number,
+          ): void => {
+            const observedAt = new Date(
+              observationStartedAt + observationOrdinal,
+            ).toISOString();
+            const features: RuntimeFeatures = {
+              ...telemetry.features,
+              protocolRank: observation.protocol === "typed_tool" ? 1 : 0,
+            };
+            runtimeCostModel.observe({
+              features,
+              durationMs: observation.durationMs,
+              usage: observation.usage,
+              status: observation.status,
+              observedAt,
+            });
+            options.runtimeProfileStore?.appendObservation({
+              observationId: `observation-${createHash("sha256")
+                .update([
+                  runId,
+                  completed.request.requestId,
+                  String(waves.length),
+                  String(retryRound),
+                  String(decisionOrdinal),
+                  String(observationOrdinal),
+                  observation.status,
+                ].join("\0"), "utf8")
+                .digest("hex")
+                .slice(0, 24)}`,
+              requestId: completed.request.requestId,
+              modelId: runtimeSet.primary.model.id,
+              languageProfileId: context.languageProfile.id,
+              taskType: "translate",
+              protocol: observation.protocol,
+              effort: telemetry.variant.effort,
+              inputEstimate: features.inputTokens,
+              outputEstimate: features.outputTokens,
+              sourceTokens: features.sourceTokens,
+              contextProfile: telemetry.variant.contextProfile,
+              concurrency: features.concurrency,
+              cacheHitRatio: features.cacheHitRatio,
+              riskScore: features.riskScore,
+              durationMs: observation.durationMs,
+              usage: observation.usage,
+              status: observation.status,
+              observedAt,
+            });
+          };
+          telemetry.recoveries.forEach((recovery, index) => {
+            recordRuntimeObservation(recovery, index);
           });
-          options.runtimeProfileStore?.appendObservation({
-            observationId: `observation-${createHash("sha256")
-              .update([
-                runId,
-                completed.request.requestId,
-                String(waves.length),
-                String(retryRound),
-                String(decisionOrdinal),
-              ].join("\0"), "utf8")
-              .digest("hex")
-              .slice(0, 24)}`,
-            requestId: completed.request.requestId,
-            modelId: executionRuntime.model.id,
-            languageProfileId: context.languageProfile.id,
-            taskType: "translate",
-            protocol: telemetry.variant.protocol,
-            effort: telemetry.variant.effort,
-            inputEstimate: telemetry.features.inputTokens,
-            outputEstimate: telemetry.features.outputTokens,
-            sourceTokens: telemetry.features.sourceTokens,
-            contextProfile: telemetry.variant.contextProfile,
-            concurrency: telemetry.features.concurrency,
-            cacheHitRatio: telemetry.features.cacheHitRatio,
-            riskScore: telemetry.features.riskScore,
-            durationMs: telemetry.durationMs,
-            usage: telemetry.usage,
+          recordRuntimeObservation({
+            durationMs: telemetry.observationDurationMs,
+            usage: telemetry.observationUsage,
             status: telemetry.status,
-            observedAt,
-          });
+            protocol: telemetry.variant.protocol === "framed_text"
+              ? "framed_text"
+              : "typed_tool",
+          }, telemetry.recoveries.length);
+        };
+        const recordContextProfile = (
+          execution: PlannedTranslationExecution,
+        ): void => {
+          for (const window of execution.admitted.request.windows) {
+            schedulerMetrics.contextProfiles[window.windowId] =
+              execution.variant.contextProfile;
+          }
+        };
+        let completionOrder: CompletedRequest[];
+        if (schedulerMode === "active") {
+          completionOrder = await runWithDynamicScheduler(
+            requestPlanning,
+            scheduler,
+            dynamicScheduler,
+            executePlannedRequest,
+            {
+              actualRunTokens: () => schedulerMetrics.actualTokens,
+              decision: decisionMetadata,
+              onDecision: recordDispatchReport,
+              onLaunch: recordContextProfile,
+              onComplete: observeCompletedRequest,
+              ...(options.signal === undefined
+                ? {}
+                : { signal: options.signal }),
+            },
+          );
+        } else {
+          const legacyExecutionByTaskId = requestPlanning.legacyByTaskId;
+          for (const execution of legacyExecutionByTaskId.values()) {
+            recordContextProfile(execution);
+          }
+          completionOrder = await runWithAdaptiveScheduler(
+            requestInputs,
+            scheduler,
+            (item) => {
+              const execution = legacyExecutionByTaskId.get(
+                item.request.requestId,
+              );
+              if (execution === undefined) {
+                throw new Error(
+                  `missing legacy execution for ${item.request.requestId}`,
+                );
+              }
+              return executePlannedRequest(execution);
+            },
+            options.signal,
+          );
+          for (const completed of completionOrder) {
+            observeCompletedRequest(completed);
+          }
         }
+        schedulerMetrics.actualWallTimeMs +=
+          performance.now() - dynamicExecutionStartedAt;
         if (options.runtimeProfileStore !== undefined) {
           persistRuntimeCostModel(
             options.runtimeProfileStore,

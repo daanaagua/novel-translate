@@ -41,6 +41,7 @@ export interface SchedulerDispatchReport {
     | "bounded"
     | "fallback";
   readonly dispatchedTaskIds: readonly string[];
+  readonly dispatchedVariants: readonly PlannedTaskDispatch[];
   readonly predictedWallTimeMs: number;
   readonly predictedTokens: number;
   readonly validatorsSkipped: 0;
@@ -62,6 +63,10 @@ export interface SchedulerRunReport {
   readonly predictedTokens: number;
   readonly actualTokens: number;
   readonly tokenUsageComplete: boolean;
+  readonly contextProfiles: Readonly<Record<
+    string,
+    "lean" | "balanced" | "rich"
+  >>;
 }
 
 function variantsById(
@@ -164,6 +169,7 @@ export class DynamicScheduler {
         mode: this.mode,
         planningStatus: "disabled",
         dispatchedTaskIds: Object.freeze([...options.legacyTaskIds]),
+        dispatchedVariants: Object.freeze(legacy),
         predictedWallTimeMs: legacyPrediction.wallTimeMs,
         predictedTokens: legacyPrediction.totalTokens,
         validatorsSkipped: 0,
@@ -185,6 +191,7 @@ export class DynamicScheduler {
         dispatchedTaskIds: Object.freeze(
           selectedDispatch.map((item) => item.taskId),
         ),
+        dispatchedVariants: Object.freeze([...selectedDispatch]),
         predictedWallTimeMs: decision.predictedWallTimeMs,
         predictedTokens: decision.predictedTotalTokens,
         validatorsSkipped: 0,
@@ -207,6 +214,7 @@ export class DynamicScheduler {
         mode: this.mode,
         planningStatus: "fallback",
         dispatchedTaskIds: Object.freeze([...options.legacyTaskIds]),
+        dispatchedVariants: Object.freeze(legacy),
         predictedWallTimeMs: legacyPrediction.wallTimeMs,
         predictedTokens: legacyPrediction.totalTokens,
         validatorsSkipped: 0,

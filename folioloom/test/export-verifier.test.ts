@@ -223,6 +223,7 @@ test("partial scheduler report contains only aggregate execution metrics", () =>
       predictedTokens: 800,
       actualTokens: 820,
       tokenUsageComplete: true,
+      contextProfiles: { "window-a": "lean" as const },
     };
     const paths = writeLosslessBookArtifacts(
       item.store,
