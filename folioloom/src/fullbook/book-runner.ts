@@ -40,6 +40,10 @@ import {
   persistedStyleFromKnowledge,
 } from "../knowledge/persisted-style.js";
 import { stableTermsFromKnowledge } from "../knowledge/stable-terms-from-knowledge.js";
+import {
+  conceptFromAnchor,
+  type LexicalSemanticClass,
+} from "../knowledge/lexical-concept.js";
 import { createKnowledgeSnapshot } from "../knowledge/snapshot.js";
 import { SourceLedger } from "../source/source-ledger.js";
 import type { LosslessBlock } from "../source/types.js";
@@ -729,6 +733,12 @@ function waveAnchorInputHash(
       target: term.target,
       locked: term.locked,
       ...(term.policy === undefined ? {} : { policy: term.policy }),
+      ...(term.semanticClass === undefined ? {} : { semanticClass: term.semanticClass }),
+      ...(term.allowedTargets === undefined ? {} : { allowedTargets: term.allowedTargets }),
+      ...(term.revisionId === undefined ? {} : { revisionId: term.revisionId }),
+      ...(term.renderFingerprint === undefined
+        ? {}
+        : { renderFingerprint: term.renderFingerprint }),
       ...(term.note === undefined ? {} : { note: term.note }),
       ...(term.origin === undefined ? {} : { origin: term.origin }),
     })),
@@ -820,16 +830,24 @@ function decidedAnchorFormsFromKnowledge(revisions: readonly unknown[]): string[
       return [];
     }
     const revision = raw as { kind?: unknown; payload?: unknown; status?: unknown };
-    if (revision.kind !== "lexical_anchor_decision"
+    if ((revision.kind !== "lexical_anchor_decision"
+      && revision.kind !== "lexical_concept")
       || (revision.status !== "active" && revision.status !== "contextual")
       || revision.payload === null
       || typeof revision.payload !== "object"
       || Array.isArray(revision.payload)) {
       return [];
     }
-    const sourceForm = (revision.payload as { sourceForm?: unknown }).sourceForm;
-    return typeof sourceForm === "string" && sourceForm.trim().length > 0
-      ? [sourceForm]
+    const payload = revision.payload as {
+      sourceForm?: unknown;
+      sourceForms?: unknown;
+    };
+    if (revision.kind === "lexical_concept" && Array.isArray(payload.sourceForms)) {
+      return payload.sourceForms.filter((sourceForm): sourceForm is string =>
+        typeof sourceForm === "string" && sourceForm.trim().length > 0);
+    }
+    return typeof payload.sourceForm === "string" && payload.sourceForm.trim().length > 0
+      ? [payload.sourceForm]
       : [];
   });
 }
@@ -902,17 +920,52 @@ function waveKnowledgeCandidates(
     .flatMap((link) => link.normalizedForms));
   const projectedTermForms = new Set(outcome.terms.map((term) =>
     context.languageProfile.normalizeSourceForm(term.sourceForm)));
+  const termsByForm = new Map(outcome.terms.map((term) => [
+    context.languageProfile.normalizeSourceForm(term.sourceForm),
+    term,
+  ]));
+  const conceptForms = new Set<string>();
   const result: WaveKnowledgeCandidate[] = [];
   for (const anchor of outcome.anchors) {
     const normalizedSource = context.languageProfile.normalizeSourceForm(anchor.sourceForm);
-    if (anchor.mode !== "contextual" && !projectedTermForms.has(normalizedSource)) {
+    const semanticClass = anchor.semanticClass ?? "unclassified";
+    const term = termsByForm.get(normalizedSource);
+    const conceptEligible = [
+      "proper_name",
+      "unique_title",
+      "technical_term",
+      "role",
+    ].includes(semanticClass);
+    if (conceptEligible && term !== undefined) {
+      const concept = conceptFromAnchor({
+        sourceForm: anchor.sourceForm,
+        target: simplifyChineseTranslation(anchor.target),
+        mode: anchor.mode,
+        semanticClass: semanticClass as LexicalSemanticClass,
+        confidence: anchor.confidence,
+        allowedRealizations: term.allowedTargets ?? [term.target],
+      });
+      conceptForms.add(normalizedSource);
+      result.push({
+        candidate: {
+          recordId: `wave-lexical-concept-${createHash("sha256")
+            .update(`${runId}\0${canonicalJson(concept)}`)
+            .digest("hex")
+            .slice(0, 24)}`,
+          normalizedSubject: normalizedSource,
+          kind: "lexical_concept",
+          payload: concept,
+        },
+        sourceForms: concept.sourceForms,
+      });
       continue;
     }
+    if (anchor.mode !== "contextual" && !projectedTermForms.has(normalizedSource)) continue;
     const payload = {
       sourceForm: anchor.sourceForm,
       target: simplifyChineseTranslation(anchor.target),
       mode: anchor.mode,
-      semanticClass: anchor.semanticClass ?? "unclassified",
+      semanticClass,
       confidence: anchor.confidence,
     };
     result.push({
@@ -930,7 +983,9 @@ function waveKnowledgeCandidates(
   }
   for (const sourceTerm of outcome.terms) {
     const term = softenModelAnchorTerm(sourceTerm);
-    if (entityForms.has(context.languageProfile.normalizeSourceForm(term.sourceForm))) {
+    const normalizedSource =
+      context.languageProfile.normalizeSourceForm(term.sourceForm);
+    if (entityForms.has(normalizedSource) || conceptForms.has(normalizedSource)) {
       continue;
     }
     const payload = { ...term, target: simplifyChineseTranslation(term.target) };
@@ -940,7 +995,7 @@ function waveKnowledgeCandidates(
           .update(`${runId}\0${canonicalJson(payload)}`)
           .digest("hex")
           .slice(0, 24)}`,
-        normalizedSubject: context.languageProfile.normalizeSourceForm(term.sourceForm),
+        normalizedSubject: normalizedSource,
         kind: "lexical_anchor",
         payload,
       },

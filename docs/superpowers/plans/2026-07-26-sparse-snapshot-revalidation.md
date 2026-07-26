@@ -285,7 +285,7 @@ git commit -m "feat: model contextual lexical concepts"
 - 测试：`folioloom/test/knowledge-import-runtime.test.ts`
 - 测试：`folioloom/test/book-runner.test.ts`
 
-- [ ] **步骤 1：编写 `Prokurist` 回归失败测试**
+- [x] **步骤 1：编写 `Prokurist` 回归失败测试**
 
 模型把 `Prokurist` 返回为：
 
@@ -302,7 +302,7 @@ git commit -m "feat: model contextual lexical concepts"
 断言 outcome 含一个 `policy="contextual"` 的 term；`Fenster` 作为
 `ordinary_word/contextual` 仍然只形成负缓存，不进入 terms。
 
-- [ ] **步骤 2：运行测试确认失败**
+- [x] **步骤 2：运行测试确认失败**
 
 ```powershell
 npm test -- --test-name-pattern="contextual role anchor"
@@ -310,7 +310,7 @@ npm test -- --test-name-pattern="contextual role anchor"
 
 预期：FAIL，当前 `anchorTerms` 只接受 `mode === "stable"`。
 
-- [ ] **步骤 3：扩充锚点 schema 和映射**
+- [x] **步骤 3：扩充锚点 schema 和映射**
 
 给 `semanticClass` 增加 `role`。`anchorTerms` 接受：
 
@@ -328,14 +328,14 @@ const anchorTerms = anchors
 
 `anchorAsTerm()` 保留 contextual policy，不能再统一软化成 preferred。
 
-- [ ] **步骤 4：持久化闭合概念**
+- [x] **步骤 4：持久化闭合概念**
 
 `waveKnowledgeCandidates()` 对 eligible anchor 写
 `kind="lexical_concept"` 的闭合 payload。普通词仍写
 `lexical_anchor_decision`。`stableTermsFromKnowledge()` 读取
 `lexical_concept`，同时保留旧 `lexical_anchor` 兼容。
 
-- [ ] **步骤 5：验证并提交**
+- [x] **步骤 5：验证并提交**
 
 ```powershell
 npm test -- --test-name-pattern="contextual role anchor|stable terms from knowledge|completed waves remember"

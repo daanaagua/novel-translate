@@ -694,6 +694,65 @@ test("completed waves remember contextual anchor decisions and free later slots 
   }
 });
 
+test("completed waves persist a contextual role as one closed lexical concept", async () => {
+  const source = [
+    "Prokurist sprach mit Gregor.",
+    "Gregor antwortete dem Prokurist.",
+    "Der Prokurist beobachtete Gregor.",
+  ].join(" ");
+  const fixture = losslessFixture(source, "de");
+  const response = (context: Context) => {
+    const prompt = userText(context);
+    if (prompt.includes("SOURCE-LANGUAGE FORMS AND COMPACT CONCORDANCE")) {
+      const match =
+        /SOURCE-LANGUAGE FORMS AND COMPACT CONCORDANCE\n\n(\[[\s\S]*?\])\n\nESTABLISHED TERMS/u
+          .exec(prompt);
+      assert.ok(match?.[1]);
+      const candidates = JSON.parse(match[1]) as Array<{ sourceForm: string }>;
+      return fauxAssistantMessage(fauxToolCall("submit_lexical_anchors", {
+        anchors: candidates.map((candidate) => candidate.sourceForm === "Prokurist"
+          ? {
+              sourceForm: candidate.sourceForm,
+              target: "主事",
+              mode: "contextual",
+              semanticClass: "role",
+              confidence: 0.95,
+            }
+          : {
+              sourceForm: candidate.sourceForm,
+              target: candidate.sourceForm === "Gregor" ? "格里高尔" : "",
+              mode: candidate.sourceForm === "Gregor" ? "stable" : "contextual",
+              semanticClass: candidate.sourceForm === "Gregor"
+                ? "proper_name"
+                : "ordinary_word",
+              confidence: 0.95,
+            }),
+        entityLinks: [],
+      }), { stopReason: "toolUse" });
+    }
+    return losslessBatchResponse(context);
+  };
+  fixture.faux.setResponses(Array.from({ length: 6 }, () => response));
+
+  const result = await runBook(fixture.options as never);
+  assert.equal(result.status.humanRequiredWindows, 0);
+
+  const store = new LosslessBookStore(fixture.options.storePath);
+  try {
+    const prokurist = store.knowledgeRevisions("run-lossless")
+      .filter((revision) => revision.normalizedSubject === "prokurist");
+    assert.equal(prokurist.length, 1);
+    assert.equal(prokurist[0]?.kind, "lexical_concept");
+    assert.equal((prokurist[0]?.payload as { policy?: string }).policy, "contextual");
+    assert.equal(
+      (prokurist[0]?.payload as { canonicalTarget?: string }).canonicalTarget,
+      "主事",
+    );
+  } finally {
+    store.close();
+  }
+});
+
 test("a stable anchor below the projection threshold is reconsidered in the next wave", async () => {
   const source = "Smoky met Edgewood. Smoky left Edgewood.";
   const fixture = losslessFixture(`${source}[[]]${source}`);

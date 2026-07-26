@@ -726,6 +726,63 @@ test("single-pass lexical anchor decisions remain preferred rather than hard-loc
   assert.equal(outcome.terms[0]?.policy, "preferred");
 });
 
+test("contextual role anchor remains translator-visible without forcing one surface form", async () => {
+  const faux = fauxProvider();
+  faux.setResponses([fauxAssistantMessage(fauxToolCall("submit_lexical_anchors", {
+    anchors: [{
+      sourceForm: "Prokurist",
+      target: "主事",
+      mode: "contextual",
+      semanticClass: "role",
+      confidence: 0.95,
+    }, {
+      sourceForm: "Fenster",
+      target: "窗户",
+      mode: "contextual",
+      semanticClass: "ordinary_word",
+      confidence: 0.99,
+    }],
+    entityLinks: [],
+  }), { stopReason: "toolUse" })]);
+
+  const outcome = await new LexicalAnchorer(new PiRuntime()).run({
+    candidates: [{
+      sourceForm: "Prokurist",
+      contexts: ["Der Prokurist sprach mit Gregor."],
+      corpusFrequency: 4,
+      currentWaveOccurrences: 2,
+      documentFrequency: 2,
+    }, {
+      sourceForm: "Fenster",
+      contexts: ["Gregor sah zum Fenster."],
+      corpusFrequency: 4,
+      currentWaveOccurrences: 2,
+      documentFrequency: 2,
+    }],
+    stableTerms: [],
+    model: faux.getModel(),
+    streamFn: faux.provider.streamSimple.bind(faux.provider),
+    budget: new BudgetLedger(),
+    sourceLanguageProfile: getSourceLanguageProfile("de"),
+  });
+
+  assert.deepEqual(outcome.terms.map((term) => ({
+    sourceForm: term.sourceForm,
+    target: term.target,
+    policy: term.policy,
+    semanticClass: term.semanticClass,
+    allowedTargets: term.allowedTargets,
+    hasFingerprint: term.renderFingerprint?.length === 64,
+  })), [{
+    sourceForm: "Prokurist",
+    target: "主事",
+    policy: "contextual",
+    semanticClass: "role",
+    allowedTargets: ["主事"],
+    hasFingerprint: true,
+  }]);
+});
+
 test("one source-supported proper-name classification remains a preference", async () => {
   const source = "진양은 성으로 향했다. 진양이 성주를 만났다. 진양을 모두가 기다렸다.";
   const candidates = collectWindowAnchorCandidates(

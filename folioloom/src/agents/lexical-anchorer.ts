@@ -11,6 +11,10 @@ import {
   type EntityLinkEvidenceKind,
 } from "../domain/entity-links.js";
 import type { BudgetLedger } from "../kernel/budget.js";
+import {
+  conceptFromAnchor,
+  type LexicalSemanticClass,
+} from "../knowledge/lexical-concept.js";
 import { getSourceLanguageProfile } from "../language/profiles.js";
 import type { SourceLanguageProfile } from "../language/types.js";
 import { sourceTextForTranslation } from "../source/layout-separators.js";
@@ -33,6 +37,7 @@ export type LexicalAnchorSemanticClass =
   | "proper_name"
   | "unique_title"
   | "technical_term"
+  | "role"
   | "form_of_address"
   | "ordinary_word"
   | "unclassified";
@@ -80,6 +85,14 @@ const PREFERRED_FALLBACK_CLASSES = new Set<LexicalAnchorSemanticClass>([
   "proper_name",
   "unique_title",
   "technical_term",
+  "role",
+]);
+
+const CONCEPT_ELIGIBLE_CLASSES = new Set<LexicalAnchorSemanticClass>([
+  "proper_name",
+  "unique_title",
+  "technical_term",
+  "role",
 ]);
 
 function lexicalProtocolError(message: string): ModelProviderError {
@@ -247,7 +260,7 @@ export function parseLexicalPreferredFallbackResponse(
       target: simplifyChineseTranslation(
         candidate.sourceAuthoredTarget ?? decision?.target ?? "",
       ),
-      mode: "stable",
+      mode: decision?.semanticClass === "role" ? "contextual" : "stable",
       semanticClass: decision?.semanticClass ?? "unclassified",
       lockEligible: false,
       confidence: candidate.sourceAuthoredTarget === undefined
@@ -360,7 +373,7 @@ export class LexicalAnchorer {
         "For sourceAuthoredTarget, copy that printed Hanja/Chinese target exactly; the harness will normalize its Chinese script.",
         "Do not infer aliases or entity identity in this compatibility path. Every returned binding is only a preferred rendering, never a hard constraint.",
         "Inside the exact response frame, emit one JSON array and nothing else. Each item must contain exactly sourceForm, target, semanticClass, and confidence.",
-        "semanticClass must be proper_name, unique_title, or technical_term. confidence must be from 0.8 through 1.",
+        "semanticClass must be proper_name, unique_title, technical_term, or role. Use role for a profession, office, or institutional function whose Chinese wording may vary by sentence. confidence must be from 0.8 through 1.",
       ].join("\n"),
       prompt: [
         "CANDIDATES AND COMPACT CONCORDANCE",
@@ -421,6 +434,7 @@ export class LexicalAnchorer {
             Type.Literal("proper_name"),
             Type.Literal("unique_title"),
             Type.Literal("technical_term"),
+            Type.Literal("role"),
             Type.Literal("form_of_address"),
             Type.Literal("ordinary_word"),
             Type.Literal("unclassified"),
@@ -563,12 +577,12 @@ export class LexicalAnchorer {
       systemPrompt: [
         "You establish run-local lexical anchors before parallel literary translation.",
         `The source language is ${profile.displayName} (${profile.id}).`,
-        "Mark proper names, unique titles, and invariant technical terms as stable and choose one concise Chinese target.",
+        "Mark proper names, unique titles, and invariant technical terms as stable and choose one concise Chinese target. Classify professions, offices, and institutional functions as role; give their concise default Chinese rendering and normally mark them contextual.",
         "For every anchor, classify semanticClass. Use proper_name only for a concrete named entity; common nouns, pronouns, verbs, and forms of address must use their corresponding non-name class.",
         "A sourceAuthoredTarget is an explicit Hanja/Chinese gloss printed immediately after that source form. For a stable proper name, unique title, or technical term, use that target exactly; the harness treats this source-authored evidence as authoritative.",
         "Every single-pass lexical classification remains a preference; only independently confirmed entity links or user-supplied glossary policy may become exact constraints.",
         "Write every Chinese target in Simplified Chinese (zh-Hans); the harness will normalize model-created targets before persistence.",
-        "Mark ordinary words, forms whose Chinese rendering changes by discourse role, and forms of address as contextual.",
+        "Mark ordinary words and forms of address as contextual. A role may also be contextual while remaining translator-visible semantic knowledge.",
         "Do not force surface consistency where Chinese grammar or relationship context requires variation.",
         "When compact evidence explicitly links two supplied forms to one entity, submit an entityLinks item and quote the exact supplied context. Leave uncertain relationships unconfirmed.",
         "Quote the smallest source span containing every linked form and any overt naming cue. Links from this single pass remain provisional until independent evidence accumulates; never treat one model judgment as an exact constraint.",
@@ -604,7 +618,7 @@ export class LexicalAnchorer {
       .flatMap((link) => link.normalizedForms));
     const anchorTerms = anchors
       .filter((anchor) =>
-        anchor.mode === "stable"
+        CONCEPT_ELIGIBLE_CLASSES.has(anchor.semanticClass ?? "unclassified")
         && (anchor.lockEligible === true || anchor.confidence >= 0.8)
         && anchor.target.trim().length > 0
         && !confirmedForms.has(profile.normalizeSourceForm(anchor.sourceForm)))
@@ -665,6 +679,31 @@ export function sourceAuthoredAnchorFallback(
 }
 
 export function anchorAsTerm(anchor: LexicalAnchor): StableTerm {
+  if (CONCEPT_ELIGIBLE_CLASSES.has(anchor.semanticClass ?? "unclassified")) {
+    const concept = conceptFromAnchor({
+      sourceForm: anchor.sourceForm,
+      target: anchor.target,
+      mode: anchor.mode,
+      semanticClass: anchor.semanticClass as LexicalSemanticClass,
+      confidence: anchor.confidence,
+    });
+    return {
+      conceptId: concept.conceptId,
+      lexemeId: `${concept.conceptId}-lexeme`,
+      sourceForm: concept.sourceForms[0]!,
+      canonicalSource: concept.normalizedSubject,
+      target: concept.canonicalTarget,
+      locked: concept.policy === "locked",
+      policy: concept.policy,
+      semanticClass: concept.semanticClass,
+      allowedTargets: concept.allowedRealizations,
+      revisionId: concept.revisionId,
+      renderFingerprint: concept.renderFingerprint,
+      note: concept.policy === "contextual"
+        ? "semantic role with context-sensitive Chinese surface realization"
+        : "single-pass model anchor; prefer this rendering but allow context-sensitive Chinese wording",
+    };
+  }
   const id = createHash("sha256")
     .update(`${anchor.sourceForm}\0${anchor.target}`)
     .digest("hex")
