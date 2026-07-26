@@ -298,6 +298,39 @@ test("manual narrative memory is projected only when its source form is present"
   ).revisions.length, 0);
 });
 
+test("lexical decision negative cache never enters translator knowledge", () => {
+  const profile = getSourceLanguageProfile("de");
+  const payload = {
+    sourceForm: "Fenster",
+    target: "",
+    mode: "contextual",
+    semanticClass: "ordinary_word",
+    confidence: 0.99,
+  };
+  const decision = {
+    revisionId: "r-ordinary-fenster",
+    revision: 1,
+    normalizedSubject: "fenster",
+    kind: "lexical_anchor_decision",
+    payload,
+    alternatives: [payload],
+    status: "contextual" as const,
+    candidateIds: ["candidate-fenster"],
+    sourceWindowIds: ["window-prior"],
+  };
+
+  const projection = projectKnowledgeForTranslation(
+    [decision],
+    ["Das Fenster war offen."],
+    profile,
+  );
+
+  assert.equal(projection.metadata.total, 1);
+  assert.equal(projection.metadata.projected, 0);
+  assert.equal(projection.metadata.omitted, 1);
+  assert.deepEqual(projection.revisions, []);
+});
+
 test("positioned narrative memory follows its block range instead of leaking by subject text", () => {
   const profile = getSourceLanguageProfile("en");
   const allBlocks = Array.from({ length: 6 }, (_, index) =>

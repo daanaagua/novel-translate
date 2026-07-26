@@ -447,6 +447,10 @@ export function projectKnowledgeForTranslation(
   for (const raw of revisions) {
     const revision = parseRevision(raw);
     if (revision === undefined) continue;
+    // Lexical decisions are durable scheduler state: they prevent the same
+    // ordinary word from consuming later anchor slots, but they are not a
+    // translation fact and must never consume model-visible context.
+    if (revision.kind === "lexical_anchor_decision") continue;
     const positionMatch = positionedMemoryMatch(revision, positions);
     const matched = positionMatch.positioned
       ? positionMatch.windowIds.length > 0

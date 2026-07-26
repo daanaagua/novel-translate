@@ -181,10 +181,16 @@ function sortedAlternatives(values: readonly unknown[]): unknown[] {
 }
 
 function singletonCandidateStatus(kind: string, payload: unknown): KnowledgeStatus {
-  if (kind !== "entity_alias_link"
-    || payload === null
-    || typeof payload !== "object"
-    || Array.isArray(payload)) {
+  if (payload === null || typeof payload !== "object" || Array.isArray(payload)) {
+    return "active";
+  }
+  if (kind === "lexical_anchor_decision") {
+    const decision = payload as { mode?: unknown; semanticClass?: unknown };
+    return decision.mode === "contextual" || decision.semanticClass === "ordinary_word"
+      ? "contextual"
+      : "active";
+  }
+  if (kind !== "entity_alias_link") {
     return "active";
   }
   const status = (payload as { status?: unknown }).status;

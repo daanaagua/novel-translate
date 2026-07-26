@@ -374,7 +374,7 @@ npx vitest run --config vitest.desktop.config.ts src/desktop/renderer/src/App.te
 
 预期：PASS。
 
-- [ ] **步骤 6：提交语言和结构支持**
+- [x] **步骤 6：提交语言和结构支持**
 
 ```bash
 git add src/language src/source src/desktop test
@@ -391,7 +391,7 @@ git commit -m "feat: strengthen German French and Spanish source support"
 - 修改：`test/translation-request.test.ts`
 - 修改：`test/knowledge-store.test.ts`
 
-- [ ] **步骤 1：编写负缓存状态、后续跳过和不投影测试**
+- [x] **步骤 1：编写负缓存状态、后续跳过和不投影测试**
 
 ```ts
 test("ordinary-word lexical decisions become contextual negative cache", () => {
@@ -413,17 +413,17 @@ test("lexical negative cache suppresses reconsideration without entering transla
 });
 ```
 
-- [ ] **步骤 2：运行测试确认当前裁决状态为 active 且会进入投影**
+- [x] **步骤 2：运行测试确认当前裁决状态为 active 且会进入投影**
 
 运行：`node --test --import tsx test/knowledge-store.test.ts test/translation-request.test.ts test/book-runner.test.ts`
 
 预期：FAIL，`lexical_anchor_decision` 仍以 active 状态进入 source-matched projection。
 
-- [ ] **步骤 3：实现语义类别驱动的负缓存**
+- [x] **步骤 3：实现语义类别驱动的负缓存**
 
 `singletonCandidateStatus()` 对 `lexical_anchor_decision` 的 contextual/普通词裁决返回 `contextual`；`decidedAnchorFormsFromKnowledge()` 同时读取 `active` 和 `contextual`；`projectKnowledgeForTranslation()` 明确跳过 `lexical_anchor_decision`，因为它只服务于本地候选调度，不是翻译事实。proper name、unique title、technical term 和实体关系仍由现有 `lexical_anchor`/`entity_alias_link` 路径投影。
 
-- [ ] **步骤 4：运行知识链与全书 runner 定向测试**
+- [x] **步骤 4：运行知识链与全书 runner 定向测试**
 
 运行：`node --test --import tsx test/knowledge-store.test.ts test/translation-request.test.ts test/book-runner.test.ts test/lexical-anchor.test.ts`
 

@@ -821,7 +821,7 @@ function decidedAnchorFormsFromKnowledge(revisions: readonly unknown[]): string[
     }
     const revision = raw as { kind?: unknown; payload?: unknown; status?: unknown };
     if (revision.kind !== "lexical_anchor_decision"
-      || revision.status !== "active"
+      || (revision.status !== "active" && revision.status !== "contextual")
       || revision.payload === null
       || typeof revision.payload !== "object"
       || Array.isArray(revision.payload)) {

@@ -683,6 +683,15 @@ test("completed waves remember contextual anchor decisions and free later slots 
   assert.ok(anchorWaves[1]?.includes("진양"), JSON.stringify(anchorWaves));
   assert.ok(anchorWaves[1]?.includes("옥관패"), JSON.stringify(anchorWaves));
   assert.ok(anchorWaves[1]?.every((form) => !anchorWaves[0]?.includes(form)), JSON.stringify(anchorWaves));
+  const store = new LosslessBookStore(fixture.options.storePath);
+  try {
+    const decisions = store.knowledgeRevisions("run-lossless")
+      .filter((revision) => revision.kind === "lexical_anchor_decision");
+    assert.ok(decisions.length > 0);
+    assert.ok(decisions.every((revision) => revision.status === "contextual"));
+  } finally {
+    store.close();
+  }
 });
 
 test("a stable anchor below the projection threshold is reconsidered in the next wave", async () => {
