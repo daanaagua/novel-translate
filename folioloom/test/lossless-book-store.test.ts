@@ -245,6 +245,84 @@ function alphaUsage(
   };
 }
 
+function createStaleConceptTask(
+  store: LosslessBookStore,
+  current = reviseConcept(alphaConcept(), {
+    canonicalTarget: "阿法",
+    allowedRealizations: ["阿法"],
+  }),
+) {
+  const initialSnapshot = createKnowledgeSnapshot("run-a", []);
+  const runId = initialize(store, {
+    ...runMeta("model-a", "a"),
+    initialSnapshotId: initialSnapshot.id,
+    initialSnapshot,
+  }, windowsApart());
+  const previous = alphaConcept();
+  const [first, second] = blocks();
+  store.upsertLexicalConcepts(runId, [previous]);
+  store.claimWindow(runId, "window-0");
+  store.stageWindow({
+    ...validStage(runId, "window-0", initialSnapshot.id),
+    translations: [{
+      blockId: first!.id,
+      sourceHash: first!.sourceHash,
+      text: "阿尔法。",
+    }],
+    knowledgeCandidates: [],
+    conceptBindings: {
+      usages: [alphaUsage("阿尔法", previous)],
+      concepts: [previous],
+    },
+  });
+  store.promoteStagedWindow(runId, "window-0");
+
+  const candidate = {
+    recordId: "knowledge-current-alpha",
+    normalizedSubject: current.normalizedSubject,
+    kind: "lexical_concept",
+    payload: current,
+  };
+  store.claimWindow(runId, "window-1");
+  store.stageWindow({
+    ...validStage(runId, "window-1", initialSnapshot.id),
+    translations: [{
+      blockId: second!.id,
+      sourceHash: second!.sourceHash,
+      text: "贝塔。",
+    }],
+    knowledgeCandidates: [candidate],
+    conceptBindings: { usages: [], concepts: [] },
+  });
+  const knowledge = new KnowledgeStore(store.knowledgeRevisions(runId));
+  const appendedRevisions = knowledge.reconcileCandidates(
+    [candidate],
+    "window-1",
+  );
+  const currentSnapshot = store.latestKnowledgeSnapshot(runId);
+  const nextSnapshot = createKnowledgeSnapshot(
+    runId,
+    knowledge.projectableRevisions(),
+    currentSnapshot.id,
+  );
+  store.promoteStagedWindow({
+    runId,
+    windowId: "window-1",
+    ordinal: 1,
+    snapshotId: currentSnapshot.id,
+    candidates: [candidate],
+    appendedRevisions,
+    nextSnapshot,
+  });
+  return {
+    runId,
+    first: first!,
+    previous,
+    current,
+    nextSnapshot,
+  };
+}
+
 test("schema v3 enables foreign keys and WAL and creates every audit table", () => {
   const path = fixturePath();
   const store = new LosslessBookStore(path);
@@ -857,6 +935,126 @@ test("concept promotion creates one sparse task only for an active stale binding
   assert.equal(
     store.activeTranslationBindings(runId, second!.id).length,
     0,
+  );
+  store.close();
+});
+
+test("revalidation noop advances the binding without creating a translation version", () => {
+  const store = new LosslessBookStore(fixturePath());
+  const fixture = createStaleConceptTask(store, reviseConcept(alphaConcept(), {
+    canonicalTarget: "阿尔法先生",
+    allowedRealizations: ["阿尔法", "阿尔法先生"],
+  }));
+  const task = store.claimNextRevalidationTask(fixture.runId, 2);
+  assert.ok(task);
+  const work = store.revalidationWorkItem(fixture.runId, task.taskId);
+  assert.equal(work.translation.version, 1);
+  assert.equal(work.concepts[0]?.appliedConcept.revisionId, fixture.previous.revisionId);
+  assert.equal(work.concepts[0]?.currentConcept.revisionId, fixture.current.revisionId);
+
+  store.resolveRevalidationNoop(fixture.runId, task.taskId, {
+    reason: "surface_still_allowed",
+  });
+
+  assert.equal(store.activeTranslations(fixture.runId)[0]?.version, 1);
+  const [binding] = store.activeTranslationBindings(
+    fixture.runId,
+    fixture.first.id,
+  );
+  assert.equal(binding?.appliedRevisionId, fixture.current.revisionId);
+  assert.equal(binding?.validationStatus, "clean");
+  assert.equal(store.revalidationTasks(fixture.runId)[0]?.status, "resolved_noop");
+  store.close();
+});
+
+test("metadata-only lexical revisions advance active bindings without scheduling work", () => {
+  const store = new LosslessBookStore(fixturePath());
+  const current = reviseConcept(alphaConcept(), { confidence: 0.99 });
+  const fixture = createStaleConceptTask(store, current);
+
+  assert.deepEqual(store.revalidationTasks(fixture.runId), []);
+  const [binding] = store.activeTranslationBindings(
+    fixture.runId,
+    fixture.first.id,
+  );
+  assert.equal(binding?.appliedRevisionId, current.revisionId);
+  assert.equal(binding?.appliedRenderFingerprint, current.renderFingerprint);
+  assert.equal(binding?.validatedRevisionId, current.revisionId);
+  assert.equal(binding?.validationStatus, "clean");
+  store.close();
+});
+
+test("revalidation replacement preserves history and activates version two", () => {
+  const path = fixturePath();
+  const store = new LosslessBookStore(path);
+  const fixture = createStaleConceptTask(store);
+  const task = store.claimNextRevalidationTask(fixture.runId, 2);
+  assert.ok(task);
+  const usage = alphaUsage("阿法", fixture.current);
+
+  const replacementId = store.replaceTranslationForRevalidation({
+    runId: fixture.runId,
+    taskId: task.taskId,
+    snapshotId: fixture.nextSnapshot.id,
+    action: "repair",
+    text: "阿法。",
+    resultStatus: "completed",
+    termUsages: [usage],
+    concepts: [fixture.current],
+    result: { reason: "one_surface_conflict" },
+  });
+
+  assert.equal(store.activeTranslations(fixture.runId)[0]?.version, 2);
+  assert.equal(store.activeTranslations(fixture.runId)[0]?.text, "阿法。");
+  assert.equal(
+    store.revalidationTasks(fixture.runId)[0]?.replacementTranslationId,
+    replacementId,
+  );
+  assert.equal(store.revalidationTasks(fixture.runId)[0]?.status, "resolved_repair");
+  const [binding] = store.activeTranslationBindings(
+    fixture.runId,
+    fixture.first.id,
+  );
+  assert.equal(binding?.appliedRevisionId, fixture.current.revisionId);
+  assert.equal(binding?.validationStatus, "clean");
+  store.close();
+
+  const database = new DatabaseSync(path);
+  const versions = database.prepare(`
+    SELECT version, active FROM translations
+    WHERE run_id=? AND block_id=? ORDER BY version
+  `).all(fixture.runId, fixture.first.id) as unknown as Array<{
+    version: number;
+    active: number;
+  }>;
+  assert.deepEqual(versions.map((row) => ({ ...row })), [
+    { version: 1, active: 0 },
+    { version: 2, active: 1 },
+  ]);
+  database.close();
+});
+
+test("failed revalidation retains the old active version and marks only its binding warning stale", () => {
+  const store = new LosslessBookStore(fixturePath());
+  const fixture = createStaleConceptTask(store);
+  const task = store.claimNextRevalidationTask(fixture.runId, 2);
+  assert.ok(task);
+
+  store.completeRevalidationWithWarning(fixture.runId, task.taskId, {
+    code: "PROVIDER_UNAVAILABLE",
+  });
+
+  const [active] = store.activeTranslations(fixture.runId);
+  assert.equal(active?.version, 1);
+  assert.equal(active?.text, "阿尔法。");
+  assert.equal(
+    store.activeTranslationBindings(fixture.runId, fixture.first.id)[0]
+      ?.validationStatus,
+    "warning_stale",
+  );
+  assert.equal(
+    store.revalidationTasks(fixture.runId)[0]?.status,
+    "completed_with_warning",
   );
   store.close();
 });

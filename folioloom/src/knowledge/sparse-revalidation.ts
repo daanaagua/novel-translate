@@ -46,11 +46,88 @@ export interface BindingGateDecision {
   readonly incompatibleConceptIds: readonly string[];
 }
 
+export interface RevalidationBindingState {
+  readonly conceptId: string;
+  readonly appliedConcept: LexicalConcept;
+  readonly currentConcept: LexicalConcept;
+  readonly termUsages: readonly TermUsageSubmission[];
+}
+
+export interface RevalidationBindingDecision {
+  readonly action: "noop" | "repair" | "retranslate";
+  readonly conceptIds: readonly string[];
+}
+
 export interface SparseRevalidationInput {
   readonly concepts: readonly LexicalConcept[];
   readonly occurrences: readonly ConceptOccurrence[];
   readonly translations: readonly ActiveTranslationDependency[];
   readonly toSnapshotId: string;
+}
+
+function sameStrings(
+  left: readonly string[],
+  right: readonly string[],
+): boolean {
+  if (left.length !== right.length) return false;
+  const orderedLeft = [...left].sort();
+  const orderedRight = [...right].sort();
+  return orderedLeft.every((value, index) => value === orderedRight[index]);
+}
+
+/**
+ * Decide the cheapest safe action from durable receipts.  A changed target
+ * vocabulary can be repaired locally only when one recorded surface is now
+ * illegal and the concept's identity, source forms, semantic class, policy,
+ * visibility, and discourse role are otherwise unchanged.  Broader changes
+ * deliberately fall back to a complete block translation.
+ */
+export function evaluateRevalidationBindings(
+  bindings: readonly RevalidationBindingState[],
+): RevalidationBindingDecision {
+  const ordered = [...bindings].sort((left, right) =>
+    left.conceptId.localeCompare(right.conceptId));
+  const conceptIds = ordered.map((binding) => binding.conceptId);
+  if (new Set(conceptIds).size !== conceptIds.length) {
+    throw new Error("duplicate revalidation concept binding");
+  }
+
+  let incompatibleUsages = 0;
+  let substantiveChange = false;
+  for (const binding of ordered) {
+    if (binding.appliedConcept.conceptId !== binding.conceptId
+      || binding.currentConcept.conceptId !== binding.conceptId) {
+      throw new Error(`revalidation concept provenance mismatch: ${binding.conceptId}`);
+    }
+    if (binding.termUsages.length === 0) {
+      substantiveChange = true;
+      continue;
+    }
+    incompatibleUsages += binding.termUsages.filter((usage) =>
+      usage.conceptId !== binding.conceptId
+      || !termSurfaceAllowed(
+        binding.currentConcept,
+        usage.targetSurface,
+      )).length;
+    substantiveChange ||= binding.appliedConcept.normalizedSubject
+        !== binding.currentConcept.normalizedSubject
+      || binding.appliedConcept.semanticClass
+        !== binding.currentConcept.semanticClass
+      || binding.appliedConcept.policy !== binding.currentConcept.policy
+      || binding.appliedConcept.visibility !== binding.currentConcept.visibility
+      || !sameStrings(
+        binding.appliedConcept.sourceForms,
+        binding.currentConcept.sourceForms,
+      );
+  }
+
+  if (incompatibleUsages === 0 && !substantiveChange) {
+    return { action: "noop", conceptIds };
+  }
+  if (!substantiveChange && incompatibleUsages === 1) {
+    return { action: "repair", conceptIds };
+  }
+  return { action: "retranslate", conceptIds };
 }
 
 function changeSetHash(

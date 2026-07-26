@@ -91,18 +91,26 @@ import {
   type ConceptOccurrenceSpan,
 } from "../knowledge/concept-occurrence-index.js";
 import {
+  evaluateRevalidationBindings,
   evaluateStagedConceptBindings,
   planSparseRevalidation,
   type BindingGateDecision,
+  type RevalidationBindingState,
 } from "../knowledge/sparse-revalidation.js";
 import type {
   LexicalConcept,
   LexicalSemanticClass,
 } from "../knowledge/lexical-concept.js";
-import type {
-  TermConceptProjection,
-  TermUsageSubmission,
+import {
+  expectedTermOccurrences,
+  validateTermUsages,
+  type TermConceptProjection,
+  type TermUsageSubmission,
 } from "../knowledge/term-usage.js";
+/*
+ * Keep the runtime validators above in the storage commit gate.  A durable
+ * replacement must not trust that its caller used the same request harness.
+ */
 import {
   knowledgeRevisionMatchesSearch,
   type KnowledgeDiagnosticsSummary,
@@ -312,6 +320,46 @@ export interface KnowledgeRevalidationTask {
   readonly replacementTranslationId: number | null;
 }
 
+export interface RevalidationTranslationRecord
+  extends ActiveLosslessTranslation {
+  readonly translationId: number;
+  readonly snapshotId: string;
+}
+
+export interface RevalidationSourceBlock {
+  readonly blockId: string;
+  readonly sourceVersion: string;
+  readonly sourceHash: string;
+  readonly sourceText: string;
+  readonly globalIndex: number;
+  readonly tokenCount: number;
+}
+
+export interface RevalidationConceptState extends RevalidationBindingState {
+  readonly appliedConcept: StoredLexicalConcept;
+  readonly currentConcept: StoredLexicalConcept;
+}
+
+export interface RevalidationWorkItem {
+  readonly task: KnowledgeRevalidationTask;
+  readonly translation: RevalidationTranslationRecord;
+  readonly source: RevalidationSourceBlock;
+  readonly window: PersistedLosslessWindow;
+  readonly concepts: readonly RevalidationConceptState[];
+}
+
+export interface RevalidationReplacementInput {
+  readonly runId: string;
+  readonly taskId: string;
+  readonly snapshotId: string;
+  readonly action: "repair" | "retranslate";
+  readonly text: string;
+  readonly resultStatus: "completed" | "completed_with_warnings";
+  readonly termUsages: readonly TermUsageSubmission[];
+  readonly concepts: readonly TermConceptProjection[];
+  readonly result: unknown;
+}
+
 export interface WindowFailureInput {
   error: string;
   retry: boolean;
@@ -504,6 +552,7 @@ interface ReadOnlySnapshot {
 }
 
 const READ_ONLY_SNAPSHOT_ATTEMPTS = 3;
+const DEFAULT_MAX_REVALIDATION_ATTEMPTS = 2;
 
 export class LosslessReadSnapshotError extends Error {
   readonly code = "LOSSLESS_READ_SNAPSHOT_UNSTABLE";
@@ -779,6 +828,21 @@ interface TranslationConceptBindingRow {
   term_usages_json: string;
   validation_status: TranslationConceptBinding["validationStatus"];
   validated_revision_id: string;
+}
+
+interface KnowledgeRevalidationTaskRow {
+  task_id: string;
+  run_id: string;
+  translation_id: number;
+  block_id: string;
+  change_set_hash: string;
+  from_snapshot_id: string;
+  to_snapshot_id: string;
+  concept_ids_json: string;
+  status: KnowledgeRevalidationTask["status"];
+  attempts: number;
+  result_json: string;
+  replacement_translation_id: number | null;
 }
 
 function all<T>(statement: StatementSync, ...values: any[]): T[] {
@@ -1145,6 +1209,28 @@ function validateWarnings(warnings: readonly string[]): string {
     throw new TypeError("warnings must be an array of strings");
   }
   return jsonText(warnings, "warnings");
+}
+
+function revalidationTaskFromRow(
+  row: KnowledgeRevalidationTaskRow,
+): KnowledgeRevalidationTask {
+  return {
+    taskId: row.task_id,
+    runId: row.run_id,
+    translationId: row.translation_id,
+    blockId: row.block_id,
+    changeSetHash: row.change_set_hash,
+    fromSnapshotId: row.from_snapshot_id,
+    toSnapshotId: row.to_snapshot_id,
+    conceptIds: stringArrayFromJson(
+      row.concept_ids_json,
+      "revalidation concept IDs",
+    ),
+    status: row.status,
+    attempts: row.attempts,
+    result: JSON.parse(row.result_json) as unknown,
+    replacementTranslationId: row.replacement_translation_id,
+  };
 }
 
 function lexicalConceptFromRow(row: LexicalConceptRow): StoredLexicalConcept {
@@ -2725,39 +2811,452 @@ export class LosslessBookStore {
   revalidationTasks(runId: string): KnowledgeRevalidationTask[] {
     if (this.#schemaVersion !== LOSSLESS_BOOK_SCHEMA_VERSION) return [];
     this.#run(runId);
-    return all<{
-      task_id: string;
-      run_id: string;
-      translation_id: number;
-      block_id: string;
-      change_set_hash: string;
-      from_snapshot_id: string;
-      to_snapshot_id: string;
-      concept_ids_json: string;
-      status: KnowledgeRevalidationTask["status"];
-      attempts: number;
-      result_json: string;
-      replacement_translation_id: number | null;
-    }>(this.#database.prepare(`
+    return all<KnowledgeRevalidationTaskRow>(this.#database.prepare(`
       SELECT * FROM knowledge_revalidation_tasks
       WHERE run_id=? ORDER BY created_at, task_id
-    `), runId).map((row) => ({
-      taskId: row.task_id,
-      runId: row.run_id,
-      translationId: row.translation_id,
-      blockId: row.block_id,
-      changeSetHash: row.change_set_hash,
-      fromSnapshotId: row.from_snapshot_id,
-      toSnapshotId: row.to_snapshot_id,
-      conceptIds: stringArrayFromJson(
-        row.concept_ids_json,
-        "revalidation concept IDs",
-      ),
-      status: row.status,
-      attempts: row.attempts,
-      result: JSON.parse(row.result_json) as unknown,
-      replacementTranslationId: row.replacement_translation_id,
-    }));
+    `), runId).map(revalidationTaskFromRow);
+  }
+
+  claimNextRevalidationTask(
+    runId: string,
+    maxAttempts = DEFAULT_MAX_REVALIDATION_ATTEMPTS,
+  ): KnowledgeRevalidationTask | undefined {
+    if (this.#schemaVersion !== LOSSLESS_BOOK_SCHEMA_VERSION) return undefined;
+    this.#run(runId);
+    requireSafeInteger(maxAttempts, "maxAttempts", 1);
+    return this.#transaction(() => {
+      const abandoned = all<KnowledgeRevalidationTaskRow>(
+        this.#database.prepare(`
+          SELECT task.*
+          FROM knowledge_revalidation_tasks AS task
+          JOIN translations AS translation
+            ON translation.translation_id=task.translation_id
+          WHERE task.run_id=?
+            AND task.status IN ('pending','validating')
+            AND translation.active=0
+          ORDER BY task.created_at, task.task_id
+        `),
+        runId,
+      );
+      for (const row of abandoned) {
+        this.#finishRevalidationTask(
+          revalidationTaskFromRow(row),
+          "resolved_noop",
+          { reason: "translation_superseded" },
+          null,
+          "clean",
+        );
+      }
+
+      const exhausted = all<KnowledgeRevalidationTaskRow>(
+        this.#database.prepare(`
+          SELECT task.*
+          FROM knowledge_revalidation_tasks AS task
+          JOIN translations AS translation
+            ON translation.translation_id=task.translation_id
+          WHERE task.run_id=? AND task.status='validating'
+            AND task.attempts>=? AND translation.active=1
+          ORDER BY task.created_at, task.task_id
+        `),
+        runId,
+        maxAttempts,
+      );
+      for (const row of exhausted) {
+        this.#finishRevalidationTask(
+          revalidationTaskFromRow(row),
+          "completed_with_warning",
+          { code: "REVALIDATION_ATTEMPTS_EXHAUSTED" },
+          null,
+          "warning_stale",
+        );
+      }
+
+      const row = one<KnowledgeRevalidationTaskRow>(
+        this.#database.prepare(`
+          SELECT task.*
+          FROM knowledge_revalidation_tasks AS task
+          JOIN translations AS translation
+            ON translation.translation_id=task.translation_id
+          WHERE task.run_id=?
+            AND task.status IN ('pending','validating')
+            AND task.attempts<?
+            AND translation.active=1
+          ORDER BY task.created_at, task.task_id
+          LIMIT 1
+        `),
+        runId,
+        maxAttempts,
+      );
+      if (row === undefined) return undefined;
+      const claimed = this.#database.prepare(`
+        UPDATE knowledge_revalidation_tasks
+        SET status='validating', attempts=attempts+1
+        WHERE run_id=? AND task_id=?
+          AND status IN ('pending','validating') AND attempts=?
+      `).run(runId, row.task_id, row.attempts);
+      if (Number(claimed.changes) !== 1) {
+        throw new Error(`failed to claim revalidation task ${row.task_id}`);
+      }
+      const task = this.#revalidationTask(runId, row.task_id);
+      for (const conceptId of task.conceptIds) {
+        this.#database.prepare(`
+          UPDATE translation_concept_bindings
+          SET validation_status='validating', updated_at=datetime('now')
+          WHERE translation_id=? AND concept_id=?
+        `).run(task.translationId, conceptId);
+      }
+      this.#appendEvent(runId, "sparse_revalidation_claimed", {
+        runId,
+        taskId: task.taskId,
+        attempt: task.attempts,
+      });
+      return task;
+    });
+  }
+
+  revalidationWorkItem(
+    runId: string,
+    taskId: string,
+  ): RevalidationWorkItem {
+    if (this.#schemaVersion !== LOSSLESS_BOOK_SCHEMA_VERSION) {
+      throw new Error("schema v4 write upgrade required");
+    }
+    this.#run(runId);
+    requireNonempty(taskId, "taskId");
+    const task = this.#revalidationTask(runId, taskId);
+    if (task.status !== "validating") {
+      throw new Error(`revalidation task is not validating: ${taskId}`);
+    }
+    const translation = one<{
+      translation_id: number;
+      run_id: string;
+      window_id: string;
+      block_id: string;
+      source_version: string;
+      source_hash: string;
+      text: string;
+      result_status: ActiveLosslessTranslation["status"];
+      version: number;
+      snapshot_id: string;
+      source_text: string;
+      global_index: number;
+      token_count: number;
+    }>(this.#database.prepare(`
+      SELECT t.translation_id, t.run_id, t.window_id, t.block_id,
+             t.source_version, t.source_hash, t.text, t.result_status,
+             t.version, t.snapshot_id, b.source_text, b.global_index,
+             b.token_count
+      FROM translations AS t
+      JOIN logical_blocks AS b
+        ON b.source_version=t.source_version AND b.block_id=t.block_id
+      WHERE t.translation_id=? AND t.run_id=? AND t.active=1
+    `), task.translationId, runId);
+    if (translation === undefined || translation.block_id !== task.blockId) {
+      throw new Error(`revalidation task translation is no longer active: ${taskId}`);
+    }
+    const window = this.#window(runId, translation.window_id);
+    if (window === undefined) {
+      throw new Error(`revalidation task window is missing: ${taskId}`);
+    }
+    const bindingRows = all<TranslationConceptBindingRow>(
+      this.#database.prepare(`
+        SELECT * FROM translation_concept_bindings
+        WHERE translation_id=? ORDER BY concept_id
+      `),
+      task.translationId,
+    );
+    const bindingByConcept = new Map(bindingRows.map((binding) => [
+      binding.concept_id,
+      binding,
+    ]));
+    const concepts = task.conceptIds.map((conceptId): RevalidationConceptState => {
+      const binding = bindingByConcept.get(conceptId);
+      if (binding === undefined) {
+        throw new Error(`revalidation binding is missing: ${taskId}/${conceptId}`);
+      }
+      const applied = one<LexicalConceptRow>(this.#database.prepare(`
+        SELECT * FROM lexical_concepts
+        WHERE run_id=? AND concept_id=? AND revision_id=?
+      `), runId, conceptId, binding.applied_revision_id);
+      const current = one<LexicalConceptRow>(this.#database.prepare(`
+        SELECT * FROM lexical_concepts
+        WHERE run_id=? AND concept_id=? AND active=1
+      `), runId, conceptId);
+      if (applied === undefined || current === undefined) {
+        throw new Error(`revalidation concept revision is missing: ${taskId}/${conceptId}`);
+      }
+      return {
+        conceptId,
+        appliedConcept: lexicalConceptFromRow(applied),
+        currentConcept: lexicalConceptFromRow(current),
+        termUsages: termUsagesFromJson(binding.term_usages_json),
+      };
+    });
+    return {
+      task,
+      translation: {
+        translationId: translation.translation_id,
+        runId: translation.run_id,
+        windowId: translation.window_id,
+        blockId: translation.block_id,
+        sourceVersion: translation.source_version,
+        sourceHash: translation.source_hash,
+        text: translation.text,
+        status: translation.result_status,
+        version: translation.version,
+        snapshotId: translation.snapshot_id,
+      },
+      source: {
+        blockId: translation.block_id,
+        sourceVersion: translation.source_version,
+        sourceHash: translation.source_hash,
+        sourceText: translation.source_text,
+        globalIndex: translation.global_index,
+        tokenCount: translation.token_count,
+      },
+      window,
+      concepts,
+    };
+  }
+
+  resolveRevalidationNoop(
+    runId: string,
+    taskId: string,
+    result: unknown,
+  ): void {
+    requireNonempty(runId, "runId");
+    requireNonempty(taskId, "taskId");
+    const resultJson = jsonText(result, "revalidation result");
+    this.#transaction(() => {
+      const work = this.revalidationWorkItem(runId, taskId);
+      const decision = evaluateRevalidationBindings(work.concepts);
+      if (decision.action !== "noop") {
+        throw new Error(`revalidation task ${taskId} is not a local noop`);
+      }
+      for (const state of work.concepts) {
+        const updated = this.#database.prepare(`
+          UPDATE translation_concept_bindings
+          SET applied_revision_id=?, applied_render_fingerprint=?,
+              validation_status='clean', validated_revision_id=?,
+              updated_at=datetime('now')
+          WHERE translation_id=? AND concept_id=?
+        `).run(
+          state.currentConcept.revisionId,
+          state.currentConcept.renderFingerprint,
+          state.currentConcept.revisionId,
+          work.translation.translationId,
+          state.conceptId,
+        );
+        if (Number(updated.changes) !== 1) {
+          throw new Error(`failed to resolve revalidation binding ${state.conceptId}`);
+        }
+      }
+      const completed = this.#database.prepare(`
+        UPDATE knowledge_revalidation_tasks
+        SET status='resolved_noop', result_json=?, resolved_at=datetime('now')
+        WHERE run_id=? AND task_id=? AND status='validating'
+      `).run(resultJson, runId, taskId);
+      if (Number(completed.changes) !== 1) {
+        throw new Error(`failed to resolve revalidation task ${taskId}`);
+      }
+      this.#appendEvent(runId, "sparse_revalidation_resolved_noop", {
+        runId,
+        taskId,
+      });
+    });
+  }
+
+  replaceTranslationForRevalidation(
+    input: RevalidationReplacementInput,
+  ): number {
+    requireNonempty(input.runId, "runId");
+    requireNonempty(input.taskId, "taskId");
+    requireNonempty(input.snapshotId, "snapshotId");
+    requireNonempty(input.text, "revalidation translation text");
+    if (input.action !== "repair" && input.action !== "retranslate") {
+      throw new TypeError("revalidation action must be repair or retranslate");
+    }
+    if (input.resultStatus !== "completed"
+      && input.resultStatus !== "completed_with_warnings") {
+      throw new TypeError("invalid revalidation result status");
+    }
+    const resultJson = jsonText(input.result, "revalidation result");
+    return this.#transaction(() => {
+      const work = this.revalidationWorkItem(input.runId, input.taskId);
+      const snapshot = one<{ present: number }>(this.#database.prepare(`
+        SELECT 1 AS present FROM knowledge_snapshots
+        WHERE run_id=? AND snapshot_id=?
+      `), input.runId, input.snapshotId);
+      if (snapshot === undefined) {
+        throw new Error(
+          `revalidation snapshot does not belong to run ${input.runId}`,
+        );
+      }
+      const decision = evaluateRevalidationBindings(work.concepts);
+      if (decision.action !== input.action) {
+        throw new Error(
+          `revalidation action mismatch: expected ${decision.action}, got ${input.action}`,
+        );
+      }
+      const currentById = new Map(input.concepts.map((concept) => [
+        concept.conceptId,
+        concept,
+      ]));
+      for (const concept of input.concepts) {
+        const active = this.activeLexicalConcept(input.runId, concept.conceptId);
+        if (active === undefined
+          || active.revisionId !== concept.revisionId
+          || active.renderFingerprint !== concept.renderFingerprint) {
+          throw new Error(
+            `replacement uses a stale lexical concept ${concept.conceptId}`,
+          );
+        }
+      }
+      for (const conceptId of work.task.conceptIds) {
+        if (!currentById.has(conceptId)) {
+          throw new Error(`replacement omitted changed concept ${conceptId}`);
+        }
+      }
+      const run = this.#run(input.runId);
+      const sourcePayload = JSON.parse(
+        this.#source(run.source_version).source_payload_json,
+      ) as { sourceLanguage?: unknown };
+      const profile = getSourceLanguageProfile(
+        typeof sourcePayload.sourceLanguage === "string"
+          ? sourcePayload.sourceLanguage
+          : undefined,
+      );
+      const expected = expectedTermOccurrences(
+        [{ id: work.source.blockId, sourceText: work.source.sourceText }],
+        input.concepts,
+        profile,
+      );
+      const failures = validateTermUsages(
+        expected,
+        input.termUsages,
+        { [work.source.blockId]: input.text },
+      );
+      if (failures.length > 0) {
+        throw new Error(
+          `replacement term usage validation failed: ${failures
+            .map((failure) => failure.code)
+            .join(",")}`,
+        );
+      }
+      for (const conceptId of work.task.conceptIds) {
+        if (!expected.some((occurrence) => occurrence.conceptId === conceptId)) {
+          throw new Error(`replacement source occurrence missing for ${conceptId}`);
+        }
+      }
+      const staged = one<{ count: number }>(this.#database.prepare(`
+        SELECT COUNT(*) AS count FROM translations
+        WHERE run_id=? AND window_id=? AND stage_state='staged' AND active=0
+      `), input.runId, work.translation.windowId)?.count ?? 0;
+      if (staged !== 0) {
+        throw new Error(
+          `revalidation window already contains staged translations: ${work.translation.windowId}`,
+        );
+      }
+      const inserted = this.#database.prepare(`
+        INSERT INTO translations(
+          run_id, window_id, source_version, block_id, version, source_hash,
+          text, result_status, stage_state, active, snapshot_id
+        ) VALUES(?, ?, ?, ?,
+          COALESCE((
+            SELECT MAX(version)+1 FROM translations
+            WHERE run_id=? AND block_id=?
+          ), 1),
+          ?, ?, ?, 'staged', 0, ?)
+      `).run(
+        input.runId,
+        work.translation.windowId,
+        work.source.sourceVersion,
+        work.source.blockId,
+        input.runId,
+        work.source.blockId,
+        work.source.sourceHash,
+        input.text,
+        input.resultStatus,
+        input.snapshotId,
+      );
+      const replacementTranslationId = Number(inserted.lastInsertRowid);
+      if (!Number.isSafeInteger(replacementTranslationId)
+        || replacementTranslationId < 1) {
+        throw new Error(`failed to insert revalidation replacement ${input.taskId}`);
+      }
+      this.#writeWindowConceptBindings(
+        input.runId,
+        work.translation.windowId,
+        input.termUsages,
+        input.concepts,
+      );
+      const deactivated = this.#database.prepare(`
+        UPDATE translations SET active=0
+        WHERE translation_id=? AND run_id=? AND active=1
+      `).run(work.translation.translationId, input.runId);
+      if (Number(deactivated.changes) !== 1) {
+        throw new Error(`active translation changed during revalidation ${input.taskId}`);
+      }
+      const activated = this.#database.prepare(`
+        UPDATE translations SET active=1, stage_state='promoted'
+        WHERE translation_id=? AND run_id=? AND active=0 AND stage_state='staged'
+      `).run(replacementTranslationId, input.runId);
+      if (Number(activated.changes) !== 1) {
+        throw new Error(`failed to activate revalidation replacement ${input.taskId}`);
+      }
+      const terminalStatus = input.action === "repair"
+        ? "resolved_repair"
+        : "resolved_retranslate";
+      const completed = this.#database.prepare(`
+        UPDATE knowledge_revalidation_tasks
+        SET status=?, result_json=?, replacement_translation_id=?,
+            resolved_at=datetime('now')
+        WHERE run_id=? AND task_id=? AND status='validating'
+      `).run(
+        terminalStatus,
+        resultJson,
+        replacementTranslationId,
+        input.runId,
+        input.taskId,
+      );
+      if (Number(completed.changes) !== 1) {
+        throw new Error(`failed to complete revalidation task ${input.taskId}`);
+      }
+      this.#appendEvent(input.runId, "sparse_revalidation_replaced", {
+        runId: input.runId,
+        taskId: input.taskId,
+        action: input.action,
+        oldTranslationId: work.translation.translationId,
+        replacementTranslationId,
+      });
+      return replacementTranslationId;
+    });
+  }
+
+  completeRevalidationWithWarning(
+    runId: string,
+    taskId: string,
+    result: unknown,
+  ): void {
+    requireNonempty(runId, "runId");
+    requireNonempty(taskId, "taskId");
+    this.#transaction(() => {
+      const task = this.#revalidationTask(runId, taskId);
+      if (task.status !== "validating") {
+        throw new Error(`revalidation task is not validating: ${taskId}`);
+      }
+      this.#finishRevalidationTask(
+        task,
+        "completed_with_warning",
+        result,
+        null,
+        "warning_stale",
+      );
+      this.#appendEvent(runId, "sparse_revalidation_warning", {
+        runId,
+        taskId,
+      });
+    });
   }
 
   knowledgeState(runId: string): KnowledgeStateView {
@@ -5309,6 +5808,28 @@ export class LosslessBookStore {
       .map((revision) => lexicalConceptFromPayload(revision.payload));
     if (concepts.length === 0) return;
     const changes = this.#upsertLexicalConceptRows(runId, concepts);
+    for (const change of changes) {
+      if (change.renderChanged) continue;
+      this.#database.prepare(`
+        UPDATE translation_concept_bindings
+        SET applied_revision_id=?,
+            validated_revision_id=?,
+            validation_status='clean',
+            updated_at=datetime('now')
+        WHERE concept_id=?
+          AND applied_render_fingerprint=?
+          AND translation_id IN (
+            SELECT translation_id FROM translations
+            WHERE run_id=? AND active=1
+          )
+      `).run(
+        change.revisionId,
+        change.revisionId,
+        change.conceptId,
+        change.renderFingerprint,
+        runId,
+      );
+    }
     const renderChanged = new Set(changes
       .filter((change) => change.renderChanged)
       .map((change) => change.conceptId));
@@ -5692,6 +6213,62 @@ export class LosslessBookStore {
         jsonText(orderedUsages, "term usages"),
         item.concept.revisionId,
       );
+    }
+  }
+
+  #revalidationTask(
+    runId: string,
+    taskId: string,
+  ): KnowledgeRevalidationTask {
+    const row = one<KnowledgeRevalidationTaskRow>(
+      this.#database.prepare(`
+        SELECT * FROM knowledge_revalidation_tasks
+        WHERE run_id=? AND task_id=?
+      `),
+      runId,
+      taskId,
+    );
+    if (row === undefined) {
+      throw new Error(`unknown revalidation task ${runId}/${taskId}`);
+    }
+    return revalidationTaskFromRow(row);
+  }
+
+  #finishRevalidationTask(
+    task: KnowledgeRevalidationTask,
+    status: Extract<
+      KnowledgeRevalidationTask["status"],
+      "resolved_noop" | "completed_with_warning"
+    >,
+    result: unknown,
+    replacementTranslationId: number | null,
+    bindingStatus: Extract<
+      TranslationConceptBinding["validationStatus"],
+      "clean" | "warning_stale"
+    >,
+  ): void {
+    const resultJson = jsonText(result, "revalidation result");
+    for (const conceptId of task.conceptIds) {
+      this.#database.prepare(`
+        UPDATE translation_concept_bindings
+        SET validation_status=?, updated_at=datetime('now')
+        WHERE translation_id=? AND concept_id=?
+      `).run(bindingStatus, task.translationId, conceptId);
+    }
+    const completed = this.#database.prepare(`
+      UPDATE knowledge_revalidation_tasks
+      SET status=?, result_json=?, replacement_translation_id=?,
+          resolved_at=datetime('now')
+      WHERE run_id=? AND task_id=? AND status IN ('pending','validating')
+    `).run(
+      status,
+      resultJson,
+      replacementTranslationId,
+      task.runId,
+      task.taskId,
+    );
+    if (Number(completed.changes) !== 1) {
+      throw new Error(`failed to finish revalidation task ${task.taskId}`);
     }
   }
 

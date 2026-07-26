@@ -6,6 +6,7 @@ import {
   reviseConcept,
 } from "../src/knowledge/lexical-concept.js";
 import {
+  evaluateRevalidationBindings,
   evaluateStagedConceptBindings,
   planSparseRevalidation,
   type ActiveTranslationDependency,
@@ -214,4 +215,47 @@ test("the submission gate upgrades allowed surfaces and rejects obsolete ones", 
   });
   assert.equal(obsolete.status, "retry_latest_snapshot");
   assert.deepEqual(obsolete.incompatibleConceptIds, [current.conceptId]);
+});
+
+test("revalidation action distinguishes noop, one-surface repair, and substantive retranslation", () => {
+  const previous = oldConcept();
+  const current = currentConcept();
+  const usage = (targetSurface: string) => ({
+    occurrenceId: "occurrence-0",
+    blockId: "block-0",
+    conceptId: current.conceptId,
+    sourceForm: "Prokurist",
+    sourceStart: 0,
+    sourceEnd: 9,
+    discourseRole: "narrative" as const,
+    targetSurface,
+  });
+  const state = (
+    currentConceptRevision: ReturnType<typeof currentConcept>,
+    targetSurface: string,
+  ) => [{
+    conceptId: current.conceptId,
+    appliedConcept: previous,
+    currentConcept: currentConceptRevision,
+    termUsages: [usage(targetSurface)],
+  }];
+
+  assert.deepEqual(
+    evaluateRevalidationBindings(state(current, "主事先生")),
+    { action: "noop", conceptIds: [current.conceptId] },
+  );
+  assert.deepEqual(
+    evaluateRevalidationBindings(state(current, "秘书主任")),
+    { action: "repair", conceptIds: [current.conceptId] },
+  );
+
+  const policyChange = reviseConcept(previous, {
+    canonicalTarget: "主事",
+    allowedRealizations: ["主事"],
+    policy: "locked",
+  });
+  assert.deepEqual(
+    evaluateRevalidationBindings(state(policyChange, "秘书主任")),
+    { action: "retranslate", conceptIds: [current.conceptId] },
+  );
 });

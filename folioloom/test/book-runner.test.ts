@@ -15,6 +15,7 @@ import {
 
 import {
   BookRequestCapacityError,
+  drainKnowledgeRevalidationTasks,
   runBook,
   windowOptionsForRunMode,
 } from "../src/fullbook/book-runner.js";
@@ -27,6 +28,11 @@ import { annotateStructure } from "../src/source/structure-annotator.js";
 import { BookStore } from "../src/storage/book-store.js";
 import { LosslessBookStore } from "../src/storage/lossless-book-store.js";
 import { createKnowledgeSnapshot } from "../src/knowledge/snapshot.js";
+import {
+  conceptFromAnchor,
+  reviseConcept,
+} from "../src/knowledge/lexical-concept.js";
+import { BudgetExceeded } from "../src/kernel/budget.js";
 import { scalarLength } from "../src/source/types.js";
 import {
   WeightedTokenEstimator,
@@ -128,6 +134,202 @@ test("fast mode uses larger bounded windows unless the caller supplies tighter l
     maxBlocks: 4,
   });
   assert.deepEqual(windowOptionsForRunMode("quality", {}), {});
+});
+
+function revalidationQueueFixture(input: {
+  readonly currentTarget: string;
+  readonly allowedTargets: readonly string[];
+  readonly policy?: "locked" | "preferred" | "contextual";
+}) {
+  const previous = conceptFromAnchor({
+    sourceForm: "Prokurist",
+    target: "秘书主任",
+    mode: "contextual",
+    semanticClass: "role",
+    confidence: 0.95,
+  });
+  const current = reviseConcept(previous, {
+    canonicalTarget: input.currentTarget,
+    allowedRealizations: input.allowedTargets,
+    ...(input.policy === undefined ? {} : { policy: input.policy }),
+  });
+  let terminal = false;
+  let claimed = false;
+  const calls = {
+    noop: 0,
+    replace: [] as Array<"repair" | "retranslate">,
+    warning: 0,
+  };
+  const task = {
+    taskId: "task-0",
+    runId: "run-0",
+    translationId: 1,
+    blockId: "block-0",
+    changeSetHash: "a".repeat(64),
+    fromSnapshotId: "snapshot-old",
+    toSnapshotId: "snapshot-new",
+    conceptIds: [current.conceptId],
+    status: "validating" as const,
+    attempts: 1,
+    result: {},
+    replacementTranslationId: null,
+  };
+  const store = {
+    claimNextRevalidationTask() {
+      if (terminal || claimed) return undefined;
+      claimed = true;
+      return task;
+    },
+    revalidationWorkItem() {
+      return {
+        task,
+        translation: {
+          translationId: 1,
+          runId: "run-0",
+          windowId: "window-0",
+          blockId: "block-0",
+          sourceVersion: "source-0",
+          sourceHash: "source-hash",
+          text: "秘书主任。",
+          status: "completed" as const,
+          version: 1,
+          snapshotId: "snapshot-old",
+        },
+        source: {
+          blockId: "block-0",
+          sourceVersion: "source-0",
+          sourceHash: "source-hash",
+          sourceText: "Prokurist.",
+          globalIndex: 0,
+          tokenCount: 3,
+        },
+        window: {
+          windowId: "window-0",
+          ordinal: 0,
+          chapterId: "chapter-0",
+          chapterTitle: "One",
+          blockIds: ["block-0"],
+          globalIndexes: [0],
+          sourceTokens: 3,
+          sourceChars: 10,
+          oversized: false,
+          status: "completed" as const,
+          attemptCount: 1,
+          snapshotId: "snapshot-old",
+          budget: {},
+          warnings: [],
+          lastError: "",
+        },
+        concepts: [{
+          conceptId: current.conceptId,
+          appliedConcept: { ...previous, revision: 1 },
+          currentConcept: { ...current, revision: 2 },
+          termUsages: [{
+            occurrenceId: "occurrence-0",
+            blockId: "block-0",
+            conceptId: current.conceptId,
+            sourceForm: "Prokurist",
+            sourceStart: 0,
+            sourceEnd: 9,
+            discourseRole: "narrative" as const,
+            targetSurface: "秘书主任",
+          }],
+        }],
+      };
+    },
+    resolveRevalidationNoop() {
+      calls.noop += 1;
+      terminal = true;
+    },
+    replaceTranslationForRevalidation(replacement: { action: "repair" | "retranslate" }) {
+      calls.replace.push(replacement.action);
+      terminal = true;
+      return 2;
+    },
+    completeRevalidationWithWarning() {
+      calls.warning += 1;
+      terminal = true;
+    },
+  };
+  return { store, calls, current };
+}
+
+test("revalidation noop uses durable receipts without a model call", async () => {
+  const fixture = revalidationQueueFixture({
+    currentTarget: "主事",
+    allowedTargets: ["主事", "秘书主任"],
+  });
+  let modelCalls = 0;
+  const result = await drainKnowledgeRevalidationTasks({
+    store: fixture.store as never,
+    runId: "run-0",
+    maxAttempts: 1,
+    translate: async () => {
+      modelCalls += 1;
+      throw new Error("noop must not call the model");
+    },
+    isExpectedFailure: () => false,
+  });
+  assert.equal(modelCalls, 0);
+  assert.equal(fixture.calls.noop, 1);
+  assert.deepEqual(result, {
+    claimed: 1,
+    noop: 1,
+    repaired: 0,
+    retranslated: 0,
+    warning: 0,
+    modelCalls: 0,
+  });
+});
+
+test("revalidation runs one targeted repair or full block translation from its action", async () => {
+  for (const [fixture, expected] of [
+    [revalidationQueueFixture({
+      currentTarget: "主事",
+      allowedTargets: ["主事"],
+    }), "repair"],
+    [revalidationQueueFixture({
+      currentTarget: "主事",
+      allowedTargets: ["主事"],
+      policy: "locked",
+    }), "retranslate"],
+  ] as const) {
+    const result = await drainKnowledgeRevalidationTasks({
+      store: fixture.store as never,
+      runId: "run-0",
+      maxAttempts: 1,
+      translate: async (_work, action) => ({
+        snapshotId: "snapshot-new",
+        text: "主事。",
+        resultStatus: "completed" as const,
+        termUsages: [],
+        concepts: [fixture.current],
+        result: { action },
+      }),
+      isExpectedFailure: () => false,
+    });
+    assert.deepEqual(fixture.calls.replace, [expected]);
+    assert.equal(result.modelCalls, 1);
+  }
+});
+
+test("expected revalidation failure preserves the old version and continues as warning", async () => {
+  const fixture = revalidationQueueFixture({
+    currentTarget: "主事",
+    allowedTargets: ["主事"],
+  });
+  const result = await drainKnowledgeRevalidationTasks({
+    store: fixture.store as never,
+    runId: "run-0",
+    maxAttempts: 1,
+    translate: async () => {
+      throw new BudgetExceeded("modelCalls", 1, 2);
+    },
+    isExpectedFailure: (error) => error instanceof BudgetExceeded,
+  });
+  assert.equal(fixture.calls.warning, 1);
+  assert.equal(result.warning, 1);
+  assert.equal(result.modelCalls, 1);
 });
 
 test("fast mode keeps its default physical request limit aligned with a legal 4,800-token window", async () => {

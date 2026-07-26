@@ -570,7 +570,7 @@ export function planSparseRevalidation(input: {
 概念 promotion 后调用 store 规划 API，只查询 `concept_occurrences` 命中
 块和旧 binding。`UNIQUE(translation_id, change_set_hash)` 保证恢复幂等。
 
-- [ ] **步骤 6：验证并提交**
+- [x] **步骤 6：验证并提交**
 
 ```powershell
 npm test -- --test-name-pattern="sparse revalidation|reverse physical completion|knowledge"
@@ -586,7 +586,7 @@ git commit -m "feat: invalidate only stale concept bindings"
 - 修改：`folioloom/src/storage/lossless-book-store.ts`
 - 修改：`folioloom/test/book-runner.test.ts`
 
-- [ ] **步骤 1：编写 noop、修复、重译和失败保留测试**
+- [x] **步骤 1：编写 noop、修复、重译和失败保留测试**
 
 四个用例：
 
@@ -596,13 +596,13 @@ git commit -m "feat: invalidate only stale concept bindings"
 4. provider/预算失败：旧 version 仍 active，binding 为
    `warning_stale`，其他窗口继续。
 
-- [ ] **步骤 2：运行测试确认失败**
+- [x] **步骤 2：运行测试确认失败**
 
 ```powershell
 npm test -- --test-name-pattern="revalidation noop|revalidation repair|warning stale"
 ```
 
-- [ ] **步骤 3：实现任务循环**
+- [x] **步骤 3：实现任务循环**
 
 每个波次结束后、选择下一波之前：
 
@@ -622,7 +622,7 @@ while (true) {
 同一任务最多使用现有 `maxAttempts`。重验产生的知识候选只进入下一波，
 不能在当前任务排空时递归触发无限循环。
 
-- [ ] **步骤 4：实现版本切换事务**
+- [x] **步骤 4：实现版本切换事务**
 
 新译文完整通过后：
 
@@ -633,7 +633,7 @@ while (true) {
 - 任务写 replacement ID 和终态；
 - 旧译文、旧 binding 和事件历史保留。
 
-- [ ] **步骤 5：验证并提交**
+- [x] **步骤 5：验证并提交**
 
 ```powershell
 npm test -- --test-name-pattern="revalidation"

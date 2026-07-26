@@ -26,8 +26,11 @@ import {
   relevantGlossaryTerms,
   type LoadedGlossary,
 } from "../glossary/glossary-profile.js";
-import { DEFAULT_BUDGET_LIMITS } from "../kernel/budget.js";
-import { BudgetLedger } from "../kernel/budget.js";
+import {
+  BudgetExceeded,
+  BudgetLedger,
+  DEFAULT_BUDGET_LIMITS,
+} from "../kernel/budget.js";
 import { RunLease } from "../kernel/run-lease.js";
 import {
   canonicalJson,
@@ -44,6 +47,10 @@ import {
   conceptFromAnchor,
   type LexicalSemanticClass,
 } from "../knowledge/lexical-concept.js";
+import {
+  evaluateRevalidationBindings,
+  type RevalidationBindingDecision,
+} from "../knowledge/sparse-revalidation.js";
 import { conceptsFromStableTerms } from "../knowledge/term-usage.js";
 import { createKnowledgeSnapshot } from "../knowledge/snapshot.js";
 import { SourceLedger } from "../source/source-ledger.js";
@@ -65,8 +72,11 @@ import {
 } from "../storage/book-store.js";
 import {
   LosslessBookStore,
+  type KnowledgeRevalidationTask,
   type LosslessBookStatusSummary,
   type PersistedLosslessWindow,
+  type RevalidationReplacementInput,
+  type RevalidationWorkItem,
 } from "../storage/lossless-book-store.js";
 import type { TranslationMemoryCandidate } from "../tools/candidate-collector.js";
 import type { StyleState } from "../tools/translation-tools.js";
@@ -359,6 +369,15 @@ export class BookRequestCapacityError extends Error {
   }
 }
 
+class RevalidationOutputError extends Error {
+  readonly code = "REVALIDATION_OUTPUT_INVALID" as const;
+
+  constructor(detail: string) {
+    super(`REVALIDATION_OUTPUT_INVALID: ${detail}`);
+    this.name = "RevalidationOutputError";
+  }
+}
+
 export interface LosslessBookRunResult {
   outcome: "completed" | "completed_with_warnings" | "human_required" | "partial";
   runId: string;
@@ -369,6 +388,129 @@ export interface LosslessBookRunResult {
   wallTimeMs: number;
   leaseReleased: boolean;
   artifacts: null;
+}
+
+type RevalidationQueueStore = Pick<
+  LosslessBookStore,
+  | "claimNextRevalidationTask"
+  | "revalidationWorkItem"
+  | "resolveRevalidationNoop"
+  | "replaceTranslationForRevalidation"
+  | "completeRevalidationWithWarning"
+>;
+
+export interface RevalidationTranslationOutput
+  extends Omit<
+    RevalidationReplacementInput,
+    "runId" | "taskId" | "action"
+  > {}
+
+export interface RevalidationDrainReport {
+  readonly claimed: number;
+  readonly noop: number;
+  readonly repaired: number;
+  readonly retranslated: number;
+  readonly warning: number;
+  readonly modelCalls: number;
+}
+
+export interface RevalidationDrainOptions {
+  readonly store: RevalidationQueueStore;
+  readonly runId: string;
+  readonly maxAttempts: number;
+  readonly translate: (
+    work: RevalidationWorkItem,
+    action: Exclude<RevalidationBindingDecision["action"], "noop">,
+  ) => Promise<RevalidationTranslationOutput>;
+  readonly isExpectedFailure: (error: unknown) => boolean;
+  readonly shouldRetryFailure?: (
+    error: unknown,
+    task: KnowledgeRevalidationTask,
+  ) => boolean;
+}
+
+function revalidationFailureCode(error: unknown): string {
+  if (error instanceof ModelProviderError) {
+    return `PROVIDER_${error.kind.toUpperCase()}`;
+  }
+  if (error instanceof BudgetExceeded) {
+    return "BUDGET_EXCEEDED";
+  }
+  if (error instanceof BookRequestCapacityError) {
+    return error.code;
+  }
+  return "REVALIDATION_FAILED";
+}
+
+/**
+ * Drain only the durable task set that already exists. Translation-generated
+ * knowledge is intentionally absent from this loop, so one revalidation wave
+ * cannot recursively schedule itself.
+ */
+export async function drainKnowledgeRevalidationTasks(
+  options: RevalidationDrainOptions,
+): Promise<RevalidationDrainReport> {
+  positiveInteger(options.maxAttempts, "revalidation maxAttempts");
+  const report = {
+    claimed: 0,
+    noop: 0,
+    repaired: 0,
+    retranslated: 0,
+    warning: 0,
+    modelCalls: 0,
+  };
+  while (true) {
+    const task = options.store.claimNextRevalidationTask(
+      options.runId,
+      options.maxAttempts,
+    );
+    if (task === undefined) break;
+    report.claimed += 1;
+    const work = options.store.revalidationWorkItem(
+      options.runId,
+      task.taskId,
+    );
+    const decision = evaluateRevalidationBindings(work.concepts);
+    if (decision.action === "noop") {
+      options.store.resolveRevalidationNoop(
+        options.runId,
+        task.taskId,
+        { reason: "recorded_surfaces_remain_allowed" },
+      );
+      report.noop += 1;
+      continue;
+    }
+    try {
+      report.modelCalls += 1;
+      const output = await options.translate(work, decision.action);
+      options.store.replaceTranslationForRevalidation({
+        ...output,
+        runId: options.runId,
+        taskId: task.taskId,
+        action: decision.action,
+      });
+      if (decision.action === "repair") {
+        report.repaired += 1;
+      } else {
+        report.retranslated += 1;
+      }
+    } catch (error) {
+      if (!options.isExpectedFailure(error)) {
+        throw error;
+      }
+      const retryable = options.shouldRetryFailure?.(error, task) ?? true;
+      if (retryable && task.attempts < options.maxAttempts) {
+        continue;
+      }
+      options.store.completeRevalidationWithWarning(
+        options.runId,
+        task.taskId,
+        { code: revalidationFailureCode(error) },
+      );
+      report.warning += 1;
+    }
+  }
+  return report;
 }
 
 interface AttemptResult {
@@ -1696,6 +1838,170 @@ async function runLosslessBook(
     });
     const blockById = new Map(context.losslessBlocks.map((block) => [block.id, block]));
     let fastWaveHorizonMultiplier = runtimeSet.mode === "fast" ? 2 : 1;
+    const translateRevalidation = async (
+      work: RevalidationWorkItem,
+      action: "repair" | "retranslate",
+    ): Promise<RevalidationTranslationOutput> => {
+      throwIfAborted(options.signal);
+      const sourceBlock = blockById.get(work.source.blockId);
+      if (sourceBlock === undefined
+        || sourceBlock.sourceHash !== work.source.sourceHash) {
+        throw new RevalidationOutputError("source block provenance changed");
+      }
+      const snapshot = store.latestKnowledgeSnapshot(runId);
+      if (snapshot.id !== work.task.toSnapshotId) {
+        const currentConceptIds = new Set(
+          stableTermsFromKnowledge(snapshot.revisions)
+            .map((term) => term.conceptId),
+        );
+        if (work.task.conceptIds.some((conceptId) =>
+          !currentConceptIds.has(conceptId))) {
+          throw new RevalidationOutputError(
+            "latest snapshot no longer contains a changed concept",
+          );
+        }
+      }
+      const requestStyle = mergeStyleState(
+        options.styleState,
+        persistedStyleFromKnowledge(snapshot.revisions),
+      );
+      const requestWindow: RequestBatchWindow = {
+        windowId: work.window.windowId,
+        ordinal: work.window.ordinal,
+        chapterId: work.window.chapterId,
+        chapterTitle: work.window.chapterTitle,
+        blockIds: [work.source.blockId],
+        globalIndexes: [work.source.globalIndex],
+        sourceTokens: work.source.tokenCount,
+        sourceChars: Array.from(work.source.sourceText).length,
+        oversized: work.source.tokenCount > maxRequestTokens,
+        status: "pending",
+      };
+      const request: PhysicalRequestPlan = {
+        requestId: `revalidation-${createHash("sha256")
+          .update([
+            runId,
+            work.task.taskId,
+            String(work.task.attempts),
+          ].join("\0"), "utf8")
+          .digest("hex")
+          .slice(0, 24)}`,
+        windows: [requestWindow],
+        sourceTokens: requestWindow.sourceTokens,
+      };
+      const terms = termsForWindows(
+        uniqueTerms([
+          ...context.stableTerms.map((term) => ({
+            ...term,
+            origin: term.origin ?? "legacy" as const,
+          })),
+          ...(options.glossary?.stableTerms ?? []),
+          ...stableTermsFromKnowledge(snapshot.revisions),
+        ], context),
+        [requestWindow],
+        context,
+        options.glossary,
+      );
+      const effectiveStyle = projectEffectiveStyle(composeEffectiveStyle({
+        constitution: losslessStyleConstitution(requestStyle),
+        voices: losslessVoiceProfiles(requestStyle),
+        observations: store.styleObservations(runId),
+        currentOrdinal: work.window.ordinal,
+        sourceText: work.source.sourceText,
+        defaultVoiceId: "narrator",
+      }));
+      const runtime = work.task.attempts > 1
+        ? runtimeSet.escalation
+        : runtimeSet.primary;
+      const budget = new BudgetLedger();
+      const result = await runTranslationBatch({
+        request,
+        blocks: context.losslessBlocks,
+        stableTerms: terms,
+        snapshot,
+        styleState: requestStyle,
+        sourceLanguageProfile: context.languageProfile,
+        entityLinkWarnings: [],
+        effectiveStyleByWindow: {
+          [requestWindow.windowId]: effectiveStyle,
+        },
+        responseProtocol: runtimeSet.mode === "fast"
+          ? "framed_text"
+          : "typed_tool",
+        model: runtime.model,
+        streamFn: runtime.streamFn,
+        thinkingLevel: runtime.thinkingLevel,
+        repairRuntime: {
+          model: runtimeSet.escalation.model,
+          streamFn: runtimeSet.escalation.streamFn,
+          thinkingLevel: runtimeSet.escalation.thinkingLevel,
+        },
+        budget,
+        signal: options.signal,
+        deadlineMs: options.hardDeadlineMs,
+      });
+      const windowResult = result.windows.find((candidate) =>
+        candidate.windowId === requestWindow.windowId);
+      if (windowResult === undefined
+        || windowResult.status === "failed"
+        || windowResult.translations.length !== 1
+        || windowResult.translations[0]?.blockId !== work.source.blockId) {
+        throw new RevalidationOutputError("single-block translation was incomplete");
+      }
+      const translatedText = windowResult.translations[0].text;
+      const active = store.activeTranslations(runId);
+      const activeIndex = active.findIndex((translation) =>
+        translation.blockId === work.source.blockId);
+      const boundaryTranslations = [
+        ...(activeIndex > 0 ? [active[activeIndex - 1]!] : []),
+        {
+          ...work.translation,
+          text: translatedText,
+        },
+        ...(activeIndex >= 0 && activeIndex + 1 < active.length
+          ? [active[activeIndex + 1]!]
+          : []),
+      ].map((translation) => ({
+        blockId: translation.blockId,
+        text: translation.text,
+      }));
+      const boundaryBlocks = boundaryTranslations
+        .map((translation) => blockById.get(translation.blockId))
+        .filter((block): block is BookContext["losslessBlocks"][number] =>
+          block !== undefined)
+        .map(losslessAsV4);
+      const boundary = new TranslationValidator().validateCrossBlockAlignment(
+        boundaryBlocks,
+        {
+          translations: boundaryTranslations,
+          notes: [],
+          repaired: action === "repair",
+        },
+      );
+      if (boundary.failures.length > 0) {
+        throw new RevalidationOutputError("cross-block alignment failed");
+      }
+      const warnings = [...windowResult.notes, ...result.responseErrors];
+      return {
+        snapshotId: snapshot.id,
+        text: translatedText,
+        resultStatus: warnings.length > 0
+          ? "completed_with_warnings"
+          : "completed",
+        termUsages: windowResult.termUsages,
+        concepts: conceptsFromStableTerms(terms),
+        result: {
+          action,
+          responseWarnings: result.responseErrors.length,
+          notes: windowResult.notes.length,
+          modelCalls: result.run.modelCalls
+            + result.repairRuns.reduce(
+              (total, repairRun) => total + repairRun.modelCalls,
+              0,
+            ),
+        },
+      };
+    };
 
     while (processedWindows < maxWindows) {
       throwIfAborted(options.signal);
@@ -1705,6 +2011,20 @@ async function runLosslessBook(
       // window is claimed, so the next request sees the newest durable user
       // knowledge without ever changing a running/staged wave.
       store.syncScopedKnowledge(runId);
+      await drainKnowledgeRevalidationTasks({
+        store,
+        runId,
+        maxAttempts,
+        translate: translateRevalidation,
+        isExpectedFailure: (error) =>
+          error instanceof ModelProviderError
+          || error instanceof BudgetExceeded
+          || error instanceof BookRequestCapacityError
+          || error instanceof RevalidationOutputError,
+        shouldRetryFailure: (error) =>
+          error instanceof RevalidationOutputError
+          || (error instanceof ModelProviderError && error.retryable),
+      });
       const allWindows = store.allWindows(runId);
       const barrier = firstUncommitted(allWindows);
       if (barrier === undefined || barrier.status !== "pending") {
