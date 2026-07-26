@@ -76,7 +76,7 @@ const PUBLIC_ERRORS: Readonly<Record<string, PublicErrorDefinition>> = Object.fr
   },
   SOURCE_ENCODING_UNSUPPORTED: {
     message: "无法读取这份书稿的文字编码",
-    nextAction: "请先把书稿转换为 UTF-8、Shift-JIS、EUC-JP、EUC-KR 或 CP949 后重试。",
+    nextAction: "请先把书稿转换为 UTF-8，或选择 Shift-JIS、EUC-JP、EUC-KR、CP949、Windows-1252 后重试。",
     retryable: false,
   },
   DESKTOP_TRIAL_ALREADY_RUNNING: {

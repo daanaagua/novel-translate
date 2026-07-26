@@ -372,6 +372,21 @@ h2 {
 .project-header .quiet-button { flex: 0 0 auto; margin-top: 3px; }
 .project-header .project-diagnostic { margin-top: 4px; }
 
+.source-language-field {
+  width: min(260px, 100%);
+  margin: 18px 0 12px;
+}
+
+.source-replace-controls {
+  display: grid;
+  justify-items: end;
+}
+
+.source-replace-controls .source-language-field {
+  width: 210px;
+  margin: 0 0 10px;
+}
+
 .setup-workspace-grid {
   display: grid;
   grid-template-columns: minmax(220px, 0.7fr) minmax(0, 1.8fr);

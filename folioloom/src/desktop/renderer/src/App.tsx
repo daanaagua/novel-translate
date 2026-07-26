@@ -4,6 +4,7 @@ import type {
   DesktopChooseSourceResult,
   DesktopSourceEncoding,
   DesktopSourceEncodingRequired,
+  DesktopSourceLanguageChoice,
   DesktopDiscoverModelsRequest,
   DesktopError,
   DesktopExportDestination,
@@ -325,12 +326,14 @@ export function App({ api }: AppProps): JSX.Element {
     acceptOnboarding(stateResult);
   }
 
-  async function chooseSource(): Promise<void> {
+  async function chooseSource(
+    sourceLanguage: DesktopSourceLanguageChoice = "auto",
+  ): Promise<void> {
     setActiveWorkspace("overview");
     setPendingEncoding(undefined);
     setBusyAction("choose-source");
     try {
-      const sourceResult = await desktopApi.chooseSource();
+      const sourceResult = await desktopApi.chooseSource({ sourceLanguage });
       if (!sourceResult.ok) {
         if (sourceResult.error.code === "DESKTOP_SELECTION_CANCELLED") {
           setOperationError(undefined);
@@ -668,7 +671,7 @@ export function App({ api }: AppProps): JSX.Element {
           <WorkspacePlaceholder
             workspace="review"
             snapshot={onboarding.project}
-            onChooseProject={() => { void chooseSource(); }}
+            onChooseProject={() => { void chooseSource("auto"); }}
           />
         )}
       </div>

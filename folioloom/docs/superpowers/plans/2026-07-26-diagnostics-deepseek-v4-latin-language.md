@@ -325,7 +325,7 @@ git commit -m "fix: require current DeepSeek V4 model ids"
 - 修改：`test/desktop-ipc.test.ts`
 - 修改：`src/desktop/renderer/src/App.test.tsx`
 
-- [ ] **步骤 1：编写检测、混合前言、低置信和章节布局测试**
+- [x] **步骤 1：编写检测、混合前言、低置信和章节布局测试**
 
 ```ts
 test("detects German, French and Spanish fiction after a short English front matter", () => {
@@ -343,17 +343,17 @@ test("standalone Roman chapter headings require blank-line layout evidence", () 
 
 同时覆盖 `KAPITEL 1`、`1. Kapitel`、`Erstes Kapitel`、`CHAPITRE I`、`PREMIER CHAPITRE`、`CAPÍTULO I`、`CAPITULO 1`，以及 UTF-8/UTF-16/Windows-1252 重音字符和弯引号导入。
 
-- [ ] **步骤 2：运行测试确认德语 `I.` 和语言覆盖链尚未工作**
+- [x] **步骤 2：运行测试确认德语 `I.` 和语言覆盖链尚未工作**
 
 运行：`node --test --import tsx test/language-profile.test.ts test/source-importer.test.ts test/desktop-ipc.test.ts`
 
 预期：FAIL，缺少章节模式或 GUI/IPC 语言覆盖请求。
 
-- [ ] **步骤 3：实现确定性检测和有布局证据的标题**
+- [x] **步骤 3：实现确定性检测和有布局证据的标题**
 
 增加德法西高辨识度功能词和分段采样，仍保持低证据返回 `undefined`。扩展三个 profile 的标题正则；`structure-annotator.ts` 对单独阿拉伯数字或罗马数字统一要求前后空行，避免正文误判。
 
-- [ ] **步骤 4：实现可选原文语言覆盖**
+- [x] **步骤 4：实现可选原文语言覆盖**
 
 ```ts
 export interface DesktopChooseSourceRequest {
@@ -363,7 +363,7 @@ export interface DesktopChooseSourceRequest {
 
 初始页和更换书稿区域提供默认“自动检测”的选择框。IPC 只接受受支持 ID，并把选择传给 `DesktopSourceService.importSource()`；编码确认沿用 pending import 中已保存的语言值。
 
-- [ ] **步骤 5：运行语言、导入、IPC 和 renderer 测试**
+- [x] **步骤 5：运行语言、导入、IPC 和 renderer 测试**
 
 运行：
 

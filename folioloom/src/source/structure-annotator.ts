@@ -6,6 +6,8 @@ import type { SourceInput, StructureAnnotation, StructureKind } from "./types.js
 import { coordinatesFor, sourceTextFor } from "./types.js";
 
 const AMBIGUOUS_JAPANESE_NUMERAL_HEADING = /^(?:[一二三四五六七八九十百千〇零]+|\d{1,4})$/u;
+const AMBIGUOUS_STANDALONE_LATIN_NUMERAL_HEADING =
+  /^(?:\d{1,4}|[IVXLCDM]+)\.?$/iu;
 
 function hasStrongLayoutEvidence(
   lines: readonly RegExpMatchArray[],
@@ -48,8 +50,11 @@ export function annotateStructure(
     if (heading === null) {
       continue;
     }
-    if (profile.id === "ja"
-      && AMBIGUOUS_JAPANESE_NUMERAL_HEADING.test(match[0].trim())
+    const title = match[0].trim();
+    if (((profile.id === "ja"
+      && AMBIGUOUS_JAPANESE_NUMERAL_HEADING.test(title))
+      || (profile.scripts.includes("latin")
+        && AMBIGUOUS_STANDALONE_LATIN_NUMERAL_HEADING.test(title)))
       && !hasStrongLayoutEvidence(lines, lineIndex)) {
       continue;
     }

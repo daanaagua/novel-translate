@@ -67,7 +67,8 @@ const DEFINITIONS: readonly ProfileDefinition[] = [
     volumePatterns: [/^LIVRE(?:\s+(?:\d+|[IVXLCDM]+|[\p{L}-]+))?$/iu],
     chapterPatterns: [
       /^CHAPITRE(?:\s+(?:\d+|[IVXLCDM]+|[\p{L}-]+))?$/iu,
-      /^[IVXLCDM]+$/u,
+      /^(?:PREMIER|PREMIÈRE|DEUXIÈME|TROISIÈME|QUATRIÈME|CINQUIÈME)\s+CHAPITRE$/iu,
+      /^[IVXLCDM]+\.?$/iu,
     ],
     stopWords: [
       "au", "aux", "avec", "ce", "ces", "chapitre", "dans", "de", "des",
@@ -85,7 +86,12 @@ const DEFINITIONS: readonly ProfileDefinition[] = [
     displayName: "German",
     locale: "de",
     volumePatterns: [/^(?:BUCH|BAND)(?:\s+(?:\d+|[IVXLCDM]+|[\p{L}-]+))?$/iu],
-    chapterPatterns: [/^KAPITEL(?:\s+(?:\d+|[IVXLCDM]+|[\p{L}-]+))?$/iu],
+    chapterPatterns: [
+      /^KAPITEL(?:\s+(?:\d+|[IVXLCDM]+|[\p{L}-]+))?$/iu,
+      /^(?:\d+|[IVXLCDM]+)\.\s*KAPITEL$/iu,
+      /^(?:ERSTES|ZWEITES|DRITTES|VIERTES|FÜNFTES|SECHSTES|SIEBTES|ACHTES|NEUNTES|ZEHNTES)\s+KAPITEL$/iu,
+      /^[IVXLCDM]+\.?$/iu,
+    ],
     stopWords: ["aber", "das", "der", "die", "ein", "eine", "er", "es", "im", "in", "mit", "sie", "und", "von", "zu"],
     script: "latin",
     aliasCuePatterns: [/\b(?:auch bekannt als|bekannt als|genannt)\b/iu],
@@ -95,7 +101,11 @@ const DEFINITIONS: readonly ProfileDefinition[] = [
     displayName: "Spanish",
     locale: "es",
     volumePatterns: [/^LIBRO(?:\s+(?:\d+|[IVXLCDM]+|[\p{L}-]+))?$/iu],
-    chapterPatterns: [/^CAP[IÍ]TULO(?:\s+(?:\d+|[IVXLCDM]+|[\p{L}-]+))?$/iu],
+    chapterPatterns: [
+      /^CAP[IÍ]TULO(?:\s+(?:\d+|[IVXLCDM]+|[\p{L}-]+))?$/iu,
+      /^(?:PRIMER|PRIMERO|SEGUNDO|TERCER|TERCERO|CUARTO|QUINTO)\s+CAP[IÍ]TULO$/iu,
+      /^[IVXLCDM]+\.?$/iu,
+    ],
     stopWords: ["a", "con", "de", "del", "el", "ella", "en", "la", "las", "los", "pero", "por", "que", "se", "un", "una", "y"],
     script: "latin",
     aliasCuePatterns: [

@@ -22,6 +22,7 @@ const ENCODING_LABELS: Readonly<Record<DesktopSourceEncoding, string>> = {
   "euc-jp": "EUC-JP（日文）",
   "euc-kr": "EUC-KR（韩文）",
   "windows-949": "Windows-949 / CP949（韩文）",
+  "windows-1252": "Windows-1252（西欧文字）",
 };
 
 export function EncodingChooser({

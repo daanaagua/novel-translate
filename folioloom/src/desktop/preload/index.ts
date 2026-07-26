@@ -27,7 +27,9 @@ function trialProgress(value: unknown): DesktopTrialProgress | undefined {
 }
 
 const desktopApi: FolioLoomDesktopApi = {
-  chooseSource: () => ipcRenderer.invoke("folioloom:choose-source"),
+  chooseSource: (request) => request === undefined
+    ? ipcRenderer.invoke("folioloom:choose-source")
+    : ipcRenderer.invoke("folioloom:choose-source", request),
   confirmSourceEncoding: (request) => ipcRenderer.invoke("folioloom:confirm-source-encoding", request),
   getOnboardingState: () => ipcRenderer.invoke("folioloom:onboarding-state"),
   discoverModels: (request) => ipcRenderer.invoke("folioloom:discover-models", request),

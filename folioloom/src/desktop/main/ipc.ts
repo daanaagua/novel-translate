@@ -3,6 +3,7 @@ import { basename, extname } from "node:path";
 
 import type {
   DesktopChooseSourceResult,
+  DesktopChooseSourceRequest,
   DesktopConfirmSourceEncodingRequest,
   DesktopDoctorReport,
   DesktopDiagnosticExportResult,
@@ -285,6 +286,7 @@ const PROVIDER_ID = /^[a-z][a-z0-9-]{0,63}$/u;
 const SOURCE_ENCODINGS = new Set([
   "utf-8", "utf-16le", "utf-16be", "utf-32le", "utf-32be",
   "shift_jis", "euc-jp", "euc-kr", "windows-949",
+  "windows-1252",
 ]);
 const KNOWLEDGE_OBJECT_TYPES = new Set<KnowledgeObjectType>([
   "term", "entity", "alias", "relation", "memory", "style",
@@ -302,6 +304,7 @@ const IMPORT_SCOPES = new Set(["book", "project"] as const);
 const IMPORT_ENCODINGS = new Set([
   "utf-8", "utf-16le", "utf-16be",
   "shift_jis", "euc-jp", "euc-kr", "windows-949",
+  "windows-1252",
 ] as const);
 const MAPPING_CONFIDENCE = new Set(["high", "medium", "low"] as const);
 const IMPORT_DECISIONS = new Set([
@@ -313,6 +316,9 @@ const EXPORT_FORMATS = new Set<DesktopExportFormat>([
   "bilingual_txt",
   "epub",
 ]);
+const SOURCE_LANGUAGE_CHOICES: ReadonlySet<string> = new Set([
+  "auto", "en", "de", "fr", "es", "ru", "ja", "ko",
+] as const);
 function failure<T = never>(code: string, message: string): DesktopResult<T> {
   return fail({ code, message, retryable: false });
 }
@@ -380,6 +386,25 @@ function noArguments(args: readonly unknown[], label: string): void {
   if (args.length !== 0) {
     inputError(`${label} does not accept a payload`);
   }
+}
+
+function chooseSourceRequest(args: readonly unknown[]): DesktopChooseSourceRequest {
+  if (args.length === 0) return {};
+  const input = exactRecord(
+    oneArgument(args, "choose-source"),
+    "choose-source",
+    ["sourceLanguage"],
+  );
+  if (
+    input.sourceLanguage !== undefined
+    && (typeof input.sourceLanguage !== "string"
+      || !SOURCE_LANGUAGE_CHOICES.has(input.sourceLanguage))
+  ) {
+    inputError("choose-source sourceLanguage is not supported");
+  }
+  return input.sourceLanguage === undefined
+    ? {}
+    : { sourceLanguage: input.sourceLanguage as DesktopChooseSourceRequest["sourceLanguage"] };
 }
 
 function exactRecord(value: unknown, label: string, allowed: readonly string[]): Record<string, unknown> {
@@ -1262,7 +1287,7 @@ export function registerDesktopIpc(dependencies: DesktopIpcDependencies): void {
   }));
 
   handleTrusted("folioloom:choose-source", async (_event, ...args) => resultFrom(async () => {
-    noArguments(args, "choose-source");
+    const request = chooseSourceRequest(args);
     if (dependencies.fullBookService.hasActiveTask()) {
       return failure(
         "DESKTOP_FULLBOOK_ACTIVE",
@@ -1276,7 +1301,12 @@ export function registerDesktopIpc(dependencies: DesktopIpcDependencies): void {
     if (!isManuscriptPath(sourcePath)) {
       return invalidSelection("sourcePath must use a supported manuscript extension");
     }
-    const imported = await dependencies.sourceService.importSource({ sourcePath });
+    const imported = await dependencies.sourceService.importSource({
+      sourcePath,
+      ...(request.sourceLanguage === undefined || request.sourceLanguage === "auto"
+        ? {}
+        : { sourceLanguage: request.sourceLanguage }),
+    });
     if (imported.status === "encoding_required") {
       return ok({
         status: imported.status,

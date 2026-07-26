@@ -190,6 +190,7 @@ const ENCODING_LABELS: ReadonlySet<CanonicalEncodingLabel> = new Set([
   "euc-jp",
   "euc-kr",
   "windows-949",
+  "windows-1252",
 ]);
 
 const ENCODING_DECISION_SOURCES: ReadonlySet<EncodingDecisionSource> = new Set([

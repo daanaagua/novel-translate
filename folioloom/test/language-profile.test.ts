@@ -39,6 +39,55 @@ test("Korean is detected independently of undetermined text", () => {
   assert.ok((detected?.confidence ?? 0) >= 0.8);
 });
 
+test("German, French and Spanish survive short English publishing front matter", () => {
+  const frontMatter = [
+    "Copyright notice. All rights reserved.",
+    "This ebook may not be redistributed without permission.",
+  ].join("\n");
+  const fixtures = [
+    ["de", "Als Gregor Samsa eines Morgens aus unruhigen Träumen erwachte, fand er sich in seinem Bett zu einem ungeheueren Ungeziefer verwandelt. Er lag auf seinem panzerartig harten Rücken und sah, wenn er den Kopf ein wenig hob, seinen gewölbten Bauch."],
+    ["fr", "Lorsque Gregor Samsa s’éveilla un matin au sortir de rêves agités, il se retrouva dans son lit changé en un énorme insecte. Il était couché sur son dos dur, et il voyait son ventre bombé."],
+    ["es", "Al despertar Gregorio Samsa una mañana, tras un sueño intranquilo, se encontró en su cama convertido en un monstruoso insecto. Estaba echado sobre el duro caparazón de su espalda y veía su vientre abombado."],
+  ] as const;
+  for (const [language, prose] of fixtures) {
+    const detected = detectLanguage(`${frontMatter}\n\n${prose.repeat(8)}`);
+    assert.equal(detected?.id, language);
+    assert.ok((detected?.confidence ?? 0) >= 0.7);
+  }
+  assert.equal(detectLanguage("Copyright notice. All rights reserved."), undefined);
+});
+
+test("German French and Spanish profiles recognize common chapter conventions", () => {
+  const german = getSourceLanguageProfile("de");
+  const french = getSourceLanguageProfile("fr");
+  const spanish = getSourceLanguageProfile("es");
+  for (const heading of ["KAPITEL 1", "1. Kapitel", "Erstes Kapitel", "I."]) {
+    assert.equal(german.detectStructureHeading(heading)?.kind, "chapter_heading", heading);
+  }
+  for (const heading of ["CHAPITRE I", "PREMIER CHAPITRE", "I."]) {
+    assert.equal(french.detectStructureHeading(heading)?.kind, "chapter_heading", heading);
+  }
+  for (const heading of ["CAPÍTULO I", "CAPITULO 1", "PRIMER CAPÍTULO", "I."]) {
+    assert.equal(spanish.detectStructureHeading(heading)?.kind, "chapter_heading", heading);
+  }
+});
+
+test("standalone Latin chapter numerals require blank-line layout evidence", () => {
+  const german = getSourceLanguageProfile("de");
+  const inline = annotateStructure(
+    "Vorbemerkung.\nI.\nAls Gregor Samsa erwachte.",
+    "source-de-inline",
+    german,
+  );
+  const isolated = annotateStructure(
+    "Vorbemerkung.\n\nI.\n\nAls Gregor Samsa erwachte.",
+    "source-de-isolated",
+    german,
+  );
+  assert.equal(inline.length, 0);
+  assert.deepEqual(isolated.map((annotation) => annotation.title), ["I."]);
+});
+
 test("Japanese and Korean profiles expose headings, sentence boundaries, and bounded candidates", () => {
   const japanese = getSourceLanguageProfile("ja");
   const korean = getSourceLanguageProfile("ko");

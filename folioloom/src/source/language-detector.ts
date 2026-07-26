@@ -6,11 +6,29 @@ export interface DetectedLanguage {
 const MAX_SAMPLE_CHARS = 48_000;
 
 const LATIN_STOP_WORDS: ReadonlyMap<string, readonly string[]> = new Map([
-  ["en", ["the", "and", "of", "to", "in", "is", "that", "for", "with", "on", "as", "was"]],
-  ["fr", ["le", "la", "les", "de", "des", "et", "en", "un", "une", "que", "pour", "dans"]],
-  ["de", ["der", "die", "das", "und", "den", "von", "zu", "mit", "ist", "ein", "eine", "nicht"]],
-  ["es", ["el", "la", "los", "las", "de", "del", "y", "en", "que", "por", "para", "una"]],
+  ["en", ["the", "and", "of", "to", "in", "is", "that", "for", "with", "on", "as", "was", "were", "from", "had", "his"]],
+  ["fr", ["le", "la", "les", "de", "des", "du", "et", "en", "un", "une", "que", "pour", "dans", "sur", "avec", "mais", "avait", "était", "son", "ses"]],
+  ["de", ["der", "die", "das", "und", "den", "dem", "des", "von", "zu", "mit", "ist", "war", "ein", "eine", "einer", "nicht", "sich", "auf", "als", "sein"]],
+  ["es", ["el", "la", "los", "las", "de", "del", "y", "en", "que", "por", "para", "una", "un", "con", "pero", "había", "estaba", "se", "su"]],
 ]);
+
+const LATIN_SIGNATURES: ReadonlyMap<string, RegExp> = new Map([
+  ["de", /\b(?:aber|auch|einem|einen|einer|eines|nicht|sich|seine|seinen|wurde|über)\b|[äöüß]/giu],
+  ["fr", /\b(?:ainsi|avait|avec|comme|dans|était|lorsque|mais|sans|sous)\b|[àâçéèêëîïôùûüÿœ]/giu],
+  ["es", /\b(?:aunque|como|cuando|desde|estaba|había|pero|porque|sobre|tras)\b|[¿¡áéíóúñ]/giu],
+  ["en", /\b(?:although|because|could|should|through|when|which|would)\b/giu],
+]);
+
+function stratifiedSample(source: string): string {
+  if (source.length <= MAX_SAMPLE_CHARS) return source;
+  const window = Math.floor(MAX_SAMPLE_CHARS / 3);
+  const middle = Math.max(0, Math.floor((source.length - window) / 2));
+  return [
+    source.slice(0, window),
+    source.slice(middle, middle + window),
+    source.slice(-window),
+  ].join("\n");
+}
 
 function confidence(hits: number, totalLetters: number): number {
   return Math.min(0.98, Number((0.55 + Math.min(0.3, hits / 20) + Math.min(0.13, totalLetters / 2_000)).toFixed(2)));
@@ -48,7 +66,8 @@ function detectLatinLanguage(sample: string): DetectedLanguage | undefined {
   const wordSet = new Set(words);
   const scores = [...LATIN_STOP_WORDS.entries()].map(([id, stopWords]) => ({
     id,
-    score: words.reduce((total, word) => total + (stopWords.includes(word) ? 1 : 0), 0),
+    score: words.reduce((total, word) => total + (stopWords.includes(word) ? 1 : 0), 0)
+      + countMatches(sample, LATIN_SIGNATURES.get(id) as RegExp) * 2,
     distinct: stopWords.reduce((total, word) => total + (wordSet.has(word) ? 1 : 0), 0),
   })).sort((left, right) => right.score - left.score || right.distinct - left.distinct);
   const best = scores[0];
@@ -70,7 +89,7 @@ function detectLatinLanguage(sample: string): DetectedLanguage | undefined {
  * an undetermined state when this returns undefined rather than inventing a language.
  */
 export function detectLanguage(source: string): DetectedLanguage | undefined {
-  const sample = source.slice(0, MAX_SAMPLE_CHARS);
+  const sample = stratifiedSample(source);
   if (sample.trim().length === 0) {
     return undefined;
   }

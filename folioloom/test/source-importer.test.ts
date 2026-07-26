@@ -124,6 +124,28 @@ function utf32(value: string, littleEndian: boolean): Buffer {
   return Buffer.concat(parts);
 }
 
+function windows1252(value: string): Buffer {
+  const special = new Map<number, number>([
+    [0x00ab, 0xab],
+    [0x00bb, 0xbb],
+    [0x00df, 0xdf],
+    [0x00e0, 0xe0],
+    [0x00e9, 0xe9],
+    [0x00f3, 0xf3],
+    [0x2014, 0x97],
+    [0x2018, 0x91],
+    [0x2019, 0x92],
+    [0x201c, 0x93],
+    [0x201d, 0x94],
+  ]);
+  return Buffer.from([...value].map((scalar) => {
+    const point = scalar.codePointAt(0)!;
+    const byte = point <= 0x7f ? point : special.get(point);
+    if (byte === undefined) throw new TypeError(`fixture cannot encode U+${point.toString(16)}`);
+    return byte;
+  }));
+}
+
 function bomEncoded(name: string, source: string): { payload: Buffer; encoding: string; bomSize: number } {
   switch (name) {
     case "utf8":
@@ -174,6 +196,28 @@ test("source importer writes a certified scalar ledger for UTF-8 text and Markdo
   } finally {
     rmSync(text.directory, { recursive: true, force: true });
     rmSync(markdown.directory, { recursive: true, force: true });
+  }
+});
+
+test("source importer preserves Windows-1252 accents, quotes and dashes", async () => {
+  const source = "CHAPITRE I\r\n\r\n«L’été» — déjà.\r\nStraße y corazón.";
+  const fixture = writeFixture("latin-novel.txt", windows1252(source));
+  try {
+    const result = await importSource({
+      sourcePath: fixture.sourcePath,
+      projectDirectory: projectDirectory(fixture.directory),
+      sourceLanguage: "fr",
+      explicitEncoding: "windows-1252",
+    });
+    const ledger = SourceLedger.open(result.manifestPath);
+    assert.equal(ledger.encoding, "windows-1252");
+    assert.equal(
+      ledger.sourceText,
+      "CHAPITRE I\n\n«L’été» — déjà.\nStraße y corazón.",
+    );
+    assert.doesNotMatch(ledger.sourceText, /\uFFFD/u);
+  } finally {
+    rmSync(fixture.directory, { recursive: true, force: true });
   }
 });
 

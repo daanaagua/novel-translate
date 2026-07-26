@@ -8,6 +8,7 @@ import type {
   DesktopResult,
   DesktopSourceEncoding,
   DesktopSourceEncodingRequired,
+  DesktopSourceLanguageChoice,
   DesktopTestModelRequest,
   DesktopTestModelResult,
   DesktopTrialMode,
@@ -27,7 +28,7 @@ interface OnboardingProps {
   trialProgress?: DesktopTrialProgress;
   trialResult?: DesktopTrialResult;
   pendingEncoding?: DesktopSourceEncodingRequired;
-  onChooseSource(): Promise<void>;
+  onChooseSource(sourceLanguage: DesktopSourceLanguageChoice): Promise<void>;
   onConfirmSourceEncoding(encoding: DesktopSourceEncoding): Promise<void>;
   onDiscoverModels(request: DesktopDiscoverModelsRequest): Promise<DesktopResult<readonly DesktopModelOption[]>>;
   onTestModel(request: DesktopTestModelRequest): Promise<DesktopResult<DesktopTestModelResult>>;
@@ -70,6 +71,20 @@ const TRIAL_STAGE_LABELS: Record<DesktopTrialProgress["stage"], string> = {
   failed: "试译未完成",
 };
 
+const SOURCE_LANGUAGES: ReadonlyArray<{
+  id: DesktopSourceLanguageChoice;
+  label: string;
+}> = [
+  { id: "auto", label: "自动检测" },
+  { id: "en", label: "英语" },
+  { id: "de", label: "德语" },
+  { id: "fr", label: "法语" },
+  { id: "es", label: "西班牙语" },
+  { id: "ru", label: "俄语" },
+  { id: "ja", label: "日语" },
+  { id: "ko", label: "韩语" },
+];
+
 export function Onboarding({
   onboarding,
   busyAction,
@@ -89,6 +104,25 @@ export function Onboarding({
 }: OnboardingProps): JSX.Element {
   const [modelDraftMatchesActive, setModelDraftMatchesActive] = useState(false);
   const [trialMode, setTrialMode] = useState<DesktopTrialMode>("quality");
+  const [sourceLanguage, setSourceLanguage] =
+    useState<DesktopSourceLanguageChoice>("auto");
+  const sourceLanguageField = (
+    <label className="field source-language-field">
+      <span>原文语言</span>
+      <select
+        aria-label="原文语言"
+        value={sourceLanguage}
+        disabled={busyAction !== undefined}
+        onChange={(event) => {
+          setSourceLanguage(event.target.value as DesktopSourceLanguageChoice);
+        }}
+      >
+        {SOURCE_LANGUAGES.map((language) => (
+          <option key={language.id} value={language.id}>{language.label}</option>
+        ))}
+      </select>
+    </label>
+  );
   const sourceReady = onboarding.project !== undefined;
   const modelReady = onboarding.activeModel?.capability === "ready";
   const trialEnabled = sourceReady
@@ -132,7 +166,7 @@ export function Onboarding({
               pending={pendingEncoding}
               busy={busyAction !== undefined}
               onConfirm={onConfirmSourceEncoding}
-              onChooseAnother={onChooseSource}
+              onChooseAnother={() => onChooseSource(sourceLanguage)}
             />
           </div>
           {errorPanel}
@@ -150,11 +184,12 @@ export function Onboarding({
               <p className="eyebrow">FolioLoom / Start</p>
               <h1>开始翻译一本书</h1>
               <p className="onboarding-lead">选择书稿，连接你自己的模型，然后先用一个片段确认翻译效果。</p>
+              {sourceLanguageField}
               <button
                 className="primary-button"
                 type="button"
                 disabled={busyAction !== undefined}
-                onClick={() => { void onChooseSource(); }}
+                onClick={() => { void onChooseSource(sourceLanguage); }}
               >
                 {busyAction === "choose-source" ? "正在选择…" : "选择书稿"}
               </button>
@@ -188,14 +223,17 @@ export function Onboarding({
             )}</p>
             <p className="section-copy project-diagnostic">{formatChars(onboarding.project?.sourceChars ?? 0)} 字符</p>
           </div>
-          <button
-            className="quiet-button"
-            type="button"
-            disabled={busyAction !== undefined}
-            onClick={() => { void onChooseSource(); }}
-          >
-            更换书稿
-          </button>
+          <div className="source-replace-controls">
+            {sourceLanguageField}
+            <button
+              className="quiet-button"
+              type="button"
+              disabled={busyAction !== undefined}
+              onClick={() => { void onChooseSource(sourceLanguage); }}
+            >
+              更换书稿
+            </button>
+          </div>
         </header>
 
         <div className="setup-workspace-grid">

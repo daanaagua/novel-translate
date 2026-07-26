@@ -105,6 +105,7 @@ interface IpcFixture {
   trustedEvent: unknown;
   snapshotCalls: number;
   sourceImports: readonly string[];
+  sourceRequests: readonly unknown[];
   encodingConfirmations: readonly unknown[];
   modelCalls: {
     discoveries: readonly unknown[];
@@ -156,6 +157,7 @@ function registerFixtureHandlers(options: IpcFixtureOptions = {}): IpcFixture {
   const activeRunIds = options.activeRunIds ?? [];
   const handlers = new Map<string, DesktopIpcHandler>();
   const sourceImports: string[] = [];
+  const sourceRequests: unknown[] = [];
   const encodingConfirmations: unknown[] = [];
   const discoveries: unknown[] = [];
   const tests: unknown[] = [];
@@ -307,6 +309,7 @@ function registerFixtureHandlers(options: IpcFixtureOptions = {}): IpcFixture {
     sourceService: {
       async importSource(request) {
         sourceImports.push(request.sourcePath);
+        sourceRequests.push(request);
         return options.sourceEncodingRequired
           ? {
             status: "encoding_required" as const,
@@ -562,6 +565,9 @@ function registerFixtureHandlers(options: IpcFixtureOptions = {}): IpcFixture {
     },
     get sourceImports() {
       return sourceImports;
+    },
+    get sourceRequests() {
+      return sourceRequests;
     },
     get encodingConfirmations() {
       return encodingConfirmations;
@@ -1118,6 +1124,35 @@ test("choose-source imports a selected manuscript without exposing a path-taking
     assert.equal(fixture.currentRequest?.manifestPath.endsWith("Imported\\source_manifest.json"), true);
   } finally {
     rmSync(fixture.directory, { recursive: true, force: true });
+  }
+});
+
+test("choose-source forwards only a supported explicit source-language override", async () => {
+  const fixture = registerFixtureHandlers({ pickedSource: "source" });
+  try {
+    const result = await handler(fixture, "folioloom:choose-source")(
+      fixture.trustedEvent,
+      { sourceLanguage: "de" },
+    ) as DesktopResult<DesktopChooseSourceResult>;
+    assert.equal(result.ok, true);
+    assert.deepEqual(fixture.sourceRequests, [{
+      sourcePath: fixture.sourcePath,
+      sourceLanguage: "de",
+    }]);
+  } finally {
+    rmSync(fixture.directory, { recursive: true, force: true });
+  }
+
+  const rejected = registerFixtureHandlers({ pickedSource: "source" });
+  try {
+    const result = await handler(rejected, "folioloom:choose-source")(
+      rejected.trustedEvent,
+      { sourceLanguage: "xx", sourcePath: "C:\\outside.txt" },
+    ) as DesktopResult<unknown>;
+    assert.equal(result.ok, false);
+    assert.equal(rejected.sourceRequests.length, 0);
+  } finally {
+    rmSync(rejected.directory, { recursive: true, force: true });
   }
 });
 

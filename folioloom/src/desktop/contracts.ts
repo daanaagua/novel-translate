@@ -55,13 +55,28 @@ export type DesktopSourceEncoding =
   | "shift_jis"
   | "euc-jp"
   | "euc-kr"
-  | "windows-949";
+  | "windows-949"
+  | "windows-1252";
 
 export interface DesktopSourceEncodingRequired {
   status: "encoding_required";
   pendingImportId: string;
   fileName: string;
   encodings: readonly DesktopSourceEncoding[];
+}
+
+export type DesktopSourceLanguageChoice =
+  | "auto"
+  | "en"
+  | "de"
+  | "fr"
+  | "es"
+  | "ru"
+  | "ja"
+  | "ko";
+
+export interface DesktopChooseSourceRequest {
+  sourceLanguage?: DesktopSourceLanguageChoice;
 }
 
 export type DesktopChooseSourceResult =

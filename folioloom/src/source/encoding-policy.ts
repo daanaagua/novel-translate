@@ -11,7 +11,8 @@ export type CanonicalEncodingLabel =
   | "shift_jis"
   | "euc-jp"
   | "euc-kr"
-  | "windows-949";
+  | "windows-949"
+  | "windows-1252";
 
 export type EncodingDecisionSource = "bom" | "strict_utf8" | "heuristic" | "user";
 
@@ -86,6 +87,7 @@ const LEGACY_CANDIDATES: readonly CanonicalEncodingLabel[] = [
   "euc-jp",
   "euc-kr",
   "windows-949",
+  "windows-1252",
 ];
 
 const AUTO_ACCEPT_CONFIDENCE = 0.85;
@@ -135,6 +137,11 @@ export function normalizeEncodingLabel(value: string): CanonicalEncodingLabel {
     case "windows949":
     case "uhc":
       return "windows-949";
+    case "cp1252":
+    case "windows-1252":
+    case "windows1252":
+    case "latin1":
+      return "windows-1252";
     default:
       throw new EncodingPolicyError(
         "SOURCE_ENCODING_UNSUPPORTED",
@@ -295,6 +302,9 @@ function candidateConfidence(
   } else if (primary === "ko") {
     scriptRatio = (counts.hangul + counts.han * 0.35) / denominator;
     incompatibleRatio = (counts.kana + counts.cyrillic) / denominator;
+  } else if (primary === "de" || primary === "fr" || primary === "es" || primary === "en") {
+    scriptRatio = counts.latin / denominator;
+    incompatibleRatio = (counts.kana + counts.han + counts.hangul + counts.cyrillic) / denominator;
   } else {
     const dominant = Math.max(counts.kana + counts.han * 0.45, counts.hangul + counts.han * 0.35);
     scriptRatio = dominant / denominator;

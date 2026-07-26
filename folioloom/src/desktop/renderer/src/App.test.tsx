@@ -305,6 +305,20 @@ describe("FolioLoom desktop onboarding", () => {
     expect(screen.getByRole("button", { name: "选择书稿" })).toBeTruthy();
   });
 
+  it("lets readers override source language before choosing a manuscript", async () => {
+    const chooseSource = vi.fn().mockResolvedValue(
+      failure("DESKTOP_SELECTION_CANCELLED", "已取消选择"),
+    );
+    const user = userEvent.setup();
+    render(<App api={createApi({ chooseSource })} />);
+
+    const language = await screen.findByLabelText("原文语言") as HTMLSelectElement;
+    expect(language.value).toBe("auto");
+    await user.selectOptions(language, "de");
+    await user.click(screen.getByRole("button", { name: "选择书稿" }));
+    expect(chooseSource).toHaveBeenCalledWith({ sourceLanguage: "de" });
+  });
+
   it("keeps unavailable workspaces visible but non-interactive", async () => {
     const user = userEvent.setup();
     render(<App api={createApi()} />);
