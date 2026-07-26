@@ -2,8 +2,8 @@
 
 - 日期：2026-07-27
 - 分支：`fix/german-100k-gate`
-- 已验证实现提交：`2bb450e`
-- 当前阶段：任务 1–11 已完成；下一步执行任务 12。
+- 已验证实现提交：`3d3388b`
+- 当前阶段：任务 1–12 已完成；下一步执行任务 13。
 
 ## 已完成
 
@@ -36,6 +36,13 @@
 - 独立复核发现并以失败回归测试关闭 3 项 Important：重试不再扩大累计静态
   token 基线；校验失败不再作为成功样本学习；距离至少 24 块的可靠证据强制
   使用 rich 上下文。恢复失败和后续成功的 token 观察已分离。
+- 任务 12：CLI 支持三种优化档位、off/shadow/active 和独立 profile store；
+  桌面主进程拥有共享 store 生命周期，新运行启用动态调度，旧运行按固定
+  runtime 恢复；GUI 提供经济、均衡、极速入口以及 ETA、token 区间、偏差和
+  限流/恢复状态。CLI 与桌面 runtime set 均包含同一模型的全部合法 effort。
+- 以失败回归测试关闭 3 项 Task 12 兼容性问题：quality/economy 组合现在视为
+  一致映射；quality 新运行也会生成合法 effort variants；不一致的持久化
+  mode/profile metadata 会被拒绝。另修正两项既有 IPC 路径断言的跨平台语义。
 
 ## 验证证据
 
@@ -49,16 +56,14 @@
 - Node 24.18.0 任务 11 定向测试：10 通过、0 失败；runner、planner、
   fault injection、store、report 与 desktop 组合：186 通过、0 失败。
 - 任务 11 后 `tsc --noEmit` 与 `git diff --check` 均通过。
+- 任务 12：CLI 28 通过、0 失败；desktop Node 109 通过、0 失败；renderer
+  66 通过、0 失败；核心与桌面 TypeScript、`git diff --check` 均通过。
 - 500 bundle 上下文规划样本：17.4 ms（预热后，要求低于 50 ms）。
 - 12 项与 16 项滚动规划性能门分别通过 `<50 ms` 与 `<250 ms` 断言。
 - `git diff --check`：通过。
-- Linux/Node 22 全量基线：749 通过、4 失败、1 跳过；失败均在本阶段改动之外：
-  - 3 项既有测试使用 Windows 路径语义；
-  - 1 项要求预先存在 desktop build 产物。
-  这些门将在桌面阶段和最终验证前按不降级标准处理。
 
 ## 阻塞与下一步
 
 - 外部阻塞：无。
-- 下一步：按严格 TDD 完成任务 12 的 CLI、桌面 runtime profile、三档入口和
-  GUI 调度摘要。
+- 下一步：按严格 TDD 完成任务 13 的影子 metrics、离线回放、只读源库的
+  benchmark 副本准备器、README、验证报告和全部质量门。
