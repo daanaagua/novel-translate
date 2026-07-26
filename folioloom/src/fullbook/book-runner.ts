@@ -1934,9 +1934,8 @@ async function runLosslessBook(
         runId,
         new KnowledgeStore(store.knowledgeRevisions(runId)),
         {
-          commitPromotion: (promotion) => {
-            store.promoteStagedWindow(promotion);
-          },
+          commitPromotion: (promotion) =>
+            store.promoteStagedWindow(promotion),
         },
         snapshot,
       );
@@ -1948,6 +1947,7 @@ async function runLosslessBook(
       let retryWindows = selected;
       let providerFailure: ModelProviderError | undefined;
       let firstProviderFailure: ModelProviderError | undefined;
+      let freshWaveRequired = false;
       let initialRequestCount = 0;
       let retryRound = 0;
       const acceptedWaveTranslations = new Map<string, {
@@ -2465,12 +2465,20 @@ async function runLosslessBook(
             });
             throwIfAborted(options.signal);
             coordinator.promoteReady();
+            if (coordinator.takeRetryWindowIds().length > 0) {
+              freshWaveRequired = true;
+            }
           }
         }
         if (capacityFailure !== undefined) {
           throw capacityFailure;
         }
-        retryWindows = nextRetries;
+        if (freshWaveRequired) {
+          store.recoverInterruptedWindows(runId);
+          retryWindows = [];
+        } else {
+          retryWindows = nextRetries;
+        }
         retryRound += 1;
       }
 
@@ -2483,11 +2491,22 @@ async function runLosslessBook(
         concurrency: initialRequestCount || initialRequests.length,
         windowIds: selected.map((window) => window.windowId),
       });
-      processedWindows += selected.length;
+      const completedWindowIds = freshWaveRequired
+        ? new Set(store.allWindows(runId)
+            .filter((window) =>
+              window.status === "completed"
+              || window.status === "completed_with_warnings")
+            .map((window) => window.windowId))
+        : undefined;
+      processedWindows += completedWindowIds === undefined
+        ? selected.length
+        : selected.filter((window) =>
+            completedWindowIds.has(window.windowId)).length;
       if (runtimeSet.mode === "fast") {
         const hasUnresolvedKnowledge = store.latestKnowledgeSnapshot(runId).revisions
           .some((revision) => revision.status === "needs_revalidate");
         const waveWasUnstable = retryRound > 1
+          || freshWaveRequired
           || entityLinkWarnings.length > 0
           || hasUnresolvedKnowledge;
         fastWaveHorizonMultiplier = waveWasUnstable ? 1 : 2;

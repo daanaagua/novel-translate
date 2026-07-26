@@ -499,7 +499,7 @@ activeTranslationBindings(runId, blockId): readonly TranslationConceptBinding[];
 概念、译文、binding 和窗口状态必须在现有 stage/promote 事务边界内保持
 原子性。binding 只能指向同一 translation 的 staged/promoted 版本。
 
-- [ ] **步骤 5：验证故障回滚并提交**
+- [x] **步骤 5：验证故障回滚并提交**
 
 ```powershell
 npm test -- --test-name-pattern="concept occurrence|translation concept binding|rolls back"
@@ -517,7 +517,7 @@ git commit -m "feat: persist sparse concept dependencies"
 - 修改：`folioloom/src/fullbook/book-runner.ts`
 - 修改：`folioloom/test/book-runner.test.ts`
 
-- [ ] **步骤 1：编写 `Prokurist` 稀疏影响失败测试**
+- [x] **步骤 1：编写 `Prokurist` 稀疏影响失败测试**
 
 夹具建立：
 
@@ -534,13 +534,13 @@ assert.equal(plan.some((item) => item.blockId === "block-1"), false);
 assert.equal(plan.some((item) => item.blockId === "block-2"), false);
 ```
 
-- [ ] **步骤 2：运行测试确认失败**
+- [x] **步骤 2：运行测试确认失败**
 
 ```powershell
 npm test -- --test-name-pattern="sparse revalidation"
 ```
 
-- [ ] **步骤 3：实现纯规划函数**
+- [x] **步骤 3：实现纯规划函数**
 
 ```ts
 export function planSparseRevalidation(input: {
@@ -554,7 +554,7 @@ export function planSparseRevalidation(input: {
 产生候选。对同一 translation 合并 concept IDs 并生成稳定
 `changeSetHash`。
 
-- [ ] **步骤 4：实现提交门**
+- [x] **步骤 4：实现提交门**
 
 在窗口 promotion 前比较 staged binding 与最新 concept：
 
@@ -565,7 +565,7 @@ export function planSparseRevalidation(input: {
 
 不能因为全局 snapshot ID 不同而直接拒绝整个窗口。
 
-- [ ] **步骤 5：实现已完成块任务创建**
+- [x] **步骤 5：实现已完成块任务创建**
 
 概念 promotion 后调用 store 规划 API，只查询 `concept_occurrences` 命中
 块和旧 binding。`UNIQUE(translation_id, change_set_hash)` 保证恢复幂等。

@@ -90,6 +90,11 @@ import {
   type ConceptOccurrence,
   type ConceptOccurrenceSpan,
 } from "../knowledge/concept-occurrence-index.js";
+import {
+  evaluateStagedConceptBindings,
+  planSparseRevalidation,
+  type BindingGateDecision,
+} from "../knowledge/sparse-revalidation.js";
 import type {
   LexicalConcept,
   LexicalSemanticClass,
@@ -282,6 +287,29 @@ export interface TranslationConceptBinding {
     | "stale"
     | "warning_stale";
   readonly validatedRevisionId: string;
+}
+
+export type WindowPromotionOutcome = "promoted" | "retry_latest_snapshot";
+
+export interface KnowledgeRevalidationTask {
+  readonly taskId: string;
+  readonly runId: string;
+  readonly translationId: number;
+  readonly blockId: string;
+  readonly changeSetHash: string;
+  readonly fromSnapshotId: string;
+  readonly toSnapshotId: string;
+  readonly conceptIds: readonly string[];
+  readonly status:
+    | "pending"
+    | "validating"
+    | "resolved_noop"
+    | "resolved_repair"
+    | "resolved_retranslate"
+    | "completed_with_warning";
+  readonly attempts: number;
+  readonly result: unknown;
+  readonly replacementTranslationId: number | null;
 }
 
 export interface WindowFailureInput {
@@ -1917,17 +1945,17 @@ export class LosslessBookStore {
     this.#faultInjector?.checkpoint("after_stage");
   }
 
-  promoteStagedWindow(promotion: CommitPromotion): void;
+  promoteStagedWindow(promotion: CommitPromotion): WindowPromotionOutcome;
   promoteStagedWindow(
     runId: string,
     windowId: string,
     nextSnapshot?: KnowledgeSnapshot,
-  ): void;
+  ): WindowPromotionOutcome;
   promoteStagedWindow(
     promotionOrRunId: CommitPromotion | string,
     legacyWindowId?: string,
     legacyNextSnapshot?: KnowledgeSnapshot,
-  ): void {
+  ): WindowPromotionOutcome {
     const promotion = typeof promotionOrRunId === "string"
       ? undefined
       : promotionOrRunId;
@@ -1937,7 +1965,7 @@ export class LosslessBookStore {
     requireNonempty(runId, "runId");
     requireNonempty(windowId, "windowId");
     this.#faultInjector?.checkpoint("before_promote");
-    this.#transaction(() => {
+    return this.#transaction((): WindowPromotionOutcome => {
       const row = one<WindowRow & { result_status: string | null }>(
         this.#database.prepare(`
           SELECT * FROM window_plans WHERE run_id=? AND window_id=?
@@ -1984,6 +2012,34 @@ export class LosslessBookStore {
         throw new Error(
           `earlier ordinal ${earlier.window_id} blocks promotion of ${windowId}`,
         );
+      }
+      const bindingGate = this.#evaluateStagedBindingGate(runId, windowId);
+      if (bindingGate.status === "retry_latest_snapshot") {
+        this.#database.prepare(`
+          DELETE FROM translations
+          WHERE run_id=? AND window_id=? AND stage_state='staged' AND active=0
+        `).run(runId, windowId);
+        this.#database.prepare(`
+          DELETE FROM knowledge_candidates
+          WHERE run_id=? AND window_id=? AND stage_state='staged'
+        `).run(runId, windowId);
+        const reset = this.#database.prepare(`
+          UPDATE window_plans
+          SET status='pending', result_status=NULL, snapshot_id=NULL,
+              style_tail='', warnings_json='[]',
+              last_error='staged concept binding requires the latest snapshot',
+              updated_at=datetime('now')
+          WHERE run_id=? AND window_id=? AND status='staged'
+        `).run(runId, windowId);
+        if (Number(reset.changes) !== 1) {
+          throw new Error(`failed to reset stale staged window ${runId}/${windowId}`);
+        }
+        this.#appendEvent(runId, "window_concept_binding_retry", {
+          runId,
+          windowId,
+          incompatibleConceptIds: bindingGate.incompatibleConceptIds,
+        });
+        return "retry_latest_snapshot";
       }
 
       const stagedCandidateRows = all<{
@@ -2189,7 +2245,11 @@ export class LosslessBookStore {
           undefined,
         );
       }
-      this.#projectLexicalConceptRevisions(runId, appendedRevisions);
+      this.#projectLexicalConceptRevisions(
+        runId,
+        appendedRevisions,
+        nextSnapshot?.id ?? row.snapshot_id,
+      );
       if (appendedRevisions.length > 0) {
         const updatedKnowledgeState = this.#database.prepare(`
           UPDATE knowledge_state
@@ -2229,6 +2289,7 @@ export class LosslessBookStore {
         snapshotId: row.snapshot_id,
         nextSnapshotId: nextSnapshot?.id ?? null,
       });
+      return "promoted";
     });
   }
 
@@ -2658,6 +2719,44 @@ export class LosslessBookStore {
       termUsages: termUsagesFromJson(row.term_usages_json),
       validationStatus: row.validation_status,
       validatedRevisionId: row.validated_revision_id,
+    }));
+  }
+
+  revalidationTasks(runId: string): KnowledgeRevalidationTask[] {
+    if (this.#schemaVersion !== LOSSLESS_BOOK_SCHEMA_VERSION) return [];
+    this.#run(runId);
+    return all<{
+      task_id: string;
+      run_id: string;
+      translation_id: number;
+      block_id: string;
+      change_set_hash: string;
+      from_snapshot_id: string;
+      to_snapshot_id: string;
+      concept_ids_json: string;
+      status: KnowledgeRevalidationTask["status"];
+      attempts: number;
+      result_json: string;
+      replacement_translation_id: number | null;
+    }>(this.#database.prepare(`
+      SELECT * FROM knowledge_revalidation_tasks
+      WHERE run_id=? ORDER BY created_at, task_id
+    `), runId).map((row) => ({
+      taskId: row.task_id,
+      runId: row.run_id,
+      translationId: row.translation_id,
+      blockId: row.block_id,
+      changeSetHash: row.change_set_hash,
+      fromSnapshotId: row.from_snapshot_id,
+      toSnapshotId: row.to_snapshot_id,
+      conceptIds: stringArrayFromJson(
+        row.concept_ids_json,
+        "revalidation concept IDs",
+      ),
+      status: row.status,
+      attempts: row.attempts,
+      result: JSON.parse(row.result_json) as unknown,
+      replacementTranslationId: row.replacement_translation_id,
     }));
   }
 
@@ -5138,9 +5237,71 @@ export class LosslessBookStore {
     }
   }
 
+  #evaluateStagedBindingGate(
+    runId: string,
+    windowId: string,
+  ): BindingGateDecision {
+    const rows = all<TranslationConceptBindingRow>(this.#database.prepare(`
+      SELECT b.*
+      FROM translations AS t
+      JOIN translation_concept_bindings AS b
+        ON b.translation_id=t.translation_id
+      WHERE t.run_id=? AND t.window_id=?
+        AND t.stage_state='staged' AND t.active=0
+      ORDER BY b.concept_id, b.translation_id
+    `), runId, windowId);
+    if (rows.length === 0) {
+      return {
+        status: "compatible",
+        updates: [],
+        incompatibleConceptIds: [],
+      };
+    }
+    const conceptIds = [...new Set(rows.map((row) => row.concept_id))];
+    const concepts = conceptIds.flatMap((conceptId) => {
+      const row = one<LexicalConceptRow>(this.#database.prepare(`
+        SELECT * FROM lexical_concepts
+        WHERE run_id=? AND concept_id=? AND active=1
+      `), runId, conceptId);
+      return row === undefined ? [] : [lexicalConceptFromRow(row)];
+    });
+    const decision = evaluateStagedConceptBindings({
+      concepts,
+      bindings: rows.map((row) => ({
+        conceptId: row.concept_id,
+        appliedRevisionId: row.applied_revision_id,
+        appliedRenderFingerprint: row.applied_render_fingerprint,
+        termUsages: termUsagesFromJson(row.term_usages_json),
+      })),
+    });
+    if (decision.status !== "compatible") return decision;
+    for (const update of decision.updates) {
+      this.#database.prepare(`
+        UPDATE translation_concept_bindings
+        SET applied_revision_id=?, applied_render_fingerprint=?,
+            validation_status='clean', validated_revision_id=?,
+            updated_at=datetime('now')
+        WHERE concept_id=? AND translation_id IN (
+          SELECT translation_id FROM translations
+          WHERE run_id=? AND window_id=?
+            AND stage_state='staged' AND active=0
+        )
+      `).run(
+        update.revisionId,
+        update.renderFingerprint,
+        update.revisionId,
+        update.conceptId,
+        runId,
+        windowId,
+      );
+    }
+    return decision;
+  }
+
   #projectLexicalConceptRevisions(
     runId: string,
     revisions: readonly KnowledgeRevision[],
+    toSnapshotId: string,
   ): void {
     const concepts = revisions
       .filter((revision) =>
@@ -5199,6 +5360,111 @@ export class LosslessBookStore {
         occurrence.sourceSpans.length,
         jsonText(occurrence.sourceSpans, "concept occurrence spans"),
       );
+    }
+    this.#createSparseRevalidationTasks(
+      runId,
+      changedConcepts,
+      occurrences,
+      toSnapshotId,
+    );
+  }
+
+  #createSparseRevalidationTasks(
+    runId: string,
+    concepts: readonly LexicalConcept[],
+    occurrences: readonly ConceptOccurrence[],
+    toSnapshotId: string,
+  ): void {
+    if (concepts.length === 0 || occurrences.length === 0) return;
+    const conceptIds = new Set(concepts.map((concept) => concept.conceptId));
+    const rows = all<{
+      translation_id: number;
+      block_id: string;
+      snapshot_id: string;
+      concept_id: string;
+      applied_revision_id: string;
+      applied_render_fingerprint: string;
+    }>(this.#database.prepare(`
+      SELECT t.translation_id, t.block_id, t.snapshot_id,
+             b.concept_id, b.applied_revision_id,
+             b.applied_render_fingerprint
+      FROM translations AS t
+      JOIN translation_concept_bindings AS b
+        ON b.translation_id=t.translation_id
+      WHERE t.run_id=? AND t.active=1
+      ORDER BY t.translation_id, b.concept_id
+    `), runId).filter((row) => conceptIds.has(row.concept_id));
+    const dependencies = new Map<number, {
+      translationId: number;
+      blockId: string;
+      snapshotId: string;
+      bindings: Array<{
+        conceptId: string;
+        appliedRevisionId: string;
+        appliedRenderFingerprint: string;
+      }>;
+    }>();
+    for (const row of rows) {
+      const dependency = dependencies.get(row.translation_id) ?? {
+        translationId: row.translation_id,
+        blockId: row.block_id,
+        snapshotId: row.snapshot_id,
+        bindings: [],
+      };
+      dependency.bindings.push({
+        conceptId: row.concept_id,
+        appliedRevisionId: row.applied_revision_id,
+        appliedRenderFingerprint: row.applied_render_fingerprint,
+      });
+      dependencies.set(row.translation_id, dependency);
+    }
+    const candidates = planSparseRevalidation({
+      concepts,
+      occurrences,
+      translations: [...dependencies.values()],
+      toSnapshotId,
+    });
+    const insert = this.#database.prepare(`
+      INSERT OR IGNORE INTO knowledge_revalidation_tasks(
+        task_id, run_id, translation_id, block_id, change_set_hash,
+        from_snapshot_id, to_snapshot_id, concept_ids_json, status
+      ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, 'pending')
+    `);
+    for (const candidate of candidates) {
+      const taskId = `revalidation-${hashText([
+        runId,
+        String(candidate.translationId),
+        candidate.changeSetHash,
+      ].join("\0")).slice(0, 32)}`;
+      insert.run(
+        taskId,
+        runId,
+        candidate.translationId,
+        candidate.blockId,
+        candidate.changeSetHash,
+        candidate.fromSnapshotId,
+        candidate.toSnapshotId,
+        jsonText(candidate.conceptIds, "revalidation concept IDs"),
+      );
+      for (const conceptId of candidate.conceptIds) {
+        this.#database.prepare(`
+          UPDATE translation_concept_bindings
+          SET validation_status='stale', updated_at=datetime('now')
+          WHERE translation_id=? AND concept_id=?
+        `).run(candidate.translationId, conceptId);
+      }
+    }
+    if (candidates.length > 0) {
+      this.#appendEvent(runId, "sparse_revalidation_planned", {
+        runId,
+        toSnapshotId,
+        taskIds: candidates.map((candidate) =>
+          `revalidation-${hashText([
+            runId,
+            String(candidate.translationId),
+            candidate.changeSetHash,
+          ].join("\0")).slice(0, 32)}`),
+      });
     }
   }
 

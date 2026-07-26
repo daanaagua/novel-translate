@@ -415,6 +415,49 @@ test("a promotion failure cannot skip the failing ordinal", () => {
   assert.deepEqual(attempts, [0, 0, 1]);
 });
 
+test("a submission-gate retry releases the bound ordinal for a fresh snapshot", () => {
+  const runId = "run-gate-retry";
+  const initial = createKnowledgeSnapshot(runId, []);
+  let retry = true;
+  const coordinator = new CommitCoordinator(
+    runId,
+    new KnowledgeStore(),
+    {
+      commitPromotion: () => {
+        if (retry) return "retry_latest_snapshot";
+        return "promoted";
+      },
+    },
+    initial,
+  );
+  coordinator.bindWindow({
+    ordinal: 0,
+    windowId: "window-0",
+    snapshot: initial,
+  });
+  coordinator.stage({
+    runId,
+    ordinal: 0,
+    windowId: "window-0",
+    snapshotId: initial.id,
+    candidates: [],
+  });
+
+  assert.deepEqual(coordinator.promoteReady(), []);
+  assert.deepEqual(coordinator.takeRetryWindowIds(), ["window-0"]);
+  assert.deepEqual(coordinator.takeRetryWindowIds(), []);
+
+  retry = false;
+  coordinator.stage({
+    runId,
+    ordinal: 0,
+    windowId: "window-0",
+    snapshotId: coordinator.snapshotForNextWave().id,
+    candidates: [],
+  });
+  assert.deepEqual(coordinator.promoteReady(), ["window-0"]);
+});
+
 test("windows must be bound with continuous ordinals and matching identities", () => {
   const coordinator = new CommitCoordinator("run-continuous");
   const snapshot = coordinator.snapshotForNextWave();

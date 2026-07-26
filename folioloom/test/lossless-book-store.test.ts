@@ -223,9 +223,11 @@ function alphaConcept() {
   });
 }
 
-function alphaUsage(): TermUsageSubmission {
+function alphaUsage(
+  targetSurface = "阿尔法",
+  concept = alphaConcept(),
+): TermUsageSubmission {
   const [first] = blocks();
-  const concept = alphaConcept();
   const occurrence = expectedTermOccurrences(
     [{ id: first!.id, sourceText: first!.sourceText }],
     [concept],
@@ -239,7 +241,7 @@ function alphaUsage(): TermUsageSubmission {
     sourceStart: occurrence.sourceStart,
     sourceEnd: occurrence.sourceEnd,
     discourseRole: "narrative",
-    targetSurface: "阿尔法",
+    targetSurface,
   };
 }
 
@@ -672,6 +674,189 @@ test("translation concept bindings follow the staged translation version", () =>
   assert.deepEqual(
     store.activeTranslationBindings(runId, second!.id),
     [],
+  );
+  store.close();
+});
+
+test("promotion retries a staged translation whose term surface became obsolete", () => {
+  const store = new LosslessBookStore(fixturePath());
+  const runId = initialize(store);
+  const previous = alphaConcept();
+  const current = reviseConcept(previous, {
+    canonicalTarget: "阿法",
+    allowedRealizations: ["阿法"],
+  });
+  store.upsertLexicalConcepts(runId, [previous]);
+  store.claimWindow(runId, "window-0");
+  const [first, second] = blocks();
+  store.stageWindow({
+    ...validStage(),
+    translations: [
+      {
+        blockId: first!.id,
+        sourceHash: first!.sourceHash,
+        text: "阿尔法。",
+      },
+      {
+        blockId: second!.id,
+        sourceHash: second!.sourceHash,
+        text: "贝塔。",
+      },
+    ],
+    knowledgeCandidates: [],
+    conceptBindings: {
+      usages: [alphaUsage("阿尔法", previous)],
+      concepts: [previous],
+    },
+  });
+  store.upsertLexicalConcepts(runId, [current]);
+
+  assert.equal(
+    store.promoteStagedWindow(runId, "window-0"),
+    "retry_latest_snapshot",
+  );
+  assert.equal(store.activeTranslations(runId).length, 0);
+  assert.equal(store.auditRows(runId).windows[0]?.status, "pending");
+  assert.deepEqual(store.activeTranslationBindings(runId, first!.id), []);
+  store.close();
+});
+
+test("promotion adopts the latest concept revision when its surfaces remain allowed", () => {
+  const store = new LosslessBookStore(fixturePath());
+  const runId = initialize(store);
+  const previous = conceptFromAnchor({
+    sourceForm: "Alpha",
+    target: "阿尔法",
+    mode: "contextual",
+    semanticClass: "technical_term",
+    confidence: 0.95,
+    allowedRealizations: ["阿尔法", "阿尔法先生"],
+  });
+  const current = reviseConcept(previous, {
+    canonicalTarget: "阿尔法先生",
+    allowedRealizations: ["阿尔法", "阿尔法先生"],
+  });
+  store.upsertLexicalConcepts(runId, [previous]);
+  store.claimWindow(runId, "window-0");
+  const [first, second] = blocks();
+  store.stageWindow({
+    ...validStage(),
+    translations: [
+      {
+        blockId: first!.id,
+        sourceHash: first!.sourceHash,
+        text: "阿尔法先生。",
+      },
+      {
+        blockId: second!.id,
+        sourceHash: second!.sourceHash,
+        text: "贝塔。",
+      },
+    ],
+    knowledgeCandidates: [],
+    conceptBindings: {
+      usages: [alphaUsage("阿尔法先生", previous)],
+      concepts: [previous],
+    },
+  });
+  store.upsertLexicalConcepts(runId, [current]);
+
+  assert.equal(
+    store.promoteStagedWindow(runId, "window-0"),
+    "promoted",
+  );
+  const [binding] = store.activeTranslationBindings(runId, first!.id);
+  assert.equal(binding?.appliedRevisionId, current.revisionId);
+  assert.equal(
+    binding?.appliedRenderFingerprint,
+    current.renderFingerprint,
+  );
+  assert.equal(binding?.validatedRevisionId, current.revisionId);
+  store.close();
+});
+
+test("concept promotion creates one sparse task only for an active stale binding", () => {
+  const store = new LosslessBookStore(fixturePath());
+  const initialSnapshot = createKnowledgeSnapshot("run-a", []);
+  const runId = initialize(store, {
+    ...runMeta("model-a", "a"),
+    initialSnapshotId: initialSnapshot.id,
+    initialSnapshot,
+  }, windowsApart());
+  const previous = alphaConcept();
+  const current = reviseConcept(previous, {
+    canonicalTarget: "阿法",
+    allowedRealizations: ["阿法"],
+  });
+  store.upsertLexicalConcepts(runId, [previous]);
+  const [first, second] = blocks();
+
+  store.claimWindow(runId, "window-0");
+  store.stageWindow({
+    ...validStage(runId, "window-0", initialSnapshot.id),
+    translations: [{
+      blockId: first!.id,
+      sourceHash: first!.sourceHash,
+      text: "阿尔法。",
+    }],
+    knowledgeCandidates: [],
+    conceptBindings: {
+      usages: [alphaUsage("阿尔法", previous)],
+      concepts: [previous],
+    },
+  });
+  store.promoteStagedWindow(runId, "window-0");
+
+  const candidate = {
+    recordId: "knowledge-current-alpha",
+    normalizedSubject: current.normalizedSubject,
+    kind: "lexical_concept",
+    payload: current,
+  };
+  store.claimWindow(runId, "window-1");
+  store.stageWindow({
+    ...validStage(runId, "window-1", initialSnapshot.id),
+    translations: [{
+      blockId: second!.id,
+      sourceHash: second!.sourceHash,
+      text: "贝塔。",
+    }],
+    knowledgeCandidates: [candidate],
+    conceptBindings: { usages: [], concepts: [] },
+  });
+  const knowledge = new KnowledgeStore(store.knowledgeRevisions(runId));
+  const appendedRevisions = knowledge.reconcileCandidates(
+    [candidate],
+    "window-1",
+  );
+  const currentSnapshot = store.latestKnowledgeSnapshot(runId);
+  const nextSnapshot = createKnowledgeSnapshot(
+    runId,
+    knowledge.projectableRevisions(),
+    currentSnapshot.id,
+  );
+  store.promoteStagedWindow({
+    runId,
+    windowId: "window-1",
+    ordinal: 1,
+    snapshotId: currentSnapshot.id,
+    candidates: [candidate],
+    appendedRevisions,
+    nextSnapshot,
+  });
+
+  const tasks = store.revalidationTasks(runId);
+  assert.equal(tasks.length, 1);
+  assert.equal(tasks[0]?.blockId, first!.id);
+  assert.deepEqual(tasks[0]?.conceptIds, [current.conceptId]);
+  assert.equal(tasks[0]?.status, "pending");
+  assert.equal(
+    store.activeTranslationBindings(runId, first!.id)[0]?.validationStatus,
+    "stale",
+  );
+  assert.equal(
+    store.activeTranslationBindings(runId, second!.id).length,
+    0,
   );
   store.close();
 });

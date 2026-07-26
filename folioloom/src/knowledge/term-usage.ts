@@ -196,8 +196,8 @@ function targetText(
   return (values as Readonly<Record<string, string>>)[blockId];
 }
 
-function allowedSurface(
-  expected: ExpectedTermOccurrence,
+export function termSurfaceAllowed(
+  expected: Pick<ExpectedTermOccurrence, "allowedRealizations" | "policy">,
   surface: string,
 ): boolean {
   if (expected.allowedRealizations.includes(surface)) return true;
@@ -252,7 +252,7 @@ export function validateTermUsages(
       fail("TERM_USAGE_SOURCE_MISMATCH", submission.occurrenceId);
       continue;
     }
-    if (!allowedSurface(known, submission.targetSurface)) {
+    if (!termSurfaceAllowed(known, submission.targetSurface)) {
       fail("TERM_USAGE_TARGET_NOT_ALLOWED", submission.occurrenceId);
       continue;
     }
