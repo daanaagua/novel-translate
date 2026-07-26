@@ -159,6 +159,18 @@ export interface LosslessBookAuditReport {
   runStatus: string;
   runMetadata: unknown;
   complete: boolean;
+  structurallyComplete: boolean;
+  knowledgeConverged: boolean;
+  strictExportable: boolean;
+  revalidation: {
+    pending: number;
+    validating: number;
+    stale: number;
+    warningStale: number;
+    resolvedNoop: number;
+    repaired: number;
+    retranslated: number;
+  };
   totalBlockCount: number;
   translatedBlockCount: number;
   missingBlockIds: string[];
@@ -466,7 +478,37 @@ export function auditLosslessBookStore(
   if (state.runStatus === "completed" && missingBlockIds.length > 0) {
     incidents.push("RUN_LINEAGE_INVALID");
   }
+  const structurallyComplete = missingBlockIds.length === 0
+    && incidents.length === 0;
+  const revalidation = {
+    pending: state.revalidationTasks.filter((task) =>
+      task.status === "pending").length,
+    validating: state.revalidationTasks.filter((task) =>
+      task.status === "validating").length,
+    stale: state.conceptBindings.filter((binding) =>
+      binding.validationStatus === "pending"
+      || binding.validationStatus === "validating"
+      || binding.validationStatus === "stale").length,
+    warningStale: state.conceptBindings.filter((binding) =>
+      binding.validationStatus === "warning_stale").length,
+    resolvedNoop: state.revalidationTasks.filter((task) =>
+      task.status === "resolved_noop").length,
+    repaired: state.revalidationTasks.filter((task) =>
+      task.status === "resolved_repair").length,
+    retranslated: state.revalidationTasks.filter((task) =>
+      task.status === "resolved_retranslate").length,
+  };
+  const knowledgeConverged = revalidation.pending === 0
+    && revalidation.validating === 0
+    && revalidation.stale === 0
+    && revalidation.warningStale === 0
+    && state.revalidationTasks.every((task) =>
+      task.status !== "completed_with_warning");
+  if (!knowledgeConverged) {
+    incidents.push("STALE_KNOWLEDGE_BINDING");
+  }
   const incidentCodes = [...new Set(incidents)].sort();
+  const strictExportable = structurallyComplete && knowledgeConverged;
   return {
     schema: "v5-book-store-audit-1",
     runId: state.runId,
@@ -475,7 +517,11 @@ export function auditLosslessBookStore(
     modelId: state.modelId,
     runStatus: state.runStatus,
     runMetadata: state.runMetadata,
-    complete: missingBlockIds.length === 0 && incidentCodes.length === 0,
+    complete: strictExportable,
+    structurallyComplete,
+    knowledgeConverged,
+    strictExportable,
+    revalidation,
     totalBlockCount: blocks.length,
     translatedBlockCount: translatedBlockIds.size,
     missingBlockIds,
@@ -489,8 +535,10 @@ export function losslessBookLineage(
   runId: string,
 ): LosslessBookLineage {
   const audit = auditLosslessBookStore(store, runId);
-  if (audit.incidentCodes.length > 0) {
-    throw new Error(`lossless lineage audit failed: ${audit.incidentCodes.join(",")}`);
+  const integrityIncidents = audit.incidentCodes.filter((code) =>
+    code !== "STALE_KNOWLEDGE_BINDING");
+  if (integrityIncidents.length > 0) {
+    throw new Error(`lossless lineage audit failed: ${integrityIncidents.join(",")}`);
   }
   const state = store.auditState(runId);
   const active = new Map(store.activeTranslations(runId).map((item) => [item.blockId, item]));
@@ -576,10 +624,17 @@ export function writeLosslessBookArtifacts(
   options: WriteLosslessBookArtifactsOptions = {},
 ): LosslessBookArtifactPaths {
   const audit = auditLosslessBookStore(store, runId);
-  if (audit.incidentCodes.length > 0) {
-    throw new Error(`lossless export audit failed: ${audit.incidentCodes.join(",")}`);
+  const integrityIncidents = audit.incidentCodes.filter((code) =>
+    code !== "STALE_KNOWLEDGE_BINDING");
+  if (integrityIncidents.length > 0) {
+    throw new Error(`lossless export audit failed: ${integrityIncidents.join(",")}`);
   }
-  if (!options.allowIncomplete && !audit.complete) {
+  if (!options.allowIncomplete && !audit.strictExportable) {
+    if (!audit.knowledgeConverged) {
+      throw new Error(
+        "strict book export requires knowledge convergence: STALE_KNOWLEDGE_BINDING",
+      );
+    }
     throw new Error(
       `strict book export requires ${audit.totalBlockCount} translated blocks; found ${audit.translatedBlockCount}`,
     );
@@ -600,6 +655,10 @@ export function writeLosslessBookArtifacts(
     modelId: audit.modelId,
     runMetadata: audit.runMetadata,
     complete: audit.complete,
+    structurallyComplete: audit.structurallyComplete,
+    knowledgeConverged: audit.knowledgeConverged,
+    strictExportable: audit.strictExportable,
+    revalidation: audit.revalidation,
     missingBlockIds: audit.missingBlockIds,
     missingBlockCount: audit.missingBlockCount,
     status: store.statusSummary(runId),

@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { spawnSync } from "node:child_process";
-import { mkdtempSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import test from "node:test";
@@ -11,7 +11,10 @@ import { BookContext } from "../src/fullbook/book-context.js";
 import { planBookWindows } from "../src/fullbook/window-planner.js";
 import { KnowledgeStore } from "../src/knowledge/knowledge-store.js";
 import { createKnowledgeSnapshot } from "../src/knowledge/snapshot.js";
-import { auditLosslessBookStore } from "../src/report.js";
+import {
+  auditLosslessBookStore,
+  writeLosslessBookArtifacts,
+} from "../src/report.js";
 import { LosslessBookStore } from "../src/storage/lossless-book-store.js";
 
 function sourceManifest(source: string): string {
@@ -126,6 +129,60 @@ function completeRun(withKnowledge = false): { storePath: string; runId: string 
   return { storePath, runId };
 }
 
+function injectKnowledgeRevalidation(
+  storePath: string,
+  runId: string,
+  input: {
+    bindingStatus: "stale" | "warning_stale";
+    taskStatus: "pending" | "completed_with_warning";
+  },
+): void {
+  const database = new DatabaseSync(storePath);
+  try {
+    const translation = database.prepare(`
+      SELECT translation_id, block_id, snapshot_id
+      FROM translations
+      WHERE run_id=? AND active=1
+      ORDER BY translation_id
+      LIMIT 1
+    `).get(runId) as {
+      translation_id: number;
+      block_id: string;
+      snapshot_id: string;
+    } | undefined;
+    assert.ok(translation);
+    database.prepare(`
+      INSERT INTO translation_concept_bindings(
+        translation_id, concept_id, applied_revision_id,
+        applied_render_fingerprint, term_usages_json,
+        validation_status, validated_revision_id
+      ) VALUES(?, 'concept-audit', 'revision-old', ?, '[]', ?, 'revision-old')
+    `).run(
+      translation.translation_id,
+      "a".repeat(64),
+      input.bindingStatus,
+    );
+    database.prepare(`
+      INSERT INTO knowledge_revalidation_tasks(
+        task_id, run_id, translation_id, block_id, change_set_hash,
+        from_snapshot_id, to_snapshot_id, concept_ids_json, status
+      ) VALUES(
+        'task-audit', ?, ?, ?, ?, ?, ?, '["concept-audit"]', ?
+      )
+    `).run(
+      runId,
+      translation.translation_id,
+      translation.block_id,
+      "b".repeat(64),
+      translation.snapshot_id,
+      translation.snapshot_id,
+      input.taskStatus,
+    );
+  } finally {
+    database.close();
+  }
+}
+
 test("audit rejects an empty active translation in a completed run", () => {
   const fixture = completeRun();
   const database = new DatabaseSync(fixture.storePath);
@@ -137,6 +194,72 @@ test("audit rejects an empty active translation in a completed run", () => {
     const report = auditLosslessBookStore(store, fixture.runId);
     assert.equal(report.complete, false);
     assert.ok(report.incidentCodes.includes("ACTIVE_TRANSLATION_INVALID"));
+  } finally {
+    store.close();
+  }
+});
+
+test("knowledge convergence blocks strict export without hiding structural completeness", () => {
+  const fixture = completeRun();
+  injectKnowledgeRevalidation(fixture.storePath, fixture.runId, {
+    bindingStatus: "stale",
+    taskStatus: "pending",
+  });
+  const store = new LosslessBookStore(fixture.storePath);
+  try {
+    const report = auditLosslessBookStore(store, fixture.runId);
+    assert.equal(report.structurallyComplete, true);
+    assert.equal(report.knowledgeConverged, false);
+    assert.equal(report.strictExportable, false);
+    assert.equal(report.complete, false);
+    assert.ok(report.incidentCodes.includes("STALE_KNOWLEDGE_BINDING"));
+    assert.deepEqual(report.revalidation, {
+      pending: 1,
+      validating: 0,
+      stale: 1,
+      warningStale: 0,
+      resolvedNoop: 0,
+      repaired: 0,
+      retranslated: 0,
+    });
+
+    const output = mkdtempSync(join(tmpdir(), "folioloom-stale-export-"));
+    assert.throws(
+      () => writeLosslessBookArtifacts(store, fixture.runId, output),
+      /STALE_KNOWLEDGE_BINDING|knowledge convergence/u,
+    );
+    const paths = writeLosslessBookArtifacts(
+      store,
+      fixture.runId,
+      output,
+      { allowIncomplete: true },
+    );
+    assert.match(paths.translation, /\.partial\.txt$/u);
+    const exportedAudit = JSON.parse(
+      readFileSync(paths.audit, "utf8"),
+    ) as Record<string, unknown>;
+    assert.equal(exportedAudit.structurallyComplete, true);
+    assert.equal(exportedAudit.knowledgeConverged, false);
+    assert.equal(exportedAudit.strictExportable, false);
+  } finally {
+    store.close();
+  }
+});
+
+test("warning-stale bindings remain explicit strict-export blockers", () => {
+  const fixture = completeRun();
+  injectKnowledgeRevalidation(fixture.storePath, fixture.runId, {
+    bindingStatus: "warning_stale",
+    taskStatus: "completed_with_warning",
+  });
+  const store = new LosslessBookStore(fixture.storePath);
+  try {
+    const report = auditLosslessBookStore(store, fixture.runId);
+    assert.equal(report.structurallyComplete, true);
+    assert.equal(report.knowledgeConverged, false);
+    assert.equal(report.strictExportable, false);
+    assert.equal(report.revalidation.warningStale, 1);
+    assert.ok(report.incidentCodes.includes("STALE_KNOWLEDGE_BINDING"));
   } finally {
     store.close();
   }

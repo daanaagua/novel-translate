@@ -624,6 +624,18 @@ test("book audit recomputes persisted integrity and missing blocks without a pro
   assert.equal(report.protocolVersion, "lossless-v5-1");
   assert.equal(report.modelId, "test-model");
   assert.equal(report.complete, false);
+  assert.equal(report.structurallyComplete, false);
+  assert.equal(report.knowledgeConverged, true);
+  assert.equal(report.strictExportable, false);
+  assert.deepEqual(report.revalidation, {
+    pending: 0,
+    validating: 0,
+    stale: 0,
+    warningStale: 0,
+    resolvedNoop: 0,
+    repaired: 0,
+    retranslated: 0,
+  });
   assert.ok(Number(report.missingBlockCount) > 0);
   assert.ok((report.incidentCodes as string[]).includes("SOURCE_HASH_MISMATCH"));
 });

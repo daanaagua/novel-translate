@@ -693,7 +693,7 @@ git commit -m "fix: normalize generic Chinese variant glyphs"
 - 修改：`folioloom/test/lossless-audit.test.ts`
 - 修改：`folioloom/test/cli.test.ts`
 
-- [ ] **步骤 1：编写审计失败测试**
+- [x] **步骤 1：编写审计失败测试**
 
 活动译文完整但存在 pending/stale binding 时：
 
@@ -707,13 +707,13 @@ assert.ok(report.incidentCodes.includes("STALE_KNOWLEDGE_BINDING"));
 
 `warning_stale` 同样阻止严格导出；普通 partial 导出必须清楚标注。
 
-- [ ] **步骤 2：运行测试确认失败**
+- [x] **步骤 2：运行测试确认失败**
 
 ```powershell
 npm test -- --test-name-pattern="knowledge converged|strict export"
 ```
 
-- [ ] **步骤 3：扩充报告**
+- [x] **步骤 3：扩充报告**
 
 报告增加：
 
@@ -735,7 +735,7 @@ revalidation: {
 保留现有 `complete` 兼容字段，但其值只等于 `strictExportable`；新增字段
 使结构状态可单独解释。
 
-- [ ] **步骤 4：验证并提交**
+- [x] **步骤 4：验证并提交**
 
 ```powershell
 npm test -- --test-name-pattern="knowledge converged|strict export|book audit"

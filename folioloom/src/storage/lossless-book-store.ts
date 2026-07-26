@@ -517,6 +517,12 @@ export interface LosslessAuditSnapshot {
   payload: unknown;
 }
 
+export interface LosslessAuditConceptBinding {
+  translationId: number;
+  conceptId: string;
+  validationStatus: TranslationConceptBinding["validationStatus"];
+}
+
 export interface LosslessAuditState {
   runId: string;
   sourceVersion: string;
@@ -532,6 +538,8 @@ export interface LosslessAuditState {
   translations: LosslessAuditTranslation[];
   knowledgeRevisions: LosslessAuditKnowledgeRevision[];
   snapshots: LosslessAuditSnapshot[];
+  conceptBindings: LosslessAuditConceptBinding[];
+  revalidationTasks: KnowledgeRevalidationTask[];
 }
 
 type LosslessStoreOpenMode = "read-write" | "read-only";
@@ -5194,6 +5202,25 @@ export class LosslessBookStore {
       contentHash: row.content_hash,
       payload: JSON.parse(row.payload_json) as unknown,
     }));
+    const conceptBindings = this.#schemaVersion === LOSSLESS_BOOK_SCHEMA_VERSION
+      ? all<{
+          translation_id: number;
+          concept_id: string;
+          validation_status: TranslationConceptBinding["validationStatus"];
+        }>(this.#database.prepare(`
+          SELECT binding.translation_id, binding.concept_id,
+                 binding.validation_status
+          FROM translation_concept_bindings AS binding
+          JOIN translations AS translation
+            ON translation.translation_id=binding.translation_id
+          WHERE translation.run_id=? AND translation.active=1
+          ORDER BY binding.translation_id, binding.concept_id
+        `), runId).map((row) => ({
+          translationId: row.translation_id,
+          conceptId: row.concept_id,
+          validationStatus: row.validation_status,
+        }))
+      : [];
     return {
       runId: run.run_id,
       sourceVersion: run.source_version,
@@ -5209,6 +5236,8 @@ export class LosslessBookStore {
       translations,
       knowledgeRevisions,
       snapshots,
+      conceptBindings,
+      revalidationTasks: this.revalidationTasks(runId),
     };
   }
 
