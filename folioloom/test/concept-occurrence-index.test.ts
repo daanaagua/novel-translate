@@ -1,7 +1,10 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { conceptFromAnchor } from "../src/knowledge/lexical-concept.js";
+import {
+  conceptFromAnchor,
+  reviseConcept,
+} from "../src/knowledge/lexical-concept.js";
 import {
   buildConceptOccurrenceIndex,
 } from "../src/knowledge/concept-occurrence-index.js";
@@ -79,4 +82,89 @@ test("concept occurrence index groups repeated exact spans by concept and block"
       sourceForm: "Prokurist",
     }],
   }]);
+});
+
+test("three-million-character occurrence indexing stays one-pass and revision-stable", (t) => {
+  const heapBefore = process.memoryUsage().heapUsed;
+  let observedHeap = heapBefore;
+  const concepts = Array.from({ length: 1_000 }, (_, index) =>
+    conceptFromAnchor({
+      sourceForm: `ScaleTerm${index.toString().padStart(4, "0")}`,
+      target: `术语${index}`,
+      mode: "stable",
+      semanticClass: "technical_term",
+      confidence: 0.9,
+    }));
+  const impactForm = "ScaleTerm0999";
+  const blocks = Array.from({ length: 600 }, (_, index) => {
+    const localForm = `ScaleTerm${index.toString().padStart(4, "0")}`;
+    const prefix = index < 10
+      ? `${localForm} ${impactForm} `
+      : `${localForm} `;
+    return {
+      blockId: `scale-block-${index.toString().padStart(3, "0")}`,
+      sourceText: `${prefix}${"x".repeat(5_000 - prefix.length)}`,
+    };
+  });
+  assert.equal(
+    blocks.reduce((sum, block) => sum + block.sourceText.length, 0),
+    3_000_000,
+  );
+
+  const blockTexts = new Set(blocks.map((block) => block.sourceText));
+  const base = getSourceLanguageProfile("en");
+  let normalizedBlocks = 0;
+  let segmentedBlocks = 0;
+  const measuredProfile: SourceLanguageProfile = {
+    ...base,
+    normalizeSourceForm(text) {
+      if (blockTexts.has(text)) normalizedBlocks += 1;
+      return base.normalizeSourceForm(text);
+    },
+    segment(text) {
+      if (blockTexts.has(text)) segmentedBlocks += 1;
+      return base.segment(text);
+    },
+  };
+  const firstRows = buildConceptOccurrenceIndex(
+    blocks,
+    concepts,
+    measuredProfile,
+  );
+  observedHeap = Math.max(observedHeap, process.memoryUsage().heapUsed);
+  assert.equal(normalizedBlocks, 600);
+  assert.equal(segmentedBlocks, 600);
+  assert.equal(firstRows.length, 610);
+
+  const rowKeys = new Set(firstRows.map((row) =>
+    `${row.conceptId}\0${row.blockId}`));
+  const impactIndex = concepts.findIndex((concept) =>
+    concept.sourceForms.includes(impactForm));
+  assert.notEqual(impactIndex, -1);
+  let impact = concepts[impactIndex]!;
+  const rowsAfterFirstRevision = rowKeys.size;
+  for (let revision = 0; revision < 10; revision += 1) {
+    impact = reviseConcept(impact, {
+      confidence: 0.8 + revision / 100,
+    });
+    for (const key of [...rowKeys]) {
+      if (key.startsWith(`${impact.conceptId}\0`)) rowKeys.delete(key);
+    }
+    for (const row of buildConceptOccurrenceIndex(blocks, [impact], base)) {
+      rowKeys.add(`${row.conceptId}\0${row.blockId}`);
+    }
+    observedHeap = Math.max(observedHeap, process.memoryUsage().heapUsed);
+  }
+  assert.equal(rowKeys.size, rowsAfterFirstRevision);
+  const observedHeapDelta = Math.max(0, observedHeap - heapBefore);
+  assert.ok(observedHeapDelta < 512 * 1024 * 1024);
+  t.diagnostic(JSON.stringify({
+    sourceCharacters: 3_000_000,
+    blocks: 600,
+    concepts: 1_000,
+    occurrenceRows: firstRows.length,
+    revisions: 10,
+    rowsAfterRevisions: rowKeys.size,
+    observedHeapDeltaBytes: observedHeapDelta,
+  }));
 });

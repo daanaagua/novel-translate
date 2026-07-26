@@ -259,3 +259,72 @@ test("revalidation action distinguishes noop, one-surface repair, and substantiv
     { action: "retranslate", conceptIds: [current.conceptId] },
   );
 });
+
+test("large sparse planning ignores unrelated changes and selects ten affected blocks", () => {
+  const previous = conceptFromAnchor({
+    sourceForm: "ScaleTerm0999",
+    target: "旧译名",
+    mode: "stable",
+    semanticClass: "technical_term",
+    confidence: 0.95,
+  });
+  const current = reviseConcept(previous, {
+    canonicalTarget: "新译名",
+  });
+  const unrelated = reviseConcept(conceptFromAnchor({
+    sourceForm: "AbsentScaleTerm",
+    target: "无关旧译",
+    mode: "stable",
+    semanticClass: "technical_term",
+    confidence: 0.95,
+  }), {
+    canonicalTarget: "无关新译",
+  });
+  const occurrences = Array.from({ length: 10 }, (_, index) => ({
+    conceptId: current.conceptId,
+    blockId: `scale-block-${index.toString().padStart(3, "0")}`,
+    sourceSpans: [{
+      start: 14,
+      end: 27,
+      sourceForm: "ScaleTerm0999",
+    }],
+  }));
+  const translations: ActiveTranslationDependency[] = Array.from(
+    { length: 600 },
+    (_, index) => ({
+      translationId: index + 1,
+      blockId: `scale-block-${index.toString().padStart(3, "0")}`,
+      snapshotId: "snapshot-old",
+      bindings: index < 10
+        ? [{
+            conceptId: current.conceptId,
+            appliedRevisionId: previous.revisionId,
+            appliedRenderFingerprint: previous.renderFingerprint,
+          }]
+        : [],
+    }),
+  );
+
+  const unrelatedTasks = planSparseRevalidation({
+    concepts: [unrelated],
+    occurrences,
+    translations,
+    toSnapshotId: "snapshot-new",
+  });
+  const affectedTasks = planSparseRevalidation({
+    concepts: [current],
+    occurrences,
+    translations,
+    toSnapshotId: "snapshot-new",
+  });
+
+  assert.equal(unrelatedTasks.length, 0);
+  assert.equal(affectedTasks.length, 10);
+  assert.deepEqual(
+    affectedTasks.map((task) => task.blockId),
+    Array.from(
+      { length: 10 },
+      (_, index) => `scale-block-${index.toString().padStart(3, "0")}`,
+    ),
+  );
+});

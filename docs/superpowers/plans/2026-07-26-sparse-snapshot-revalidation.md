@@ -751,7 +751,7 @@ git commit -m "feat: require knowledge convergence for strict export"
 - 修改：`folioloom/test/sparse-revalidation.test.ts`
 - 修改：`docs/superpowers/reports/2026-07-26-sparse-revalidation-validation.md`
 
-- [ ] **步骤 1：增加三百万字符合成测试**
+- [x] **步骤 1：增加三百万字符合成测试**
 
 构造三百万字符、六百块、一千概念的固定种子样本。记录：
 
@@ -771,7 +771,7 @@ assert.equal(unrelatedTasks, 0);
 assert.equal(affectedTasks, 10);
 ```
 
-- [ ] **步骤 2：运行核心和桌面全套验证**
+- [x] **步骤 2：运行核心和桌面全套验证**
 
 ```powershell
 npm test
@@ -784,7 +784,7 @@ git diff --check
 
 预期：全部 exit 0；Windows 不支持符号链接的既有单项允许显式 skip。
 
-- [ ] **步骤 3：编写验证报告并提交**
+- [x] **步骤 3：编写验证报告并提交**
 
 报告记录测试总数、规模样本耗时/内存、数据库增长、已知非目标和提交
 哈希，不复制任何密钥或受版权保护正文。
