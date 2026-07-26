@@ -37,6 +37,10 @@ export interface StableTerm {
   target: string;
   locked: boolean;
   policy?: StableTermPolicy;
+  semanticClass?: "proper_name" | "unique_title" | "technical_term" | "role";
+  allowedTargets?: readonly string[];
+  revisionId?: string;
+  renderFingerprint?: string;
   note?: string;
   origin?: "legacy" | "knowledge" | "glossary";
 }

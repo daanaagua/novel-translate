@@ -192,7 +192,7 @@ git commit -m "feat: add sparse revalidation schema"
 - 创建：`folioloom/test/lexical-concept.test.ts`
 - 修改：`folioloom/src/domain/types.ts`
 
-- [ ] **步骤 1：编写概念归一化失败测试**
+- [x] **步骤 1：编写概念归一化失败测试**
 
 覆盖：
 
@@ -219,7 +219,7 @@ assert.notEqual(
 
 并断言 `ordinary_word` 不能升级为概念，任意 `kind` 不能绕过 schema。
 
-- [ ] **步骤 2：运行测试确认失败**
+- [x] **步骤 2：运行测试确认失败**
 
 ```powershell
 npm test -- --test-name-pattern="lexical concept"
@@ -227,7 +227,7 @@ npm test -- --test-name-pattern="lexical concept"
 
 预期：FAIL，模块不存在。
 
-- [ ] **步骤 3：实现概念类型和指纹**
+- [x] **步骤 3：实现概念类型和指纹**
 
 导出：
 
@@ -253,7 +253,7 @@ export interface LexicalConcept {
 `renderFingerprint` 只哈希 source forms、semantic class、canonical target、
 policy、allowed realizations 和 visibility。
 
-- [ ] **步骤 4：扩充 StableTerm**
+- [x] **步骤 4：扩充 StableTerm**
 
 在 `domain/types.ts` 增加：
 
@@ -266,7 +266,7 @@ renderFingerprint?: string;
 
 现有调用者保持兼容。
 
-- [ ] **步骤 5：运行测试验证通过并提交**
+- [x] **步骤 5：运行测试验证通过并提交**
 
 ```powershell
 npm test -- --test-name-pattern="lexical concept"
