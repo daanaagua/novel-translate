@@ -10,6 +10,7 @@ import { DatabaseSync } from "node:sqlite";
 import { BookContext } from "../src/fullbook/book-context.js";
 import { planBookWindows } from "../src/fullbook/window-planner.js";
 import { KnowledgeStore } from "../src/knowledge/knowledge-store.js";
+import { conceptFromAnchor } from "../src/knowledge/lexical-concept.js";
 import { createKnowledgeSnapshot } from "../src/knowledge/snapshot.js";
 import {
   auditLosslessBookStore,
@@ -218,6 +219,7 @@ test("knowledge convergence blocks strict export without hiding structural compl
       validating: 0,
       stale: 1,
       warningStale: 0,
+      coverageMissing: 0,
       resolvedNoop: 0,
       repaired: 0,
       retranslated: 0,
@@ -241,6 +243,37 @@ test("knowledge convergence blocks strict export without hiding structural compl
     assert.equal(exportedAudit.structurallyComplete, true);
     assert.equal(exportedAudit.knowledgeConverged, false);
     assert.equal(exportedAudit.strictExportable, false);
+  } finally {
+    store.close();
+  }
+});
+
+test("audit rejects an active translation whose concept occurrence has no binding", () => {
+  const fixture = completeRun();
+  const store = new LosslessBookStore(fixture.storePath);
+  try {
+    const concept = conceptFromAnchor({
+      sourceForm: "Alpha",
+      target: "阿尔法",
+      mode: "stable",
+      semanticClass: "technical_term",
+      confidence: 0.95,
+    });
+    const [block] = store.auditState(fixture.runId).blocks;
+    assert.ok(block);
+    store.upsertLexicalConcepts(fixture.runId, [concept]);
+    store.replaceConceptOccurrences(fixture.runId, concept.conceptId, [{
+      conceptId: concept.conceptId,
+      blockId: block.blockId,
+      sourceSpans: [{ start: 0, end: 5, sourceForm: "Alpha" }],
+    }]);
+
+    const report = auditLosslessBookStore(store, fixture.runId);
+    assert.equal(report.structurallyComplete, true);
+    assert.equal(report.knowledgeConverged, false);
+    assert.equal(report.strictExportable, false);
+    assert.equal(report.revalidation.coverageMissing, 1);
+    assert.ok(report.incidentCodes.includes("STALE_KNOWLEDGE_BINDING"));
   } finally {
     store.close();
   }

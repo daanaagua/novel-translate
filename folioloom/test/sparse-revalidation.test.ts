@@ -96,6 +96,40 @@ test("sparse revalidation selects only active stale bindings at actual occurrenc
     && /^[a-f0-9]{64}$/u.test(candidate.changeSetHash)));
 });
 
+test("sparse revalidation selects an occurrence hit that has no prior binding", () => {
+  const current = currentConcept();
+  const plan = planSparseRevalidation({
+    concepts: [current],
+    occurrences: [{
+      conceptId: current.conceptId,
+      blockId: "block-0",
+      sourceSpans: [{ start: 0, end: 9, sourceForm: "Prokurist" }],
+    }],
+    translations: [{
+      translationId: 10,
+      blockId: "block-0",
+      snapshotId: "snapshot-before-concept",
+      bindings: [],
+    }, {
+      translationId: 11,
+      blockId: "block-1",
+      snapshotId: "snapshot-before-concept",
+      bindings: [],
+    }],
+    toSnapshotId: "snapshot-with-concept",
+  });
+
+  assert.deepEqual(plan.map((candidate) => ({
+    translationId: candidate.translationId,
+    blockId: candidate.blockId,
+    conceptIds: candidate.conceptIds,
+  })), [{
+    translationId: 10,
+    blockId: "block-0",
+    conceptIds: [current.conceptId],
+  }]);
+});
+
 test("metadata-only concept revisions do not invalidate translations", () => {
   const previous = oldConcept();
   const confidenceOnly = reviseConcept(previous, { confidence: 0.99 });

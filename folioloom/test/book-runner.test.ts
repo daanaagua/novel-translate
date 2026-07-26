@@ -279,7 +279,17 @@ test("revalidation noop uses durable receipts without a model call", async () =>
     retranslated: 0,
     warning: 0,
     modelCalls: 0,
+    modelDurationMs: 0,
+    inputTokens: 0,
+    outputTokens: 0,
+    cacheReadTokens: 0,
+    cacheWriteTokens: 0,
+    reasoningTokens: 0,
+    totalTokens: 0,
+    tokenUsageComplete: true,
+    wallTimeMs: result.wallTimeMs,
   });
+  assert.ok(result.wallTimeMs >= 0);
 });
 
 test("revalidation runs one targeted repair or full block translation from its action", async () => {
@@ -330,6 +340,48 @@ test("expected revalidation failure preserves the old version and continues as w
   assert.equal(fixture.calls.warning, 1);
   assert.equal(result.warning, 1);
   assert.equal(result.modelCalls, 1);
+  assert.equal(result.tokenUsageComplete, false);
+});
+
+test("revalidation monitoring reports only the incremental model time and tokens", async () => {
+  const fixture = revalidationQueueFixture({
+    currentTarget: "manager",
+    allowedTargets: ["manager"],
+  });
+  const result = await drainKnowledgeRevalidationTasks({
+    store: fixture.store as never,
+    runId: "run-0",
+    maxAttempts: 1,
+    translate: async (_work, action) => ({
+      snapshotId: "snapshot-new",
+      text: "manager",
+      resultStatus: "completed" as const,
+      termUsages: [],
+      concepts: [fixture.current],
+      result: { action },
+      telemetry: {
+        modelCalls: 2,
+        modelDurationMs: 125,
+        inputTokens: 1_000,
+        outputTokens: 200,
+        cacheReadTokens: 600,
+        cacheWriteTokens: 50,
+        reasoningTokens: 75,
+        totalTokens: 1_325,
+      },
+    }),
+    isExpectedFailure: () => false,
+  });
+
+  assert.equal(result.modelCalls, 2);
+  assert.equal(result.modelDurationMs, 125);
+  assert.equal(result.inputTokens, 1_000);
+  assert.equal(result.outputTokens, 200);
+  assert.equal(result.cacheReadTokens, 600);
+  assert.equal(result.cacheWriteTokens, 50);
+  assert.equal(result.reasoningTokens, 75);
+  assert.equal(result.totalTokens, 1_325);
+  assert.equal(result.tokenUsageComplete, true);
 });
 
 test("fast mode keeps its default physical request limit aligned with a legal 4,800-token window", async () => {

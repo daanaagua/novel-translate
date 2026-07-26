@@ -632,6 +632,7 @@ test("book audit recomputes persisted integrity and missing blocks without a pro
     validating: 0,
     stale: 0,
     warningStale: 0,
+    coverageMissing: 0,
     resolvedNoop: 0,
     repaired: 0,
     retranslated: 0,

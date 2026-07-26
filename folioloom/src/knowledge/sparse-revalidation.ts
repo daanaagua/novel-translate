@@ -166,6 +166,14 @@ export function planSparseRevalidation(
   }
   const occurrenceKeys = new Set(input.occurrences.map((occurrence) =>
     `${occurrence.conceptId}\0${occurrence.blockId}`));
+  const occurrenceConceptIdsByBlock = new Map<string, Set<string>>();
+  for (const occurrence of input.occurrences) {
+    if (!conceptById.has(occurrence.conceptId)) continue;
+    const conceptIds = occurrenceConceptIdsByBlock.get(occurrence.blockId)
+      ?? new Set<string>();
+    conceptIds.add(occurrence.conceptId);
+    occurrenceConceptIdsByBlock.set(occurrence.blockId, conceptIds);
+  }
   const candidates: RevalidationCandidate[] = [];
   for (const translation of input.translations) {
     if (!Number.isSafeInteger(translation.translationId)
@@ -173,12 +181,21 @@ export function planSparseRevalidation(
       throw new TypeError("translationId must be a positive safe integer");
     }
     const changed = new Map<string, LexicalConcept>();
-    for (const binding of translation.bindings) {
-      const current = conceptById.get(binding.conceptId);
+    const bindingByConceptId = new Map(
+      translation.bindings.map((binding) => [binding.conceptId, binding]),
+    );
+    for (const conceptId of occurrenceConceptIdsByBlock.get(
+      translation.blockId,
+    ) ?? []) {
+      const current = conceptById.get(conceptId);
       if (current === undefined
-        || !occurrenceKeys.has(`${binding.conceptId}\0${translation.blockId}`)
-        || binding.appliedRevisionId === current.revisionId
-        || binding.appliedRenderFingerprint === current.renderFingerprint) {
+        || !occurrenceKeys.has(`${conceptId}\0${translation.blockId}`)) {
+        continue;
+      }
+      const binding = bindingByConceptId.get(conceptId);
+      if (binding !== undefined
+        && (binding.appliedRevisionId === current.revisionId
+          || binding.appliedRenderFingerprint === current.renderFingerprint)) {
         continue;
       }
       changed.set(current.conceptId, current);

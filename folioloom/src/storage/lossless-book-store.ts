@@ -320,6 +320,14 @@ export interface KnowledgeRevalidationTask {
   readonly replacementTranslationId: number | null;
 }
 
+export interface ConceptCoverageRevalidationReport {
+  readonly occurrenceDependencies: number;
+  readonly candidateTranslations: number;
+  readonly tasksCreated: number;
+  readonly bindingsCreated: number;
+  readonly wallTimeMs: number;
+}
+
 export interface RevalidationTranslationRecord
   extends ActiveLosslessTranslation {
   readonly translationId: number;
@@ -523,6 +531,12 @@ export interface LosslessAuditConceptBinding {
   validationStatus: TranslationConceptBinding["validationStatus"];
 }
 
+export interface LosslessAuditMissingConceptBinding {
+  translationId: number;
+  blockId: string;
+  conceptId: string;
+}
+
 export interface LosslessAuditState {
   runId: string;
   sourceVersion: string;
@@ -539,6 +553,7 @@ export interface LosslessAuditState {
   knowledgeRevisions: LosslessAuditKnowledgeRevision[];
   snapshots: LosslessAuditSnapshot[];
   conceptBindings: LosslessAuditConceptBinding[];
+  missingConceptBindings: LosslessAuditMissingConceptBinding[];
   revalidationTasks: KnowledgeRevalidationTask[];
 }
 
@@ -2816,6 +2831,63 @@ export class LosslessBookStore {
     }));
   }
 
+  ensureConceptCoverageRevalidationTasks(
+    runId: string,
+    toSnapshotId: string,
+  ): ConceptCoverageRevalidationReport {
+    if (this.#schemaVersion !== LOSSLESS_BOOK_SCHEMA_VERSION) {
+      throw new Error("schema v4 write upgrade required");
+    }
+    this.#run(runId);
+    requireNonempty(toSnapshotId, "toSnapshotId");
+    const snapshot = one<{ present: number }>(this.#database.prepare(`
+      SELECT 1 AS present FROM knowledge_snapshots
+      WHERE run_id=? AND snapshot_id=?
+    `), runId, toSnapshotId);
+    if (snapshot === undefined) {
+      throw new Error(`unknown knowledge snapshot ${runId}/${toSnapshotId}`);
+    }
+    return this.#transaction(() => {
+      const concepts = all<LexicalConceptRow>(this.#database.prepare(`
+        SELECT * FROM lexical_concepts
+        WHERE run_id=? AND active=1
+        ORDER BY concept_id
+      `), runId).map(lexicalConceptFromRow);
+      const occurrences = all<{
+        concept_id: string;
+        block_id: string;
+        occurrence_count: number;
+        source_spans_json: string;
+      }>(this.#database.prepare(`
+        SELECT concept_id, block_id, occurrence_count, source_spans_json
+        FROM concept_occurrences
+        WHERE run_id=?
+        ORDER BY concept_id, block_id
+      `), runId).map((row): ConceptOccurrence => {
+        const sourceSpans = JSON.parse(
+          row.source_spans_json,
+        ) as ConceptOccurrence["sourceSpans"];
+        if (!Array.isArray(sourceSpans)
+          || sourceSpans.length !== row.occurrence_count) {
+          throw new Error(
+            `corrupt concept occurrences for ${row.concept_id}/${row.block_id}`,
+          );
+        }
+        return {
+          conceptId: row.concept_id,
+          blockId: row.block_id,
+          sourceSpans,
+        };
+      });
+      return this.#createSparseRevalidationTasks(
+        runId,
+        concepts,
+        occurrences,
+        toSnapshotId,
+      );
+    });
+  }
+
   revalidationTasks(runId: string): KnowledgeRevalidationTask[] {
     if (this.#schemaVersion !== LOSSLESS_BOOK_SCHEMA_VERSION) return [];
     this.#run(runId);
@@ -3165,6 +3237,17 @@ export class LosslessBookStore {
           `revalidation window already contains staged translations: ${work.translation.windowId}`,
         );
       }
+      if (work.window.status !== "completed"
+        && work.window.status !== "completed_with_warnings") {
+        throw new Error(
+          `revalidation window is not committed: ${work.translation.windowId}`,
+        );
+      }
+      const effectiveResultStatus =
+        work.window.status === "completed_with_warnings"
+        || input.resultStatus === "completed_with_warnings"
+          ? "completed_with_warnings"
+          : "completed";
       const inserted = this.#database.prepare(`
         INSERT INTO translations(
           run_id, window_id, source_version, block_id, version, source_hash,
@@ -3184,7 +3267,7 @@ export class LosslessBookStore {
         work.source.blockId,
         work.source.sourceHash,
         input.text,
-        input.resultStatus,
+        effectiveResultStatus,
         input.snapshotId,
       );
       const replacementTranslationId = Number(inserted.lastInsertRowid);
@@ -3211,6 +3294,30 @@ export class LosslessBookStore {
       `).run(replacementTranslationId, input.runId);
       if (Number(activated.changes) !== 1) {
         throw new Error(`failed to activate revalidation replacement ${input.taskId}`);
+      }
+      if (effectiveResultStatus !== work.window.status) {
+        const updatedWindow = this.#database.prepare(`
+          UPDATE window_plans SET status=?
+          WHERE run_id=? AND window_id=? AND status=?
+        `).run(
+          effectiveResultStatus,
+          input.runId,
+          work.translation.windowId,
+          work.window.status,
+        );
+        if (Number(updatedWindow.changes) !== 1) {
+          throw new Error(
+            `revalidation window status changed concurrently: ${work.translation.windowId}`,
+          );
+        }
+        this.#database.prepare(`
+          UPDATE translations SET result_status=?
+          WHERE run_id=? AND window_id=? AND active=1
+        `).run(
+          effectiveResultStatus,
+          input.runId,
+          work.translation.windowId,
+        );
       }
       const terminalStatus = input.action === "repair"
         ? "resolved_repair"
@@ -5221,6 +5328,34 @@ export class LosslessBookStore {
           validationStatus: row.validation_status,
         }))
       : [];
+    const missingConceptBindings = this.#schemaVersion === LOSSLESS_BOOK_SCHEMA_VERSION
+      ? all<{
+          translation_id: number;
+          block_id: string;
+          concept_id: string;
+        }>(this.#database.prepare(`
+          SELECT translation.translation_id, translation.block_id,
+                 occurrence.concept_id
+          FROM translations AS translation
+          JOIN concept_occurrences AS occurrence
+            ON occurrence.run_id=translation.run_id
+           AND occurrence.block_id=translation.block_id
+          JOIN lexical_concepts AS concept
+            ON concept.run_id=occurrence.run_id
+           AND concept.concept_id=occurrence.concept_id
+           AND concept.active=1
+          LEFT JOIN translation_concept_bindings AS binding
+            ON binding.translation_id=translation.translation_id
+           AND binding.concept_id=occurrence.concept_id
+          WHERE translation.run_id=? AND translation.active=1
+            AND binding.translation_id IS NULL
+          ORDER BY translation.translation_id, occurrence.concept_id
+        `), runId).map((row) => ({
+          translationId: row.translation_id,
+          blockId: row.block_id,
+          conceptId: row.concept_id,
+        }))
+      : [];
     return {
       runId: run.run_id,
       sourceVersion: run.source_version,
@@ -5237,6 +5372,7 @@ export class LosslessBookStore {
       knowledgeRevisions,
       snapshots,
       conceptBindings,
+      missingConceptBindings,
       revalidationTasks: this.revalidationTasks(runId),
     };
   }
@@ -5924,26 +6060,60 @@ export class LosslessBookStore {
     concepts: readonly LexicalConcept[],
     occurrences: readonly ConceptOccurrence[],
     toSnapshotId: string,
-  ): void {
-    if (concepts.length === 0 || occurrences.length === 0) return;
+  ): ConceptCoverageRevalidationReport {
+    const startedAt = performance.now();
+    if (concepts.length === 0 || occurrences.length === 0) {
+      return {
+        occurrenceDependencies: 0,
+        candidateTranslations: 0,
+        tasksCreated: 0,
+        bindingsCreated: 0,
+        wallTimeMs: performance.now() - startedAt,
+      };
+    }
     const conceptIds = new Set(concepts.map((concept) => concept.conceptId));
-    const rows = all<{
+    const conceptById = new Map(concepts.map((concept) => [
+      concept.conceptId,
+      concept,
+    ]));
+    const occurrenceDependencies = new Set(occurrences
+      .filter((occurrence) => conceptIds.has(occurrence.conceptId))
+      .map((occurrence) =>
+        `${occurrence.conceptId}\0${occurrence.blockId}`));
+    const occurrenceBlockIds = [...new Set(occurrences
+      .filter((occurrence) => conceptIds.has(occurrence.conceptId))
+      .map((occurrence) => occurrence.blockId))];
+    const rows: Array<{
       translation_id: number;
       block_id: string;
       snapshot_id: string;
-      concept_id: string;
-      applied_revision_id: string;
-      applied_render_fingerprint: string;
-    }>(this.#database.prepare(`
-      SELECT t.translation_id, t.block_id, t.snapshot_id,
-             b.concept_id, b.applied_revision_id,
-             b.applied_render_fingerprint
-      FROM translations AS t
-      JOIN translation_concept_bindings AS b
-        ON b.translation_id=t.translation_id
-      WHERE t.run_id=? AND t.active=1
-      ORDER BY t.translation_id, b.concept_id
-    `), runId).filter((row) => conceptIds.has(row.concept_id));
+      concept_id: string | null;
+      applied_revision_id: string | null;
+      applied_render_fingerprint: string | null;
+    }> = [];
+    const blockBatchSize = 400;
+    for (let offset = 0; offset < occurrenceBlockIds.length; offset += blockBatchSize) {
+      const blockIds = occurrenceBlockIds.slice(offset, offset + blockBatchSize);
+      const placeholders = blockIds.map(() => "?").join(",");
+      rows.push(...all<{
+        translation_id: number;
+        block_id: string;
+        snapshot_id: string;
+        concept_id: string | null;
+        applied_revision_id: string | null;
+        applied_render_fingerprint: string | null;
+      }>(this.#database.prepare(`
+        SELECT t.translation_id, t.block_id, t.snapshot_id,
+               b.concept_id, b.applied_revision_id,
+               b.applied_render_fingerprint
+        FROM translations AS t
+        LEFT JOIN translation_concept_bindings AS b
+          ON b.translation_id=t.translation_id
+        WHERE t.run_id=? AND t.active=1
+          AND t.block_id IN (${placeholders})
+        ORDER BY t.translation_id, b.concept_id
+      `), runId, ...blockIds));
+    }
     const dependencies = new Map<number, {
       translationId: number;
       blockId: string;
@@ -5961,11 +6131,16 @@ export class LosslessBookStore {
         snapshotId: row.snapshot_id,
         bindings: [],
       };
-      dependency.bindings.push({
-        conceptId: row.concept_id,
-        appliedRevisionId: row.applied_revision_id,
-        appliedRenderFingerprint: row.applied_render_fingerprint,
-      });
+      if (row.concept_id !== null
+        && row.applied_revision_id !== null
+        && row.applied_render_fingerprint !== null
+        && conceptIds.has(row.concept_id)) {
+        dependency.bindings.push({
+          conceptId: row.concept_id,
+          appliedRevisionId: row.applied_revision_id,
+          appliedRenderFingerprint: row.applied_render_fingerprint,
+        });
+      }
       dependencies.set(row.translation_id, dependency);
     }
     const candidates = planSparseRevalidation({
@@ -5980,13 +6155,22 @@ export class LosslessBookStore {
         from_snapshot_id, to_snapshot_id, concept_ids_json, status
       ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, 'pending')
     `);
+    const insertPlaceholderBinding = this.#database.prepare(`
+      INSERT OR IGNORE INTO translation_concept_bindings(
+        translation_id, concept_id, applied_revision_id,
+        applied_render_fingerprint, term_usages_json, validation_status,
+        validated_revision_id
+      ) VALUES(?, ?, ?, ?, '[]', 'stale', ?)
+    `);
+    const createdTaskIds: string[] = [];
+    let bindingsCreated = 0;
     for (const candidate of candidates) {
       const taskId = `revalidation-${hashText([
         runId,
         String(candidate.translationId),
         candidate.changeSetHash,
       ].join("\0")).slice(0, 32)}`;
-      insert.run(
+      const inserted = insert.run(
         taskId,
         runId,
         candidate.translationId,
@@ -5996,7 +6180,36 @@ export class LosslessBookStore {
         candidate.toSnapshotId,
         jsonText(candidate.conceptIds, "revalidation concept IDs"),
       );
+      const existingTask = Number(inserted.changes) === 1
+        ? undefined
+        : one<{ status: KnowledgeRevalidationTask["status"] }>(
+            this.#database.prepare(`
+              SELECT status FROM knowledge_revalidation_tasks
+              WHERE run_id=? AND task_id=?
+            `),
+            runId,
+            taskId,
+          );
+      const activeTask = Number(inserted.changes) === 1
+        || existingTask?.status === "pending"
+        || existingTask?.status === "validating";
+      if (Number(inserted.changes) === 1) {
+        createdTaskIds.push(taskId);
+      }
+      if (!activeTask) continue;
       for (const conceptId of candidate.conceptIds) {
+        const concept = conceptById.get(conceptId);
+        if (concept === undefined) {
+          throw new Error(`revalidation concept is missing: ${conceptId}`);
+        }
+        const placeholder = insertPlaceholderBinding.run(
+          candidate.translationId,
+          conceptId,
+          concept.revisionId,
+          concept.renderFingerprint,
+          concept.revisionId,
+        );
+        bindingsCreated += Number(placeholder.changes);
         this.#database.prepare(`
           UPDATE translation_concept_bindings
           SET validation_status='stale', updated_at=datetime('now')
@@ -6004,18 +6217,20 @@ export class LosslessBookStore {
         `).run(candidate.translationId, conceptId);
       }
     }
-    if (candidates.length > 0) {
+    if (createdTaskIds.length > 0) {
       this.#appendEvent(runId, "sparse_revalidation_planned", {
         runId,
         toSnapshotId,
-        taskIds: candidates.map((candidate) =>
-          `revalidation-${hashText([
-            runId,
-            String(candidate.translationId),
-            candidate.changeSetHash,
-          ].join("\0")).slice(0, 32)}`),
+        taskIds: createdTaskIds,
       });
     }
+    return {
+      occurrenceDependencies: occurrenceDependencies.size,
+      candidateTranslations: candidates.length,
+      tasksCreated: createdTaskIds.length,
+      bindingsCreated,
+      wallTimeMs: performance.now() - startedAt,
+    };
   }
 
   #upsertLexicalConceptRows(

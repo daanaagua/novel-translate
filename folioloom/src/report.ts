@@ -167,6 +167,7 @@ export interface LosslessBookAuditReport {
     validating: number;
     stale: number;
     warningStale: number;
+    coverageMissing: number;
     resolvedNoop: number;
     repaired: number;
     retranslated: number;
@@ -491,6 +492,7 @@ export function auditLosslessBookStore(
       || binding.validationStatus === "stale").length,
     warningStale: state.conceptBindings.filter((binding) =>
       binding.validationStatus === "warning_stale").length,
+    coverageMissing: state.missingConceptBindings.length,
     resolvedNoop: state.revalidationTasks.filter((task) =>
       task.status === "resolved_noop").length,
     repaired: state.revalidationTasks.filter((task) =>
@@ -502,6 +504,7 @@ export function auditLosslessBookStore(
     && revalidation.validating === 0
     && revalidation.stale === 0
     && revalidation.warningStale === 0
+    && revalidation.coverageMissing === 0
     && state.revalidationTasks.every((task) =>
       task.status !== "completed_with_warning");
   if (!knowledgeConverged) {

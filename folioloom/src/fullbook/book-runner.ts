@@ -72,6 +72,7 @@ import {
 } from "../storage/book-store.js";
 import {
   LosslessBookStore,
+  type ConceptCoverageRevalidationReport,
   type KnowledgeRevalidationTask,
   type LosslessBookStatusSummary,
   type PersistedLosslessWindow,
@@ -386,6 +387,10 @@ export interface LosslessBookRunResult {
   status: LosslessBookStatusSummary;
   windows: PersistedLosslessWindow[];
   wallTimeMs: number;
+  revalidationOverhead: {
+    readonly coverageScan: ConceptCoverageRevalidationReport;
+    readonly drain: RevalidationDrainReport;
+  };
   leaseReleased: boolean;
   artifacts: null;
 }
@@ -403,7 +408,20 @@ export interface RevalidationTranslationOutput
   extends Omit<
     RevalidationReplacementInput,
     "runId" | "taskId" | "action"
-  > {}
+  > {
+  readonly telemetry?: RevalidationModelTelemetry;
+}
+
+export interface RevalidationModelTelemetry {
+  readonly modelCalls: number;
+  readonly modelDurationMs: number;
+  readonly inputTokens: number;
+  readonly outputTokens: number;
+  readonly cacheReadTokens: number;
+  readonly cacheWriteTokens: number;
+  readonly reasoningTokens: number;
+  readonly totalTokens: number;
+}
 
 export interface RevalidationDrainReport {
   readonly claimed: number;
@@ -412,6 +430,15 @@ export interface RevalidationDrainReport {
   readonly retranslated: number;
   readonly warning: number;
   readonly modelCalls: number;
+  readonly modelDurationMs: number;
+  readonly inputTokens: number;
+  readonly outputTokens: number;
+  readonly cacheReadTokens: number;
+  readonly cacheWriteTokens: number;
+  readonly reasoningTokens: number;
+  readonly totalTokens: number;
+  readonly tokenUsageComplete: boolean;
+  readonly wallTimeMs: number;
 }
 
 export interface RevalidationDrainOptions {
@@ -451,6 +478,7 @@ export async function drainKnowledgeRevalidationTasks(
   options: RevalidationDrainOptions,
 ): Promise<RevalidationDrainReport> {
   positiveInteger(options.maxAttempts, "revalidation maxAttempts");
+  const startedAt = performance.now();
   const report = {
     claimed: 0,
     noop: 0,
@@ -458,6 +486,14 @@ export async function drainKnowledgeRevalidationTasks(
     retranslated: 0,
     warning: 0,
     modelCalls: 0,
+    modelDurationMs: 0,
+    inputTokens: 0,
+    outputTokens: 0,
+    cacheReadTokens: 0,
+    cacheWriteTokens: 0,
+    reasoningTokens: 0,
+    totalTokens: 0,
+    tokenUsageComplete: true,
   };
   while (true) {
     const task = options.store.claimNextRevalidationTask(
@@ -482,7 +518,21 @@ export async function drainKnowledgeRevalidationTasks(
     }
     try {
       report.modelCalls += 1;
+      const modelStartedAt = performance.now();
       const output = await options.translate(work, decision.action);
+      if (output.telemetry === undefined) {
+        report.modelDurationMs += performance.now() - modelStartedAt;
+        report.tokenUsageComplete = false;
+      } else {
+        report.modelCalls += output.telemetry.modelCalls - 1;
+        report.modelDurationMs += output.telemetry.modelDurationMs;
+        report.inputTokens += output.telemetry.inputTokens;
+        report.outputTokens += output.telemetry.outputTokens;
+        report.cacheReadTokens += output.telemetry.cacheReadTokens;
+        report.cacheWriteTokens += output.telemetry.cacheWriteTokens;
+        report.reasoningTokens += output.telemetry.reasoningTokens;
+        report.totalTokens += output.telemetry.totalTokens;
+      }
       options.store.replaceTranslationForRevalidation({
         ...output,
         runId: options.runId,
@@ -495,6 +545,7 @@ export async function drainKnowledgeRevalidationTasks(
         report.retranslated += 1;
       }
     } catch (error) {
+      report.tokenUsageComplete = false;
       if (!options.isExpectedFailure(error)) {
         throw error;
       }
@@ -510,7 +561,54 @@ export async function drainKnowledgeRevalidationTasks(
       report.warning += 1;
     }
   }
-  return report;
+  return {
+    ...report,
+    wallTimeMs: performance.now() - startedAt,
+  };
+}
+
+function emptyRevalidationDrainReport(): RevalidationDrainReport {
+  return {
+    claimed: 0,
+    noop: 0,
+    repaired: 0,
+    retranslated: 0,
+    warning: 0,
+    modelCalls: 0,
+    modelDurationMs: 0,
+    inputTokens: 0,
+    outputTokens: 0,
+    cacheReadTokens: 0,
+    cacheWriteTokens: 0,
+    reasoningTokens: 0,
+    totalTokens: 0,
+    tokenUsageComplete: true,
+    wallTimeMs: 0,
+  };
+}
+
+function mergeRevalidationDrainReports(
+  left: RevalidationDrainReport,
+  right: RevalidationDrainReport,
+): RevalidationDrainReport {
+  return {
+    claimed: left.claimed + right.claimed,
+    noop: left.noop + right.noop,
+    repaired: left.repaired + right.repaired,
+    retranslated: left.retranslated + right.retranslated,
+    warning: left.warning + right.warning,
+    modelCalls: left.modelCalls + right.modelCalls,
+    modelDurationMs: left.modelDurationMs + right.modelDurationMs,
+    inputTokens: left.inputTokens + right.inputTokens,
+    outputTokens: left.outputTokens + right.outputTokens,
+    cacheReadTokens: left.cacheReadTokens + right.cacheReadTokens,
+    cacheWriteTokens: left.cacheWriteTokens + right.cacheWriteTokens,
+    reasoningTokens: left.reasoningTokens + right.reasoningTokens,
+    totalTokens: left.totalTokens + right.totalTokens,
+    tokenUsageComplete:
+      left.tokenUsageComplete && right.tokenUsageComplete,
+    wallTimeMs: left.wallTimeMs + right.wallTimeMs,
+  };
 }
 
 interface AttemptResult {
@@ -1837,6 +1935,12 @@ async function runLosslessBook(
       ...(schedulerSnapshot === undefined ? {} : { snapshot: schedulerSnapshot }),
     });
     const blockById = new Map(context.losslessBlocks.map((block) => [block.id, block]));
+    store.syncScopedKnowledge(runId);
+    const coverageScan = store.ensureConceptCoverageRevalidationTasks(
+      runId,
+      store.latestKnowledgeSnapshot(runId).id,
+    );
+    let revalidationDrain = emptyRevalidationDrainReport();
     let fastWaveHorizonMultiplier = runtimeSet.mode === "fast" ? 2 : 1;
     const translateRevalidation = async (
       work: RevalidationWorkItem,
@@ -1982,6 +2086,41 @@ async function runLosslessBook(
         throw new RevalidationOutputError("cross-block alignment failed");
       }
       const warnings = [...windowResult.notes, ...result.responseErrors];
+      const revalidationRuns = [result.run, ...result.repairRuns];
+      const telemetry: RevalidationModelTelemetry = {
+        modelCalls: revalidationRuns.reduce(
+          (total, run) => total + run.modelCalls,
+          0,
+        ),
+        modelDurationMs: revalidationRuns.reduce(
+          (total, run) => total + run.durationMs,
+          0,
+        ),
+        inputTokens: revalidationRuns.reduce(
+          (total, run) => total + run.usage.input,
+          0,
+        ),
+        outputTokens: revalidationRuns.reduce(
+          (total, run) => total + run.usage.output,
+          0,
+        ),
+        cacheReadTokens: revalidationRuns.reduce(
+          (total, run) => total + run.usage.cacheRead,
+          0,
+        ),
+        cacheWriteTokens: revalidationRuns.reduce(
+          (total, run) => total + run.usage.cacheWrite,
+          0,
+        ),
+        reasoningTokens: revalidationRuns.reduce(
+          (total, run) => total + (run.usage.reasoning ?? 0),
+          0,
+        ),
+        totalTokens: revalidationRuns.reduce(
+          (total, run) => total + run.usage.totalTokens,
+          0,
+        ),
+      };
       return {
         snapshotId: snapshot.id,
         text: translatedText,
@@ -1990,6 +2129,7 @@ async function runLosslessBook(
           : "completed",
         termUsages: windowResult.termUsages,
         concepts: conceptsFromStableTerms(terms),
+        telemetry,
         result: {
           action,
           responseWarnings: result.responseErrors.length,
@@ -2011,7 +2151,7 @@ async function runLosslessBook(
       // window is claimed, so the next request sees the newest durable user
       // knowledge without ever changing a running/staged wave.
       store.syncScopedKnowledge(runId);
-      await drainKnowledgeRevalidationTasks({
+      const drainedRevalidation = await drainKnowledgeRevalidationTasks({
         store,
         runId,
         maxAttempts,
@@ -2025,6 +2165,10 @@ async function runLosslessBook(
           error instanceof RevalidationOutputError
           || (error instanceof ModelProviderError && error.retryable),
       });
+      revalidationDrain = mergeRevalidationDrainReports(
+        revalidationDrain,
+        drainedRevalidation,
+      );
       const allWindows = store.allWindows(runId);
       const barrier = firstUncommitted(allWindows);
       if (barrier === undefined || barrier.status !== "pending") {
@@ -2852,6 +2996,10 @@ async function runLosslessBook(
       status,
       windows: store.allWindows(runId),
       wallTimeMs: performance.now() - startedAt,
+      revalidationOverhead: {
+        coverageScan,
+        drain: revalidationDrain,
+      },
       leaseReleased: true,
       artifacts: null,
     };

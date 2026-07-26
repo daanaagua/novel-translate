@@ -939,6 +939,90 @@ test("concept promotion creates one sparse task only for an active stale binding
   store.close();
 });
 
+test("concept promotion backfills one sparse task for an earlier unbound occurrence", () => {
+  const store = new LosslessBookStore(fixturePath());
+  const initialSnapshot = createKnowledgeSnapshot("run-a", []);
+  const runId = initialize(store, {
+    ...runMeta("model-a", "a"),
+    initialSnapshotId: initialSnapshot.id,
+    initialSnapshot,
+  }, windowsApart());
+  const concept = alphaConcept();
+  const [first, second] = blocks();
+
+  store.claimWindow(runId, "window-0");
+  store.stageWindow({
+    ...validStage(runId, "window-0", initialSnapshot.id),
+    translations: [{
+      blockId: first!.id,
+      sourceHash: first!.sourceHash,
+      text: "较早完成但还不知道 Alpha 是术语的译文。",
+    }],
+    knowledgeCandidates: [],
+    conceptBindings: { usages: [], concepts: [] },
+  });
+  store.promoteStagedWindow(runId, "window-0");
+  assert.deepEqual(store.activeTranslationBindings(runId, first!.id), []);
+
+  const candidate = {
+    recordId: "knowledge-new-alpha",
+    normalizedSubject: concept.normalizedSubject,
+    kind: "lexical_concept",
+    payload: concept,
+  };
+  store.claimWindow(runId, "window-1");
+  store.stageWindow({
+    ...validStage(runId, "window-1", initialSnapshot.id),
+    translations: [{
+      blockId: second!.id,
+      sourceHash: second!.sourceHash,
+      text: "贝塔。",
+    }],
+    knowledgeCandidates: [candidate],
+    conceptBindings: { usages: [], concepts: [] },
+  });
+  const knowledge = new KnowledgeStore(store.knowledgeRevisions(runId));
+  const appendedRevisions = knowledge.reconcileCandidates(
+    [candidate],
+    "window-1",
+  );
+  const currentSnapshot = store.latestKnowledgeSnapshot(runId);
+  const nextSnapshot = createKnowledgeSnapshot(
+    runId,
+    knowledge.projectableRevisions(),
+    currentSnapshot.id,
+  );
+  store.promoteStagedWindow({
+    runId,
+    windowId: "window-1",
+    ordinal: 1,
+    snapshotId: currentSnapshot.id,
+    candidates: [candidate],
+    appendedRevisions,
+    nextSnapshot,
+  });
+
+  assert.equal(store.revalidationTasks(runId).length, 1);
+  assert.equal(store.revalidationTasks(runId)[0]?.blockId, first!.id);
+  const [binding] = store.activeTranslationBindings(runId, first!.id);
+  assert.equal(binding?.conceptId, concept.conceptId);
+  assert.equal(binding?.validationStatus, "stale");
+  assert.deepEqual(binding?.termUsages, []);
+
+  const firstBackfill = store.ensureConceptCoverageRevalidationTasks(
+    runId,
+    nextSnapshot.id,
+  );
+  const secondBackfill = store.ensureConceptCoverageRevalidationTasks(
+    runId,
+    nextSnapshot.id,
+  );
+  assert.equal(firstBackfill.tasksCreated, 0);
+  assert.equal(secondBackfill.tasksCreated, 0);
+  assert.equal(store.revalidationTasks(runId).length, 1);
+  store.close();
+});
+
 test("revalidation noop advances the binding without creating a translation version", () => {
   const store = new LosslessBookStore(fixturePath());
   const fixture = createStaleConceptTask(store, reviseConcept(alphaConcept(), {
@@ -1032,6 +1116,37 @@ test("revalidation replacement preserves history and activates version two", () 
     { version: 2, active: 1 },
   ]);
   database.close();
+});
+
+test("revalidation replacement promotes warning status across its whole window", () => {
+  const store = new LosslessBookStore(fixturePath());
+  const fixture = createStaleConceptTask(store);
+  const task = store.claimNextRevalidationTask(fixture.runId, 2);
+  assert.ok(task);
+
+  store.replaceTranslationForRevalidation({
+    runId: fixture.runId,
+    taskId: task.taskId,
+    snapshotId: fixture.nextSnapshot.id,
+    action: "repair",
+    text: `${fixture.current.canonicalTarget}.`,
+    resultStatus: "completed_with_warnings",
+    termUsages: [
+      alphaUsage(fixture.current.canonicalTarget, fixture.current),
+    ],
+    concepts: [fixture.current],
+    result: { reason: "replacement_warning" },
+  });
+
+  assert.equal(
+    store.activeTranslations(fixture.runId)[0]?.status,
+    "completed_with_warnings",
+  );
+  assert.equal(
+    store.allWindows(fixture.runId)[0]?.status,
+    "completed_with_warnings",
+  );
+  store.close();
 });
 
 test("failed revalidation retains the old active version and marks only its binding warning stale", () => {
