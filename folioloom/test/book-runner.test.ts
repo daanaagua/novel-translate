@@ -1625,13 +1625,17 @@ test("a framed preferred fallback preserves Korean names when structured anchor 
   assert.equal(result.status.completedWindows, result.status.totalWindows);
 });
 
-test("lossless runner resumes the same isolated run and promotes the remaining ordinal", async () => {
+test("lossless runner resumes the same isolated run after increasing concurrency", async () => {
   const fixture = losslessFixture("EDGEWOOD\n\nBOOK ONE");
   fixture.faux.setResponses([fauxAssistantMessage(fauxToolCall(
     "finalize_translation_batch",
     { windows: [fixture.submission.windows[0]] },
   ), { stopReason: "toolUse" })]);
-  const first = await runBook({ ...fixture.options, maxWindows: 1 } as never);
+  const first = await runBook({
+    ...fixture.options,
+    maxWindows: 1,
+    maxConcurrency: 1,
+  } as never);
   assert.equal(first.status.completedWindows, 1);
   assert.equal(first.status.pendingWindows, 1);
 

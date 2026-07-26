@@ -142,6 +142,87 @@ test("audit rejects an empty active translation in a completed run", () => {
   }
 });
 
+test("audit accepts a snapshot projection whose latest knowledge entry is revision two", () => {
+  const manifestPath = sourceManifest("Alpha.[[]]Beta.");
+  const storePath = join(dirname(manifestPath), "book.db");
+  const runId = "run-revision-two";
+  const context = BookContext.openLossless({ manifestPath });
+  const store = new LosslessBookStore(storePath);
+  try {
+    store.registerSource(context.certifiedSource!);
+    store.replaceDerivedPlan(context.sourceLedger.sourceVersion, {
+      annotations: context.annotations,
+      blocks: context.losslessBlocks,
+    });
+    let snapshot = createKnowledgeSnapshot(runId, []);
+    store.createTranslationRun({
+      runId,
+      sourceVersion: context.sourceLedger.sourceVersion,
+      protocolVersion: "lossless-v5-1",
+      modelId: "test-model",
+      initialSnapshotId: snapshot.id,
+      initialSnapshot: snapshot,
+    });
+    const windows = planBookWindows(context.losslessBlocks, {
+      maxBlocks: 1,
+      maxSourceTokens: 100,
+      protocolVersion: "lossless-v5-1",
+    });
+    assert.equal(windows.length, 2);
+    store.initializeWindowPlan(runId, windows);
+    const blockById = new Map(context.losslessBlocks.map((block) => [block.id, block]));
+    const knowledge = new KnowledgeStore();
+    for (const [index, window] of windows.entries()) {
+      store.bindWindowsToSnapshot(runId, [window.windowId], snapshot.id);
+      store.claimWindow(runId, window.windowId);
+      const candidates = [{
+        recordId: `candidate-alpha-${index}`,
+        normalizedSubject: "alpha",
+        kind: "term",
+        payload: { target: index === 0 ? "阿尔法" : "阿尔法二" },
+      }];
+      store.stageWindow({
+        runId,
+        windowId: window.windowId,
+        snapshotId: snapshot.id,
+        status: "completed",
+        translations: window.blockIds.map((blockId) => ({
+          blockId,
+          sourceHash: blockById.get(blockId)!.sourceHash,
+          text: `译文-${index}`,
+        })),
+        knowledgeCandidates: candidates,
+        styleTail: "",
+        budget: {},
+        warnings: [],
+      });
+      const appendedRevisions = knowledge.reconcileCandidates(candidates, window.windowId);
+      const nextSnapshot = createKnowledgeSnapshot(
+        runId,
+        knowledge.projectableRevisions(),
+        snapshot.id,
+      );
+      store.promoteStagedWindow({
+        runId,
+        windowId: window.windowId,
+        ordinal: window.ordinal,
+        snapshotId: snapshot.id,
+        candidates,
+        appendedRevisions,
+        nextSnapshot,
+      });
+      snapshot = nextSnapshot;
+    }
+
+    const report = auditLosslessBookStore(store, runId);
+    assert.equal(report.complete, true);
+    assert.deepEqual(report.incidentCodes, []);
+  } finally {
+    store.close();
+    context.close();
+  }
+});
+
 test("audit replays knowledge history instead of trusting snapshot payloads", () => {
   const fixture = completeRun(true);
   const database = new DatabaseSync(fixture.storePath);

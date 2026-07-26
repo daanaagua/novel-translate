@@ -70,16 +70,20 @@ export class AdaptiveScheduler {
       return;
     }
     if (snapshot.version !== "adaptive-scheduler-1"
-      || snapshot.maxConcurrency !== this.#maxConcurrency
-      || snapshot.maxInFlightTokens !== this.#maxInFlightTokens
       || snapshot.inFlight !== 0
       || snapshot.inFlightTokens !== 0) {
       throw new TypeError("scheduler snapshot is incompatible or contains active work");
     }
-    this.#concurrency = positiveInteger(snapshot.concurrency, "snapshot.concurrency");
-    if (this.#concurrency > this.#maxConcurrency) {
-      throw new TypeError("snapshot concurrency exceeds maxConcurrency");
+    const priorMaxConcurrency = positiveInteger(
+      snapshot.maxConcurrency,
+      "snapshot.maxConcurrency",
+    );
+    positiveInteger(snapshot.maxInFlightTokens, "snapshot.maxInFlightTokens");
+    const priorConcurrency = positiveInteger(snapshot.concurrency, "snapshot.concurrency");
+    if (priorConcurrency > priorMaxConcurrency) {
+      throw new TypeError("snapshot concurrency exceeds snapshot.maxConcurrency");
     }
+    this.#concurrency = Math.min(priorConcurrency, this.#maxConcurrency);
     this.#successfulObservations = positiveOrZeroInteger(
       snapshot.successfulObservations,
       "snapshot.successfulObservations",

@@ -310,7 +310,6 @@ export function auditLosslessBookStore(
     payloadRevisions: readonly KnowledgeRevision[],
     producingWindowId: string | null,
   ): KnowledgeStore => {
-    const target = new KnowledgeStore(payloadRevisions);
     const previous = projectedKnowledge ?? new KnowledgeStore();
     const selected: Array<{
       readonly index: number;
@@ -328,7 +327,7 @@ export function auditLosslessBookStore(
         }
       }
     } else {
-      for (const targetRevision of target.listRevisions()) {
+      for (const targetRevision of payloadRevisions) {
         const previousRevision = previous.latestRevision(
           targetRevision.normalizedSubject,
           targetRevision.kind,
@@ -363,7 +362,7 @@ export function auditLosslessBookStore(
     );
     const actual = createKnowledgeSnapshot(
       state.runId,
-      target.projectableRevisions(),
+      payloadRevisions,
       previousSnapshotId,
     );
     if (canonicalJson(expected) !== canonicalJson(actual)) {
