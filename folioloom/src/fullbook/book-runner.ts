@@ -1620,9 +1620,6 @@ function planningRuntimes(
   executionRuntime: TranslationRuntime,
   retryRound: number,
 ): readonly TranslationRuntime[] {
-  if (runtimeSet.mode === "quality") {
-    return [executionRuntime];
-  }
   const variants = validateRuntimeVariants([
     executionRuntime,
     ...(runtimeSet.variants ?? []),

@@ -1461,6 +1461,54 @@ test("low-risk windows use lean context while high-risk windows keep rich eviden
   });
 });
 
+test("active quality runs can select a lower legal effort variant", async () => {
+  const fixture = losslessFixture("a quiet room.");
+  const low = fauxProvider();
+  const high = fauxProvider();
+  low.setResponses([losslessBatchResponse]);
+  high.setResponses([losslessBatchResponse]);
+  const model = high.getModel();
+  const highStream = high.provider.streamSimple.bind(high.provider);
+
+  const result = await runBook({
+    ...fixture.options,
+    model,
+    streamFn: highStream,
+    schedulerMode: "active",
+    optimizationProfile: "economy",
+    runtimeSet: {
+      mode: "quality",
+      primary: {
+        model,
+        streamFn: highStream,
+        effort: "high",
+        thinkingLevel: "high",
+      },
+      escalation: {
+        model,
+        streamFn: highStream,
+        effort: "high",
+        thinkingLevel: "high",
+      },
+      variants: [{
+        model: low.getModel(),
+        streamFn: low.provider.streamSimple.bind(low.provider),
+        effort: "low",
+        thinkingLevel: "low",
+      }, {
+        model,
+        streamFn: highStream,
+        effort: "high",
+        thinkingLevel: "high",
+      }],
+    },
+  });
+
+  assert.equal(result.status.completedWindows, 1);
+  assert.equal(low.state.callCount, 1);
+  assert.equal(high.state.callCount, 0);
+});
+
 test("evidence at least twenty-four blocks away forces rich context", async () => {
   const fixture = losslessFixture(
     Array.from(
