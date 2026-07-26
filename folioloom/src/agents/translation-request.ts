@@ -60,6 +60,8 @@ export interface TranslationRequestInput {
   blocks: readonly LosslessBlock[];
   stableTerms: readonly StableTerm[];
   snapshot: TranslationBatchSnapshot;
+  selectedKnowledgeRevisionIds?: readonly string[];
+  contextProfileName?: "lean" | "balanced" | "rich";
   styleState?: Readonly<Record<string, string>>;
   previousActiveTail?: string;
   sourceLanguageProfile?: SourceLanguageProfile;
@@ -274,6 +276,9 @@ export function prepareTranslationRequest(
     snapshotId: input.snapshot.id,
     sourceLanguage: { id: profile.id, displayName: profile.displayName },
     targetLanguage: DEFAULT_TARGET_LANGUAGE.id,
+    ...(input.contextProfileName === undefined
+      ? {}
+      : { contextProfileName: input.contextProfileName }),
   };
   const memoryPayload = projectKnowledgeForTranslation(
     input.snapshot.revisions,
@@ -292,6 +297,11 @@ export function prepareTranslationRequest(
           windowId: window.windowId,
         };
       })),
+      ...(input.selectedKnowledgeRevisionIds === undefined
+        ? {}
+        : {
+          selectedRevisionIds: new Set(input.selectedKnowledgeRevisionIds),
+        }),
     },
   );
   const termsPayload = {

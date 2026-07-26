@@ -5,7 +5,10 @@ import {
   type KnowledgeStatus,
 } from "./knowledge-store.js";
 import { sourceFormsFromRevision } from "./knowledge-source-forms.js";
+import type { ContextEvidenceBundle } from "../fullbook/context-profile-planner.js";
+import type { RiskDimension } from "../fullbook/task-risk.js";
 import type { SourceLanguageProfile } from "../language/types.js";
+import { WeightedTokenEstimator } from "../source/token-estimator.js";
 
 /**
  * Translator prompts must not grow with the durable book snapshot.  These
@@ -49,6 +52,21 @@ export interface TranslationKnowledgeProjectionOptions {
   readonly corpusBlocks?: readonly TranslationKnowledgeBlockPosition[];
   /** Blocks actually contained in this physical translation request. */
   readonly currentBlocks?: readonly TranslationKnowledgeCurrentBlockPosition[];
+  /** Exact request-local revision selection produced by the context planner. */
+  readonly selectedRevisionIds?: ReadonlySet<string>;
+}
+
+export interface TranslationKnowledgeCandidate {
+  readonly bundleId: string;
+  readonly revisionIds: readonly string[];
+  readonly kind: ContextEvidenceBundle["kind"];
+  readonly tokenCost: number;
+  readonly utility: number;
+  readonly coverage: readonly RiskDimension[];
+  readonly requires: readonly string[];
+  readonly redundancyGroup?: string;
+  readonly mandatory: boolean;
+  readonly payload: unknown;
 }
 
 export interface TranslationKnowledgeProjectionMetadata {
@@ -101,6 +119,14 @@ interface Candidate {
   readonly appliesToWindowIds?: readonly string[];
 }
 
+interface CandidateGroups {
+  readonly total: number;
+  readonly validRevisionIds: ReadonlySet<string>;
+  readonly matchingNeedsRevalidate: readonly Candidate[];
+  readonly matchingOther: readonly Candidate[];
+  readonly globalFallbacks: readonly Candidate[];
+}
+
 interface ResolvedOptions {
   readonly maxEntries: number;
   readonly maxSerializedBytes: number;
@@ -116,6 +142,8 @@ interface PositionedMemoryMatch {
   readonly positioned: boolean;
   readonly windowIds: readonly string[];
 }
+
+const KNOWLEDGE_TOKEN_ESTIMATOR = new WeightedTokenEstimator();
 
 function compareText(left: string, right: string): number {
   return left < right ? -1 : left > right ? 1 : 0;
@@ -417,25 +445,20 @@ function appendIfWithinBounds(
   return true;
 }
 
-/**
- * Produce a deterministic, request-local view of durable knowledge.  The
- * caller's complete snapshot is neither modified nor serialized wholesale.
- */
-export function projectKnowledgeForTranslation(
+function candidateGroups(
   revisions: readonly unknown[],
   sourceTexts: readonly string[],
   profile: SourceLanguageProfile,
-  options: TranslationKnowledgeProjectionOptions = {},
-): TranslationKnowledgeProjection {
+  options: TranslationKnowledgeProjectionOptions,
+): CandidateGroups {
   if (!Array.isArray(revisions)) {
     throw new TypeError("revisions must be an array");
   }
-  if (!Array.isArray(sourceTexts) || sourceTexts.some((text) => typeof text !== "string")) {
+  if (!Array.isArray(sourceTexts)
+    || sourceTexts.some((text) => typeof text !== "string")) {
     throw new TypeError("sourceTexts must be an array of strings");
   }
-  const resolved = resolvedOptions(options);
   const positions = positionContext(options);
-  const total = revisions.length;
   const normalizedSource = profile.normalizeSourceForm(sourceTexts.join("\n"));
   const sourceTokens = new Set(profile.segment(sourceTexts.join("\n"))
     .filter((token) => token.isWordLike)
@@ -443,13 +466,12 @@ export function projectKnowledgeForTranslation(
   const matchingNeedsRevalidate: Candidate[] = [];
   const matchingOther: Candidate[] = [];
   const globalFallbacks: Candidate[] = [];
+  const validRevisionIds = new Set<string>();
 
   for (const raw of revisions) {
     const revision = parseRevision(raw);
     if (revision === undefined) continue;
-    // Lexical decisions are durable scheduler state: they prevent the same
-    // ordinary word from consuming later anchor slots, but they are not a
-    // translation fact and must never consume model-visible context.
+    validRevisionIds.add(revision.revisionId);
     if (revision.kind === "lexical_anchor_decision") continue;
     const positionMatch = positionedMemoryMatch(revision, positions);
     const matched = positionMatch.positioned
@@ -470,12 +492,7 @@ export function projectKnowledgeForTranslation(
       }
       continue;
     }
-    // A positioned memory is governed exclusively by its declared range.
-    // Revalidation status must not turn an out-of-range memory into a global
-    // fallback for an unrelated window.
     if (positionMatch.positioned) continue;
-    // Contextual facts must have literal current-source evidence.  Other
-    // records can supply only the deliberately tiny, deterministic fallback.
     if (revision.status !== "contextual" && isGlobalFallback(revision)) {
       globalFallbacks.push({ revision, scope: "global_fallback" });
     }
@@ -484,26 +501,254 @@ export function projectKnowledgeForTranslation(
   matchingNeedsRevalidate.sort(compareCandidate);
   matchingOther.sort(compareCandidate);
   globalFallbacks.sort(compareCandidate);
+  return {
+    total: revisions.length,
+    validRevisionIds,
+    matchingNeedsRevalidate,
+    matchingOther,
+    globalFallbacks,
+  };
+}
+
+function eligibleCandidates(
+  groups: CandidateGroups,
+  options: ResolvedOptions,
+): readonly Candidate[] {
+  return [
+    ...groups.matchingNeedsRevalidate,
+    ...groups.matchingOther,
+    ...groups.globalFallbacks.slice(0, options.maxGlobalFallbackEntries),
+  ];
+}
+
+function contextBundleKind(
+  knowledgeKind: string,
+): ContextEvidenceBundle["kind"] {
+  if (knowledgeKind === "lexical_anchor" || knowledgeKind === "term_sense") {
+    return "term";
+  }
+  if (knowledgeKind === "entity_relation") {
+    return "relation";
+  }
+  if (knowledgeKind === "entity_identity"
+    || knowledgeKind === "entity_alias_link"
+    || knowledgeKind === "coreference") {
+    return "entity";
+  }
+  if (knowledgeKind === "style_directive") {
+    return "style";
+  }
+  return "memory";
+}
+
+const COVERAGE_ORDER = [
+  "entity_identity",
+  "pronoun_resolution",
+  "part_whole",
+  "control",
+  "causality",
+  "timeline",
+  "viewpoint",
+  "character_knowledge",
+] as const satisfies readonly RiskDimension[];
+
+function explicitCoverage(candidate: Candidate): readonly RiskDimension[] {
+  const coverage = new Set<RiskDimension>();
+  const payload = record(candidate.revision.payload);
+  if (candidate.revision.kind === "entity_identity") {
+    coverage.add("entity_identity");
+  }
+  if (candidate.revision.kind === "coreference") {
+    coverage.add("pronoun_resolution");
+  }
+  if (candidate.revision.kind === "entity_relation"
+    && payload !== undefined
+    && nonemptyString(payload.fromEntityId) !== undefined
+    && nonemptyString(payload.toEntityId) !== undefined) {
+    const relationType = nonemptyString(payload.relationType);
+    if (relationType === "identity") {
+      coverage.add("entity_identity");
+    } else if (relationType === "part_of") {
+      coverage.add("entity_identity");
+      coverage.add("part_whole");
+    } else if (relationType === "control") {
+      coverage.add("entity_identity");
+      coverage.add("control");
+    } else if (relationType === "causality"
+      || relationType === "timeline"
+      || relationType === "viewpoint"
+      || relationType === "character_knowledge") {
+      coverage.add(relationType);
+    }
+  }
+  if (payload !== undefined) {
+    if (Object.hasOwn(payload, "timeline") && payload.timeline !== undefined) {
+      coverage.add("timeline");
+    }
+    if (Object.hasOwn(payload, "viewpoint") && payload.viewpoint !== undefined) {
+      coverage.add("viewpoint");
+    }
+    if (Object.hasOwn(payload, "characterKnowledge")
+      && payload.characterKnowledge !== undefined) {
+      coverage.add("character_knowledge");
+    }
+    if (Object.hasOwn(payload, "causality") && payload.causality !== undefined) {
+      coverage.add("causality");
+    }
+  }
+  return COVERAGE_ORDER.filter((dimension) => coverage.has(dimension));
+}
+
+function candidateUtility(candidate: Candidate): number {
+  const scopeUtility = candidate.scope === "position_matched"
+    ? 12
+    : candidate.scope === "source_matched" ? 10 : 2;
+  const statusUtility = candidate.revision.status === "needs_revalidate"
+    ? 4
+    : candidate.revision.status === "active" ? 3 : 1;
+  const payload = record(candidate.revision.payload);
+  const confidence = payload !== undefined
+    && typeof payload.confidence === "number"
+    && Number.isFinite(payload.confidence)
+    ? Math.min(1, Math.max(0, payload.confidence))
+    : 0;
+  return scopeUtility + statusUtility + confidence * 2;
+}
+
+function translationKnowledgeCandidate(
+  candidate: Candidate,
+  profile: SourceLanguageProfile,
+): TranslationKnowledgeCandidate {
+  const payload = projectedRevision(candidate);
+  return {
+    bundleId: `knowledge:${candidate.revision.revisionId}`,
+    revisionIds: [candidate.revision.revisionId],
+    kind: contextBundleKind(candidate.revision.kind),
+    tokenCost: KNOWLEDGE_TOKEN_ESTIMATOR.estimateJson(
+      payload,
+      profile,
+    ).tokens,
+    utility: candidateUtility(candidate),
+    coverage: explicitCoverage(candidate),
+    requires: [],
+    redundancyGroup: [
+      candidate.revision.kind,
+      candidate.revision.normalizedSubject,
+    ].join(":"),
+    mandatory: candidate.revision.status === "needs_revalidate",
+    payload,
+  };
+}
+
+function selectedRevisionIdSet(
+  selected: ReadonlySet<string> | undefined,
+): ReadonlySet<string> | undefined {
+  if (selected === undefined) {
+    return undefined;
+  }
+  if (selected === null
+    || typeof selected !== "object"
+    || typeof selected[Symbol.iterator] !== "function") {
+    throw new TypeError("selectedRevisionIds must be a set of revision ids");
+  }
+  const result = new Set<string>();
+  for (const revisionId of selected) {
+    const normalized = nonemptyString(revisionId);
+    if (normalized === undefined) {
+      throw new TypeError("selected knowledge revision id must be nonempty");
+    }
+    result.add(normalized);
+  }
+  return result;
+}
+
+export function collectTranslationKnowledgeCandidates(
+  revisions: readonly unknown[],
+  sourceTexts: readonly string[],
+  profile: SourceLanguageProfile,
+  options: TranslationKnowledgeProjectionOptions = {},
+): readonly TranslationKnowledgeCandidate[] {
+  const resolved = resolvedOptions(options);
+  return eligibleCandidates(
+    candidateGroups(revisions, sourceTexts, profile, options),
+    resolved,
+  ).map((candidate) => translationKnowledgeCandidate(candidate, profile));
+}
+
+/**
+ * Produce a deterministic, request-local view of durable knowledge.  The
+ * caller's complete snapshot is neither modified nor serialized wholesale.
+ */
+export function projectKnowledgeForTranslation(
+  revisions: readonly unknown[],
+  sourceTexts: readonly string[],
+  profile: SourceLanguageProfile,
+  options: TranslationKnowledgeProjectionOptions = {},
+): TranslationKnowledgeProjection {
+  const resolved = resolvedOptions(options);
+  const groups = candidateGroups(revisions, sourceTexts, profile, options);
+  const total = groups.total;
 
   const empty = projectionWithStableByteCount(total, [], resolved);
   if (empty.metadata.serializedBytes > resolved.maxSerializedBytes) {
     throw new RangeError("maxSerializedBytes cannot fit knowledge projection metadata");
   }
+  const selectedRevisionIds = selectedRevisionIdSet(
+    options.selectedRevisionIds,
+  );
+  if (selectedRevisionIds !== undefined) {
+    for (const revisionId of selectedRevisionIds) {
+      if (!groups.validRevisionIds.has(revisionId)) {
+        throw new Error(
+          `selected knowledge revision does not exist: ${revisionId}`,
+        );
+      }
+    }
+    if (selectedRevisionIds.size > resolved.maxEntries) {
+      throw new RangeError("selected knowledge revisions exceed entry budget");
+    }
+    const applicable = eligibleCandidates(groups, resolved);
+    const applicableIds = new Set(
+      applicable.map((candidate) => candidate.revision.revisionId),
+    );
+    for (const revisionId of selectedRevisionIds) {
+      if (!applicableIds.has(revisionId)) {
+        throw new Error(
+          `selected knowledge revision is not applicable: ${revisionId}`,
+        );
+      }
+    }
+    const selected: ProjectedKnowledgeRevision[] = [];
+    for (const candidate of applicable) {
+      if (!selectedRevisionIds.has(candidate.revision.revisionId)) {
+        continue;
+      }
+      if (!appendIfWithinBounds(total, selected, candidate, resolved)) {
+        throw new RangeError(
+          "selected knowledge revisions exceed serialized byte budget",
+        );
+      }
+    }
+    if (selected.length !== selectedRevisionIds.size) {
+      throw new Error("selected knowledge revisions are not uniquely applicable");
+    }
+    return projectionWithStableByteCount(total, selected, resolved);
+  }
 
   const selected: ProjectedKnowledgeRevision[] = [];
-  for (const candidate of matchingNeedsRevalidate) {
+  for (const candidate of groups.matchingNeedsRevalidate) {
     appendIfWithinBounds(total, selected, candidate, resolved);
   }
 
   // Literal evidence in the current source always outranks a global fallback.
   // Otherwise two unrelated terminology fallbacks could evict an identity or
   // causal fact that the current passage actually names.
-  for (const candidate of matchingOther) {
+  for (const candidate of groups.matchingOther) {
     appendIfWithinBounds(total, selected, candidate, resolved);
   }
 
   let fallbackCount = 0;
-  for (const candidate of globalFallbacks) {
+  for (const candidate of groups.globalFallbacks) {
     if (fallbackCount >= resolved.maxGlobalFallbackEntries) break;
     if (appendIfWithinBounds(total, selected, candidate, resolved)) fallbackCount += 1;
   }
