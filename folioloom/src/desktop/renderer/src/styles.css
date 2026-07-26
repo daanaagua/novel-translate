@@ -204,12 +204,47 @@ h2 {
 
 .sidebar-footnote {
   display: flex;
-  align-items: center;
-  gap: 8px;
+  flex-direction: column;
+  align-items: stretch;
+  gap: 9px;
   margin-top: auto;
   padding: 20px 8px 0;
   color: var(--faint);
   font-size: 12px;
+}
+
+.sidebar-project-state {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.sidebar-diagnostic-button {
+  width: 100%;
+  padding: 8px 10px;
+  border: 1px solid var(--line-soft);
+  border-radius: 8px;
+  background: transparent;
+  color: var(--muted);
+  cursor: pointer;
+  font: inherit;
+  text-align: left;
+}
+
+.sidebar-diagnostic-button:hover:not(:disabled) {
+  border-color: color-mix(in srgb, var(--teal), transparent 55%);
+  color: var(--ink);
+}
+
+.sidebar-diagnostic-button:disabled {
+  cursor: wait;
+  opacity: 0.55;
+}
+
+.sidebar-diagnostic-feedback {
+  overflow-wrap: anywhere;
+  color: var(--faint);
+  line-height: 1.45;
 }
 
 .connection-dot {
@@ -924,6 +959,13 @@ h2 {
 }
 
 .operation-error p + p { margin-top: 5px; }
+
+.diagnostic-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 12px;
+}
 
 .technical-details { margin-top: 10px; }
 

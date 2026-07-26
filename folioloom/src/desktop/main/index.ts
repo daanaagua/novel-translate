@@ -1,8 +1,18 @@
-import { existsSync } from "node:fs";
+import { randomUUID } from "node:crypto";
+import { existsSync, readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { app, BrowserWindow, dialog, ipcMain, Menu, safeStorage, shell } from "electron";
+import {
+  app,
+  BrowserWindow,
+  clipboard,
+  dialog,
+  ipcMain,
+  Menu,
+  safeStorage,
+  shell,
+} from "electron";
 
 import {
   DESKTOP_FULLBOOK_PROGRESS_CHANNEL,
@@ -12,6 +22,12 @@ import {
   type DesktopTrialProgress,
 } from "../contracts.js";
 import { DesktopCredentialStore } from "../desktop-credential-store.js";
+import {
+  DesktopDiagnosticLogger,
+  formatDesktopDiagnosticSummary,
+  writeDesktopDiagnosticReport,
+  type DesktopDiagnosticContext,
+} from "../desktop-diagnostics.js";
 import { DesktopExportService } from "../desktop-export-service.js";
 import { DesktopFullBookService } from "../desktop-fullbook-service.js";
 import { DesktopKnowledgeImportStorage } from "../desktop-knowledge-import-storage.js";
@@ -115,8 +131,18 @@ function loadRecentRequest(preferences: DesktopPreferences): DesktopProjectReque
 
 void app.whenReady().then(() => {
   Menu.setApplicationMenu(desktopChrome.applicationMenu);
-  const preferencesPath = join(app.getPath("userData"), "desktop-preferences.json");
+  const userDataPath = app.getPath("userData");
+  const preferencesPath = join(userDataPath, "desktop-preferences.json");
   const preferences = new DesktopPreferences(preferencesPath);
+  const diagnosticLogger = new DesktopDiagnosticLogger({
+    directory: join(userDataPath, "diagnostics"),
+    appVersion: app.getVersion(),
+    pathAliases: {
+      userData: userDataPath,
+      temp: app.getPath("temp"),
+      app: app.getAppPath(),
+    },
+  });
   const projectService = new DesktopProjectService();
   const sourceService = new DesktopSourceService({
     projectsRoot: join(app.getPath("documents"), "FolioLoom", "Projects"),
@@ -153,12 +179,43 @@ void app.whenReady().then(() => {
   const trialService = new DesktopTrialService({
     runtime: runtimeResolver,
     onProgress(stage) {
+      diagnosticLogger.record({
+        event: "desktop.trial.progress",
+        operationId: "trial-active",
+        phase: stage,
+        outcome: stage === "completed"
+          ? "completed"
+          : stage === "failed"
+            ? "failed"
+            : "started",
+        ...(stage === "failed" ? { severity: "warning" as const } : {}),
+      });
       broadcastTrialProgress({ stage });
     },
   });
   const fullBookService = new DesktopFullBookService({
     runtime: runtimeResolver,
-    onProgress: broadcastFullBookProgress,
+    onProgress(progress) {
+      diagnosticLogger.record({
+        event: "desktop.fullbook.progress",
+        operationId: progress.runId,
+        phase: progress.phase,
+        outcome: progress.phase === "completed"
+          ? "completed"
+          : progress.phase === "failed"
+            ? "failed"
+            : "started",
+        ...(progress.phase === "failed" ? { severity: "warning" as const } : {}),
+        metadata: {
+          totalWindows: progress.progress.totalWindows,
+          completedWindows: progress.progress.completedWindows,
+          warningWindows: progress.progress.warningWindows,
+          humanRequiredWindows: progress.progress.humanRequiredWindows,
+          failedWindows: progress.progress.failedWindows,
+        },
+      });
+      broadcastFullBookProgress(progress);
+    },
   });
   const exportService = new DesktopExportService();
   trialServiceForShutdown = trialService;
@@ -180,6 +237,91 @@ void app.whenReady().then(() => {
     ),
   });
 
+  const diagnosticContext = (): DesktopDiagnosticContext => {
+    const modelSnapshot = modelService.snapshot();
+    const model = modelSnapshot.activeModelProfile;
+    const current = currentRequest;
+    const project = current === undefined ? undefined : projectService.snapshot(current);
+    let format = "unknown";
+    if (current !== undefined) {
+      try {
+        const manifest = JSON.parse(readFileSync(current.manifestPath, "utf8")) as {
+          source_format?: unknown;
+        };
+        if (typeof manifest.source_format === "string") format = manifest.source_format;
+      } catch {
+        // A malformed manifest is represented by the project error and latest operation.
+      }
+    }
+    const fullBook = current === undefined ? undefined : fullBookService.snapshot(current);
+    const activeRun = fullBook?.runs.find((run) => run.runId === fullBook.activeRunId)
+      ?? fullBook?.runs.at(-1);
+    return {
+      ...(model === undefined
+        ? {}
+        : {
+          model: {
+            providerId: model.providerId,
+            modelId: model.modelId,
+            ...(model.reasoningEffort === undefined
+              ? {}
+              : { reasoningEffort: model.reasoningEffort }),
+            ...(modelSnapshot.latestProbe?.status === undefined
+              ? {}
+              : { probeStatus: modelSnapshot.latestProbe.status }),
+            ...(modelSnapshot.latestProbe?.code === undefined
+              ? {}
+              : { probeCode: modelSnapshot.latestProbe.code }),
+          },
+        }),
+      ...(project?.ok !== true
+        ? {}
+        : {
+          source: {
+            format,
+            language: project.value.sourceLanguage,
+            encoding: project.value.sourceEncoding,
+            characterCount: project.value.sourceChars,
+            hashPrefix: project.value.sourceVersion.slice(0, 16),
+          },
+        }),
+      ...(activeRun === undefined
+        ? {}
+        : {
+          runSummary: {
+            runId: activeRun.runId,
+            phase: activeRun.phase,
+            totalWindows: activeRun.progress.totalWindows,
+            completedWindows: activeRun.progress.completedWindows,
+            warningWindows: activeRun.progress.warningWindows,
+            humanRequiredWindows: activeRun.progress.humanRequiredWindows,
+            failedWindows: activeRun.progress.failedWindows,
+          },
+        }),
+    };
+  };
+
+  const processFailure = (event: string, error: unknown): void => {
+    diagnosticLogger.recordFailure({
+      event,
+      operationId: randomUUID(),
+      phase: "main-process",
+      error,
+    });
+  };
+  const onUncaughtException = (error: Error): void => {
+    processFailure("desktop.process.uncaught-exception", error);
+  };
+  const onUnhandledRejection = (reason: unknown): void => {
+    processFailure("desktop.process.unhandled-rejection", reason);
+  };
+  process.on("uncaughtExceptionMonitor", onUncaughtException);
+  process.on("unhandledRejection", onUnhandledRejection);
+  app.once("will-quit", () => {
+    process.off("uncaughtExceptionMonitor", onUncaughtException);
+    process.off("unhandledRejection", onUnhandledRejection);
+  });
+
   registerDesktopIpc({
     ipcMain: {
       handle(channel, handler) {
@@ -190,6 +332,9 @@ void app.whenReady().then(() => {
       showOpenDialog(options) {
         return dialog.showOpenDialog(options);
       },
+      showSaveDialog(options) {
+        return dialog.showSaveDialog(options);
+      },
     },
     projectService,
     sourceService,
@@ -199,6 +344,35 @@ void app.whenReady().then(() => {
     exportService,
     knowledgeService,
     knowledgeImportService,
+    diagnostics: {
+      record(input) {
+        diagnosticLogger.record({
+          ...input,
+          ...(currentRequest === undefined
+            ? {}
+            : { projectDirectory: dirname(currentRequest.manifestPath) }),
+        });
+      },
+      recordFailure(input) {
+        diagnosticLogger.recordFailure({
+          ...input,
+          ...(currentRequest === undefined
+            ? {}
+            : { projectDirectory: dirname(currentRequest.manifestPath) }),
+        });
+      },
+      copySummary() {
+        clipboard.writeText(formatDesktopDiagnosticSummary(
+          diagnosticLogger.buildReport(diagnosticContext()),
+        ));
+      },
+      exportReport(path) {
+        writeDesktopDiagnosticReport(
+          path,
+          diagnosticLogger.buildReport(diagnosticContext()),
+        );
+      },
+    },
     isTrustedEvent(event) {
       return isTrustedDesktopIpcEvent(event, trustedRendererUrls);
     },

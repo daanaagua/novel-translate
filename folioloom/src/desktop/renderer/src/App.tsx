@@ -71,6 +71,8 @@ function unavailableApi(): FolioLoomDesktopApi {
     chooseExportDirectory: async () => unavailableResult(),
     exportBook: async () => unavailableResult(),
     openExportDirectory: async () => unavailableResult(),
+    copyDiagnosticSummary: async () => unavailableResult(),
+    exportDiagnostics: async () => unavailableResult(),
     listKnowledge: async () => unavailableResult(),
     getKnowledgeDetail: async () => unavailableResult(),
     mutateKnowledge: async () => unavailableResult(),
@@ -150,6 +152,7 @@ export function App({ api }: AppProps): JSX.Element {
   const [exportResult, setExportResult] = useState<DesktopExportResult>();
   const [exportError, setExportError] = useState<DesktopError>();
   const [pendingEncoding, setPendingEncoding] = useState<DesktopSourceEncodingRequired>();
+  const [diagnosticFeedback, setDiagnosticFeedback] = useState<string>();
   const onboardingGeneration = useRef(0);
   const projectGeneration = useRef(0);
 
@@ -564,6 +567,38 @@ export function App({ api }: AppProps): JSX.Element {
     }
   }
 
+  async function copyDiagnosticSummary(): Promise<void> {
+    setBusyAction("copy-diagnostics");
+    try {
+      const result = await desktopApi.copyDiagnosticSummary();
+      setDiagnosticFeedback(result.ok
+        ? "诊断摘要已复制"
+        : `复制失败：${result.error.message}`);
+    } catch (error) {
+      setDiagnosticFeedback(`复制失败：${errorFromUnknown(error).message}`);
+    } finally {
+      setBusyAction(undefined);
+    }
+  }
+
+  async function exportDiagnostics(): Promise<void> {
+    setBusyAction("export-diagnostics");
+    try {
+      const result = await desktopApi.exportDiagnostics();
+      if (!result.ok) {
+        if (result.error.code !== "DESKTOP_SELECTION_CANCELLED") {
+          setDiagnosticFeedback(`导出失败：${result.error.message}`);
+        }
+        return;
+      }
+      setDiagnosticFeedback(`诊断包已导出：${result.value.displayPath}`);
+    } catch (error) {
+      setDiagnosticFeedback(`导出失败：${errorFromUnknown(error).message}`);
+    } finally {
+      setBusyAction(undefined);
+    }
+  }
+
   return (
     <div className="workbench-shell">
       <WindowTitlebar />
@@ -571,7 +606,10 @@ export function App({ api }: AppProps): JSX.Element {
         activeWorkspace={activeWorkspace}
         hasProject={onboarding.project !== undefined}
         knowledgeAvailable={knowledgeAvailable}
+        diagnosticBusy={busyAction === "export-diagnostics"}
+        diagnosticFeedback={diagnosticFeedback}
         onSelectWorkspace={setActiveWorkspace}
+        onExportDiagnostics={() => { void exportDiagnostics(); }}
       />
       <div className="workbench-main">
         {activeWorkspace === "overview" ? (
@@ -589,6 +627,8 @@ export function App({ api }: AppProps): JSX.Element {
             onForgetCredential={forgetCredential}
             onStartTrial={startTrial}
             onCancelTrial={cancelTrial}
+            onCopyDiagnosticSummary={() => { void copyDiagnosticSummary(); }}
+            onExportDiagnostics={() => { void exportDiagnostics(); }}
           />
         ) : activeWorkspace === "runs" && onboarding.project !== undefined ? (
           <RunWorkspace

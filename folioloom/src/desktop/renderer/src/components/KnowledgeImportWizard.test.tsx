@@ -153,6 +153,8 @@ function importApi(options: {
     chooseExportDirectory: unavailable,
     exportBook: unavailable,
     openExportDirectory: unavailable,
+    copyDiagnosticSummary: unavailable,
+    exportDiagnostics: unavailable,
     listKnowledge: unavailable,
     getKnowledgeDetail: unavailable,
     mutateKnowledge: unavailable,

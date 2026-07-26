@@ -213,6 +213,11 @@ function createApi(overrides: Partial<FolioLoomDesktopApi> = {}): FolioLoomDeskt
     chooseExportDirectory: vi.fn().mockResolvedValue(failure("UNAVAILABLE", "暂不可用")),
     exportBook: vi.fn().mockResolvedValue(failure("UNAVAILABLE", "暂不可用")),
     openExportDirectory: vi.fn().mockResolvedValue(failure("UNAVAILABLE", "暂不可用")),
+    copyDiagnosticSummary: vi.fn().mockResolvedValue(ok(undefined)),
+    exportDiagnostics: vi.fn().mockResolvedValue(ok({
+      fileName: "FolioLoom-diagnostics.json",
+      displayPath: "D:\\Exports\\FolioLoom-diagnostics.json",
+    })),
     listKnowledge: vi.fn().mockResolvedValue(ok({
       generation: 0,
       snapshotId: "snapshot-0",
@@ -254,6 +259,45 @@ function createApi(overrides: Partial<FolioLoomDesktopApi> = {}): FolioLoomDeskt
 }
 
 describe("FolioLoom desktop onboarding", () => {
+  it("keeps a global private diagnostic export available without an open project", async () => {
+    const exportDiagnostics = vi.fn().mockResolvedValue(ok({
+      fileName: "FolioLoom-diagnostics.json",
+      displayPath: "D:\\Exports\\FolioLoom-diagnostics.json",
+    }));
+    const user = userEvent.setup();
+    render(<App api={createApi({ exportDiagnostics })} />);
+
+    await user.click(await screen.findByRole("button", { name: "导出诊断" }));
+    expect(exportDiagnostics).toHaveBeenCalledTimes(1);
+    expect(await screen.findByText(/FolioLoom-diagnostics\.json/u)).toBeTruthy();
+  });
+
+  it("offers copy and export actions beside an operation error", async () => {
+    const copyDiagnosticSummary = vi.fn().mockResolvedValue(ok(undefined));
+    const exportDiagnostics = vi.fn().mockResolvedValue(ok({
+      fileName: "trial-diagnostics.json",
+      displayPath: "D:\\Exports\\trial-diagnostics.json",
+    }));
+    const user = userEvent.setup();
+    render(<App api={createApi({
+      getOnboardingState: vi.fn().mockResolvedValue(
+        failure("DESKTOP_REFRESH_FAILED", "书稿状态刷新失败"),
+      ),
+      copyDiagnosticSummary,
+      exportDiagnostics,
+    })} />);
+
+    expect(await screen.findByText("书稿状态刷新失败")).toBeTruthy();
+    await user.click(screen.getByRole("button", { name: "复制诊断摘要" }));
+    expect(copyDiagnosticSummary).toHaveBeenCalledTimes(1);
+    expect(await screen.findByText("诊断摘要已复制")).toBeTruthy();
+
+    const exportButtons = screen.getAllByRole("button", { name: "导出诊断" });
+    await user.click(exportButtons[exportButtons.length - 1]!);
+    expect(exportDiagnostics).toHaveBeenCalledTimes(1);
+    expect(await screen.findByText(/trial-diagnostics\.json/u)).toBeTruthy();
+  });
+
   it("starts with a reader-facing manuscript choice instead of an engineering project picker", async () => {
     render(<App api={createApi()} />);
 

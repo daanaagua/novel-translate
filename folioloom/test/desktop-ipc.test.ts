@@ -92,6 +92,7 @@ interface IpcFixtureOptions {
   sourceEncodingRequired?: boolean;
   pickedKnowledgeImport?: boolean;
   pickedExportDirectory?: "selected" | "cancel-after-selected";
+  diagnosticSave?: "selected" | "cancel";
   fullBookActive?: boolean;
 }
 
@@ -134,6 +135,12 @@ interface IpcFixture {
   };
   dialogFilters: ReadonlyArray<{ name: string; extensions: string[] }>;
   dialogProperties: readonly string[][];
+  diagnosticCalls: {
+    events: readonly unknown[];
+    failures: readonly unknown[];
+    copies: number;
+    exports: readonly string[];
+  };
   currentRequest: DesktopProjectRequest | undefined;
 }
 
@@ -163,6 +170,10 @@ function registerFixtureHandlers(options: IpcFixtureOptions = {}): IpcFixture {
   const exportDestinations: string[] = [];
   const exportRequests: unknown[] = [];
   const openedDirectories: string[] = [];
+  const diagnosticEvents: unknown[] = [];
+  const diagnosticFailures: unknown[] = [];
+  const diagnosticExports: string[] = [];
+  let diagnosticCopies = 0;
   let trialCancellations = 0;
   let fullBookPauses = 0;
   let exportDialogCount = 0;
@@ -257,6 +268,28 @@ function registerFixtureHandlers(options: IpcFixtureOptions = {}): IpcFixture {
         return selected === undefined
           ? { canceled: true, filePaths: [] }
           : { canceled: false, filePaths: [selected] };
+      },
+      async showSaveDialog() {
+        return options.diagnosticSave === "selected"
+          ? {
+            canceled: false,
+            filePath: join(directory, "FolioLoom-diagnostics.json"),
+          }
+          : { canceled: true };
+      },
+    },
+    diagnostics: {
+      record(input) {
+        diagnosticEvents.push(input);
+      },
+      recordFailure(input) {
+        diagnosticFailures.push(input);
+      },
+      copySummary() {
+        diagnosticCopies += 1;
+      },
+      exportReport(path) {
+        diagnosticExports.push(path);
       },
     },
     projectService: {
@@ -568,6 +601,14 @@ function registerFixtureHandlers(options: IpcFixtureOptions = {}): IpcFixture {
     get dialogProperties() {
       return dialogProperties;
     },
+    get diagnosticCalls() {
+      return {
+        events: diagnosticEvents,
+        failures: diagnosticFailures,
+        copies: diagnosticCopies,
+        exports: diagnosticExports,
+      };
+    },
     get currentRequest() {
       return currentRequest;
     },
@@ -588,6 +629,7 @@ test("IPC only registers the desktop allowlist", () => {
     assert.deepEqual([...fixture.handlers.keys()].sort(), [
       "folioloom:choose-source",
       "folioloom:confirm-source-encoding",
+      "folioloom:copy-diagnostic-summary",
       "folioloom:choose-project",
       "folioloom:choose-export-directory",
       "folioloom:choose-store",
@@ -622,6 +664,7 @@ test("IPC only registers the desktop allowlist", () => {
       "folioloom:resume-fullbook",
       "folioloom:select-run",
       "folioloom:export-book",
+      "folioloom:export-diagnostics",
       "folioloom:export-state",
       "folioloom:test-model",
       "folioloom:start-fullbook",
@@ -630,6 +673,62 @@ test("IPC only registers the desktop allowlist", () => {
     ].sort());
   } finally {
     rmSync(fixture.directory, { recursive: true, force: true });
+  }
+});
+
+test("trusted IPC records only bounded operation metadata and never records request payloads", async () => {
+  const fixture = registerFixtureHandlers();
+  const apiKey = "sk-never-log-this";
+  try {
+    await handler(fixture, "folioloom:test-model")(fixture.trustedEvent, {
+      providerId: "deepseek",
+      modelId: "deepseek-v4-flash",
+      apiKey,
+    });
+    const serialized = JSON.stringify({
+      events: fixture.diagnosticCalls.events,
+      failures: fixture.diagnosticCalls.failures,
+    });
+    assert.match(serialized, /folioloom:test-model/u);
+    assert.doesNotMatch(serialized, new RegExp(apiKey));
+    assert.doesNotMatch(serialized, /providerId|modelId|args|payload/u);
+  } finally {
+    rmSync(fixture.directory, { recursive: true, force: true });
+  }
+});
+
+test("diagnostic summary and export use fixed operations while cancellation remains silent", async () => {
+  const cancelledFixture = registerFixtureHandlers({ diagnosticSave: "cancel" });
+  try {
+    const copied = await handler(cancelledFixture, "folioloom:copy-diagnostic-summary")(
+      cancelledFixture.trustedEvent,
+    ) as DesktopResult<void>;
+    assert.deepEqual(copied, ok(undefined));
+    assert.equal(cancelledFixture.diagnosticCalls.copies, 1);
+
+    const cancelled = await handler(cancelledFixture, "folioloom:export-diagnostics")(
+      cancelledFixture.trustedEvent,
+    ) as DesktopResult<unknown>;
+    assert.equal(cancelled.ok, false);
+    if (!cancelled.ok) assert.equal(cancelled.error.code, "DESKTOP_SELECTION_CANCELLED");
+    assert.equal(cancelledFixture.diagnosticCalls.exports.length, 0);
+  } finally {
+    rmSync(cancelledFixture.directory, { recursive: true, force: true });
+  }
+
+  const selectedFixture = registerFixtureHandlers({ diagnosticSave: "selected" });
+  try {
+    const exported = await handler(selectedFixture, "folioloom:export-diagnostics")(
+      selectedFixture.trustedEvent,
+    ) as DesktopResult<{ fileName: string; displayPath: string }>;
+    assert.equal(exported.ok, true);
+    if (exported.ok) {
+      assert.equal(exported.value.fileName, "FolioLoom-diagnostics.json");
+      assert.match(exported.value.displayPath, /FolioLoom-diagnostics\.json$/u);
+    }
+    assert.equal(selectedFixture.diagnosticCalls.exports.length, 1);
+  } finally {
+    rmSync(selectedFixture.directory, { recursive: true, force: true });
   }
 });
 

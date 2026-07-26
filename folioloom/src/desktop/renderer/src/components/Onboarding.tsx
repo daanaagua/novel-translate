@@ -34,6 +34,8 @@ interface OnboardingProps {
   onForgetCredential(providerId: string): Promise<DesktopResult<DesktopOnboardingState>>;
   onStartTrial(mode: DesktopTrialMode): Promise<void>;
   onCancelTrial(): Promise<void>;
+  onCopyDiagnosticSummary(): void;
+  onExportDiagnostics(): void;
 }
 
 function formatChars(value: number): string {
@@ -82,6 +84,8 @@ export function Onboarding({
   onForgetCredential,
   onStartTrial,
   onCancelTrial,
+  onCopyDiagnosticSummary,
+  onExportDiagnostics,
 }: OnboardingProps): JSX.Element {
   const [modelDraftMatchesActive, setModelDraftMatchesActive] = useState(false);
   const [trialMode, setTrialMode] = useState<DesktopTrialMode>("quality");
@@ -103,6 +107,14 @@ export function Onboarding({
       <p>{redactTechnicalDetails(operationError.message)}</p>
       {operationError.nextAction === undefined ? null : <p>{redactTechnicalDetails(operationError.nextAction)}</p>}
       <TechnicalDetails details={operationError.technicalDetails} />
+      <div className="diagnostic-actions">
+        <button className="quiet-button" type="button" onClick={onCopyDiagnosticSummary}>
+          复制诊断摘要
+        </button>
+        <button className="quiet-button" type="button" onClick={onExportDiagnostics}>
+          导出诊断
+        </button>
+      </div>
     </section>
   );
 

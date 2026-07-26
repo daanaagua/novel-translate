@@ -3,6 +3,7 @@ import type {
   DesktopConfirmSourceEncodingRequest,
   DesktopDiscoverModelsRequest,
   DesktopDoctorReport,
+  DesktopDiagnosticExportResult,
   DesktopExportDestination,
   DesktopExportRequest,
   DesktopExportResult,
@@ -74,6 +75,8 @@ export interface FolioLoomDesktopApi {
   chooseExportDirectory(): Promise<DesktopResult<DesktopExportDestination>>;
   exportBook(request: DesktopExportRequest): Promise<DesktopResult<DesktopExportResult>>;
   openExportDirectory(exportId: string): Promise<DesktopResult<void>>;
+  copyDiagnosticSummary(): Promise<DesktopResult<void>>;
+  exportDiagnostics(): Promise<DesktopResult<DesktopDiagnosticExportResult>>;
   listKnowledge(request: DesktopKnowledgeListRequest): Promise<DesktopResult<DesktopKnowledgePage>>;
   getKnowledgeDetail(objectId: string): Promise<DesktopResult<DesktopKnowledgeDetail>>;
   mutateKnowledge(request: DesktopKnowledgeMutationRequest): Promise<DesktopResult<DesktopKnowledgeMutationResult>>;

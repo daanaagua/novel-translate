@@ -60,6 +60,10 @@ const desktopApi: FolioLoomDesktopApi = {
   exportBook: (request) => ipcRenderer.invoke("folioloom:export-book", request),
   openExportDirectory: (exportId) =>
     ipcRenderer.invoke("folioloom:open-export-directory", exportId),
+  copyDiagnosticSummary: () =>
+    ipcRenderer.invoke("folioloom:copy-diagnostic-summary"),
+  exportDiagnostics: () =>
+    ipcRenderer.invoke("folioloom:export-diagnostics"),
   listKnowledge: (request) => ipcRenderer.invoke("folioloom:knowledge-list", request),
   getKnowledgeDetail: (objectId) => ipcRenderer.invoke("folioloom:knowledge-detail", objectId),
   mutateKnowledge: (request) => ipcRenderer.invoke("folioloom:knowledge-mutate", request),

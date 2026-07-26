@@ -146,6 +146,8 @@ test("preload exposes named onboarding operations without a generic IPC or crede
     "chooseExportDirectory",
     "exportBook",
     "openExportDirectory",
+    "copyDiagnosticSummary",
+    "exportDiagnostics",
     "listKnowledge",
     "getKnowledgeDetail",
     "mutateKnowledge",
@@ -173,6 +175,26 @@ test("preload exposes named onboarding operations without a generic IPC or crede
   assert.match(preloadSource, /removeListener\s*\(\s*DESKTOP_FULLBOOK_PROGRESS_CHANNEL/u);
   assert.doesNotMatch(preloadSource, /invoke\s*\(\s*(?:channel|name|method)\b/u);
   assert.doesNotMatch(preloadSource, /\b(?:getCredential|readCredential|readFile|globalThis\.fetch)\b/u);
+});
+
+test("main process owns diagnostic logs, clipboard, save dialog, and process failure capture", () => {
+  const mainSource = readFileSync(
+    new URL("../src/desktop/main/index.ts", import.meta.url),
+    "utf8",
+  );
+  const ipcSource = readFileSync(
+    new URL("../src/desktop/main/ipc.ts", import.meta.url),
+    "utf8",
+  );
+  assert.match(mainSource, /new DesktopDiagnosticLogger/u);
+  assert.match(mainSource, /clipboard\.writeText/u);
+  assert.match(mainSource, /dialog\.showSaveDialog/u);
+  assert.match(mainSource, /uncaughtExceptionMonitor/u);
+  assert.match(mainSource, /unhandledRejection/u);
+  assert.doesNotMatch(
+    ipcSource,
+    /diagnostics\.(?:record|recordFailure)\s*\(\s*\{[\s\S]{0,300}\b(?:args|payload)\b/u,
+  );
 });
 
 test("full-book progress bridge forwards only exact bounded public projections", () => {

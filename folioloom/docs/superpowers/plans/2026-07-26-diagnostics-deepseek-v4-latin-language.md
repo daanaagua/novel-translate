@@ -152,7 +152,7 @@ git commit -m "feat: add private desktop diagnostics core"
 - 修改：`test/desktop-main-security.test.ts`
 - 修改：`src/desktop/renderer/src/App.test.tsx`
 
-- [ ] **步骤 1：编写 IPC 不记录 payload、复制摘要、取消导出和成功导出测试**
+- [x] **步骤 1：编写 IPC 不记录 payload、复制摘要、取消导出和成功导出测试**
 
 ```ts
 test("trusted IPC records channel outcome without recording request payload", async () => {
@@ -176,7 +176,7 @@ test("diagnostic export cancellation is not reported as an error", async () => {
 
 在 renderer 测试中断言：左侧始终存在“导出诊断”；发生试译错误时存在“复制诊断摘要”和“导出诊断包”；成功后显示文件名而不接收内部日志目录。
 
-- [ ] **步骤 2：运行定向测试确认新通道和按钮尚不存在**
+- [x] **步骤 2：运行定向测试确认新通道和按钮尚不存在**
 
 运行：
 
@@ -187,7 +187,7 @@ npx vitest run --config vitest.desktop.config.ts src/desktop/renderer/src/App.te
 
 预期：FAIL，缺少诊断通道、API 方法和 GUI 按钮。
 
-- [ ] **步骤 3：实现 IPC 与主进程组合**
+- [x] **步骤 3：实现 IPC 与主进程组合**
 
 新增通道：
 
@@ -198,7 +198,7 @@ npx vitest run --config vitest.desktop.config.ts src/desktop/renderer/src/App.te
 
 `handleTrusted` 为每次调用生成 `operationId`，记录 `started/completed/failed`、通道和耗时；不得序列化 `args`。把 `resultFrom` 的错误捕获移动到该统一边界，使原始异常在转换成 `DesktopError` 前进入脱敏记录器。主进程注入 `dialog.showSaveDialog`、`clipboard.writeText`、应用版本和当前安全状态摘要，并捕获 `uncaughtExceptionMonitor` 与 `unhandledRejection`。
 
-- [ ] **步骤 4：实现 preload 和 GUI**
+- [x] **步骤 4：实现 preload 和 GUI**
 
 ```ts
 export interface FolioLoomDesktopApi {
@@ -209,7 +209,7 @@ export interface FolioLoomDesktopApi {
 
 Sidebar 底部增加常驻按钮；Onboarding 错误区复用相同回调。诊断反馈用 `role="status"`，取消保存不显示红色失败；renderer 不读取日志路径或日志原文。
 
-- [ ] **步骤 5：运行 IPC、renderer、安全和构建边界测试**
+- [x] **步骤 5：运行 IPC、renderer、安全和构建边界测试**
 
 运行：
 
@@ -221,7 +221,7 @@ npm run desktop:typecheck
 
 预期：PASS。
 
-- [ ] **步骤 6：提交桌面诊断集成**
+- [x] **步骤 6：提交桌面诊断集成**
 
 ```bash
 git add src/desktop test/desktop-ipc.test.ts test/desktop-main-security.test.ts

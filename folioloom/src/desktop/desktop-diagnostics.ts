@@ -480,10 +480,15 @@ function containsSensitiveString(value: string): boolean {
     "MASKED",
   );
   if (redactSecrets(normalizedMarkers, "MASKED") !== normalizedMarkers) return true;
-  if (WINDOWS_PRIVATE_PATH.test(value) || POSIX_PRIVATE_PATH.test(value)) return true;
+  const containsWindowsPath = WINDOWS_PRIVATE_PATH.test(value);
   WINDOWS_PRIVATE_PATH.lastIndex = 0;
+  const containsPosixPath = POSIX_PRIVATE_PATH.test(value);
   POSIX_PRIVATE_PATH.lastIndex = 0;
-  return URL_WITH_PRIVATE_COMPONENTS.test(value);
+  if (containsWindowsPath || containsPosixPath) return true;
+  URL_WITH_PRIVATE_COMPONENTS.lastIndex = 0;
+  const containsPrivateUrl = URL_WITH_PRIVATE_COMPONENTS.test(value);
+  URL_WITH_PRIVATE_COMPONENTS.lastIndex = 0;
+  return containsPrivateUrl;
 }
 
 function scanSafe(value: unknown, path: string, ancestors: Set<object>): void {
@@ -538,6 +543,27 @@ export function writeDesktopDiagnosticReport(
   } finally {
     rmSync(temporary, { force: true });
   }
+}
+
+export function formatDesktopDiagnosticSummary(
+  report: DesktopDiagnosticReport,
+): string {
+  assertDiagnosticReportSafe(report);
+  const operation = report.operation;
+  return [
+    `FolioLoom ${report.manifest.appVersion}`,
+    `生成时间：${report.manifest.generatedAt}`,
+    `系统：${report.environment.platform} ${report.environment.release} ${report.environment.arch}`,
+    report.model === undefined
+      ? "模型：未配置"
+      : `模型：${report.model.providerId} / ${report.model.modelId}${report.model.reasoningEffort === undefined ? "" : ` / ${report.model.reasoningEffort}`}`,
+    report.source === undefined
+      ? "书稿：未打开"
+      : `书稿：${report.source.format} / ${report.source.language} / ${report.source.encoding} / ${report.source.characterCount} 字符 / ${report.source.hashPrefix}`,
+    operation === undefined
+      ? "最近失败：无"
+      : `最近失败：${operation.errorCode ?? "UNKNOWN"} / ${operation.phase ?? operation.event} / ${operation.timestamp}`,
+  ].join("\n");
 }
 
 export class DesktopDiagnosticLogger {

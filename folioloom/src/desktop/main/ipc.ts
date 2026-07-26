@@ -1,9 +1,11 @@
+import { randomUUID } from "node:crypto";
 import { basename, extname } from "node:path";
 
 import type {
   DesktopChooseSourceResult,
   DesktopConfirmSourceEncodingRequest,
   DesktopDoctorReport,
+  DesktopDiagnosticExportResult,
   DesktopExportDestination,
   DesktopExportFormat,
   DesktopExportRequest,
@@ -71,6 +73,10 @@ import {
 import { knowledgeImportFields } from "../../knowledge-import/field-mapping.js";
 import { MAX_STAGED_IMPORT_PAGE_SIZE } from "../../knowledge-import/types.js";
 import { DesktopInputError, fail, ok, toDesktopError } from "../desktop-errors.js";
+import type {
+  DesktopDiagnosticEventInput,
+  DesktopDiagnosticFailureInput,
+} from "../desktop-diagnostics.js";
 
 export const DESKTOP_IPC_CHANNELS = [
   "folioloom:choose-source",
@@ -89,6 +95,8 @@ export const DESKTOP_IPC_CHANNELS = [
   "folioloom:choose-export-directory",
   "folioloom:export-book",
   "folioloom:open-export-directory",
+  "folioloom:copy-diagnostic-summary",
+  "folioloom:export-diagnostics",
   "folioloom:knowledge-list",
   "folioloom:knowledge-detail",
   "folioloom:knowledge-mutate",
@@ -134,6 +142,21 @@ export interface DesktopDialog {
     canceled: boolean;
     filePaths: string[];
   }>;
+  showSaveDialog(options: {
+    title: string;
+    defaultPath: string;
+    filters: Array<{ name: string; extensions: string[] }>;
+  }): Promise<{
+    canceled: boolean;
+    filePath?: string;
+  }>;
+}
+
+export interface DesktopIpcDiagnostics {
+  record(input: DesktopDiagnosticEventInput): void;
+  recordFailure(input: DesktopDiagnosticFailureInput): void;
+  copySummary(): void;
+  exportReport(path: string): void;
 }
 
 export interface DesktopIpcProjectService {
@@ -244,6 +267,7 @@ export interface DesktopIpcDependencies {
   exportService: DesktopIpcExportService;
   knowledgeService: DesktopIpcKnowledgeService;
   knowledgeImportService: DesktopIpcKnowledgeImportService;
+  diagnostics: DesktopIpcDiagnostics;
   isTrustedEvent(event: unknown): boolean;
   getCurrentRequest(): DesktopProjectRequest | undefined;
   setCurrentRequest(request: DesktopProjectRequest): void;
@@ -312,11 +336,7 @@ function untrustedEvent(): DesktopResult<never> {
 async function resultFrom<T>(
   operation: () => DesktopResult<T> | Promise<DesktopResult<T>>,
 ): Promise<DesktopResult<T>> {
-  try {
-    return await operation();
-  } catch (error) {
-    return fail(toDesktopError(error));
-  }
+  return await operation();
 }
 
 async function chooseSingleFile(
@@ -1082,16 +1102,100 @@ export function registerDesktopIpc(dependencies: DesktopIpcDependencies): void {
   let activeSnapshot: DesktopProjectSnapshot | undefined;
   let activeExportDestination: DesktopExportDestination | undefined;
 
+  const record = (input: DesktopDiagnosticEventInput): void => {
+    try {
+      dependencies.diagnostics.record(input);
+    } catch {
+      // Observability must never change an application operation.
+    }
+  };
+
+  const recordFailure = (input: DesktopDiagnosticFailureInput): void => {
+    try {
+      dependencies.diagnostics.recordFailure(input);
+    } catch {
+      // Observability must never change an application operation.
+    }
+  };
+
   const handleTrusted = (channel: DesktopIpcChannel, handler: DesktopIpcHandler): void => {
     dependencies.ipcMain.handle(channel, async (event, ...args) => {
+      const operationId = randomUUID();
+      const startedAt = performance.now();
+      record({
+        event: "desktop.ipc",
+        operationId,
+        channel,
+        outcome: "started",
+      });
       try {
         if (!dependencies.isTrustedEvent(event)) {
-          return untrustedEvent();
+          const result = untrustedEvent();
+          record({
+            event: "desktop.ipc",
+            operationId,
+            channel,
+            durationMs: performance.now() - startedAt,
+            outcome: "failed",
+            severity: "warning",
+            errorCode: "DESKTOP_UNTRUSTED_IPC",
+          });
+          return result;
         }
       } catch {
-        return untrustedEvent();
+        const result = untrustedEvent();
+        record({
+          event: "desktop.ipc",
+          operationId,
+          channel,
+          durationMs: performance.now() - startedAt,
+          outcome: "failed",
+          severity: "warning",
+          errorCode: "DESKTOP_UNTRUSTED_IPC",
+        });
+        return result;
       }
-      return handler(event, ...args);
+      try {
+        const result = await handler(event, ...args);
+        if (
+          result !== null
+          && typeof result === "object"
+          && !Array.isArray(result)
+          && Object.hasOwn(result, "ok")
+          && (result as { ok?: unknown }).ok === false
+        ) {
+          const code = (result as { ok: false; error: { code: string } }).error.code;
+          const cancelled = code === "DESKTOP_SELECTION_CANCELLED"
+            || code === "DESKTOP_TRIAL_CANCELLED";
+          record({
+            event: "desktop.ipc",
+            operationId,
+            channel,
+            durationMs: performance.now() - startedAt,
+            outcome: cancelled ? "cancelled" : "failed",
+            severity: cancelled ? "info" : "warning",
+            errorCode: code,
+          });
+        } else {
+          record({
+            event: "desktop.ipc",
+            operationId,
+            channel,
+            durationMs: performance.now() - startedAt,
+            outcome: "completed",
+          });
+        }
+        return result;
+      } catch (error) {
+        recordFailure({
+          event: "desktop.ipc",
+          operationId,
+          channel,
+          durationMs: performance.now() - startedAt,
+          error,
+        });
+        return fail(toDesktopError(error));
+      }
     });
   };
 
@@ -1132,6 +1236,30 @@ export function registerDesktopIpc(dependencies: DesktopIpcDependencies): void {
     }
     return ok(onboardingState(dependencies.modelService.snapshot(), project.value));
   };
+
+  handleTrusted("folioloom:copy-diagnostic-summary", async (_event, ...args) => resultFrom(() => {
+    noArguments(args, "copy-diagnostic-summary");
+    dependencies.diagnostics.copySummary();
+    return ok(undefined);
+  }));
+
+  handleTrusted("folioloom:export-diagnostics", async (_event, ...args) => resultFrom(async () => {
+    noArguments(args, "export-diagnostics");
+    const stamp = new Date().toISOString().replace(/[-:]/gu, "").replace(/\.\d{3}Z$/u, "Z");
+    const selection = await dependencies.dialog.showSaveDialog({
+      title: "导出 FolioLoom 诊断包",
+      defaultPath: `FolioLoom-diagnostics-${stamp}.json`,
+      filters: [{ name: "JSON 诊断包", extensions: ["json"] }],
+    });
+    if (selection.canceled || selection.filePath === undefined) {
+      return canceledSelection();
+    }
+    dependencies.diagnostics.exportReport(selection.filePath);
+    return ok({
+      fileName: basename(selection.filePath),
+      displayPath: selection.filePath,
+    } satisfies DesktopDiagnosticExportResult);
+  }));
 
   handleTrusted("folioloom:choose-source", async (_event, ...args) => resultFrom(async () => {
     noArguments(args, "choose-source");

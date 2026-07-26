@@ -6,14 +6,20 @@ interface SidebarProps {
   activeWorkspace: WorkspaceId;
   hasProject: boolean;
   knowledgeAvailable: boolean;
+  diagnosticBusy: boolean;
+  diagnosticFeedback?: string;
   onSelectWorkspace(workspace: WorkspaceId): void;
+  onExportDiagnostics(): void;
 }
 
 export function Sidebar({
   activeWorkspace,
   hasProject,
   knowledgeAvailable,
+  diagnosticBusy,
+  diagnosticFeedback,
   onSelectWorkspace,
+  onExportDiagnostics,
 }: SidebarProps): JSX.Element {
   return (
     <aside className="sidebar">
@@ -55,8 +61,21 @@ export function Sidebar({
       </nav>
 
       <div className="sidebar-footnote">
-        <span className={`connection-dot${hasProject ? " is-ready" : ""}`} aria-hidden="true" />
-        <span>{hasProject ? "书稿已打开" : "等待书稿"}</span>
+        <div className="sidebar-project-state">
+          <span className={`connection-dot${hasProject ? " is-ready" : ""}`} aria-hidden="true" />
+          <span>{hasProject ? "书稿已打开" : "等待书稿"}</span>
+        </div>
+        <button
+          className="sidebar-diagnostic-button"
+          type="button"
+          disabled={diagnosticBusy}
+          onClick={onExportDiagnostics}
+        >
+          {diagnosticBusy ? "正在导出…" : "导出诊断"}
+        </button>
+        {diagnosticFeedback === undefined ? null : (
+          <p className="sidebar-diagnostic-feedback" role="status">{diagnosticFeedback}</p>
+        )}
       </div>
     </aside>
   );

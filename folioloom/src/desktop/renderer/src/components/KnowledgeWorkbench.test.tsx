@@ -143,6 +143,8 @@ function api(overrides: Partial<FolioLoomDesktopApi> = {}): FolioLoomDesktopApi 
     chooseExportDirectory: unavailable,
     exportBook: unavailable,
     openExportDirectory: unavailable,
+    copyDiagnosticSummary: unavailable,
+    exportDiagnostics: unavailable,
     listKnowledge: vi.fn().mockResolvedValue(ok(page())),
     getKnowledgeDetail: vi.fn().mockImplementation(async (id: string) =>
       id === piaton.id

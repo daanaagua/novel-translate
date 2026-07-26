@@ -14,6 +14,8 @@ export type BusyAction =
   | "choose-export-directory"
   | "export-book"
   | "open-export-directory"
+  | "copy-diagnostics"
+  | "export-diagnostics"
   | "choose-project"
   | "choose-store"
   | "refresh"

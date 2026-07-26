@@ -291,6 +291,12 @@ export interface DesktopExportResult {
   }[];
 }
 
+export interface DesktopDiagnosticExportResult {
+  fileName: string;
+  /** The destination explicitly chosen by the user, never the internal log directory. */
+  displayPath: string;
+}
+
 export type {
   DesktopAttachGlobalKnowledgeRequest,
   DesktopGlobalKnowledgeListRequest,
