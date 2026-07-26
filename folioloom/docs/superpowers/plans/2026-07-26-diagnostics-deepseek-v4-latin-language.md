@@ -32,7 +32,7 @@
 - 创建：`test/desktop-diagnostics.test.ts`
 - 修改：`src/desktop/desktop-errors.ts`
 
-- [ ] **步骤 1：编写诊断脱敏、轮转、错误链和最终拒绝测试**
+- [x] **步骤 1：编写诊断脱敏、轮转、错误链和最终拒绝测试**
 
 ```ts
 test("diagnostic report excludes credentials, manuscript text, translations and private paths", () => {
@@ -77,13 +77,13 @@ test("final sensitive scanner refuses an unsafe report before writing", () => {
 });
 ```
 
-- [ ] **步骤 2：运行测试并确认因模块不存在而失败**
+- [x] **步骤 2：运行测试并确认因模块不存在而失败**
 
 运行：`node --test --import tsx test/desktop-diagnostics.test.ts`
 
 预期：FAIL，报告无法解析 `src/desktop/desktop-diagnostics.ts`。
 
-- [ ] **步骤 3：实现最小诊断记录器和报告生成器**
+- [x] **步骤 3：实现最小诊断记录器和报告生成器**
 
 ```ts
 export class DesktopDiagnosticLogger {
@@ -123,13 +123,13 @@ export class DesktopDiagnosticLogger {
 
 实现固定默认边界：2 MiB/文件、4 文件、16 KiB/事件、5 层 cause；最终写入采用同目录临时文件加原子重命名，安全扫描失败时不留下目标文件。
 
-- [ ] **步骤 4：运行诊断与错误映射测试**
+- [x] **步骤 4：运行诊断与错误映射测试**
 
 运行：`node --test --import tsx test/desktop-diagnostics.test.ts test/desktop-errors.test.ts`
 
 预期：PASS，且没有包含模拟密钥或私人路径的失败输出。
 
-- [ ] **步骤 5：提交诊断核心**
+- [x] **步骤 5：提交诊断核心**
 
 ```bash
 git add src/desktop/desktop-diagnostics.ts src/desktop/desktop-errors.ts test/desktop-diagnostics.test.ts
