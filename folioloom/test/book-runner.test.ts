@@ -27,6 +27,7 @@ import { SourceLedger } from "../src/source/source-ledger.js";
 import { annotateStructure } from "../src/source/structure-annotator.js";
 import { BookStore } from "../src/storage/book-store.js";
 import { LosslessBookStore } from "../src/storage/lossless-book-store.js";
+import { RuntimeProfileStore } from "../src/storage/runtime-profile-store.js";
 import { createKnowledgeSnapshot } from "../src/knowledge/snapshot.js";
 import {
   conceptFromAnchor,
@@ -1397,6 +1398,42 @@ test("two tiny logical windows use one physical model session and commit indepen
   } finally {
     store.close();
   }
+});
+
+test("lossless runner reports shadow scheduler metrics without changing legacy dispatch", async () => {
+  const fixture = losslessFixture("EDGEWOOD\n\nBOOK ONE");
+  fixture.faux.setResponses([fauxAssistantMessage(fauxToolCall(
+    "finalize_translation_batch",
+    fixture.submission,
+  ), { stopReason: "toolUse" })]);
+  const runtimeProfiles = new RuntimeProfileStore(join(
+    dirname(fixture.options.storePath),
+    "runtime-profiles.db",
+  ));
+
+  const result = await runBook({
+    ...fixture.options,
+    schedulerMode: "shadow",
+    optimizationProfile: "balanced",
+    runtimeProfileStore: runtimeProfiles,
+  });
+
+  assert.equal(fixture.faux.state.callCount, 1);
+  assert.equal(result.status.completedWindows, 2);
+  assert.equal(result.scheduler.mode, "shadow");
+  assert.equal(result.scheduler.profile, "balanced");
+  assert.equal(result.scheduler.decisions, 1);
+  assert.equal(result.scheduler.fallbacks, 0);
+  assert.ok(result.scheduler.predictedWallTimeMs > 0);
+  assert.ok(result.scheduler.actualWallTimeMs >= 0);
+  assert.ok(result.scheduler.predictedTokens > 0);
+  assert.ok(result.scheduler.actualTokens >= 0);
+  assert.equal(typeof result.scheduler.tokenUsageComplete, "boolean");
+  assert.equal(
+    runtimeProfiles.observationsForProfile("faux-1:en").length,
+    1,
+  );
+  runtimeProfiles.close();
 });
 
 test("failed lossless doctor blocks every model call", async () => {

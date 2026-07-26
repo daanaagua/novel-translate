@@ -980,6 +980,7 @@ export async function main(
       try {
         artifacts = writeLosslessBookArtifacts(store, runId, options.output, {
           allowIncomplete: true,
+          scheduler: result.scheduler,
         });
       } finally {
         store.close();

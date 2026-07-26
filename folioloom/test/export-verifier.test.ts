@@ -209,6 +209,42 @@ test("partial lineage is explicit and selected run never mixes another run", () 
   }
 });
 
+test("partial scheduler report contains only aggregate execution metrics", () => {
+  const item = fixture();
+  try {
+    addRun(item.store, item.context, "run-a", 1);
+    const scheduler = {
+      mode: "shadow" as const,
+      profile: "balanced" as const,
+      decisions: 2,
+      fallbacks: 0,
+      predictedWallTimeMs: 1_200,
+      actualWallTimeMs: 1_350,
+      predictedTokens: 800,
+      actualTokens: 820,
+      tokenUsageComplete: true,
+    };
+    const paths = writeLosslessBookArtifacts(
+      item.store,
+      "run-a",
+      item.output,
+      { allowIncomplete: true, scheduler },
+    );
+
+    const metrics = JSON.parse(readFileSync(paths.metrics, "utf8")) as {
+      scheduler?: unknown;
+    };
+    assert.deepEqual(metrics.scheduler, scheduler);
+    assert.doesNotMatch(
+      JSON.stringify(metrics.scheduler),
+      /sourceText|prompt|translation/u,
+    );
+  } finally {
+    item.store.close();
+    item.context.close();
+  }
+});
+
 test("verifier rejects lineage from a different run", () => {
   const item = fixture();
   try {

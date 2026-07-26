@@ -13,6 +13,7 @@ import { blockId as losslessBlockId } from "./source/block-builder.js";
 import { scalarLength } from "./source/types.js";
 import type { BookStore } from "./storage/book-store.js";
 import type { LosslessBookStore } from "./storage/lossless-book-store.js";
+import type { SchedulerRunReport } from "./fullbook/dynamic-scheduler.js";
 
 export interface PilotTranslation {
   blockId: string;
@@ -618,6 +619,24 @@ export function losslessBookTranslations(
 export interface WriteLosslessBookArtifactsOptions {
   allowIncomplete?: boolean;
   fileStem?: string;
+  scheduler?: SchedulerRunReport;
+}
+
+function schedulerMetricsProjection(
+  scheduler: SchedulerRunReport | undefined,
+): SchedulerRunReport | null {
+  if (scheduler === undefined) return null;
+  return {
+    mode: scheduler.mode,
+    profile: scheduler.profile,
+    decisions: scheduler.decisions,
+    fallbacks: scheduler.fallbacks,
+    predictedWallTimeMs: scheduler.predictedWallTimeMs,
+    actualWallTimeMs: scheduler.actualWallTimeMs,
+    predictedTokens: scheduler.predictedTokens,
+    actualTokens: scheduler.actualTokens,
+    tokenUsageComplete: scheduler.tokenUsageComplete,
+  };
 }
 
 export function writeLosslessBookArtifacts(
@@ -665,6 +684,7 @@ export function writeLosslessBookArtifacts(
     missingBlockIds: audit.missingBlockIds,
     missingBlockCount: audit.missingBlockCount,
     status: store.statusSummary(runId),
+    scheduler: schedulerMetricsProjection(options.scheduler),
   }, null, 2)}\n`, "utf8");
   const lineageJson = `${JSON.stringify(losslessBookLineage(store, runId), null, 2)}\n`;
   writeFileSync(paths.translationLineage, lineageJson, "utf8");

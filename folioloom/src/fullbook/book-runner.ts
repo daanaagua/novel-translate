@@ -13,7 +13,11 @@ import {
   type LexicalAnchor,
   type LexicalAnchorOutcome,
 } from "../agents/lexical-anchorer.js";
-import { ModelProviderError, PiRuntime } from "../agents/pi-runtime.js";
+import {
+  ModelProviderError,
+  PiRuntime,
+  type PiRunResult,
+} from "../agents/pi-runtime.js";
 import {
   runTranslationBatch,
   type TranslationBatchResult,
@@ -79,6 +83,7 @@ import {
   type RevalidationReplacementInput,
   type RevalidationWorkItem,
 } from "../storage/lossless-book-store.js";
+import type { RuntimeProfileStore } from "../storage/runtime-profile-store.js";
 import type { TranslationMemoryCandidate } from "../tools/candidate-collector.js";
 import type { StyleState } from "../tools/translation-tools.js";
 import { TranslationValidator } from "../validators/translation-validator.js";
@@ -101,9 +106,37 @@ import {
 } from "./adaptive-scheduler.js";
 import { CommitCoordinator } from "./commit-coordinator.js";
 import {
+  DynamicScheduler,
+  type SchedulerRunReport,
+} from "./dynamic-scheduler.js";
+import {
   boundedActiveTail,
   memoriesFromSnapshot,
 } from "./memory-projection.js";
+import {
+  optimizationPolicy,
+  profileFromLegacyRunMode,
+  type OptimizationProfile,
+  type SchedulerMode,
+} from "./optimization-policy.js";
+import {
+  planRollingHorizon,
+  type RollingPlannerInput,
+  type TaskExecutionVariant,
+} from "./rolling-horizon-planner.js";
+import {
+  loadRuntimeCostModel,
+  OnlineRuntimeCostModel,
+  persistRuntimeCostModel,
+  type RuntimeFeatures,
+} from "./runtime-cost-model.js";
+import {
+  normalizeRuntimeUsage,
+  type NormalizedRuntimeUsage,
+  type RuntimeObservationStatus,
+} from "./runtime-telemetry.js";
+import { buildTaskGraph, type SchedulerTask } from "./task-graph.js";
+import { assessTaskRisk } from "./task-risk.js";
 import type { WindowExecutionSummary } from "./types.js";
 import type {
   PhysicalRequestPlan,
@@ -332,6 +365,9 @@ export interface LosslessBookRunOptions {
   streamFn: StreamFn;
   /** Optional explicit dual-runtime policy. Legacy callers remain quality mode. */
   runtimeSet?: TranslationRuntimeSet;
+  optimizationProfile?: OptimizationProfile;
+  schedulerMode?: SchedulerMode;
+  runtimeProfileStore?: RuntimeProfileStore;
   windowOptions?: WindowPlanOptions;
   styleState?: StyleState;
   glossary?: LoadedGlossary;
@@ -391,6 +427,7 @@ export interface LosslessBookRunResult {
     readonly coverageScan: ConceptCoverageRevalidationReport;
     readonly drain: RevalidationDrainReport;
   };
+  scheduler: SchedulerRunReport;
   leaseReleased: boolean;
   artifacts: null;
 }
@@ -1410,6 +1447,135 @@ interface AdmittedRequest<TInput> {
   assessment: RequestBudgetAssessment;
 }
 
+const RUNTIME_EFFORT_RANK = new Map<string, number>([
+  ["off", 0],
+  ["minimal", 1],
+  ["low", 2],
+  ["medium", 3],
+  ["on", 3],
+  ["high", 4],
+  ["xhigh", 5],
+  ["max", 6],
+]);
+
+interface DynamicRequestPlanning {
+  readonly input: RollingPlannerInput;
+  readonly featuresByTaskId: ReadonlyMap<string, RuntimeFeatures>;
+  readonly variantsByTaskId: ReadonlyMap<string, TaskExecutionVariant>;
+  readonly baselineTokens: number;
+}
+
+function runtimeEffort(runtime: TranslationRuntime): string {
+  return runtime.effort ?? runtime.thinkingLevel ?? "high";
+}
+
+function runtimeEffortRank(runtime: TranslationRuntime): number {
+  return RUNTIME_EFFORT_RANK.get(runtimeEffort(runtime)) ?? 4;
+}
+
+function dynamicRequestPlanning<TInput extends TranslationRequestInput>(
+  requests: readonly AdmittedRequest<TInput>[],
+  options: {
+    readonly runtime: TranslationRuntime;
+    readonly snapshotId: string;
+    readonly retryRound: number;
+    readonly costModel: OnlineRuntimeCostModel;
+    readonly profile: OptimizationProfile;
+    readonly cumulativeBaselineTokens: number;
+    readonly actualRunTokens: number;
+    readonly maxConcurrency: number;
+    readonly maxInFlightTokens: number;
+  },
+): DynamicRequestPlanning {
+  const protocol = requests[0]?.fragments[0]?.input.responseProtocol
+    ?? "typed_tool";
+  const featuresByTaskId = new Map<string, RuntimeFeatures>();
+  const variantsByTaskId = new Map<string, TaskExecutionVariant>();
+  const tasks: SchedulerTask[] = requests.map((item, ordinal) => {
+    const risk = assessTaskRisk({
+      sourceTokens: item.request.sourceTokens,
+      entityMentions: 0,
+      pronounMentions: 0,
+      relationKinds: [],
+      remoteEvidenceDistance: 0,
+      lockedTermOccurrences: 0,
+      needsRevalidate: false,
+      priorRepairs: options.retryRound,
+      sourceAnomalies: 0,
+    });
+    const features: RuntimeFeatures = {
+      inputTokens: item.assessment.inputTokens,
+      outputTokens: item.assessment.outputTokens,
+      sourceTokens: item.request.sourceTokens,
+      effortRank: runtimeEffortRank(options.runtime),
+      cacheHitRatio: 0,
+      concurrency: options.maxConcurrency,
+      batchWindows: item.request.windows.length,
+      riskScore: risk.score,
+      protocolRank: protocol === "typed_tool" ? 1 : 0,
+    };
+    const rawPrediction = options.costModel.predict(features);
+    const variant: TaskExecutionVariant = {
+      variantId: `${item.request.requestId}:legacy`,
+      taskId: item.request.requestId,
+      contextProfile: "rich",
+      effort: runtimeEffort(options.runtime),
+      effortRank: features.effortRank,
+      protocol,
+      validators: [
+        "structure",
+        "terminology",
+        "cross_block",
+        "knowledge_coverage",
+      ],
+      predicted: {
+        ...rawPrediction,
+        totalTokens: Math.max(
+          rawPrediction.totalTokens,
+          item.assessment.totalReserved,
+        ),
+      },
+    };
+    featuresByTaskId.set(item.request.requestId, features);
+    variantsByTaskId.set(item.request.requestId, variant);
+    return {
+      taskId: item.request.requestId,
+      type: "translate",
+      ordinal: item.request.windows[0]?.ordinal ?? ordinal,
+      dependencyIds: [],
+      readResources: [`snapshot:${options.snapshotId}`],
+      writeResources: item.request.windows.map((window) =>
+        `window:${window.windowId}`),
+      sourceTokens: item.request.sourceTokens,
+      risk,
+    };
+  });
+  const variants = [...variantsByTaskId.values()];
+  const horizonBaselineTokens = variants.reduce(
+    (total, variant) => total + variant.predicted.totalTokens,
+    0,
+  );
+  return {
+    input: {
+      graph: buildTaskGraph(tasks),
+      completedTaskIds: [],
+      running: [],
+      variants,
+      policy: optimizationPolicy(options.profile),
+      runBaselineTotalTokens:
+        options.cumulativeBaselineTokens + horizonBaselineTokens,
+      actualRunTokens: options.actualRunTokens,
+      runningReservedTokens: 0,
+      horizonBaselineTokens,
+      maxConcurrency: options.maxConcurrency,
+      maxInFlightTokens: options.maxInFlightTokens,
+    },
+    featuresByTaskId,
+    variantsByTaskId,
+    baselineTokens: horizonBaselineTokens,
+  };
+}
+
 function contextFragmentRequestId(
   parentRequestId: string,
   windowId: string,
@@ -1618,6 +1784,34 @@ interface FragmentTranslationExecution {
   result: TranslationBatchResult;
 }
 
+function runtimeUsageForRuns(
+  runs: readonly PiRunResult[],
+): NormalizedRuntimeUsage {
+  if (runs.length === 0) {
+    return normalizeRuntimeUsage({});
+  }
+  return normalizeRuntimeUsage({
+    input: runs.reduce((total, run) => total + run.usage.input, 0),
+    output: runs.reduce((total, run) => total + run.usage.output, 0),
+    cacheRead: runs.reduce((total, run) => total + run.usage.cacheRead, 0),
+    cacheWrite: runs.reduce((total, run) => total + run.usage.cacheWrite, 0),
+    reasoning: runs.reduce(
+      (total, run) => total + (run.usage.reasoning ?? 0),
+      0,
+    ),
+    totalTokens: runs.reduce(
+      (total, run) => total + run.usage.totalTokens,
+      0,
+    ),
+  });
+}
+
+function runtimeObservationStatus(
+  status: SchedulerObservationStatus,
+): RuntimeObservationStatus {
+  return status === "busy" ? "throttled" : status;
+}
+
 interface MergedTranslationResult {
   windows: TranslationBatchWindowResult[];
   responseErrors: string[];
@@ -1802,6 +1996,15 @@ async function runLosslessBook(
 ): Promise<LosslessBookRunResult> {
   const startedAt = performance.now();
   const runtimeSet = normalizeRuntimeSet(options);
+  const schedulerMode = options.schedulerMode ?? "off";
+  if (schedulerMode !== "off"
+    && schedulerMode !== "shadow"
+    && schedulerMode !== "active") {
+    throw new TypeError(`unsupported scheduler mode: ${String(schedulerMode)}`);
+  }
+  const optimizationProfile = options.optimizationProfile
+    ?? profileFromLegacyRunMode(runtimeSet.mode);
+  optimizationPolicy(optimizationProfile);
   const maxWindows = nonNegativeInteger(
     options.maxWindows ?? Number.MAX_SAFE_INTEGER,
     "maxWindows",
@@ -1885,6 +2088,17 @@ async function runLosslessBook(
   }
   const waves: BookWaveReport[] = [];
   let processedWindows = 0;
+  const schedulerMetrics = {
+    mode: schedulerMode,
+    profile: optimizationProfile,
+    decisions: 0,
+    fallbacks: 0,
+    predictedWallTimeMs: 0,
+    actualWallTimeMs: 0,
+    predictedTokens: 0,
+    actualTokens: 0,
+    tokenUsageComplete: true,
+  };
 
   try {
     store.registerSource(context.certifiedSource as NonNullable<typeof context.certifiedSource>);
@@ -1934,6 +2148,23 @@ async function runLosslessBook(
       maxInFlightTokens,
       ...(schedulerSnapshot === undefined ? {} : { snapshot: schedulerSnapshot }),
     });
+    const runtimeProfileKey = [
+      runtimeSet.primary.model.id,
+      context.languageProfile.id,
+    ].join(":");
+    const runtimeCostModel = options.runtimeProfileStore === undefined
+      ? OnlineRuntimeCostModel.coldStart(runtimeProfileKey)
+      : loadRuntimeCostModel(options.runtimeProfileStore, runtimeProfileKey);
+    const dynamicScheduler = new DynamicScheduler({
+      mode: schedulerMode,
+      profile: optimizationProfile,
+      planner: planRollingHorizon,
+      costModel: runtimeCostModel,
+      ...(options.runtimeProfileStore === undefined
+        ? {}
+        : { profileStore: options.runtimeProfileStore }),
+    });
+    let cumulativeBaselineTokens = 0;
     const blockById = new Map(context.losslessBlocks.map((block) => [block.id, block]));
     store.syncScopedKnowledge(runId);
     const coverageScan = store.ensureConceptCoverageRevalidationTasks(
@@ -2483,6 +2714,56 @@ async function runLosslessBook(
             + `(${oversizedReservation.assessment.totalReserved} tokens)`,
           );
         }
+        const requestPlanning = dynamicRequestPlanning(requestInputs, {
+          runtime: executionRuntime,
+          snapshotId: snapshot.id,
+          retryRound,
+          costModel: runtimeCostModel,
+          profile: optimizationProfile,
+          cumulativeBaselineTokens,
+          actualRunTokens: schedulerMetrics.actualTokens,
+          maxConcurrency,
+          maxInFlightTokens,
+        });
+        cumulativeBaselineTokens += requestPlanning.baselineTokens;
+        const decisionOrdinal = schedulerMetrics.decisions;
+        const dispatchReport = dynamicScheduler.dispatch(
+          requestPlanning.input,
+          {
+            legacyTaskIds: requestInputs.map((item) =>
+              item.request.requestId),
+            decision: {
+              decisionId: `decision-${createHash("sha256")
+                .update([
+                  runId,
+                  String(waves.length),
+                  String(retryRound),
+                  String(decisionOrdinal),
+                  ...requestInputs.map((item) => item.request.requestId),
+                ].join("\0"), "utf8")
+                .digest("hex")
+                .slice(0, 24)}`,
+              runId,
+              createdAt: new Date().toISOString(),
+            },
+          },
+        );
+        if (schedulerMode !== "off") {
+          schedulerMetrics.decisions += 1;
+          if (dispatchReport.planningStatus === "fallback"
+            || dispatchReport.fallbackReason !== undefined) {
+            schedulerMetrics.fallbacks += 1;
+          }
+          schedulerMetrics.predictedWallTimeMs +=
+            dispatchReport.predictedWallTimeMs;
+          schedulerMetrics.predictedTokens += Math.max(
+            0,
+            dispatchReport.predictedTokens
+              - (dispatchReport.fallbackReason === "PLANNER_FAILED"
+                ? 0
+                : schedulerMetrics.actualTokens),
+          );
+        }
         const claimed = new Map<string, PersistedLosslessWindow>();
         throwIfAborted(options.signal);
         for (const { request } of requestInputs) {
@@ -2498,11 +2779,27 @@ async function runLosslessBook(
           budget: Readonly<Record<string, number>>;
           result?: MergedTranslationResult;
           error?: unknown;
+          runtime: {
+            readonly durationMs: number;
+            readonly usage: NormalizedRuntimeUsage;
+            readonly status: RuntimeObservationStatus;
+            readonly features: RuntimeFeatures;
+            readonly variant: TaskExecutionVariant;
+          };
         };
+        const dynamicExecutionStartedAt = performance.now();
         const completionOrder = await runWithAdaptiveScheduler(
           requestInputs,
           scheduler,
           async ({ request, fragments }): Promise<ScheduledResult<CompletedRequest>> => {
+            const requestStartedAt = performance.now();
+            const observedRuns: PiRunResult[] = [];
+            const features = requestPlanning.featuresByTaskId.get(
+              request.requestId,
+            ) as RuntimeFeatures;
+            const variant = requestPlanning.variantsByTaskId.get(
+              request.requestId,
+            ) as TaskExecutionVariant;
             // Fragments are one logical provider operation. Reusing the ledger
             // preserves the original hard ceilings instead of multiplying every
             // budget limit by the number of context-recovery fragments.
@@ -2539,6 +2836,7 @@ async function runLosslessBook(
                     signal: options.signal,
                     deadlineMs: options.hardDeadlineMs,
                   });
+                  observedRuns.push(result.run, ...result.repairRuns);
                   if (result.run.modelCalls === 1
                     && fragment.assessment.inputTokens > 0
                     && result.run.usage.input > 0) {
@@ -2677,13 +2975,21 @@ async function runLosslessBook(
             };
             try {
               const executions = await executeFragments(fragments);
+              const status = observedContextOverflow ? "context" : "success";
               return {
                 value: {
                   request,
                   budget: budget.snapshot(),
                   result: mergeFragmentTranslationResults(request, executions),
+                  runtime: {
+                    durationMs: performance.now() - requestStartedAt,
+                    usage: runtimeUsageForRuns(observedRuns),
+                    status,
+                    features,
+                    variant,
+                  },
                 },
-                status: observedContextOverflow ? "context" : "success",
+                status,
               };
             } catch (error) {
               const status: SchedulerObservationStatus = error instanceof ModelProviderError
@@ -2694,13 +3000,80 @@ async function runLosslessBook(
                 ? error.kind
                 : "failed";
               return {
-                value: { request, budget: budget.snapshot(), error },
+                value: {
+                  request,
+                  budget: budget.snapshot(),
+                  error,
+                  runtime: {
+                    durationMs: performance.now() - requestStartedAt,
+                    usage: runtimeUsageForRuns(observedRuns),
+                    status: runtimeObservationStatus(status),
+                    features,
+                    variant,
+                  },
+                },
                 status,
               };
             }
           },
           options.signal,
         );
+        schedulerMetrics.actualWallTimeMs +=
+          performance.now() - dynamicExecutionStartedAt;
+        for (const completed of completionOrder) {
+          const telemetry = completed.runtime;
+          schedulerMetrics.tokenUsageComplete =
+            schedulerMetrics.tokenUsageComplete && telemetry.usage.complete;
+          schedulerMetrics.actualTokens += telemetry.usage.complete
+            ? telemetry.usage.totalTokens
+            : Math.max(
+              telemetry.usage.totalTokens,
+              telemetry.variant.predicted.totalTokens,
+            );
+          const observedAt = new Date().toISOString();
+          runtimeCostModel.observe({
+            features: telemetry.features,
+            durationMs: telemetry.durationMs,
+            usage: telemetry.usage,
+            status: telemetry.status,
+            observedAt,
+          });
+          options.runtimeProfileStore?.appendObservation({
+            observationId: `observation-${createHash("sha256")
+              .update([
+                runId,
+                completed.request.requestId,
+                String(waves.length),
+                String(retryRound),
+                String(decisionOrdinal),
+              ].join("\0"), "utf8")
+              .digest("hex")
+              .slice(0, 24)}`,
+            requestId: completed.request.requestId,
+            modelId: executionRuntime.model.id,
+            languageProfileId: context.languageProfile.id,
+            taskType: "translate",
+            protocol: telemetry.variant.protocol,
+            effort: telemetry.variant.effort,
+            inputEstimate: telemetry.features.inputTokens,
+            outputEstimate: telemetry.features.outputTokens,
+            sourceTokens: telemetry.features.sourceTokens,
+            contextProfile: telemetry.variant.contextProfile,
+            concurrency: telemetry.features.concurrency,
+            cacheHitRatio: telemetry.features.cacheHitRatio,
+            riskScore: telemetry.features.riskScore,
+            durationMs: telemetry.durationMs,
+            usage: telemetry.usage,
+            status: telemetry.status,
+            observedAt,
+          });
+        }
+        if (options.runtimeProfileStore !== undefined) {
+          persistRuntimeCostModel(
+            options.runtimeProfileStore,
+            runtimeCostModel,
+          );
+        }
         store.saveSchedulerSnapshot(runId, scheduler.snapshot());
 
         throwIfAborted(options.signal);
@@ -3000,6 +3373,7 @@ async function runLosslessBook(
         coverageScan,
         drain: revalidationDrain,
       },
+      scheduler: { ...schedulerMetrics },
       leaseReleased: true,
       artifacts: null,
     };
