@@ -437,6 +437,25 @@ export class BookRequestCapacityError extends Error {
   }
 }
 
+export class BookTokenEnvelopeExceededError extends Error {
+  readonly code = "TOKEN_ENVELOPE_EXHAUSTED" as const;
+  readonly retryable = false;
+
+  constructor(
+    readonly actualTokens: number,
+    readonly runningReservedTokens: number,
+    readonly minimumPendingTokens: number,
+    readonly allowedTokens: number,
+  ) {
+    super(
+      `TOKEN_ENVELOPE_EXHAUSTED: actual ${actualTokens} + running `
+      + `${runningReservedTokens} + minimum pending ${minimumPendingTokens} `
+      + `exceeds allowed ${allowedTokens}`,
+    );
+    this.name = "BookTokenEnvelopeExceededError";
+  }
+}
+
 class RevalidationOutputError extends Error {
   readonly code = "REVALIDATION_OUTPUT_INVALID" as const;
 
@@ -2386,6 +2405,11 @@ async function runWithDynamicScheduler<T>(
         },
         {
           legacyTaskIds: taskOrder.filter((taskId) => pending.has(taskId)),
+          legacyVariants: taskOrder
+            .filter((taskId) => pending.has(taskId))
+            .map((taskId) => planning.legacyByTaskId.get(taskId)?.variant)
+            .filter((variant): variant is TaskExecutionVariant =>
+              variant !== undefined),
           decision: options.decision(),
         },
       );
@@ -2443,6 +2467,31 @@ async function runWithDynamicScheduler<T>(
       if (launched > 0) {
         await Promise.race([...running.values()].map((item) => item.promise));
         continue;
+      }
+      if (running.size === 0
+        && report.planningStatus === "fallback"
+        && report.dispatchedTaskIds.length === 0) {
+        const firstPendingTaskId = taskOrder.find((taskId) =>
+          pending.has(taskId));
+        const minimumPendingTokens = firstPendingTaskId === undefined
+          ? Number.POSITIVE_INFINITY
+          : planning.legacyByTaskId.get(firstPendingTaskId)
+            ?.variant.predicted.totalTokens ?? Number.POSITIVE_INFINITY;
+        const actualTokens = options.actualRunTokens();
+        const allowedTokens = Math.floor(
+          planning.input.runBaselineTotalTokens
+            * (1 + planning.input.policy.tokenIncreaseCap),
+        );
+        if (Number.isFinite(minimumPendingTokens)
+          && actualTokens + runningReservedTokens + minimumPendingTokens
+            > allowedTokens) {
+          throw new BookTokenEnvelopeExceededError(
+            actualTokens,
+            runningReservedTokens,
+            minimumPendingTokens,
+            allowedTokens,
+          );
+        }
       }
     }
 
@@ -3302,6 +3351,8 @@ async function runLosslessBook(
             {
               legacyTaskIds: requestInputs.map((item) =>
                 item.request.requestId),
+              legacyVariants: [...requestPlanning.legacyByTaskId.values()]
+                .map((execution) => execution.variant),
               decision: decisionMetadata(),
             },
           );
@@ -3774,22 +3825,30 @@ async function runLosslessBook(
         };
         let completionOrder: CompletedRequest[];
         if (schedulerMode === "active") {
-          completionOrder = await runWithDynamicScheduler(
-            requestPlanning,
-            scheduler,
-            dynamicScheduler,
-            executePlannedRequest,
-            {
-              actualRunTokens: () => schedulerMetrics.actualTokens,
-              decision: decisionMetadata,
-              onDecision: recordDispatchReport,
-              onLaunch: recordSelectedVariant,
-              onComplete: observeCompletedRequest,
-              ...(options.signal === undefined
-                ? {}
-                : { signal: options.signal }),
-            },
-          );
+          try {
+            completionOrder = await runWithDynamicScheduler(
+              requestPlanning,
+              scheduler,
+              dynamicScheduler,
+              executePlannedRequest,
+              {
+                actualRunTokens: () => schedulerMetrics.actualTokens,
+                decision: decisionMetadata,
+                onDecision: recordDispatchReport,
+                onLaunch: recordSelectedVariant,
+                onComplete: observeCompletedRequest,
+                ...(options.signal === undefined
+                  ? {}
+                  : { signal: options.signal }),
+              },
+            );
+          } catch (error) {
+            if (error instanceof BookTokenEnvelopeExceededError) {
+              store.recoverInterruptedWindows(runId);
+              store.saveSchedulerSnapshot(runId, scheduler.snapshot());
+            }
+            throw error;
+          }
         } else {
           const legacyExecutionByTaskId = requestPlanning.legacyByTaskId;
           for (const execution of legacyExecutionByTaskId.values()) {

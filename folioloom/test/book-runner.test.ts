@@ -15,6 +15,7 @@ import {
 
 import {
   BookRequestCapacityError,
+  BookTokenEnvelopeExceededError,
   drainKnowledgeRevalidationTasks,
   runBook,
   windowOptionsForRunMode,
@@ -2122,10 +2123,14 @@ test("fast mode rejects a lower-effort escalation runtime", async () => {
   assert.equal(fixture.faux.state.callCount, 0);
 });
 
-test("failed low effort retries only its task with the legal escalation runtime", async () => {
+test("failed low effort retries only its task with a token-legal escalation runtime", async () => {
   const fixture = losslessFixture("the quiet room remained empty.");
-  const low = fauxProvider();
-  const high = fauxProvider();
+  const low = fauxProvider({
+    models: [{ id: "faux-1", contextWindow: 1_000_000 }],
+  });
+  const high = fauxProvider({
+    models: [{ id: "faux-1", contextWindow: 1_000_000 }],
+  });
   const runtimeProfiles = new RuntimeProfileStore(join(
     dirname(fixture.options.storePath),
     "runtime-profiles.db",
@@ -2186,34 +2191,45 @@ test("retry rounds do not manufacture a larger cumulative token envelope", async
   high.setResponses([invalid, losslessBatchResponse]);
   const model = low.getModel();
 
-  const result = await runBook({
-    ...fixture.options,
-    model,
-    streamFn: low.provider.streamSimple.bind(low.provider),
-    schedulerMode: "active",
-    optimizationProfile: "balanced",
-    maxAttempts: 3,
-    runtimeSet: {
-      mode: "fast",
-      primary: {
-        model,
-        streamFn: low.provider.streamSimple.bind(low.provider),
-        effort: "low",
-        thinkingLevel: "low",
+  await assert.rejects(
+    runBook({
+      ...fixture.options,
+      model,
+      streamFn: low.provider.streamSimple.bind(low.provider),
+      schedulerMode: "active",
+      optimizationProfile: "balanced",
+      maxAttempts: 3,
+      runtimeSet: {
+        mode: "fast",
+        primary: {
+          model,
+          streamFn: low.provider.streamSimple.bind(low.provider),
+          effort: "low",
+          thinkingLevel: "low",
+        },
+        escalation: {
+          model: high.getModel(),
+          streamFn: high.provider.streamSimple.bind(high.provider),
+          effort: "high",
+          thinkingLevel: "high",
+        },
       },
-      escalation: {
-        model: high.getModel(),
-        streamFn: high.provider.streamSimple.bind(high.provider),
-        effort: "high",
-        thinkingLevel: "high",
-      },
+    }),
+    (error: unknown) => {
+      assert.ok(error instanceof BookTokenEnvelopeExceededError);
+      assert.equal(error.code, "TOKEN_ENVELOPE_EXHAUSTED");
+      assert.ok(error.actualTokens + error.minimumPendingTokens > error.allowedTokens);
+      return true;
     },
-  });
+  );
 
   assert.equal(low.state.callCount, 1);
-  assert.equal(high.state.callCount, 2);
-  assert.equal(result.status.completedWindows, 1);
-  assert.equal(result.scheduler.fallbacks, 2);
+  assert.equal(high.state.callCount, 0);
+  const store = new LosslessBookStore(fixture.options.storePath);
+  const status = store.statusSummary("run-lossless");
+  store.close();
+  assert.equal(status.pendingWindows, 1);
+  assert.equal(status.runningWindows, 0);
 });
 
 test("quality mode falls back from a malformed typed payload to framed text before human review", async () => {

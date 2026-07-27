@@ -115,11 +115,12 @@ export function classifyProviderErrorMessage(message: string): ModelProviderErro
   if (/(?:timed? out|timeout|deadline exceeded|etimedout)/u.test(normalized)) {
     return "timeout";
   }
-  if (/(?:malformed|invalid)[^\n]{0,48}(?:tool[ _-]?call|json|schema|stream)|(?:tool[ _-]?call)[^\n]{0,32}(?:malformed|invalid)|protocol error/u
+  if (/(?:malformed|invalid|unterminated)[^\n]{0,48}(?:tool[ _-]?call|json|schema|stream)|(?:tool[ _-]?call)[^\n]{0,32}(?:malformed|invalid)|protocol error/u
     .test(normalized)) {
     return "protocol";
   }
-  if (/(?:\b5(?:00|02|03|04|24)\b|overload|service unavailable|server error|internal error|network error|connection (?:error|refused|lost)|fetch failed|socket hang up|upstream connect)/u
+  if (normalized.trim() === "terminated"
+    || /(?:\b5(?:00|02|03|04|24)\b|overload|service unavailable|server error|internal error|network error|connection (?:error|refused|lost)|fetch failed|socket hang up|upstream connect)/u
     .test(normalized)) {
     return "busy";
   }

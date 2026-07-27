@@ -190,6 +190,8 @@ test("Pi classifies provider failures for bounded runtime recovery", async () =>
     { message: "429: rate limit exceeded", kind: "throttled", retryable: true },
     { message: "request timed out while reading the stream", kind: "timeout", retryable: true },
     { message: "503: service unavailable", kind: "busy", retryable: true },
+    { message: "terminated", kind: "busy", retryable: true },
+    { message: "unterminated JSON payload", kind: "protocol", retryable: false },
     { message: "input exceeds the context window", kind: "context", retryable: false },
     { message: "malformed tool-call stream", kind: "protocol", retryable: false },
     { message: "fixture mystery failure", kind: "unknown", retryable: false },

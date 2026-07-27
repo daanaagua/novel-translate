@@ -259,7 +259,7 @@ test("desktop imports, pauses, resumes, strictly exports, and verifies a Unicode
     });
     const running = firstPhases.waitFor("running");
     const started = await firstService.start(project, {
-      optimizationProfile: "speed",
+      optimizationProfile: "balanced",
     });
     await running;
     await withDeadline(

@@ -7,6 +7,7 @@ import {
 } from "../src/fullbook/dynamic-scheduler.js";
 import { optimizationPolicy } from "../src/fullbook/optimization-policy.js";
 import {
+  planRollingHorizon,
   type RollingPlannerInput,
   type RollingPlannerResult,
 } from "../src/fullbook/rolling-horizon-planner.js";
@@ -165,6 +166,32 @@ test("active mode dispatches the planner first batch", () => {
   assert.equal(result.shadowDecision, undefined);
 });
 
+test("active mode never delegates a no-legal-plan result past the token envelope", () => {
+  const scheduler = new DynamicScheduler(schedulerOptions({
+    mode: "active",
+    planner: planRollingHorizon,
+  }));
+  const exhausted = {
+    ...plannerInput(),
+    actualRunTokens: 220,
+  };
+
+  const result = scheduler.dispatch(exhausted, {
+    legacyTaskIds: ["task-a", "task-b"],
+  });
+
+  assert.equal(result.planningStatus, "fallback");
+  assert.equal(result.fallbackReason, "NO_LEGAL_PLAN");
+  assert.deepEqual(result.dispatchedTaskIds, []);
+  assert.deepEqual(result.dispatchedVariants, []);
+  assert.deepEqual(result.contextProfiles, {
+    lean: 0,
+    balanced: 0,
+    rich: 0,
+  });
+  assert.equal(result.validatorsSkipped, 0);
+});
+
 test("planner failure falls back without skipping validation", () => {
   const scheduler = new DynamicScheduler(schedulerOptions({
     mode: "active",
@@ -174,6 +201,106 @@ test("planner failure falls back without skipping validation", () => {
   }));
 
   const result = scheduler.dispatch(plannerInput(), {
+    legacyTaskIds: ["task-a"],
+  });
+
+  assert.equal(result.planningStatus, "fallback");
+  assert.equal(result.fallbackReason, "PLANNER_FAILED");
+  assert.deepEqual(result.dispatchedTaskIds, ["task-a"]);
+  assert.equal(result.validatorsSkipped, 0);
+});
+
+test("planner failure cannot bypass an exhausted token envelope", () => {
+  const scheduler = new DynamicScheduler(schedulerOptions({
+    mode: "active",
+    planner: () => {
+      throw new Error("solver unavailable");
+    },
+  }));
+
+  const result = scheduler.dispatch({
+    ...plannerInput(),
+    actualRunTokens: 220,
+  }, {
+    legacyTaskIds: ["task-a"],
+  });
+
+  assert.equal(result.planningStatus, "fallback");
+  assert.equal(result.fallbackReason, "TOKEN_ENVELOPE_EXHAUSTED");
+  assert.deepEqual(result.dispatchedTaskIds, []);
+  assert.deepEqual(result.dispatchedVariants, []);
+  assert.equal(result.validatorsSkipped, 0);
+});
+
+test("token-bounded planner fallback preserves the legacy task prefix", () => {
+  const scheduler = new DynamicScheduler(schedulerOptions({
+    mode: "active",
+    planner: () => {
+      throw new Error("solver unavailable");
+    },
+  }));
+  const input = plannerInput();
+
+  const result = scheduler.dispatch({
+    ...input,
+    variants: input.variants.map((variant) => ({
+      ...variant,
+      predicted: {
+        ...variant.predicted,
+        totalTokens: variant.taskId === "task-a" ? 200 : 100,
+      },
+    })),
+    actualRunTokens: 70,
+  }, {
+    legacyTaskIds: ["task-a", "task-b"],
+  });
+
+  assert.equal(result.fallbackReason, "TOKEN_ENVELOPE_EXHAUSTED");
+  assert.deepEqual(result.dispatchedTaskIds, []);
+});
+
+test("planner failure reserves the actual legacy variant rather than a cheaper planned variant", () => {
+  const scheduler = new DynamicScheduler(schedulerOptions({
+    mode: "active",
+    planner: () => {
+      throw new Error("solver unavailable");
+    },
+  }));
+  const input = plannerInput();
+  const planned = input.variants.find((variant) =>
+    variant.taskId === "task-a")!;
+
+  const result = scheduler.dispatch({
+    ...input,
+    actualRunTokens: 70,
+  }, {
+    legacyTaskIds: ["task-a"],
+    legacyVariants: [{
+      ...planned,
+      variantId: "legacy-task-a",
+      predicted: {
+        ...planned.predicted,
+        totalTokens: 200,
+      },
+    }],
+  });
+
+  assert.equal(result.fallbackReason, "TOKEN_ENVELOPE_EXHAUSTED");
+  assert.deepEqual(result.dispatchedTaskIds, []);
+});
+
+test("shadow mode preserves legacy dispatch when planner failure exhausts its estimate", () => {
+  const scheduler = new DynamicScheduler(schedulerOptions({
+    mode: "shadow",
+    planner: () => {
+      throw new Error("solver unavailable");
+    },
+  }));
+
+  const result = scheduler.dispatch({
+    ...plannerInput(),
+    actualRunTokens: 220,
+  }, {
     legacyTaskIds: ["task-a"],
   });
 

@@ -29,6 +29,7 @@ export interface DynamicSchedulerDecisionMetadata {
 
 export interface DynamicSchedulerDispatchOptions {
   readonly legacyTaskIds: readonly string[];
+  readonly legacyVariants?: readonly TaskExecutionVariant[];
   readonly decision?: DynamicSchedulerDecisionMetadata;
 }
 
@@ -104,20 +105,28 @@ function firstVariantByTaskId(
 function legacyDispatch(
   input: RollingPlannerInput,
   taskIds: readonly string[],
+  legacyVariants: readonly TaskExecutionVariant[] = [],
 ): readonly PlannedTaskDispatch[] {
   const variantByTaskId = firstVariantByTaskId(input.variants);
+  const legacyVariantByTaskId = firstVariantByTaskId(legacyVariants);
   return taskIds.map((taskId) => ({
     taskId,
-    variantId: variantByTaskId.get(taskId)?.variantId ?? "",
+    variantId: legacyVariantByTaskId.get(taskId)?.variantId
+      ?? variantByTaskId.get(taskId)?.variantId
+      ?? "",
   }));
 }
 
 function contextProfileCounts(
   input: RollingPlannerInput,
   dispatch: readonly PlannedTaskDispatch[],
+  legacyVariants: readonly TaskExecutionVariant[] = [],
 ): Readonly<Record<"lean" | "balanced" | "rich", number>> {
   const result = { lean: 0, balanced: 0, rich: 0 };
-  const variantById = variantsById(input.variants);
+  const variantById = variantsById([
+    ...input.variants,
+    ...legacyVariants,
+  ]);
   const variantByTaskId = firstVariantByTaskId(input.variants);
   for (const item of dispatch) {
     const variant = variantById.get(item.variantId)
@@ -132,11 +141,15 @@ function contextProfileCounts(
 function legacyProjection(
   input: RollingPlannerInput,
   dispatch: readonly PlannedTaskDispatch[],
+  legacyVariants: readonly TaskExecutionVariant[] = [],
 ): {
   readonly wallTimeMs: number;
   readonly totalTokens: number;
 } {
-  const variantById = variantsById(input.variants);
+  const variantById = variantsById([
+    ...input.variants,
+    ...legacyVariants,
+  ]);
   const variantByTaskId = firstVariantByTaskId(input.variants);
   const selected = dispatch
     .map((item) =>
@@ -154,6 +167,38 @@ function legacyProjection(
       0,
     ),
   };
+}
+
+function legacyDispatchWithinTokenEnvelope(
+  input: RollingPlannerInput,
+  dispatch: readonly PlannedTaskDispatch[],
+  legacyVariants: readonly TaskExecutionVariant[] = [],
+): readonly PlannedTaskDispatch[] {
+  const allowedTokens = Math.floor(
+    input.runBaselineTotalTokens
+      + input.runBaselineTotalTokens * input.policy.tokenIncreaseCap
+      + Number.EPSILON,
+  );
+  let remainingTokens = allowedTokens
+    - input.actualRunTokens
+    - input.runningReservedTokens;
+  if (remainingTokens <= 0) return [];
+
+  const variantById = variantsById([
+    ...input.variants,
+    ...legacyVariants,
+  ]);
+  const selected: PlannedTaskDispatch[] = [];
+  for (const item of dispatch) {
+    const variant = variantById.get(item.variantId);
+    if (variant === undefined
+      || variant.predicted.totalTokens > remainingTokens) {
+      break;
+    }
+    selected.push(item);
+    remainingTokens -= variant.predicted.totalTokens;
+  }
+  return selected;
 }
 
 export class DynamicScheduler {
@@ -175,8 +220,17 @@ export class DynamicScheduler {
     input: RollingPlannerInput,
     options: DynamicSchedulerDispatchOptions,
   ): SchedulerDispatchReport {
-    const legacy = legacyDispatch(input, options.legacyTaskIds);
-    const legacyPrediction = legacyProjection(input, legacy);
+    const legacyVariants = options.legacyVariants ?? [];
+    const legacy = legacyDispatch(
+      input,
+      options.legacyTaskIds,
+      legacyVariants,
+    );
+    const legacyPrediction = legacyProjection(
+      input,
+      legacy,
+      legacyVariants,
+    );
     if (this.mode === "off") {
       return Object.freeze({
         mode: this.mode,
@@ -187,15 +241,18 @@ export class DynamicScheduler {
         predictedWallTimeMs: legacyPrediction.wallTimeMs,
         predictedTokens: legacyPrediction.totalTokens,
         validatorsSkipped: 0,
-        contextProfiles: contextProfileCounts(input, legacy),
+        contextProfiles: contextProfileCounts(
+          input,
+          legacy,
+          legacyVariants,
+        ),
       });
     }
 
     try {
       const decision = this.#planner(input);
       const plannedDispatch = decision.firstDispatch;
-      const useLegacy = this.mode === "shadow"
-        || decision.planningStatus === "fallback";
+      const useLegacy = this.mode === "shadow";
       const selectedDispatch = useLegacy ? legacy : plannedDispatch;
       const report: SchedulerDispatchReport = Object.freeze({
         mode: this.mode,
@@ -212,7 +269,10 @@ export class DynamicScheduler {
         validatorsSkipped: 0,
         contextProfiles: contextProfileCounts(
           input,
-          plannedDispatch.length > 0 ? plannedDispatch : legacy,
+          this.mode === "shadow"
+            ? (plannedDispatch.length > 0 ? plannedDispatch : legacy)
+            : selectedDispatch,
+          legacyVariants,
         ),
         ...(this.mode === "shadow" ? { shadowDecision: decision } : {}),
         ...(decision.planningStatus === "fallback"
@@ -225,17 +285,39 @@ export class DynamicScheduler {
       if (error instanceof TaskGraphIntegrityError) {
         throw error;
       }
+      const boundedLegacy = this.mode === "active"
+        ? legacyDispatchWithinTokenEnvelope(
+          input,
+          legacy,
+          legacyVariants,
+        )
+        : legacy;
+      const legacyPrediction = legacyProjection(
+        input,
+        boundedLegacy,
+        legacyVariants,
+      );
+      const envelopeExhausted = legacy.length > 0
+        && boundedLegacy.length === 0;
       const report: SchedulerDispatchReport = Object.freeze({
         mode: this.mode,
         planningStatus: "fallback",
         plannerDeadlineReached: false,
-        dispatchedTaskIds: Object.freeze([...options.legacyTaskIds]),
-        dispatchedVariants: Object.freeze(legacy),
+        dispatchedTaskIds: Object.freeze(
+          boundedLegacy.map((item) => item.taskId),
+        ),
+        dispatchedVariants: Object.freeze([...boundedLegacy]),
         predictedWallTimeMs: legacyPrediction.wallTimeMs,
         predictedTokens: legacyPrediction.totalTokens,
         validatorsSkipped: 0,
-        contextProfiles: contextProfileCounts(input, legacy),
-        fallbackReason: "PLANNER_FAILED",
+        contextProfiles: contextProfileCounts(
+          input,
+          boundedLegacy,
+          legacyVariants,
+        ),
+        fallbackReason: envelopeExhausted
+          ? "TOKEN_ENVELOPE_EXHAUSTED"
+          : "PLANNER_FAILED",
       });
       this.#recordDecision(report, options);
       return report;

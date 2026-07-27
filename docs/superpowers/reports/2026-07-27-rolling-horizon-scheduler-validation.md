@@ -2,8 +2,8 @@
 
 - 日期：2026-07-27
 - 分支：`fix/german-100k-gate`
-- 验证范围：任务 1–13 的确定性实现、离线回放、影子一致性、数据库副本准备器、CLI、桌面端和生产构建
-- 结论：确定性实现与离线质量门通过；真实 DeepSeek 五块回溯因本机缺少凭据和源数据库而未执行
+- 验证范围：任务 1–13 的确定性实现、离线回放、影子一致性、数据库副本准备器、CLI、桌面端、生产构建，以及后续 DeepSeek 德语前 10 万字符真实运行
+- 结论：确定性实现与离线质量门通过；后续真实运行的无损审计通过，但 active/balanced token 硬包络失败，因此整体验收不通过
 
 ## 验证环境
 
@@ -13,8 +13,8 @@
 - Node.js：24.18.0
 - npm：10.9.7
 - SQLite：3.53.1
-- 模型与 API：未连接；本机未设置 DeepSeek、OpenAI 或 Anthropic API 凭据
-- provider cache：未使用；离线回放使用固定遥测，短样本使用本地确定性 faux provider
+- 初始离线阶段：未连接模型；离线回放使用固定遥测，短样本使用本地确定性 faux provider
+- 后续真实阶段：使用本机 OpenCode 已有 DeepSeek 凭据连接 `deepseek-v4-flash`；凭据未写入报告、数据库或 Git
 
 ## Kafka 五任务离线回放
 
@@ -103,14 +103,18 @@ git diff --check
 
 第一次全量运行暴露两项测试环境问题：一个旧测试在 Linux 上使用 Windows 绝对路径样本，另一个构建产物测试在执行 production build 前找不到 preload。前者改为宿主平台绝对临时路径且保留原安全断言；后者由规定的 `desktop:build` 生成产物。随后全量运行通过，未降低任何阈值。
 
-## 真实五块回溯限制
+## 后续真实验证
 
-本机未发现可用的 DeepSeek 凭据，也未在工作区或 `/home/ubuntu` 下发现可复制的 `book.db`。因此没有：
+随后从本机 OpenCode 配置读取已有 DeepSeek 凭据，创建独立的德语《变形记》
+前 99,953 字符项目，使用 `deepseek-v4-flash`、`active/balanced` 完成真实
+翻译。最终达到 19/19 窗口、20/20 逻辑块、`coverageMissing=0`、
+`knowledgeConverged=true`、`strictExportable=true` 和 0 incident。
 
-- 对真实项目调用 benchmark 准备器；
-- 发起付费模型请求；
-- 测量真实 provider 墙钟、usage、缓存、限流或波动；
-- 生成真实 `coverageMissing=0`、`knowledgeConverged=true` 和 0 incident 审计；
-- 证明真实运行低于 246 秒或 token 不超过静态基线 110%。
+但最后一次续跑的调度指标为实际 359,975 token、允许 261,358 token，超出
+98,617（37.7%）。此外，独立严格导出的 metrics 中 `scheduler` 为 `null`，
+说明跨命令调度指标尚未持久化。因此，原报告中的“缺少外部验证”限制已经解除，
+但真实验证转而确认了一项 active token 硬门实现失败。
 
-这是一项外部验证限制，不是确定性实现失败。具备源数据库和原模型凭据后，必须先关闭写入该数据库的进程，使用准备器创建新副本并确认源 SHA-256 不变，再对副本执行 `active/balanced` 五块回溯。真实结果不得通过修改阈值、质量门或源数据库来补齐。
+完整过程、原文哈希、恢复记录、审计、输出路径、根因和未解决阻塞见：
+
+`docs/superpowers/reports/2026-07-27-kafka-german-100k-live-validation.md`

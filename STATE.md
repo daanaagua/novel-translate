@@ -1,10 +1,12 @@
-# FolioLoom 滚动调度器最终状态
+# FolioLoom 滚动调度器当前状态
 
 - 日期：2026-07-27
 - 分支：`fix/german-100k-gate`
-- 已验证实现提交：`aed8992`
-- 状态：计划任务 1–13 的确定性实现和离线验证已完成，并已推送到
-  `origin/fix/german-100k-gate`。
+- 离线验证基线提交：`d0604a4`
+- 真实验证与修复：本文件所在提交
+- 状态：计划任务 1–13 的确定性实现和离线验证已完成；后续德语《变形记》
+  前 99,953 字符真实运行完成并通过无损审计，但暴露 token 硬包络和调度
+  metrics 持久化缺陷，整体验收尚未通过。
 - 不变量：逻辑窗口保持不可变，`CommitCoordinator` 顺序未改变，
   `book.db` schema 未改变，质量门和 token 阈值未降低。
 
@@ -20,6 +22,9 @@
 - `3d3388b`、`824a83e`：完成任务 12 的 CLI、桌面端和合法 effort 修复。
 - `aed8992`：完成任务 13 的 metrics、离线回放、多语言一致性、
   benchmark 副本准备器、README 和验证报告。
+- `d0604a4`：记录任务 1–13 离线完成状态。
+- 本文件所在提交：把 provider 流 `terminated` 归类为可重试故障，并阻止
+  active fallback 绕过 token 包络。
 
 ## 验证证据
 
@@ -35,18 +40,31 @@
 - Kafka 五任务离线回放：静态串行基线 492,000 ms，动态预测 213,000 ms，
   降幅 56.7%；token 为 227,700/273,240，资源冲突为 0，规划耗时
   12.823 ms。
+- 本次真实验证修复后的相关测试：94 通过、0 失败。
+- 本次修复后的全量 Node 测试：830 通过、0 失败、1 跳过；renderer：
+  66 通过、0 失败；核心和 desktop TypeScript 均为 0 error；production
+  build 和产物校验通过。
 
 完整证据见
 `docs/superpowers/reports/2026-07-27-rolling-horizon-scheduler-validation.md`。
 
-## 外部验证限制
+## 真实验证结果
 
-本机没有可用的 DeepSeek 凭据，也没有可复制的真实 `book.db`，因此未执行
-真实《变形记》五块 active/balanced 回溯，未产生真实 provider 的墙钟、
-usage、缓存、限流及 `coverageMissing=0`、`knowledgeConverged=true`、
-0 incident 审计证据。这不影响确定性实现和离线质量门结论。
+- 样本：Project Gutenberg 德语《变形记》正文前 99,953 Unicode scalar。
+- 模型与模式：`deepseek-v4-flash`、`active/balanced`。
+- 完成度：19/19 窗口、20/20 逻辑块、43 次模型调用。
+- 审计：原文 SHA-256 不变，`coverageMissing=0`、
+  `knowledgeConverged=true`、`strictExportable=true`、0 incident。
+- 最后一次续跑 token：baseline 237,599、allowed 261,358、
+  actual 359,975，超出允许值 98,617（37.7%）。
+- 独立严格导出：成功，但 metrics 中 `scheduler=null`。
 
-获得源数据库和原模型凭据后，唯一剩余步骤是关闭源库写入者，使用
-`folioloom/scripts/prepare-revalidation-benchmark.ts` 创建并校验 SHA-256
-不变的副本，
-再只对副本执行五块回溯；不得修改源库、阈值或质量门。
+完整证据见
+`docs/superpowers/reports/2026-07-27-kafka-german-100k-live-validation.md`。
+
+## 未完成项
+
+1. 持久化跨 `book run` 续跑的累计 baseline、allowed、actual 和 usage 完整性；
+2. 让独立 `book export` 读取持久化调度 metrics；
+3. 将协议降级、repair、上下文拆分和并发在途请求纳入同一 token 硬门；
+4. 在全新隔离数据库上重新执行真实运行，确认 active 模式不再超限。
