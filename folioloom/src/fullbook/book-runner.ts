@@ -3277,46 +3277,96 @@ async function runLosslessBook(
             || anchorRuntime.streamFn !== runtimeSet.escalation.streamFn
             || anchorRuntime.effort !== runtimeSet.escalation.effort
             || anchorRuntime.thinkingLevel !== runtimeSet.escalation.thinkingLevel;
-          let outcome: Pick<LexicalAnchorOutcome, "anchors" | "entityLinks" | "terms">;
-          if (runtimeSet.mode === "fast") {
-            try {
-              outcome = await resolvePreferredFallback(anchorRuntime);
-            } catch (error) {
-              throwIfAborted(options.signal);
-              const cannotBenefitFromEscalation = error instanceof ModelProviderError
-                && (error.kind === "auth" || error.kind === "quota");
-              if (cannotBenefitFromEscalation || !escalationIsDistinct) {
-                if (error instanceof ModelProviderError && error.kind === "protocol") {
-                  outcome = sourceAuthoredAnchorFallback(anchorCandidates);
+          const anchorRequestId = `anchor:${runId}:wave${waves.length}:${inputHash.slice(0, 12)}`;
+          const anchorPredictedTokens = Math.max(
+            256,
+            anchorCandidates.length * 120,
+          );
+          if (!tokenLedger.state().baselinedTaskIds.has(anchorRequestId)) {
+            persistLedgerEvent({
+              type: "baseline_added",
+              taskIds: [anchorRequestId],
+              baselineTokens: anchorPredictedTokens,
+              source: "anchor",
+              reason: "wave_anchor",
+            });
+          }
+          if (
+            schedulerMode === "active"
+            && !tokenLedger.canReserve(anchorPredictedTokens, 0)
+          ) {
+            throw new BookTokenEnvelopeExceededError(
+              schedulerMetrics.actualTokens,
+              tokenLedger.state().reservedTokens,
+              anchorPredictedTokens,
+              schedulerMetrics.allowedTokens,
+            );
+          }
+          if (!tokenLedger.state().openReservations.has(anchorRequestId)) {
+            persistLedgerEvent({
+              type: "reserved",
+              requestId: anchorRequestId,
+              purpose: "anchor",
+              taskIds: [anchorRequestId],
+              predictedTokens: anchorPredictedTokens,
+              attempt: 0,
+            });
+          }
+          let outcome: Pick<LexicalAnchorOutcome, "anchors" | "entityLinks" | "terms">
+            | undefined;
+          try {
+            if (runtimeSet.mode === "fast") {
+              try {
+                outcome = await resolvePreferredFallback(anchorRuntime);
+              } catch (error) {
+                throwIfAborted(options.signal);
+                const cannotBenefitFromEscalation = error instanceof ModelProviderError
+                  && (error.kind === "auth" || error.kind === "quota");
+                if (cannotBenefitFromEscalation || !escalationIsDistinct) {
+                  if (error instanceof ModelProviderError && error.kind === "protocol") {
+                    outcome = sourceAuthoredAnchorFallback(anchorCandidates);
+                  } else {
+                    throw error;
+                  }
                 } else {
+                  try {
+                    outcome = await resolveAnchors(runtimeSet.escalation);
+                  } catch (escalationError) {
+                    if (!(escalationError instanceof ModelProviderError)
+                      || escalationError.kind !== "protocol") {
+                      throw escalationError;
+                    }
+                    outcome = await preferredOrSourceFallback(runtimeSet.escalation);
+                  }
+                }
+              }
+            } else {
+              try {
+                outcome = await resolveAnchors(anchorRuntime);
+              } catch (error) {
+                throwIfAborted(options.signal);
+                if (!(error instanceof ModelProviderError) || error.kind !== "protocol") {
                   throw error;
                 }
-              } else {
-                try {
-                  outcome = await resolveAnchors(runtimeSet.escalation);
-                } catch (escalationError) {
-                  if (!(escalationError instanceof ModelProviderError)
-                    || escalationError.kind !== "protocol") {
-                    throw escalationError;
-                  }
-                  outcome = await preferredOrSourceFallback(runtimeSet.escalation);
-                }
-              }
-            }
-          } else {
-            try {
-              outcome = await resolveAnchors(anchorRuntime);
-            } catch (error) {
-              throwIfAborted(options.signal);
-              if (!(error instanceof ModelProviderError) || error.kind !== "protocol") {
-                throw error;
-              }
-              try {
                 outcome = await preferredOrSourceFallback(anchorRuntime);
-              } catch (fallbackError) {
-                throw fallbackError;
               }
             }
+          } finally {
+            if (tokenLedger.state().openReservations.has(anchorRequestId)) {
+              const modelCalls = anchorBudget.snapshot().modelCalls ?? 0;
+              persistLedgerEvent({
+                type: "settled",
+                requestId: anchorRequestId,
+                actualTokens: modelCalls > 0
+                  ? anchorPredictedTokens * modelCalls
+                  : anchorPredictedTokens,
+                usageComplete: false,
+                outcome: outcome === undefined ? "failed" : "success",
+              });
+            }
+          }
+          if (outcome === undefined) {
+            throw new Error("lexical anchor produced no outcome");
           }
           waveAnchorSnapshot = {
             schemaVersion: "v5-wave-anchor-1",
@@ -3600,6 +3650,56 @@ async function runLosslessBook(
             let observedContextOverflow = false;
             let contextSplitAttempts = 0;
             let protocolSplitAttempts = 0;
+            let secondaryChargeOrdinal = 0;
+            const chargeSecondaryFragments = async (
+              purpose: "repair" | "protocol_switch" | "context_split",
+              admitted: readonly AdmittedRequestFragment<TranslationRequestInput>[],
+              run: () => Promise<FragmentTranslationExecution[]>,
+            ): Promise<FragmentTranslationExecution[]> => {
+              const predictedTokens = Math.max(
+                1,
+                admitted.reduce(
+                  (total, item) => total + item.assessment.totalReserved,
+                  0,
+                ),
+              );
+              if (
+                schedulerMode === "active"
+                && !tokenLedger.canReserve(predictedTokens, 0)
+              ) {
+                throw new BookTokenEnvelopeExceededError(
+                  schedulerMetrics.actualTokens,
+                  tokenLedger.state().reservedTokens,
+                  predictedTokens,
+                  schedulerMetrics.allowedTokens,
+                );
+              }
+              // Hold secondary headroom while the recovery call runs; actual
+              // usage is settled on the parent request to avoid double-count.
+              const secondaryId = `${request.requestId}:${purpose}:${secondaryChargeOrdinal}`;
+              secondaryChargeOrdinal += 1;
+              if (!tokenLedger.state().openReservations.has(secondaryId)) {
+                persistLedgerEvent({
+                  type: "reserved",
+                  requestId: secondaryId,
+                  purpose,
+                  taskIds: [request.requestId],
+                  predictedTokens,
+                  attempt: retryRound,
+                });
+              }
+              try {
+                return await run();
+              } finally {
+                if (tokenLedger.state().openReservations.has(secondaryId)) {
+                  persistLedgerEvent({
+                    type: "released",
+                    requestId: secondaryId,
+                    reason: "superseded",
+                  });
+                }
+              }
+            };
             const executeFragments = async (
               pendingFragments: readonly AdmittedRequestFragment<TranslationRequestInput>[],
               activeRuntime: TranslationRuntime = selectedRuntime,
@@ -3690,10 +3790,14 @@ async function runLosslessBook(
                         buildFramedTranslationInput,
                         fragment.depth,
                       );
-                      completed.push(...await executeFragments(
+                      completed.push(...await chargeSecondaryFragments(
+                        "protocol_switch",
                         admittedFallback,
-                        runtimeSet.escalation,
-                        true,
+                        () => executeFragments(
+                          admittedFallback,
+                          runtimeSet.escalation,
+                          true,
+                        ),
                       ));
                       continue;
                     }
@@ -3743,16 +3847,23 @@ async function runLosslessBook(
                         selectedBuildInput,
                         fragment.depth + 1,
                       );
-                      completed.push(...await executeFragments(
+                      completed.push(...await chargeSecondaryFragments(
+                        "context_split",
                         admittedChildren,
-                        runtimeSet.escalation,
-                        true,
+                        () => executeFragments(
+                          admittedChildren,
+                          runtimeSet.escalation,
+                          true,
+                        ),
                       ));
                       continue;
                     }
                   }
                   completed.push({ fragment, result });
                 } catch (error) {
+                  if (error instanceof BookTokenEnvelopeExceededError) {
+                    throw error;
+                  }
                   if (error instanceof ModelProviderError
                     && error.kind === "protocol"
                     && fragment.input.responseProtocol === "typed_tool"
@@ -3778,10 +3889,14 @@ async function runLosslessBook(
                       buildFramedTranslationInput,
                       fragment.depth,
                     );
-                    completed.push(...await executeFragments(
+                    completed.push(...await chargeSecondaryFragments(
+                      "protocol_switch",
                       admittedFallback,
-                      activeRuntime,
-                      false,
+                      () => executeFragments(
+                        admittedFallback,
+                        activeRuntime,
+                        false,
+                      ),
                     ));
                     continue;
                   }
@@ -3821,10 +3936,14 @@ async function runLosslessBook(
                     selectedBuildInput,
                     fragment.depth + 1,
                   );
-                  completed.push(...await executeFragments(
+                  completed.push(...await chargeSecondaryFragments(
+                    "context_split",
                     admittedChildren,
-                    activeRuntime,
-                    true,
+                    () => executeFragments(
+                      admittedChildren,
+                      activeRuntime,
+                      true,
+                    ),
                   ));
                 }
               }
