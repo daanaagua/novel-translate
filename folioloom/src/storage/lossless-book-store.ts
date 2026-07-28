@@ -12,6 +12,12 @@ import { DatabaseSync, type StatementSync } from "node:sqlite";
 
 import type { CommitPromotion } from "../fullbook/commit-coordinator.js";
 import type { AdaptiveSchedulerSnapshot } from "../fullbook/adaptive-scheduler.js";
+import type { SchedulerRunReport } from "../fullbook/dynamic-scheduler.js";
+import {
+  TokenLedger,
+  type LedgerEvent,
+  type TokenLedgerInit,
+} from "../fullbook/token-ledger.js";
 import type { BookWindowPlan, BookWindowStatus } from "../fullbook/types.js";
 import {
   classifyImport,
@@ -5491,6 +5497,83 @@ export class LosslessBookStore {
     });
   }
 
+  appendTokenLedgerEvent(runId: string, event: LedgerEvent): void {
+    this.#run(runId);
+    validateLedgerEvent(event);
+    this.#transaction(() => {
+      this.#appendEvent(runId, ledgerEventKind(event.type), {
+        event,
+        ts: new Date().toISOString(),
+      });
+    });
+  }
+
+  loadTokenLedgerEvents(runId: string): LedgerEvent[] {
+    this.#run(runId);
+    const rows = this.#database.prepare(`
+      SELECT kind, payload_json FROM events
+      WHERE run_id=? AND kind IN (
+        'token_ledger_baseline_added',
+        'token_ledger_reserved',
+        'token_ledger_settled',
+        'token_ledger_released',
+        'token_ledger_counters_patched'
+      )
+      ORDER BY sequence ASC
+    `).all(runId) as Array<{ kind: string; payload_json: string }>;
+    return rows.map((row) => parseLedgerEventPayload(row.kind, row.payload_json));
+  }
+
+  loadTokenLedger(runId: string, init: TokenLedgerInit): TokenLedger {
+    return TokenLedger.fromEvents(init, this.loadTokenLedgerEvents(runId));
+  }
+
+  saveSchedulerRunProjection(runId: string, report: SchedulerRunReport): void {
+    this.#run(runId);
+    validateSchedulerRunReport(report);
+    this.#transaction(() => {
+      this.#appendEvent(runId, "scheduler_run_projection", {
+        report,
+        ts: new Date().toISOString(),
+      });
+    });
+  }
+
+  loadSchedulerMetrics(
+    runId: string,
+    init?: TokenLedgerInit,
+  ): SchedulerRunReport | undefined {
+    this.#run(runId);
+    const projection = one<{ payload_json: string }>(this.#database.prepare(`
+      SELECT payload_json FROM events
+      WHERE run_id=? AND kind='scheduler_run_projection'
+      ORDER BY sequence DESC LIMIT 1
+    `), runId);
+    if (projection !== undefined) {
+      const payload = JSON.parse(projection.payload_json) as { report?: unknown };
+      if (
+        payload === null
+        || typeof payload !== "object"
+        || payload.report === undefined
+      ) {
+        throw new Error(`corrupt scheduler run projection for ${runId}`);
+      }
+      validateSchedulerRunReport(payload.report);
+      return structuredClone(payload.report) as SchedulerRunReport;
+    }
+
+    const events = this.loadTokenLedgerEvents(runId);
+    if (events.length === 0) {
+      return undefined;
+    }
+    if (init === undefined) {
+      throw new TypeError(
+        "loadSchedulerMetrics requires TokenLedgerInit when rebuilding from ledger events",
+      );
+    }
+    return TokenLedger.fromEvents(init, events).toSchedulerRunReport();
+  }
+
   #initializeSchema(): void {
     this.#database.exec("BEGIN IMMEDIATE");
     try {
@@ -8165,6 +8248,115 @@ export class LosslessBookStore {
     } catch (error) {
       this.#database.exec("ROLLBACK");
       throw error;
+    }
+  }
+}
+
+const LEDGER_EVENT_KINDS = {
+  baseline_added: "token_ledger_baseline_added",
+  reserved: "token_ledger_reserved",
+  settled: "token_ledger_settled",
+  released: "token_ledger_released",
+  counters_patched: "token_ledger_counters_patched",
+} as const;
+
+function ledgerEventKind(type: LedgerEvent["type"]): string {
+  const kind = LEDGER_EVENT_KINDS[type];
+  if (kind === undefined) {
+    throw new TypeError(`unknown ledger event type: ${String(type)}`);
+  }
+  return kind;
+}
+
+function validateLedgerEvent(event: LedgerEvent): void {
+  if (event === null || typeof event !== "object" || !("type" in event)) {
+    throw new TypeError("ledger event must be an object with type");
+  }
+  // Round-trip through TokenLedger validates numeric and sequence rules for
+  // standalone checks; store only needs structural presence for append.
+  switch (event.type) {
+    case "baseline_added":
+      if (!Array.isArray(event.taskIds) || event.taskIds.length === 0) {
+        throw new TypeError("baseline_added.taskIds must be non-empty");
+      }
+      if (!Number.isSafeInteger(event.baselineTokens) || event.baselineTokens < 0) {
+        throw new TypeError("baseline_added.baselineTokens invalid");
+      }
+      return;
+    case "reserved":
+      if (typeof event.requestId !== "string" || event.requestId.trim() === "") {
+        throw new TypeError("reserved.requestId invalid");
+      }
+      if (!Number.isSafeInteger(event.predictedTokens) || event.predictedTokens < 0) {
+        throw new TypeError("reserved.predictedTokens invalid");
+      }
+      return;
+    case "settled":
+      if (typeof event.requestId !== "string" || event.requestId.trim() === "") {
+        throw new TypeError("settled.requestId invalid");
+      }
+      if (!Number.isSafeInteger(event.actualTokens) || event.actualTokens < 0) {
+        throw new TypeError("settled.actualTokens invalid");
+      }
+      return;
+    case "released":
+      if (typeof event.requestId !== "string" || event.requestId.trim() === "") {
+        throw new TypeError("released.requestId invalid");
+      }
+      return;
+    case "counters_patched":
+      if (event.patch === null || typeof event.patch !== "object") {
+        throw new TypeError("counters_patched.patch invalid");
+      }
+      return;
+    default: {
+      const _exhaustive: never = event;
+      throw new TypeError(`unknown ledger event: ${JSON.stringify(_exhaustive)}`);
+    }
+  }
+}
+
+function parseLedgerEventPayload(kind: string, payloadJson: string): LedgerEvent {
+  const payload = JSON.parse(payloadJson) as { event?: unknown };
+  if (payload === null || typeof payload !== "object" || payload.event === undefined) {
+    throw new Error(`corrupt token ledger event payload for kind ${kind}`);
+  }
+  const event = payload.event as LedgerEvent;
+  validateLedgerEvent(event);
+  const expected = LEDGER_EVENT_KINDS[event.type];
+  if (expected !== kind) {
+    throw new Error(
+      `token ledger event kind mismatch: row ${kind} payload ${event.type}`,
+    );
+  }
+  return event;
+}
+
+function validateSchedulerRunReport(report: unknown): asserts report is SchedulerRunReport {
+  if (report === null || typeof report !== "object") {
+    throw new TypeError("scheduler run report must be an object");
+  }
+  const value = report as Record<string, unknown>;
+  for (const key of [
+    "mode",
+    "profile",
+    "planningStatus",
+    "decisions",
+    "fallbacks",
+    "baselineWallTimeMs",
+    "predictedWallTimeMs",
+    "actualWallTimeMs",
+    "baselineTokens",
+    "allowedTokens",
+    "predictedTokens",
+    "actualTokens",
+    "tokenUsageComplete",
+    "plannerDeadlines",
+    "throttles",
+    "recoveries",
+  ] as const) {
+    if (!(key in value)) {
+      throw new TypeError(`scheduler run report missing ${key}`);
     }
   }
 }
