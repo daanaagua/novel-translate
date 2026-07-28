@@ -5,7 +5,7 @@
 - 规格：`docs/superpowers/specs/2026-07-28-token-ledger-and-scheduler-control-plane-design.md`
 - 计划：`docs/superpowers/plans/2026-07-28-token-ledger-and-scheduler-control-plane.md`
 - 真实验收报告：`docs/superpowers/reports/2026-07-28-kafka-german-100k-token-ledger-live-validation.md`
-- 状态：**P0 + 德语 100k active/balanced 真实验收通过**。P1–P3 未做。
+- 状态：**P0 + P1/P2 核心 + 德语 100k 真实验收通过**。P3 与 ExecutionWorker 整段抽出未做。
 
 ## 已完成
 
@@ -29,10 +29,16 @@
 
 ## 仍未完成
 
-1. **P1**：拆 AdmissionController / ExecutionWorker / TelemetrySink；AIMD in-flight 读 ledger.reserved；
-2. **P2**：active 下 AIMD 降为拥塞传感；
-3. **P3**：Python/TS 边界文档冻结；
-4. anchor 路径补齐真实供应商 usage（当前 `tokenUsageComplete` 可能为 false）。
+1. **P1 残余**：ExecutionWorker 尚未从 book-runner 整段抽出（Admission/Telemetry/Congestion 已落地）；
+2. **P3**：Python/TS 边界文档冻结；
+3. anchor 路径补齐真实供应商 usage（当前 `tokenUsageComplete` 可能为 false）。
+
+## P1/P2 本轮新增
+
+- `admission-controller.ts`：唯一发车/结算入口
+- `congestion-sensor.ts`：AIMD 拥塞传感
+- `telemetry-sink.ts`：成本模型与 profile 观察
+- active 模式 `tokenGate: "external"`：并发仍由 AIMD，token 硬门只信 ledger
 
 ## 不变量
 

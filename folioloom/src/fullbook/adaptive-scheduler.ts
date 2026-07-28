@@ -94,13 +94,22 @@ export class AdaptiveScheduler {
     );
   }
 
-  tryAcquire(estimatedTokens: number): SchedulerPermit | undefined {
+  tryAcquire(
+    estimatedTokens: number,
+    options: { readonly tokenGate?: "internal" | "external" } = {},
+  ): SchedulerPermit | undefined {
     const tokens = positiveInteger(estimatedTokens, "estimatedTokens");
-    if (this.#permits.size >= this.#concurrency
-      || this.#inFlightTokens + tokens > this.#maxInFlightTokens) {
+    const tokenGate = options.tokenGate ?? "internal";
+    if (this.#permits.size >= this.#concurrency) {
+      return undefined;
+    }
+    if (tokenGate === "internal"
+      && this.#inFlightTokens + tokens > this.#maxInFlightTokens) {
       return undefined;
     }
     const id = Symbol("scheduler-permit");
+    // External token gate: still track estimated tokens for snapshots, but do
+    // not refuse the slot — durable envelope lives on TokenLedger.
     this.#permits.set(id, tokens);
     this.#inFlightTokens += tokens;
     let released = false;

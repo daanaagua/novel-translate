@@ -105,7 +105,13 @@ import {
   AdaptiveScheduler,
   type SchedulerObservationStatus,
 } from "./adaptive-scheduler.js";
+import {
+  AdmissionController,
+  BookTokenEnvelopeExceededError,
+} from "./admission-controller.js";
+import { CongestionSensor } from "./congestion-sensor.js";
 import { CommitCoordinator } from "./commit-coordinator.js";
+import { TelemetrySink } from "./telemetry-sink.js";
 import {
   planContextProfiles,
   type ContextProfile,
@@ -441,24 +447,7 @@ export class BookRequestCapacityError extends Error {
   }
 }
 
-export class BookTokenEnvelopeExceededError extends Error {
-  readonly code = "TOKEN_ENVELOPE_EXHAUSTED" as const;
-  readonly retryable = false;
-
-  constructor(
-    readonly actualTokens: number,
-    readonly runningReservedTokens: number,
-    readonly minimumPendingTokens: number,
-    readonly allowedTokens: number,
-  ) {
-    super(
-      `TOKEN_ENVELOPE_EXHAUSTED: actual ${actualTokens} + running `
-      + `${runningReservedTokens} + minimum pending ${minimumPendingTokens} `
-      + `exceeds allowed ${allowedTokens}`,
-    );
-    this.name = "BookTokenEnvelopeExceededError";
-  }
-}
+export { BookTokenEnvelopeExceededError };
 
 class RevalidationOutputError extends Error {
   readonly code = "REVALIDATION_OUTPUT_INVALID" as const;
@@ -2342,9 +2331,11 @@ async function runWithDynamicScheduler<T>(
       value: T,
       execution: PlannedTranslationExecution,
     ) => void;
+    readonly tokenGate?: "internal" | "external";
     readonly signal?: AbortSignal;
   },
 ): Promise<T[]> {
+  const tokenGate = options.tokenGate ?? "internal";
   const taskOrder = planning.input.graph.tasks.map((task) => task.taskId);
   const pending = new Set(taskOrder);
   const completedTaskIds = new Set<string>();
@@ -2396,6 +2387,8 @@ async function runWithDynamicScheduler<T>(
           }] as const;
         }),
       );
+      // Congestion sensor owns recommended concurrency; token envelope is
+      // external (ledger) when tokenGate is external.
       const adaptiveConcurrency = scheduler.snapshot().concurrency;
       const report = dynamicScheduler.dispatch(
         {
@@ -2444,6 +2437,7 @@ async function runWithDynamicScheduler<T>(
         }
         const permit = scheduler.tryAcquire(
           execution.admitted.assessment.totalReserved,
+          { tokenGate },
         );
         if (permit === undefined) continue;
 
@@ -2822,6 +2816,18 @@ async function runLosslessBook(
       schedulerMetrics.actualTokens = state.spentTokens;
       schedulerMetrics.tokenUsageComplete = state.tokenUsageComplete;
     };
+    const admission = new AdmissionController({
+      ledger: tokenLedger,
+      mode: schedulerMode,
+      persist: persistLedgerEvent,
+    });
+    const congestion = new CongestionSensor(scheduler);
+    const telemetrySink = new TelemetrySink({
+      costModel: runtimeCostModel,
+      ...(options.runtimeProfileStore === undefined
+        ? {}
+        : { profileStore: options.runtimeProfileStore }),
+    });
     flushSchedulerProjection = (): void => {
       tokenLedger.apply({
         type: "counters_patched",
@@ -3100,34 +3106,25 @@ async function runLosslessBook(
       if (drainedRevalidation.modelCalls > 0) {
         const requestId = `revalidation:${runId}:wave${waves.length}:claimed${drainedRevalidation.claimed}`;
         const predictedTokens = Math.max(1, drainedRevalidation.totalTokens);
-        if (!tokenLedger.state().baselinedTaskIds.has(requestId)) {
-          persistLedgerEvent({
-            type: "baseline_added",
-            taskIds: [requestId],
-            baselineTokens: predictedTokens,
-            source: "revalidate",
-            reason: "wave_drain",
-          });
-        }
-        if (!tokenLedger.state().openReservations.has(requestId)) {
-          persistLedgerEvent({
-            type: "reserved",
-            requestId,
-            purpose: "revalidate",
-            taskIds: [requestId],
-            predictedTokens,
-            attempt: 0,
-          });
-        }
-        if (tokenLedger.state().openReservations.has(requestId)) {
-          persistLedgerEvent({
-            type: "settled",
-            requestId,
-            actualTokens: drainedRevalidation.totalTokens,
-            usageComplete: drainedRevalidation.tokenUsageComplete,
-            outcome: "success",
-          });
-        }
+        admission.addBaseline({
+          taskIds: [requestId],
+          baselineTokens: predictedTokens,
+          source: "revalidate",
+          reason: "wave_drain",
+        });
+        admission.reserve({
+          requestId,
+          purpose: "revalidate",
+          taskIds: [requestId],
+          predictedTokens,
+          attempt: 0,
+        });
+        admission.settle({
+          requestId,
+          actualTokens: drainedRevalidation.totalTokens,
+          usageComplete: drainedRevalidation.tokenUsageComplete,
+          outcome: "success",
+        });
         flushSchedulerProjection();
       }
       const allWindows = store.allWindows(runId);
@@ -3282,36 +3279,19 @@ async function runLosslessBook(
             256,
             anchorCandidates.length * 120,
           );
-          if (!tokenLedger.state().baselinedTaskIds.has(anchorRequestId)) {
-            persistLedgerEvent({
-              type: "baseline_added",
-              taskIds: [anchorRequestId],
-              baselineTokens: anchorPredictedTokens,
-              source: "anchor",
-              reason: "wave_anchor",
-            });
-          }
-          if (
-            schedulerMode === "active"
-            && !tokenLedger.canReserve(anchorPredictedTokens, 0)
-          ) {
-            throw new BookTokenEnvelopeExceededError(
-              schedulerMetrics.actualTokens,
-              tokenLedger.state().reservedTokens,
-              anchorPredictedTokens,
-              schedulerMetrics.allowedTokens,
-            );
-          }
-          if (!tokenLedger.state().openReservations.has(anchorRequestId)) {
-            persistLedgerEvent({
-              type: "reserved",
-              requestId: anchorRequestId,
-              purpose: "anchor",
-              taskIds: [anchorRequestId],
-              predictedTokens: anchorPredictedTokens,
-              attempt: 0,
-            });
-          }
+          admission.addBaseline({
+            taskIds: [anchorRequestId],
+            baselineTokens: anchorPredictedTokens,
+            source: "anchor",
+            reason: "wave_anchor",
+          });
+          admission.reserve({
+            requestId: anchorRequestId,
+            purpose: "anchor",
+            taskIds: [anchorRequestId],
+            predictedTokens: anchorPredictedTokens,
+            attempt: 0,
+          });
           let outcome: Pick<LexicalAnchorOutcome, "anchors" | "entityLinks" | "terms">
             | undefined;
           try {
@@ -3352,18 +3332,15 @@ async function runLosslessBook(
               }
             }
           } finally {
-            if (tokenLedger.state().openReservations.has(anchorRequestId)) {
-              const modelCalls = anchorBudget.snapshot().modelCalls ?? 0;
-              persistLedgerEvent({
-                type: "settled",
-                requestId: anchorRequestId,
-                actualTokens: modelCalls > 0
-                  ? anchorPredictedTokens * modelCalls
-                  : anchorPredictedTokens,
-                usageComplete: false,
-                outcome: outcome === undefined ? "failed" : "success",
-              });
-            }
+            const modelCalls = anchorBudget.snapshot().modelCalls ?? 0;
+            admission.settle({
+              requestId: anchorRequestId,
+              actualTokens: modelCalls > 0
+                ? anchorPredictedTokens * modelCalls
+                : anchorPredictedTokens,
+              usageComplete: false,
+              outcome: outcome === undefined ? "failed" : "success",
+            });
           }
           if (outcome === undefined) {
             throw new Error("lexical anchor produced no outcome");
@@ -3513,17 +3490,13 @@ async function runLosslessBook(
         });
         if (retryRound === 0) {
           const baselineTaskIds = requestInputs
-            .map((item) => item.request.requestId)
-            .filter((taskId) => !tokenLedger.state().baselinedTaskIds.has(taskId));
-          if (baselineTaskIds.length > 0 && requestPlanning.baselineTokens > 0) {
-            persistLedgerEvent({
-              type: "baseline_added",
-              taskIds: baselineTaskIds,
-              baselineTokens: requestPlanning.baselineTokens,
-              source: "translate_horizon",
-              reason: `wave_${waves.length}_round0`,
-            });
-          }
+            .map((item) => item.request.requestId);
+          admission.addBaseline({
+            taskIds: baselineTaskIds,
+            baselineTokens: requestPlanning.baselineTokens,
+            source: "translate_horizon",
+            reason: `wave_${waves.length}_round0`,
+          });
           cumulativeBaselineTokens = schedulerMetrics.baselineTokens;
           schedulerMetrics.baselineWallTimeMs +=
             requestPlanning.baselineWallTimeMs;
@@ -3663,41 +3636,19 @@ async function runLosslessBook(
                   0,
                 ),
               );
-              if (
-                schedulerMode === "active"
-                && !tokenLedger.canReserve(predictedTokens, 0)
-              ) {
-                throw new BookTokenEnvelopeExceededError(
-                  schedulerMetrics.actualTokens,
-                  tokenLedger.state().reservedTokens,
-                  predictedTokens,
-                  schedulerMetrics.allowedTokens,
-                );
-              }
-              // Hold secondary headroom while the recovery call runs; actual
-              // usage is settled on the parent request to avoid double-count.
               const secondaryId = `${request.requestId}:${purpose}:${secondaryChargeOrdinal}`;
               secondaryChargeOrdinal += 1;
-              if (!tokenLedger.state().openReservations.has(secondaryId)) {
-                persistLedgerEvent({
-                  type: "reserved",
-                  requestId: secondaryId,
-                  purpose,
-                  taskIds: [request.requestId],
-                  predictedTokens,
-                  attempt: retryRound,
-                });
-              }
+              const hold = admission.holdSecondary({
+                requestId: secondaryId,
+                purpose,
+                taskIds: [request.requestId],
+                predictedTokens,
+                attempt: retryRound,
+              });
               try {
                 return await run();
               } finally {
-                if (tokenLedger.state().openReservations.has(secondaryId)) {
-                  persistLedgerEvent({
-                    type: "released",
-                    requestId: secondaryId,
-                    reason: "superseded",
-                  });
-                }
+                hold.release();
               }
             };
             const executeFragments = async (
@@ -4047,8 +3998,7 @@ async function runLosslessBook(
                 telemetry.usage.totalTokens,
                 telemetry.variant.predicted.totalTokens,
               );
-            persistLedgerEvent({
-              type: "settled",
+            admission.settle({
               requestId,
               actualTokens,
               usageComplete: telemetry.usage.complete,
@@ -4085,14 +4035,14 @@ async function runLosslessBook(
               ...telemetry.features,
               protocolRank: observation.protocol === "typed_tool" ? 1 : 0,
             };
-            runtimeCostModel.observe({
+            telemetrySink.observeRuntime({
               features,
               durationMs: observation.durationMs,
               usage: observation.usage,
               status: observation.status,
               observedAt,
             });
-            options.runtimeProfileStore?.appendObservation({
+            telemetrySink.appendProfileObservation({
               observationId: `observation-${createHash("sha256")
                 .update([
                   runId,
@@ -4153,38 +4103,21 @@ async function runLosslessBook(
         const canLaunchExecution = (
           execution: PlannedTranslationExecution,
         ): boolean => {
-          if (schedulerMode !== "active") return true;
           const requestId = execution.admitted.request.requestId;
           if (tokenLedger.state().openReservations.has(requestId)) {
             return true;
           }
-          return tokenLedger.canReserve(predictedForExecution(execution), 0);
+          return admission.canLaunch(predictedForExecution(execution));
         };
         const admitExecution = (
           execution: PlannedTranslationExecution,
         ): void => {
           const requestId = execution.admitted.request.requestId;
-          if (tokenLedger.state().openReservations.has(requestId)) {
-            return;
-          }
-          const predictedTokens = predictedForExecution(execution);
-          if (
-            schedulerMode === "active"
-            && !tokenLedger.canReserve(predictedTokens, 0)
-          ) {
-            throw new BookTokenEnvelopeExceededError(
-              schedulerMetrics.actualTokens,
-              tokenLedger.state().reservedTokens,
-              predictedTokens,
-              schedulerMetrics.allowedTokens,
-            );
-          }
-          persistLedgerEvent({
-            type: "reserved",
+          admission.reserve({
             requestId,
             purpose: "translate",
             taskIds: [requestId],
-            predictedTokens,
+            predictedTokens: predictedForExecution(execution),
             attempt: retryRound,
           });
           recordSelectedVariant(execution);
@@ -4204,6 +4137,7 @@ async function runLosslessBook(
                 canLaunch: canLaunchExecution,
                 onLaunch: admitExecution,
                 onComplete: observeCompletedRequest,
+                tokenGate: "external",
                 ...(options.signal === undefined
                   ? {}
                   : { signal: options.signal }),
