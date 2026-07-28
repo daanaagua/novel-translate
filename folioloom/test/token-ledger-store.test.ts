@@ -1,11 +1,13 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { mkdtempSync } from "node:fs";
+import { mkdtempSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 
 import type { BookWindowPlan } from "../src/fullbook/types.js";
+import { createKnowledgeSnapshot } from "../src/knowledge/snapshot.js";
+import { writeLosslessBookArtifacts } from "../src/report.js";
 import { blockId } from "../src/source/block-builder.js";
 import type { LosslessBlock } from "../src/source/types.js";
 import {
@@ -91,26 +93,30 @@ function windows(): BookWindowPlan[] {
   }];
 }
 
-function runMeta(): TranslationRunMeta {
-  return {
-    runId: "run-ledger",
-    sourceVersion: "source-v1",
-    protocolVersion: "lossless-v5-1",
-    modelId: "model-a",
-    initialSnapshotId: "snapshot-a",
-    metadata: { fixture: "ledger" },
-  };
-}
-
-function openRunStore(): { store: LosslessBookStore; runId: string; path: string } {
+function openRunStore(): {
+  store: LosslessBookStore;
+  runId: string;
+  path: string;
+  snapshotId: string;
+} {
   const path = fixturePath();
   const store = new LosslessBookStore(path);
   store.registerSource(sourceInput());
   store.replaceDerivedPlan("source-v1", { blocks: blocks(), annotations: [] });
-  const meta = runMeta();
-  const runId = store.createTranslationRun(meta);
+  const runId = "run-ledger";
+  const initialSnapshot = createKnowledgeSnapshot(runId, []);
+  const meta: TranslationRunMeta = {
+    runId,
+    sourceVersion: "source-v1",
+    protocolVersion: "lossless-v5-1",
+    modelId: "model-a",
+    initialSnapshotId: initialSnapshot.id,
+    initialSnapshot,
+    metadata: { fixture: "ledger" },
+  };
+  store.createTranslationRun(meta);
   store.initializeWindowPlan(runId, windows());
-  return { store, runId, path };
+  return { store, runId, path, snapshotId: initialSnapshot.id };
 }
 
 const LEDGER_INIT = {
@@ -257,6 +263,82 @@ test("loadSchedulerMetrics rebuilds from ledger when projection missing", () => 
     assert.equal(loaded.baselineTokens, 800);
     assert.equal(loaded.actualTokens, 130);
     assert.equal(loaded.allowedTokens, 880);
+  } finally {
+    store.close();
+  }
+});
+
+test("export loads scheduler metrics from store without options.scheduler", () => {
+  const { store, runId, snapshotId } = openRunStore();
+  try {
+    const [window] = windows();
+    const [first, second] = blocks();
+    assert.ok(window && first && second);
+    store.bindWindowsToSnapshot(runId, [window.windowId], snapshotId);
+    store.claimWindow(runId, window.windowId);
+    store.stageWindow({
+      runId,
+      windowId: window.windowId,
+      snapshotId,
+      status: "completed",
+      translations: [
+        { blockId: first.id, sourceHash: first.sourceHash, text: "阿尔法。" },
+        { blockId: second.id, sourceHash: second.sourceHash, text: "贝塔。" },
+      ],
+      knowledgeCandidates: [],
+      styleTail: "阿尔法。贝塔。",
+      budget: { modelCalls: 1 },
+      warnings: [],
+    });
+    store.promoteStagedWindow(runId, window.windowId);
+
+    store.appendTokenLedgerEvent(runId, {
+      type: "baseline_added",
+      taskIds: ["task-export"],
+      baselineTokens: 2000,
+      source: "translate_horizon",
+      reason: "wave",
+    });
+    store.appendTokenLedgerEvent(runId, {
+      type: "reserved",
+      requestId: "req-export",
+      purpose: "translate",
+      taskIds: ["task-export"],
+      predictedTokens: 300,
+      attempt: 0,
+    });
+    store.appendTokenLedgerEvent(runId, {
+      type: "settled",
+      requestId: "req-export",
+      actualTokens: 350,
+      usageComplete: true,
+      outcome: "success",
+    });
+    const report = store.loadTokenLedger(runId, LEDGER_INIT).toSchedulerRunReport();
+    store.saveSchedulerRunProjection(runId, {
+      ...report,
+      decisions: 4,
+      planningStatus: "optimal",
+      predictedTokens: 300,
+    });
+
+    const output = mkdtempSync(join(tmpdir(), "folioloom-export-scheduler-"));
+    const paths = writeLosslessBookArtifacts(store, runId, output);
+    const metrics = JSON.parse(readFileSync(paths.metrics, "utf8")) as {
+      scheduler: null | {
+        tokenEnvelope: {
+          baselineTokens: number;
+          actualTokens: number;
+          allowedTokens: number;
+        };
+        decisions: number;
+      };
+    };
+    assert.notEqual(metrics.scheduler, null);
+    assert.equal(metrics.scheduler?.tokenEnvelope.baselineTokens, 2000);
+    assert.equal(metrics.scheduler?.tokenEnvelope.actualTokens, 350);
+    assert.equal(metrics.scheduler?.tokenEnvelope.allowedTokens, 2200);
+    assert.equal(metrics.scheduler?.decisions, 4);
   } finally {
     store.close();
   }

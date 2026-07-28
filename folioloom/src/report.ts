@@ -774,6 +774,8 @@ export function writeLosslessBookArtifacts(
   }), "utf8");
   writeFileSync(paths.bilingual, renderBilingual(translations), "utf8");
   writeFileSync(paths.audit, `${JSON.stringify(audit, null, 2)}\n`, "utf8");
+  const schedulerReport = options.scheduler
+    ?? store.loadSchedulerMetrics(runId);
   writeFileSync(paths.metrics, `${JSON.stringify({
     schema: "v5-book-metrics-1",
     runId: audit.runId,
@@ -789,7 +791,7 @@ export function writeLosslessBookArtifacts(
     missingBlockIds: audit.missingBlockIds,
     missingBlockCount: audit.missingBlockCount,
     status: store.statusSummary(runId),
-    scheduler: schedulerMetricsProjection(options.scheduler),
+    scheduler: schedulerMetricsProjection(schedulerReport),
   }, null, 2)}\n`, "utf8");
   const lineageJson = `${JSON.stringify(losslessBookLineage(store, runId), null, 2)}\n`;
   writeFileSync(paths.translationLineage, lineageJson, "utf8");
