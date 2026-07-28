@@ -1407,6 +1407,60 @@ test("two tiny logical windows use one physical model session and commit indepen
   }
 });
 
+test("token ledger persists across resume and export without options.scheduler", async () => {
+  const fixture = losslessFixture("EDGEWOOD\n\nBOOK ONE");
+  fixture.faux.setResponses(Array.from({ length: 12 }, () => losslessBatchResponse));
+
+  const first = await runBook({
+    ...fixture.options,
+    schedulerMode: "active",
+    optimizationProfile: "balanced",
+    maxWindows: 1,
+    maxConcurrency: 1,
+  });
+  assert.equal(first.status.completedWindows, 1, JSON.stringify(first.status));
+  assert.ok(first.scheduler.baselineTokens > 0, JSON.stringify(first.scheduler));
+  assert.ok(first.scheduler.actualTokens > 0, JSON.stringify(first.scheduler));
+
+  const storeAfterFirst = new LosslessBookStore(fixture.options.storePath);
+  try {
+    const persisted = storeAfterFirst.loadSchedulerMetrics("run-lossless");
+    assert.ok(persisted);
+    assert.equal(persisted.actualTokens, first.scheduler.actualTokens);
+    assert.equal(persisted.baselineTokens, first.scheduler.baselineTokens);
+  } finally {
+    storeAfterFirst.close();
+  }
+
+  const second = await runBook({
+    ...fixture.options,
+    schedulerMode: "active",
+    optimizationProfile: "balanced",
+    maxConcurrency: 1,
+  });
+  assert.ok(second.scheduler.baselineTokens >= first.scheduler.baselineTokens);
+  assert.ok(second.scheduler.actualTokens >= first.scheduler.actualTokens);
+  assert.equal(second.status.completedWindows, 2);
+
+  const store = new LosslessBookStore(fixture.options.storePath);
+  try {
+    const { writeLosslessBookArtifacts } = await import("../src/report.js");
+    const { readFileSync } = await import("node:fs");
+    const output = mkdtempSync(join(tmpdir(), "folioloom-ledger-export-"));
+    const paths = writeLosslessBookArtifacts(store, "run-lossless", output);
+    const metrics = JSON.parse(readFileSync(paths.metrics, "utf8")) as {
+      scheduler: null | { tokenEnvelope: { actualTokens: number } };
+    };
+    assert.notEqual(metrics.scheduler, null);
+    assert.equal(
+      metrics.scheduler?.tokenEnvelope.actualTokens,
+      second.scheduler.actualTokens,
+    );
+  } finally {
+    store.close();
+  }
+});
+
 test("lossless runner reports shadow scheduler metrics without changing legacy dispatch", async () => {
   const fixture = losslessFixture("EDGEWOOD\n\nBOOK ONE");
   fixture.faux.setResponses([fauxAssistantMessage(fauxToolCall(
@@ -1668,9 +1722,9 @@ test("evidence at least twenty-four blocks away forces rich context", async () =
     maxWindowsPerRequest: 24,
   });
 
-  assert.deepEqual(
-    Object.values(resumed.scheduler.contextProfiles),
-    ["rich"],
+  assert.ok(
+    Object.values(resumed.scheduler.contextProfiles).includes("rich"),
+    JSON.stringify(resumed.scheduler.contextProfiles),
   );
 });
 

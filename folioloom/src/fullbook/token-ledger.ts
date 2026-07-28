@@ -155,7 +155,7 @@ export class TokenLedger {
   #recoveries = 0;
   #plannerDeadlines = 0;
   #throttles = 0;
-  #planningStatus: SchedulerPlanningStatus = "optimal";
+  #planningStatus: SchedulerPlanningStatus;
   #predictedTokens = 0;
   #predictedWallTimeMs = 0;
   #actualWallTimeMs = 0;
@@ -175,6 +175,11 @@ export class TokenLedger {
       throw new TypeError("tokenIncreaseCap must be a finite non-negative number");
     }
     this.#tokenIncreaseCap = init.tokenIncreaseCap;
+    this.#planningStatus = init.mode === "off"
+      ? "disabled"
+      : init.mode === "shadow"
+        ? "shadow"
+        : "optimal";
   }
 
   static create(init: TokenLedgerInit): TokenLedger {

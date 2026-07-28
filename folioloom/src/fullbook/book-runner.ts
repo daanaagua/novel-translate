@@ -128,6 +128,10 @@ import {
   type SchedulerMode,
 } from "./optimization-policy.js";
 import {
+  TokenLedger,
+  type LedgerEvent,
+} from "./token-ledger.js";
+import {
   planRollingHorizon,
   type PlannedTaskDispatch,
   type RunningTaskReservation,
@@ -2332,6 +2336,7 @@ async function runWithDynamicScheduler<T>(
       readonly createdAt: string;
     };
     readonly onDecision: (report: SchedulerDispatchReport) => void;
+    readonly canLaunch?: (execution: PlannedTranslationExecution) => boolean;
     readonly onLaunch: (execution: PlannedTranslationExecution) => void;
     readonly onComplete: (
       value: T,
@@ -2346,6 +2351,7 @@ async function runWithDynamicScheduler<T>(
   const running = new Map<string, RunningTranslation<T>>();
   const completed: T[] = [];
 
+  try {
   while (pending.size > 0 || running.size > 0) {
     throwIfAborted(options.signal);
     if (pending.size > 0) {
@@ -2433,13 +2439,22 @@ async function runWithDynamicScheduler<T>(
             `scheduler selected unknown translation variant ${dispatch.variantId}`,
           );
         }
+        if (options.canLaunch !== undefined && !options.canLaunch(execution)) {
+          continue;
+        }
         const permit = scheduler.tryAcquire(
           execution.admitted.assessment.totalReserved,
         );
         if (permit === undefined) continue;
 
         pending.delete(dispatch.taskId);
-        options.onLaunch(execution);
+        try {
+          options.onLaunch(execution);
+        } catch (error) {
+          permit.release();
+          pending.add(dispatch.taskId);
+          throw error;
+        }
         const startedAt = performance.now();
         let promise: Promise<void>;
         promise = (async () => {
@@ -2468,27 +2483,36 @@ async function runWithDynamicScheduler<T>(
         await Promise.race([...running.values()].map((item) => item.promise));
         continue;
       }
-      if (running.size === 0
-        && report.planningStatus === "fallback"
-        && report.dispatchedTaskIds.length === 0) {
+      if (running.size === 0 && pending.size > 0) {
         const firstPendingTaskId = taskOrder.find((taskId) =>
           pending.has(taskId));
-        const minimumPendingTokens = firstPendingTaskId === undefined
-          ? Number.POSITIVE_INFINITY
+        const firstPendingExecution = firstPendingTaskId === undefined
+          ? undefined
           : planning.legacyByTaskId.get(firstPendingTaskId)
-            ?.variant.predicted.totalTokens ?? Number.POSITIVE_INFINITY;
+            ?? [...planning.executionsByVariantId.values()].find(
+              (item) => item.admitted.request.requestId === firstPendingTaskId,
+            );
+        const minimumPendingTokens = firstPendingExecution === undefined
+          ? Number.POSITIVE_INFINITY
+          : firstPendingExecution.variant.predicted.totalTokens;
         const actualTokens = options.actualRunTokens();
         const allowedTokens = Math.floor(
           planning.input.runBaselineTotalTokens
             * (1 + planning.input.policy.tokenIncreaseCap),
         );
-        if (Number.isFinite(minimumPendingTokens)
-          && actualTokens + runningReservedTokens + minimumPendingTokens
-            > allowedTokens) {
+        const blockedByEnvelope = firstPendingExecution !== undefined
+          && options.canLaunch !== undefined
+          && !options.canLaunch(firstPendingExecution);
+        if (blockedByEnvelope
+          || (report.planningStatus === "fallback"
+            && report.dispatchedTaskIds.length === 0
+            && Number.isFinite(minimumPendingTokens)
+            && actualTokens + runningReservedTokens + minimumPendingTokens
+              > allowedTokens)) {
           throw new BookTokenEnvelopeExceededError(
             actualTokens,
             runningReservedTokens,
-            minimumPendingTokens,
+            Number.isFinite(minimumPendingTokens) ? minimumPendingTokens : 0,
             allowedTokens,
           );
         }
@@ -2506,6 +2530,13 @@ async function runWithDynamicScheduler<T>(
     await Promise.race([...running.values()].map((item) => item.promise));
   }
   return completed;
+  } finally {
+    if (running.size > 0) {
+      await Promise.allSettled(
+        [...running.values()].map((item) => item.promise),
+      );
+    }
+  }
 }
 
 async function runLosslessBook(
@@ -2644,6 +2675,7 @@ async function runLosslessBook(
     throttles: 0,
     recoveries: 0,
   };
+  let flushSchedulerProjection: (() => void) | undefined;
 
   try {
     store.registerSource(context.certifiedSource as NonNullable<typeof context.certifiedSource>);
@@ -2709,7 +2741,119 @@ async function runLosslessBook(
         ? {}
         : { profileStore: options.runtimeProfileStore }),
     });
-    let cumulativeBaselineTokens = 0;
+    const tokenLedgerInit = {
+      mode: schedulerMode,
+      profile: optimizationProfile,
+      tokenIncreaseCap: selectedOptimizationPolicy.tokenIncreaseCap,
+    };
+    const tokenLedger = store.loadTokenLedger(runId, tokenLedgerInit);
+    const priorSchedulerMetrics = store.loadSchedulerMetrics(
+      runId,
+      tokenLedgerInit,
+    );
+    for (const open of [...tokenLedger.state().openReservations.values()]) {
+      // Pause/abort leaves open reserves without a durable usage proof. Release
+      // them so resume does not double-charge; completed requests always settle
+      // before the run returns under normal paths.
+      const reconcileEvent: LedgerEvent = {
+        type: "released",
+        requestId: open.requestId,
+        reason: "superseded",
+      };
+      tokenLedger.apply(reconcileEvent);
+      store.appendTokenLedgerEvent(runId, reconcileEvent);
+    }
+    if (priorSchedulerMetrics !== undefined) {
+      tokenLedger.apply({
+        type: "counters_patched",
+        patch: {
+          decisions: priorSchedulerMetrics.decisions,
+          fallbacks: priorSchedulerMetrics.fallbacks,
+          recoveries: priorSchedulerMetrics.recoveries,
+          plannerDeadlines: priorSchedulerMetrics.plannerDeadlines,
+          throttles: priorSchedulerMetrics.throttles,
+          planningStatus: priorSchedulerMetrics.planningStatus,
+          predictedTokens: priorSchedulerMetrics.predictedTokens,
+          predictedWallTimeMs: Math.floor(priorSchedulerMetrics.predictedWallTimeMs),
+          actualWallTimeMs: Math.floor(priorSchedulerMetrics.actualWallTimeMs),
+          baselineWallTimeMs: Math.floor(priorSchedulerMetrics.baselineWallTimeMs),
+          contextProfiles: priorSchedulerMetrics.contextProfiles,
+          effortCounts: priorSchedulerMetrics.effortCounts,
+          protocolCounts: priorSchedulerMetrics.protocolCounts,
+        },
+      });
+    }
+    const hydrateSchedulerMetricsFromLedger = (): void => {
+      const report = tokenLedger.toSchedulerRunReport();
+      schedulerMetrics.mode = report.mode;
+      schedulerMetrics.profile = report.profile;
+      schedulerMetrics.planningStatus = report.planningStatus;
+      schedulerMetrics.decisions = report.decisions;
+      schedulerMetrics.fallbacks = report.fallbacks;
+      schedulerMetrics.baselineWallTimeMs = report.baselineWallTimeMs;
+      schedulerMetrics.predictedWallTimeMs = report.predictedWallTimeMs;
+      schedulerMetrics.actualWallTimeMs = report.actualWallTimeMs;
+      schedulerMetrics.baselineTokens = report.baselineTokens;
+      schedulerMetrics.allowedTokens = report.allowedTokens;
+      schedulerMetrics.predictedTokens = report.predictedTokens;
+      schedulerMetrics.actualTokens = report.actualTokens;
+      schedulerMetrics.tokenUsageComplete = report.tokenUsageComplete;
+      schedulerMetrics.contextProfiles = { ...report.contextProfiles };
+      schedulerMetrics.effortCounts = { ...report.effortCounts };
+      schedulerMetrics.protocolCounts = { ...report.protocolCounts };
+      schedulerMetrics.plannerDeadlines = report.plannerDeadlines;
+      schedulerMetrics.throttles = report.throttles;
+      schedulerMetrics.recoveries = report.recoveries;
+    };
+    hydrateSchedulerMetricsFromLedger();
+    const persistLedgerEvent = (event: LedgerEvent): void => {
+      tokenLedger.apply(event);
+      try {
+        store.appendTokenLedgerEvent(runId, event);
+      } catch (error) {
+        if (!(error instanceof Error)
+          || !/not open|closed/i.test(error.message)) {
+          throw error;
+        }
+      }
+      const state = tokenLedger.state();
+      schedulerMetrics.baselineTokens = state.baselineTokens;
+      schedulerMetrics.allowedTokens = state.allowedTokens;
+      schedulerMetrics.actualTokens = state.spentTokens;
+      schedulerMetrics.tokenUsageComplete = state.tokenUsageComplete;
+    };
+    flushSchedulerProjection = (): void => {
+      tokenLedger.apply({
+        type: "counters_patched",
+        patch: {
+          decisions: schedulerMetrics.decisions,
+          fallbacks: schedulerMetrics.fallbacks,
+          recoveries: schedulerMetrics.recoveries,
+          plannerDeadlines: schedulerMetrics.plannerDeadlines,
+          throttles: schedulerMetrics.throttles,
+          planningStatus: schedulerMetrics.planningStatus,
+          predictedTokens: schedulerMetrics.predictedTokens,
+          predictedWallTimeMs: Math.floor(schedulerMetrics.predictedWallTimeMs),
+          actualWallTimeMs: Math.floor(schedulerMetrics.actualWallTimeMs),
+          baselineWallTimeMs: Math.floor(schedulerMetrics.baselineWallTimeMs),
+          contextProfiles: schedulerMetrics.contextProfiles,
+          effortCounts: schedulerMetrics.effortCounts,
+          protocolCounts: schedulerMetrics.protocolCounts,
+        },
+      });
+      try {
+        store.saveSchedulerRunProjection(
+          runId,
+          tokenLedger.toSchedulerRunReport(),
+        );
+      } catch (error) {
+        if (!(error instanceof Error)
+          || !/not open|closed/i.test(error.message)) {
+          throw error;
+        }
+      }
+    };
+    let cumulativeBaselineTokens = schedulerMetrics.baselineTokens;
     const blockById = new Map(context.losslessBlocks.map((block) => [block.id, block]));
     store.syncScopedKnowledge(runId);
     const coverageScan = store.ensureConceptCoverageRevalidationTasks(
@@ -2953,6 +3097,39 @@ async function runLosslessBook(
         revalidationDrain,
         drainedRevalidation,
       );
+      if (drainedRevalidation.modelCalls > 0) {
+        const requestId = `revalidation:${runId}:wave${waves.length}:claimed${drainedRevalidation.claimed}`;
+        const predictedTokens = Math.max(1, drainedRevalidation.totalTokens);
+        if (!tokenLedger.state().baselinedTaskIds.has(requestId)) {
+          persistLedgerEvent({
+            type: "baseline_added",
+            taskIds: [requestId],
+            baselineTokens: predictedTokens,
+            source: "revalidate",
+            reason: "wave_drain",
+          });
+        }
+        if (!tokenLedger.state().openReservations.has(requestId)) {
+          persistLedgerEvent({
+            type: "reserved",
+            requestId,
+            purpose: "revalidate",
+            taskIds: [requestId],
+            predictedTokens,
+            attempt: 0,
+          });
+        }
+        if (tokenLedger.state().openReservations.has(requestId)) {
+          persistLedgerEvent({
+            type: "settled",
+            requestId,
+            actualTokens: drainedRevalidation.totalTokens,
+            usageComplete: drainedRevalidation.tokenUsageComplete,
+            outcome: "success",
+          });
+        }
+        flushSchedulerProjection();
+      }
       const allWindows = store.allWindows(runId);
       const barrier = firstUncommitted(allWindows);
       if (barrier === undefined || barrier.status !== "pending") {
@@ -3285,14 +3462,21 @@ async function runLosslessBook(
           maxInFlightTokens,
         });
         if (retryRound === 0) {
-          cumulativeBaselineTokens += requestPlanning.baselineTokens;
+          const baselineTaskIds = requestInputs
+            .map((item) => item.request.requestId)
+            .filter((taskId) => !tokenLedger.state().baselinedTaskIds.has(taskId));
+          if (baselineTaskIds.length > 0 && requestPlanning.baselineTokens > 0) {
+            persistLedgerEvent({
+              type: "baseline_added",
+              taskIds: baselineTaskIds,
+              baselineTokens: requestPlanning.baselineTokens,
+              source: "translate_horizon",
+              reason: `wave_${waves.length}_round0`,
+            });
+          }
+          cumulativeBaselineTokens = schedulerMetrics.baselineTokens;
           schedulerMetrics.baselineWallTimeMs +=
             requestPlanning.baselineWallTimeMs;
-          schedulerMetrics.baselineTokens = cumulativeBaselineTokens;
-          schedulerMetrics.allowedTokens = Math.floor(
-            cumulativeBaselineTokens
-              * (1 + selectedOptimizationPolicy.tokenIncreaseCap),
-          );
         } else {
           schedulerMetrics.recoveries += requestInputs.length;
         }
@@ -3736,14 +3920,35 @@ async function runLosslessBook(
             ...telemetry.recoveries.map((recovery) => recovery.status),
             telemetry.status,
           ].filter((status) => status === "throttled").length;
-          schedulerMetrics.tokenUsageComplete =
-            schedulerMetrics.tokenUsageComplete && telemetry.usage.complete;
-          schedulerMetrics.actualTokens += telemetry.usage.complete
-            ? telemetry.usage.totalTokens
-            : Math.max(
-              telemetry.usage.totalTokens,
-              telemetry.variant.predicted.totalTokens,
-            );
+          const requestId = completed.request.requestId;
+          if (tokenLedger.state().openReservations.has(requestId)) {
+            const actualTokens = telemetry.usage.complete
+              ? telemetry.usage.totalTokens
+              : Math.max(
+                telemetry.usage.totalTokens,
+                telemetry.variant.predicted.totalTokens,
+              );
+            persistLedgerEvent({
+              type: "settled",
+              requestId,
+              actualTokens,
+              usageComplete: telemetry.usage.complete,
+              outcome: completed.error === undefined
+                ? "success"
+                : telemetry.status === "protocol"
+                  ? "protocol"
+                  : "failed",
+            });
+          } else {
+            schedulerMetrics.tokenUsageComplete =
+              schedulerMetrics.tokenUsageComplete && telemetry.usage.complete;
+            schedulerMetrics.actualTokens += telemetry.usage.complete
+              ? telemetry.usage.totalTokens
+              : Math.max(
+                telemetry.usage.totalTokens,
+                telemetry.variant.predicted.totalTokens,
+              );
+          }
           const observationStartedAt = Date.now();
           const recordRuntimeObservation = (
             observation: {
@@ -3823,6 +4028,48 @@ async function runLosslessBook(
             (schedulerMetrics.effortCounts[execution.variant.effort] ?? 0) + 1;
           schedulerMetrics.protocolCounts[execution.variant.protocol] += 1;
         };
+        const predictedForExecution = (
+          execution: PlannedTranslationExecution,
+        ): number => Math.max(1, execution.variant.predicted.totalTokens);
+        const canLaunchExecution = (
+          execution: PlannedTranslationExecution,
+        ): boolean => {
+          if (schedulerMode !== "active") return true;
+          const requestId = execution.admitted.request.requestId;
+          if (tokenLedger.state().openReservations.has(requestId)) {
+            return true;
+          }
+          return tokenLedger.canReserve(predictedForExecution(execution), 0);
+        };
+        const admitExecution = (
+          execution: PlannedTranslationExecution,
+        ): void => {
+          const requestId = execution.admitted.request.requestId;
+          if (tokenLedger.state().openReservations.has(requestId)) {
+            return;
+          }
+          const predictedTokens = predictedForExecution(execution);
+          if (
+            schedulerMode === "active"
+            && !tokenLedger.canReserve(predictedTokens, 0)
+          ) {
+            throw new BookTokenEnvelopeExceededError(
+              schedulerMetrics.actualTokens,
+              tokenLedger.state().reservedTokens,
+              predictedTokens,
+              schedulerMetrics.allowedTokens,
+            );
+          }
+          persistLedgerEvent({
+            type: "reserved",
+            requestId,
+            purpose: "translate",
+            taskIds: [requestId],
+            predictedTokens,
+            attempt: retryRound,
+          });
+          recordSelectedVariant(execution);
+        };
         let completionOrder: CompletedRequest[];
         if (schedulerMode === "active") {
           try {
@@ -3835,7 +4082,8 @@ async function runLosslessBook(
                 actualRunTokens: () => schedulerMetrics.actualTokens,
                 decision: decisionMetadata,
                 onDecision: recordDispatchReport,
-                onLaunch: recordSelectedVariant,
+                canLaunch: canLaunchExecution,
+                onLaunch: admitExecution,
                 onComplete: observeCompletedRequest,
                 ...(options.signal === undefined
                   ? {}
@@ -3846,14 +4094,12 @@ async function runLosslessBook(
             if (error instanceof BookTokenEnvelopeExceededError) {
               store.recoverInterruptedWindows(runId);
               store.saveSchedulerSnapshot(runId, scheduler.snapshot());
+              flushSchedulerProjection();
             }
             throw error;
           }
         } else {
           const legacyExecutionByTaskId = requestPlanning.legacyByTaskId;
-          for (const execution of legacyExecutionByTaskId.values()) {
-            recordSelectedVariant(execution);
-          }
           completionOrder = await runWithAdaptiveScheduler(
             requestInputs,
             scheduler,
@@ -3866,6 +4112,7 @@ async function runLosslessBook(
                   `missing legacy execution for ${item.request.requestId}`,
                 );
               }
+              admitExecution(execution);
               return executePlannedRequest(execution);
             },
             options.signal,
@@ -3876,6 +4123,7 @@ async function runLosslessBook(
         }
         schedulerMetrics.actualWallTimeMs +=
           performance.now() - dynamicExecutionStartedAt;
+        flushSchedulerProjection();
         if (options.runtimeProfileStore !== undefined) {
           persistRuntimeCostModel(
             options.runtimeProfileStore,
@@ -4169,6 +4417,7 @@ async function runLosslessBook(
         : status.warningWindows > 0
           ? "completed_with_warnings"
           : "completed";
+    flushSchedulerProjection();
     return {
       outcome,
       runId,
@@ -4186,6 +4435,11 @@ async function runLosslessBook(
       artifacts: null,
     };
   } catch (error) {
+    try {
+      flushSchedulerProjection?.();
+    } catch {
+      // projection flush must not mask the original failure
+    }
     if (isStorageLocked(error)) {
       throw new BookStorageIncidentError(error);
     }
