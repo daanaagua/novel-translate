@@ -16,12 +16,10 @@ import {
 import {
   ModelProviderError,
   PiRuntime,
-  type PiRunResult,
 } from "../agents/pi-runtime.js";
 import {
   runTranslationBatch,
   type TranslationBatchResult,
-  type TranslationBatchWindowResult,
 } from "../agents/translation-batch.js";
 import type { TranslationRequestInput } from "../agents/translation-request.js";
 import type { EntityLink } from "../domain/entity-links.js";
@@ -61,7 +59,6 @@ import { SourceLedger } from "../source/source-ledger.js";
 import type { LosslessBlock } from "../source/types.js";
 import {
   WeightedTokenEstimator,
-  type UsageObservation,
 } from "../source/token-estimator.js";
 import {
   analyzeSourceAnomalies,
@@ -103,7 +100,6 @@ import type {
 import { BookContext } from "./book-context.js";
 import {
   AdaptiveScheduler,
-  type SchedulerObservationStatus,
 } from "./adaptive-scheduler.js";
 import {
   AdmissionController,
@@ -122,6 +118,17 @@ import {
   type SchedulerDispatchReport,
   type SchedulerRunReport,
 } from "./dynamic-scheduler.js";
+import {
+  admitTranslationFragments,
+  assessTranslationFragment,
+  BookRequestCapacityError,
+  executePlannedTranslationRequest,
+  type AdmittedRequestFragment,
+  type CompletedTranslationRequest,
+  type MergedTranslationResult,
+  type PlannedTranslationExecution,
+  type ScheduledResult,
+} from "./execution-worker.js";
 import {
   boundedActiveTail,
   memoriesFromSnapshot,
@@ -178,10 +185,6 @@ import type {
   TranslationRuntimeSet,
 } from "./types.js";
 import { packPhysicalRequests } from "./request-batcher.js";
-import {
-  RequestBudgeter,
-  type RequestBudgetAssessment,
-} from "./request-budgeter.js";
 import {
   nextConcurrency,
   planBookWindows,
@@ -429,24 +432,7 @@ export interface LosslessBookRunOptions {
   signal?: AbortSignal;
 }
 
-export class BookRequestCapacityError extends Error {
-  readonly code = "REQUEST_CONTEXT_EXCEEDED" as const;
-  readonly retryable = false;
-
-  constructor(
-    requestId: string,
-    assessment: RequestBudgetAssessment,
-    detail?: string,
-  ) {
-    super(
-      `REQUEST_CONTEXT_EXCEEDED: ${requestId} reserves ${assessment.totalReserved} tokens `
-      + `for a ${assessment.contextWindowTokens}-token context`
-      + (detail === undefined ? "" : ` (${detail})`),
-    );
-    this.name = "BookRequestCapacityError";
-  }
-}
-
+export { BookRequestCapacityError };
 export { BookTokenEnvelopeExceededError };
 
 class RevalidationOutputError extends Error {
@@ -1231,54 +1217,13 @@ export function windowOptionsForRunMode(
   };
 }
 
-function reasoningReserveTokens(runtime: TranslationRuntime): number {
-  switch (runtime.effort ?? runtime.thinkingLevel) {
-    case undefined:
-    case "off":
-      return 0;
-    case "minimal":
-      return 512;
-    case "low":
-      return 1_024;
-    case "medium":
-    case "on":
-      return 2_048;
-    case "high":
-      return 4_096;
-    case "xhigh":
-      return 6_144;
-    case "max":
-      return 8_192;
-  }
-}
-
-function outputReserveTokens(request: PhysicalRequestPlan, runtime: TranslationRuntime): number {
-  return Math.min(
-    runtime.model.maxTokens,
-    Math.max(768, Math.ceil(request.sourceTokens * 1.6) + 512),
-  );
-}
-
-const CONTEXT_FRAGMENT_PROTOCOL_VERSION = "v5-context-fragment-1";
-const MAX_CONTEXT_SPLIT_DEPTH = 16;
-const MAX_CONTEXT_SPLIT_ATTEMPTS = 32;
-const MAX_PROTOCOL_SPLIT_ATTEMPTS = 16;
-
-interface AdmittedRequestFragment<TInput> {
-  request: PhysicalRequestPlan;
-  input: TInput;
-  assessment: RequestBudgetAssessment;
-  /** Every split raises this number, so recovery cannot re-enqueue the same shape forever. */
-  depth: number;
-}
-
 interface AdmittedRequest<TInput> {
   /** Original physical grouping: it is the durable claim/stage/promote boundary. */
   request: PhysicalRequestPlan;
   /** Context-safe provider calls, executed serially while holding one scheduler permit. */
   fragments: readonly AdmittedRequestFragment<TInput>[];
   /** Reserve only the largest fragment, never the sum of serial fragment calls. */
-  assessment: RequestBudgetAssessment;
+  assessment: AdmittedRequestFragment<TInput>["assessment"];
 }
 
 const RUNTIME_EFFORT_RANK = new Map<string, number>([
@@ -1303,16 +1248,6 @@ const TRANSLATION_VALIDATORS = [
   "cross_block",
   "knowledge_coverage",
 ] as const;
-
-interface PlannedTranslationExecution {
-  readonly admitted: AdmittedRequest<TranslationRequestInput>;
-  readonly runtime: TranslationRuntime;
-  readonly buildInput: (
-    request: PhysicalRequestPlan,
-  ) => TranslationRequestInput;
-  readonly features: RuntimeFeatures;
-  readonly variant: TaskExecutionVariant;
-}
 
 interface DynamicRequestPlanning {
   readonly input: RollingPlannerInput;
