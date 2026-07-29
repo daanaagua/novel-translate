@@ -2430,6 +2430,20 @@ test("fast mode resolves lexical anchors with one framed primary call and leaves
   assert.equal(primary.state.callCount, 3);
   assert.equal(escalation.state.callCount, 0);
   assert.equal(result.status.completedWindows, 2);
+  const store = new LosslessBookStore(fixture.options.storePath);
+  try {
+    const anchorSettlement = store.loadTokenLedgerEvents("run-lossless")
+      .find((event) =>
+        event.type === "settled"
+        && event.requestId.startsWith("anchor:"));
+    assert.equal(anchorSettlement?.type, "settled");
+    if (anchorSettlement?.type === "settled") {
+      assert.equal(anchorSettlement.usageComplete, true);
+      assert.ok(anchorSettlement.actualTokens > 0);
+    }
+  } finally {
+    store.close();
+  }
 });
 
 test("fast mode escalates only a failed framed lexical call and resumes translation on the primary runtime", async () => {

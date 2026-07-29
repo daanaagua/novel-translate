@@ -1,11 +1,12 @@
-# FolioLoom 滚动调度器当前状态
+# FolioLoom 调度控制面当前状态
 
-- 日期：2026-07-28
-- 分支：`fix/german-100k-gate`
+- 日期：2026-07-29
+- 承接分支：`fix/execution-worker-local-20260729`
+- 回并目标：`fix/german-100k-gate`
 - 规格：`docs/superpowers/specs/2026-07-28-token-ledger-and-scheduler-control-plane-design.md`
 - 计划：`docs/superpowers/plans/2026-07-28-token-ledger-and-scheduler-control-plane.md`
 - 真实验收报告：`docs/superpowers/reports/2026-07-28-kafka-german-100k-token-ledger-live-validation.md`
-- 状态：**P0 + P1/P2 核心 + 德语 100k 真实验收通过**。P3 与 ExecutionWorker 整段抽出未做。
+- 状态：**P0–P3 完成；P4 德语 100k 真实验收通过；ExecutionWorker 抽取完成。**
 
 ## 已完成
 
@@ -27,25 +28,26 @@
 - 19/19 窗口完成；严格导出通过；`scheduler ≠ null`
 - token：baseline 575,480 / allowed 633,028 / actual **422,510**（未超限）
 
-## 仍未完成
-
-1. **P1 残余**：ExecutionWorker 尚未从 book-runner 整段抽出（Admission/Telemetry/Congestion 已落地）；
-2. **P3**：Python/TS 边界文档冻结；
-3. anchor 路径补齐真实供应商 usage（当前 `tokenUsageComplete` 可能为 false）。
-
-## P1/P2 本轮新增
+## P1/P2/P3 完成
 
 - `admission-controller.ts`：唯一发车/结算入口
 - `congestion-sensor.ts`：AIMD 拥塞传感
 - `telemetry-sink.ts`：成本模型与 profile 观察
+- `execution-worker.ts`：请求预算、fragment admission、模型调用、protocol/context recovery 与 usage 归集
 - active 模式 `tokenGate: "external"`：并发仍由 AIMD，token 硬门只信 ledger
+- `docs/ARCHITECTURE.md`：冻结 TypeScript 生产内核与 Python 导入/历史边界
+- lexical anchor：成功调用使用供应商真实 usage 结算；缺失 usage 时继续保守标记不完整，不伪造 usage
 
 ## 不变量
 
 - 逻辑窗口不可变；`CommitCoordinator` 顺序不变；不加 book.db 关系表；质量门未降。
 
-## 验证
+## 2026-07-29 验证
 
-- `npm test`：核心套件绿（偶发 planner 50ms 性能抖动与负载相关）；
-- `npx tsc --noEmit`：0 error；
-- 德语 100k 真跑：见上报告。
+- `npm test`：855 tests，854 pass，0 fail，1 skip；
+- `npm run typecheck`：0 error；
+- `npm run desktop:test`：Node 108 pass / 1 skip；Renderer 66 pass；
+- `npm run desktop:typecheck`：0 error；
+- `npm run desktop:build`：production build 与 preload 验证通过；
+- `git diff --check`：通过；
+- 德语 100k 沿用已隔离且通过的 P4 真跑结果，未覆盖唯一真跑数据库。
