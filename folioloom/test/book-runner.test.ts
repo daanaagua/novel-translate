@@ -17,6 +17,7 @@ import {
   BookRequestCapacityError,
   BookTokenEnvelopeExceededError,
   drainKnowledgeRevalidationTasks,
+  planningProtocols,
   runBook,
   windowOptionsForRunMode,
 } from "../src/fullbook/book-runner.js";
@@ -142,6 +143,15 @@ test("fast mode uses larger bounded windows unless the caller supplies tighter l
     maxBlocks: 4,
   });
   assert.deepEqual(windowOptionsForRunMode("quality", {}), {});
+});
+
+test("quality retry rounds return to typed-tool instead of repeating framed protocol", () => {
+  assert.deepEqual(planningProtocols("typed_tool", 0), [
+    "typed_tool",
+    "framed_text",
+  ]);
+  assert.deepEqual(planningProtocols("typed_tool", 1), ["typed_tool"]);
+  assert.deepEqual(planningProtocols("framed_text", 1), ["framed_text"]);
 });
 
 function revalidationQueueFixture(input: {

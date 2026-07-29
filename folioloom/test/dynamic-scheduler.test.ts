@@ -192,6 +192,44 @@ test("active mode never delegates a no-legal-plan result past the token envelope
   assert.equal(result.validatorsSkipped, 0);
 });
 
+test("active mode does not delegate a cheaper legacy prefix when planned variants have no legal plan", () => {
+  const scheduler = new DynamicScheduler(schedulerOptions({
+    mode: "active",
+    planner: planRollingHorizon,
+  }));
+  const input = plannerInput();
+  const expensivePlannedVariants = input.variants.map((variant) => ({
+    ...variant,
+    predicted: {
+      ...variant.predicted,
+      totalTokens: 200,
+    },
+  }));
+  const cheaperLegacyVariants = input.variants.map((variant) => ({
+    ...variant,
+    variantId: `legacy-${variant.taskId}`,
+    predicted: {
+      ...variant.predicted,
+      totalTokens: 100,
+    },
+  }));
+
+  const result = scheduler.dispatch({
+    ...input,
+    variants: expensivePlannedVariants,
+    actualRunTokens: 70,
+  }, {
+    legacyTaskIds: ["task-a", "task-b"],
+    legacyVariants: cheaperLegacyVariants,
+  });
+
+  assert.equal(result.planningStatus, "fallback");
+  assert.equal(result.fallbackReason, "NO_LEGAL_PLAN");
+  assert.deepEqual(result.dispatchedTaskIds, []);
+  assert.deepEqual(result.dispatchedVariants, []);
+  assert.equal(result.predictedTokens, 70);
+});
+
 test("planner failure falls back without skipping validation", () => {
   const scheduler = new DynamicScheduler(schedulerOptions({
     mode: "active",

@@ -55,6 +55,87 @@ export interface AdmissionBaselineRequest {
   readonly reason: string;
 }
 
+export interface BaselineProjectionTask {
+  readonly taskId: string;
+  readonly baselineTokens: number;
+  readonly baselineWallTimeMs: number;
+}
+
+export interface WeightedBaselineProjectionTask {
+  readonly taskId: string;
+  readonly weight: number;
+}
+
+export interface IncrementalBaselineProjection {
+  readonly taskIds: readonly string[];
+  readonly baselineTokens: number;
+  readonly baselineWallTimeMs: number;
+}
+
+function allocateWeightedTotal(
+  tasks: readonly WeightedBaselineProjectionTask[],
+  total: number,
+): number[] {
+  if (tasks.length === 0) return [];
+  const safeTotal = Math.max(0, Math.floor(total));
+  const weights = tasks.map((task) =>
+    Number.isFinite(task.weight) ? Math.max(0, task.weight) : 0);
+  const weightTotal = weights.reduce((sum, weight) => sum + weight, 0);
+  const effectiveWeights = weightTotal > 0
+    ? weights
+    : tasks.map(() => 1);
+  const effectiveTotal = effectiveWeights.reduce(
+    (sum, weight) => sum + weight,
+    0,
+  );
+  let priorBoundary = 0;
+  let cumulativeWeight = 0;
+  return effectiveWeights.map((weight, index) => {
+    cumulativeWeight += weight;
+    const boundary = index === effectiveWeights.length - 1
+      ? safeTotal
+      : Math.floor(safeTotal * cumulativeWeight / effectiveTotal);
+    const allocation = boundary - priorBoundary;
+    priorBoundary = boundary;
+    return allocation;
+  });
+}
+
+export function weightedBaselineProjectionTasks(
+  tasks: readonly WeightedBaselineProjectionTask[],
+  baselineTokens: number,
+  baselineWallTimeMs: number,
+): BaselineProjectionTask[] {
+  const tokenAllocations = allocateWeightedTotal(tasks, baselineTokens);
+  const wallTimeAllocations = allocateWeightedTotal(
+    tasks,
+    baselineWallTimeMs,
+  );
+  return tasks.map((task, index) => ({
+    taskId: task.taskId,
+    baselineTokens: tokenAllocations[index] ?? 0,
+    baselineWallTimeMs: wallTimeAllocations[index] ?? 0,
+  }));
+}
+
+export function incrementalBaselineProjection(
+  tasks: readonly BaselineProjectionTask[],
+  baselinedTaskIds: ReadonlySet<string>,
+): IncrementalBaselineProjection {
+  const fresh = tasks.filter((task) => !baselinedTaskIds.has(task.taskId));
+  return {
+    taskIds: fresh.map((task) => task.taskId),
+    baselineTokens: fresh.reduce(
+      (total, task) => total + task.baselineTokens,
+      0,
+    ),
+    baselineWallTimeMs: fresh.reduce(
+      (total, task) => total + task.baselineWallTimeMs,
+      0,
+    ),
+  };
+}
+
 /**
  * Single write path for run-level token envelope decisions.
  * Planner remains pure; this controller is the only place that should
@@ -143,6 +224,17 @@ export class AdmissionController {
       usageComplete: request.usageComplete,
       outcome: request.outcome,
     });
+    if (this.#mode === "active") {
+      const state = this.#ledger.state();
+      if (state.spentTokens + state.reservedTokens > state.allowedTokens) {
+        throw new BookTokenEnvelopeExceededError(
+          state.spentTokens,
+          state.reservedTokens,
+          0,
+          state.allowedTokens,
+        );
+      }
+    }
   }
 
   release(requestId: string, reason: LedgerReleaseReason): void {

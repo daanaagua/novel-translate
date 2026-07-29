@@ -222,6 +222,9 @@ test("desktop imports, pauses, resumes, strictly exports, and verifies a Unicode
     "CHAPTER TWO",
     ...Array.from({ length: 4 }, (_, index) =>
       `The second archive preserves each later consequence ${index}. `.repeat(20)),
+    "CHAPTER THREE",
+    ...Array.from({ length: 4 }, (_, index) =>
+      `The final archive keeps one more durable section ${index}. `.repeat(20)),
   ].join("\n\n");
   writeFileSync(sourcePath, source, "utf8");
 

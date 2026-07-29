@@ -387,6 +387,7 @@ test("desktop full-book start launches in background with formal run metadata", 
 test("desktop full-book enforces one active task and pauses at the runner boundary", async () => {
   const project = fixture();
   let observedSignal: AbortSignal | undefined;
+  let shouldPause: (() => boolean) | undefined;
   let settle!: (result: LosslessBookRunResult) => void;
   const running = new Promise<LosslessBookRunResult>((resolve) => { settle = resolve; });
   try {
@@ -395,16 +396,7 @@ test("desktop full-book enforces one active task and pauses at the runner bounda
       createRunId: () => "run-fullbook-pause",
       runBook: async (options) => {
         observedSignal = options.signal;
-        options.signal?.addEventListener("abort", () => {
-          settle(runResult("run-fullbook-pause", {
-            outcome: "partial",
-            status: status({
-              pendingWindows: 2,
-              completedWindows: 0,
-              modelCalls: 0,
-            }),
-          }));
-        }, { once: true });
+        shouldPause = options.shouldPause;
         return running;
       },
       pollIntervalMs: 60_000,
@@ -424,10 +416,63 @@ test("desktop full-book enforces one active task and pauses at the runner bounda
     );
 
     const pausing = service.pause();
-    assert.equal(observedSignal?.aborted, true);
+    assert.equal(observedSignal?.aborted, false);
+    assert.equal(shouldPause?.(), true);
+    settle(runResult("run-fullbook-pause", {
+      outcome: "partial",
+      status: status({
+        pendingWindows: 2,
+        completedWindows: 0,
+        modelCalls: 0,
+      }),
+    }));
     const paused = await pausing;
     assert.equal(paused.activeRunId, undefined);
     assert.equal(paused.runs[0]?.phase, "paused");
+    assert.equal(service.hasActiveTask(), false);
+  } finally {
+    rmSync(project.directory, { recursive: true, force: true });
+  }
+});
+
+test("desktop shutdown aborts after a bounded cooperative pause grace period", async () => {
+  const project = fixture();
+  let observedSignal: AbortSignal | undefined;
+  let settle!: (result: LosslessBookRunResult) => void;
+  const running = new Promise<LosslessBookRunResult>((resolve) => {
+    settle = resolve;
+  });
+  try {
+    const service = new DesktopFullBookService({
+      runtime: runtimeResolver(),
+      createRunId: () => "run-fullbook-shutdown",
+      runBook: async (options) => {
+        observedSignal = options.signal;
+        return running;
+      },
+      pollIntervalMs: 60_000,
+      shutdownGraceMs: 5,
+    });
+    await service.start(
+      { manifestPath: project.manifestPath },
+      { optimizationProfile: "balanced" },
+    );
+
+    await Promise.race([
+      service.settleForShutdown(),
+      new Promise<never>((_resolve, reject) => {
+        setTimeout(() => reject(new Error("shutdown settlement was unbounded")), 500);
+      }),
+    ]);
+    assert.equal(observedSignal?.aborted, true);
+
+    settle(runResult("run-fullbook-shutdown", {
+      outcome: "partial",
+      status: status({ pendingWindows: 2, completedWindows: 0 }),
+    }));
+    for (let attempt = 0; attempt < 10 && service.hasActiveTask(); attempt += 1) {
+      await flushBackground();
+    }
     assert.equal(service.hasActiveTask(), false);
   } finally {
     rmSync(project.directory, { recursive: true, force: true });
@@ -451,12 +496,6 @@ test("desktop full-book resume reuses exact stored metadata and rejects a change
       runtime: storedRuntime,
       runBook: async (options) => {
         seen.push(options);
-        options.signal?.addEventListener("abort", () => {
-          settle(runResult("run-resume", {
-            outcome: "partial",
-            status: status({ pendingWindows: 2, completedWindows: 0 }),
-          }));
-        }, { once: true });
         return running;
       },
       pollIntervalMs: 60_000,
@@ -471,7 +510,12 @@ test("desktop full-book resume reuses exact stored metadata and rejects a change
     assert.deepEqual(seen[0]?.runMeta.metadata, metadata);
     assert.equal(seen[0]?.optimizationProfile, "balanced");
     assert.equal(seen[0]?.schedulerMode, "off");
-    await service.pause();
+    const pausing = service.pause();
+    settle(runResult("run-resume", {
+      outcome: "partial",
+      status: status({ pendingWindows: 2, completedWindows: 0 }),
+    }));
+    await pausing;
 
     const changed = new DesktopFullBookService({
       runtime: runtimeResolver({

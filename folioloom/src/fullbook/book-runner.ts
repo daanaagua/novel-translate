@@ -103,6 +103,8 @@ import {
 import {
   AdmissionController,
   BookTokenEnvelopeExceededError,
+  incrementalBaselineProjection,
+  weightedBaselineProjectionTasks,
 } from "./admission-controller.js";
 import { CongestionSensor } from "./congestion-sensor.js";
 import { CommitCoordinator } from "./commit-coordinator.js";
@@ -428,10 +430,35 @@ export interface LosslessBookRunOptions {
    * entered the store remains atomic and is never interrupted mid-transaction.
    */
   signal?: AbortSignal;
+  /**
+   * Requests a cooperative stop at the next durable wave boundary. Unlike
+   * aborting `signal`, this does not discard an in-flight provider response or
+   * turn an unknown-usage cancellation into permanent envelope spend.
+   */
+  shouldPause?: () => boolean;
 }
 
 export { BookRequestCapacityError };
 export { BookTokenEnvelopeExceededError };
+
+export class BookNoLegalPlanError extends Error {
+  readonly code = "NO_LEGAL_PLAN" as const;
+  readonly retryable = false;
+
+  constructor(
+    readonly actualTokens: number,
+    readonly runningReservedTokens: number,
+    readonly allowedTokens: number,
+    readonly pendingTasks: number,
+  ) {
+    super(
+      `NO_LEGAL_PLAN: planner found no legal active dispatch for `
+      + `${pendingTasks} pending task(s) with actual ${actualTokens}, running `
+      + `${runningReservedTokens}, and allowed ${allowedTokens}`,
+    );
+    this.name = "BookNoLegalPlanError";
+  }
+}
 
 class RevalidationOutputError extends Error {
   readonly code = "REVALIDATION_OUTPUT_INVALID" as const;
@@ -1568,6 +1595,20 @@ function planningRuntimes(
     runtimeEffortRank(runtime) >= minimumRank);
 }
 
+export function planningProtocols(
+  originalProtocol: "typed_tool" | "framed_text",
+  retryRound: number,
+): readonly ("typed_tool" | "framed_text")[] {
+  if (originalProtocol === "framed_text") return ["framed_text"];
+  return retryRound === 0
+    ? ["typed_tool", "framed_text"]
+    : ["typed_tool"];
+}
+
+export function translationBaselineTaskId(windowId: string): string {
+  return `translate-window:${windowId}`;
+}
+
 function dynamicRequestPlanning(
   requests: readonly PhysicalRequestPlan[],
   legacyRequests: readonly AdmittedTranslationRequest<TranslationRequestInput>[],
@@ -1665,9 +1706,10 @@ function dynamicRequestPlanning(
     }
 
     const originalProtocol = baseInput.responseProtocol ?? "typed_tool";
-    const protocols = originalProtocol === "typed_tool"
-      ? ["typed_tool", "framed_text"] as const
-      : ["framed_text"] as const;
+    const protocols = planningProtocols(
+      originalProtocol,
+      options.retryRound,
+    );
     for (const profileName of CONTEXT_PROFILE_ORDER) {
       const selectedProfile = contextPlan.profiles[profileName];
       if (selectedProfile === undefined
@@ -2050,6 +2092,12 @@ async function runWithDynamicScheduler<T>(
         const minimumPendingTokens = firstPendingExecution === undefined
           ? Number.POSITIVE_INFINITY
           : firstPendingExecution.variant.predicted.totalTokens;
+        const minimumPlannedTokens = Math.min(
+          ...[...refreshedExecutions.values()]
+            .filter((execution) =>
+              execution.admitted.request.requestId === firstPendingTaskId)
+            .map((execution) => execution.variant.predicted.totalTokens),
+        );
         const actualTokens = options.actualRunTokens();
         const allowedTokens = Math.floor(
           planning.input.runBaselineTotalTokens
@@ -2058,17 +2106,36 @@ async function runWithDynamicScheduler<T>(
         const blockedByEnvelope = firstPendingExecution !== undefined
           && options.canLaunch !== undefined
           && !options.canLaunch(firstPendingExecution);
-        if (blockedByEnvelope
+        const noLegalPlan = report.planningStatus === "fallback"
+          && report.fallbackReason === "NO_LEGAL_PLAN"
+          && report.dispatchedTaskIds.length === 0;
+        const noLegalPlanExhaustsEnvelope = noLegalPlan
+          && Number.isFinite(minimumPlannedTokens)
+          && actualTokens + runningReservedTokens + minimumPlannedTokens
+            > allowedTokens;
+        if (noLegalPlanExhaustsEnvelope
+          || blockedByEnvelope
           || (report.planningStatus === "fallback"
             && report.dispatchedTaskIds.length === 0
             && Number.isFinite(minimumPendingTokens)
             && actualTokens + runningReservedTokens + minimumPendingTokens
               > allowedTokens)) {
+          const reportedMinimum = noLegalPlanExhaustsEnvelope
+            ? minimumPlannedTokens
+            : minimumPendingTokens;
           throw new BookTokenEnvelopeExceededError(
             actualTokens,
             runningReservedTokens,
-            Number.isFinite(minimumPendingTokens) ? minimumPendingTokens : 0,
+            Number.isFinite(reportedMinimum) ? reportedMinimum : 0,
             allowedTokens,
+          );
+        }
+        if (noLegalPlan) {
+          throw new BookNoLegalPlanError(
+            actualTokens,
+            runningReservedTokens,
+            allowedTokens,
+            pending.size,
           );
         }
       }
@@ -2631,6 +2698,9 @@ async function runLosslessBook(
     };
 
     while (processedWindows < maxWindows) {
+      if (options.shouldPause?.() === true) {
+        break;
+      }
       throwIfAborted(options.signal);
       assertSourceVersionUnchanged(context);
       // A book or project catalog can be edited by another completed run while
@@ -3046,7 +3116,7 @@ async function runLosslessBook(
             + `(${oversizedReservation.assessment.totalReserved} tokens)`,
           );
         }
-        const requestPlanning = dynamicRequestPlanning(requests, requestInputs, {
+        let requestPlanning = dynamicRequestPlanning(requests, requestInputs, {
           runtimeSet,
           executionRuntime,
           mode: schedulerMode,
@@ -3064,17 +3134,34 @@ async function runLosslessBook(
           maxInFlightTokens,
         });
         if (retryRound === 0) {
-          const baselineTaskIds = requestInputs
-            .map((item) => item.request.requestId);
+          const baseline = incrementalBaselineProjection(
+            [...requestPlanning.legacyByTaskId.values()].flatMap((execution) =>
+              weightedBaselineProjectionTasks(
+                execution.admitted.request.windows.map((window) => ({
+                  taskId: translationBaselineTaskId(window.windowId),
+                  weight: window.sourceTokens,
+                })),
+                execution.variant.predicted.totalTokens,
+                execution.variant.predicted.p90DurationMs,
+              )),
+            tokenLedger.state().baselinedTaskIds,
+          );
           admission.addBaseline({
-            taskIds: baselineTaskIds,
-            baselineTokens: requestPlanning.baselineTokens,
+            taskIds: baseline.taskIds,
+            baselineTokens: baseline.baselineTokens,
             source: "translate_horizon",
             reason: `wave_${waves.length}_round0`,
           });
           cumulativeBaselineTokens = schedulerMetrics.baselineTokens;
+          requestPlanning = {
+            ...requestPlanning,
+            input: {
+              ...requestPlanning.input,
+              runBaselineTotalTokens: cumulativeBaselineTokens,
+            },
+          };
           schedulerMetrics.baselineWallTimeMs +=
-            requestPlanning.baselineWallTimeMs;
+            baseline.baselineWallTimeMs;
         } else {
           schedulerMetrics.recoveries += requestInputs.length;
         }
@@ -3302,7 +3389,8 @@ async function runLosslessBook(
           admission.reserve({
             requestId,
             purpose: "translate",
-            taskIds: [requestId],
+            taskIds: execution.admitted.request.windows.map((window) =>
+              translationBaselineTaskId(window.windowId)),
             predictedTokens: predictedForExecution(execution),
             attempt: retryRound,
           });

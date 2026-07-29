@@ -65,6 +65,7 @@ export interface DesktopFullBookServiceOptions {
   createRunId?: () => string;
   onProgress?: (progress: DesktopFullBookProgress) => void;
   pollIntervalMs?: number;
+  shutdownGraceMs?: number;
 }
 
 interface NormalizedProject {
@@ -106,6 +107,7 @@ interface ActiveFullBookTask {
   schedulerMode: "off" | "active";
   controller: AbortController;
   phase: "preparing" | "running" | "pausing";
+  pauseRequested: boolean;
   modelId: string;
   settled: Promise<void>;
   poller?: ReturnType<typeof setInterval>;
@@ -406,6 +408,7 @@ export class DesktopFullBookService {
   readonly #createRunId: () => string;
   readonly #onProgress: ((progress: DesktopFullBookProgress) => void) | undefined;
   readonly #pollIntervalMs: number;
+  readonly #shutdownGraceMs: number;
   readonly #overlays = new Map<string, RunOverlay>();
   #lastProject: NormalizedProject | undefined;
 
@@ -416,10 +419,18 @@ export class DesktopFullBookService {
     this.#createRunId = options.createRunId ?? randomUUID;
     this.#onProgress = options.onProgress;
     this.#pollIntervalMs = options.pollIntervalMs ?? DEFAULT_POLL_INTERVAL_MS;
+    this.#shutdownGraceMs = options.shutdownGraceMs ?? 5_000;
     if (!Number.isSafeInteger(this.#pollIntervalMs) || this.#pollIntervalMs <= 0) {
       throw new DesktopFullBookError(
         "DESKTOP_FULLBOOK_INPUT_INVALID",
         "pollIntervalMs must be a positive safe integer",
+      );
+    }
+    if (!Number.isSafeInteger(this.#shutdownGraceMs)
+      || this.#shutdownGraceMs <= 0) {
+      throw new DesktopFullBookError(
+        "DESKTOP_FULLBOOK_INPUT_INVALID",
+        "shutdownGraceMs must be a positive safe integer",
       );
     }
   }
@@ -589,14 +600,17 @@ export class DesktopFullBookService {
         ? { runs: [] }
         : this.snapshot(this.#lastProject.request);
     }
+    const priorPhase = task.phase;
     task.phase = "pausing";
     this.#setOverlay(task, "pausing");
     this.#emit(task);
-    if (!task.controller.signal.aborted) {
+    if (priorPhase === "preparing" && !task.controller.signal.aborted) {
       task.controller.abort(new DesktopFullBookError(
         "DESKTOP_FULLBOOK_PAUSED",
-        "full-book translation paused at a durable boundary",
+        "full-book translation paused before execution",
       ));
+    } else {
+      task.pauseRequested = true;
     }
     await task.settled;
     return this.snapshot(task.project.request);
@@ -607,8 +621,32 @@ export class DesktopFullBookService {
   }
 
   async settleForShutdown(): Promise<void> {
-    if (ACTIVE_FULLBOOK_TASK !== undefined) {
-      await this.pause();
+    const task = ACTIVE_FULLBOOK_TASK;
+    if (task === undefined) return;
+    const cooperativePause = this.pause();
+    let abortTimer: ReturnType<typeof setTimeout> | undefined;
+    let giveUpTimer: ReturnType<typeof setTimeout> | undefined;
+    const boundedShutdown = new Promise<void>((resolve) => {
+      abortTimer = setTimeout(() => {
+        if (!task.controller.signal.aborted) {
+          task.controller.abort(new DesktopFullBookError(
+            "DESKTOP_FULLBOOK_PAUSED",
+            "full-book translation aborted after the shutdown grace period",
+          ));
+        }
+        giveUpTimer = setTimeout(resolve, this.#shutdownGraceMs);
+        giveUpTimer.unref?.();
+      }, this.#shutdownGraceMs);
+      abortTimer.unref?.();
+    });
+    try {
+      await Promise.race([
+        cooperativePause.then(() => undefined),
+        boundedShutdown,
+      ]);
+    } finally {
+      if (abortTimer !== undefined) clearTimeout(abortTimer);
+      if (giveUpTimer !== undefined) clearTimeout(giveUpTimer);
     }
   }
 
@@ -634,6 +672,7 @@ export class DesktopFullBookService {
       optimizationProfile,
       schedulerMode,
       controller: new AbortController(),
+      pauseRequested: false,
       phase: "preparing",
       modelId,
       settled: Promise.resolve(),
@@ -677,6 +716,7 @@ export class DesktopFullBookService {
           ? {}
           : { runtimeProfileStore: this.#runtimeProfileStore }),
         signal: task.controller.signal,
+        shouldPause: () => task.pauseRequested,
       });
     } catch (error) {
       running = Promise.reject(error);

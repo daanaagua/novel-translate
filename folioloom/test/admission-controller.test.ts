@@ -4,6 +4,8 @@ import test from "node:test";
 import {
   AdmissionController,
   BookTokenEnvelopeExceededError,
+  incrementalBaselineProjection,
+  weightedBaselineProjectionTasks,
 } from "../src/fullbook/admission-controller.js";
 import { TokenLedger } from "../src/fullbook/token-ledger.js";
 
@@ -73,6 +75,42 @@ test("active mode rejects launch that exceeds envelope", () => {
   );
 });
 
+test("active mode persists actual usage and rejects a post-settle envelope overrun", () => {
+  const { admission, ledger } = controller("active");
+  admission.addBaseline({
+    taskIds: ["t1"],
+    baselineTokens: 100,
+    source: "translate_horizon",
+    reason: "wave",
+  });
+  admission.reserve({
+    requestId: "r1",
+    purpose: "translate",
+    taskIds: ["t1"],
+    predictedTokens: 100,
+    attempt: 0,
+  });
+
+  assert.throws(
+    () => admission.settle({
+      requestId: "r1",
+      actualTokens: 150,
+      usageComplete: true,
+      outcome: "success",
+    }),
+    (error: unknown) => {
+      assert.ok(error instanceof BookTokenEnvelopeExceededError);
+      assert.equal(error.actualTokens, 150);
+      assert.equal(error.runningReservedTokens, 0);
+      assert.equal(error.minimumPendingTokens, 0);
+      assert.equal(error.allowedTokens, 110);
+      return true;
+    },
+  );
+  assert.equal(ledger.state().spentTokens, 150);
+  assert.equal(ledger.state().reservedTokens, 0);
+});
+
 test("shadow mode still records spend but does not hard-reject", () => {
   const { admission, ledger } = controller("shadow");
   admission.addBaseline({
@@ -124,4 +162,44 @@ test("holdSecondary releases without spending", () => {
   hold.release();
   assert.equal(ledger.state().reservedTokens, 100);
   assert.equal(ledger.state().spentTokens, 0);
+});
+
+test("resume baseline projection counts only tasks not already in the durable ledger", () => {
+  const firstBatch = weightedBaselineProjectionTasks([
+    { taskId: "translate-window:a", weight: 1 },
+    { taskId: "translate-window:b", weight: 1 },
+  ], 24_000, 80_000);
+  const resumedBatch = weightedBaselineProjectionTasks([
+    { taskId: "translate-window:b", weight: 1 },
+  ], 15_000, 50_000);
+  const projection = incrementalBaselineProjection(
+    resumedBatch,
+    new Set(firstBatch.map((task) => task.taskId)),
+  );
+
+  assert.deepEqual(projection, {
+    taskIds: [],
+    baselineTokens: 0,
+    baselineWallTimeMs: 0,
+  });
+});
+
+test("weighted baseline projection preserves request totals across logical windows", () => {
+  const tasks = weightedBaselineProjectionTasks([
+    { taskId: "translate-window:a", weight: 1 },
+    { taskId: "translate-window:b", weight: 2 },
+  ], 10, 20);
+
+  assert.deepEqual(tasks, [
+    {
+      taskId: "translate-window:a",
+      baselineTokens: 3,
+      baselineWallTimeMs: 6,
+    },
+    {
+      taskId: "translate-window:b",
+      baselineTokens: 7,
+      baselineWallTimeMs: 14,
+    },
+  ]);
 });
