@@ -83,7 +83,6 @@ const CONTEXT_FRAGMENT_PROTOCOL_VERSION = "v5-context-fragment-1";
 export const MAX_CONTEXT_SPLIT_DEPTH = 16;
 export const MAX_CONTEXT_SPLIT_ATTEMPTS = 32;
 export const MAX_PROTOCOL_SPLIT_ATTEMPTS = 16;
-export const MAX_PARAGRAPH_REFINEMENTS_PER_PLAN = 1;
 export const MAX_TARGETED_REPAIRS_PER_REQUEST = 3;
 
 export interface AdmittedRequestFragment<TInput> {
@@ -94,7 +93,7 @@ export interface AdmittedRequestFragment<TInput> {
   depth: number;
   readonly paragraphPlan?: ParagraphFragmentPlan;
   readonly paragraphUnit?: ParagraphFragmentUnit;
-  /** One fixed refinement level; children never carry another refinement plan. */
+  /** Balanced local bisection tree; only a failed node descends into its children. */
   readonly paragraphRefinements?: readonly AdmittedRequestFragment<TInput>[];
 }
 
@@ -105,12 +104,15 @@ export interface AdmittedTranslationRequest<TInput> {
   readonly fragments: readonly AdmittedRequestFragment<TInput>[];
   /** Largest serial fragment reservation used by the outer schedulers. */
   readonly assessment: RequestBudgetAssessment;
+  /** Pre-admitted topology used to size anti-loop limits for later recovery. */
+  readonly paragraphRecoveryFragments:
+    readonly AdmittedRequestFragment<TInput>[];
   /**
    * Bounded reserve for whole-request degeneration into paragraph vectors and
-   * their one legal scalar-refinement level.
+   * their complete legal local-bisection graph.
    */
   readonly paragraphRecoveryReserveTokens: number;
-  /** Legal-policy baseline reserve for at most one refined unit per paragraph plan. */
+  /** Legal-policy baseline reserve for the admitted local-bisection graph. */
   readonly paragraphRefinementReserveTokens: number;
   /** Bounded reserve for independent semantic repair scopes in this request. */
   readonly targetedRepairReserveTokens: number;
@@ -193,6 +195,15 @@ function fragmentTranslationTurnLimit(
   return fragment.input.responseProtocol === "framed_text" ? 1 : 2;
 }
 
+function admittedFragmentTree<TInput>(
+  fragments: readonly AdmittedRequestFragment<TInput>[],
+): AdmittedRequestFragment<TInput>[] {
+  return fragments.flatMap((fragment) => [
+    fragment,
+    ...admittedFragmentTree(fragment.paragraphRefinements ?? []),
+  ]);
+}
+
 /**
  * Size the local anti-loop ledger from the already-admitted execution graph.
  * Token admission remains authoritative; these counters only prevent a legal
@@ -206,34 +217,12 @@ export function executionBudgetLimits(
   readonly translationToolCalls: number;
   readonly repairTurns: number;
 } {
-  const directTurns = fragments.reduce(
+  const legalFragments = admittedFragmentTree(fragments);
+  const legalTranslationTurns = legalFragments.reduce(
     (total, fragment) => total + fragmentTranslationTurnLimit(fragment),
     0,
   );
-  const refinementTurnsByPlan = new Map<string, number>();
-  for (const fragment of fragments) {
-    const planId = fragment.paragraphPlan?.planId;
-    if (planId === undefined) continue;
-    const turns = (fragment.paragraphRefinements ?? []).reduce(
-      (total, refinement) =>
-        total + fragmentTranslationTurnLimit(refinement),
-      0,
-    );
-    refinementTurnsByPlan.set(
-      planId,
-      Math.max(refinementTurnsByPlan.get(planId) ?? 0, turns),
-    );
-  }
-  const refinementTurns = [...refinementTurnsByPlan.values()].reduce(
-    (total, turns) => total + turns,
-    0,
-  );
-  const legalTranslationTurns = directTurns + refinementTurns;
-  const potentialRepairScopes = fragments.reduce(
-    (total, fragment) =>
-      total + 1 + (fragment.paragraphRefinements?.length ?? 0),
-    0,
-  );
+  const potentialRepairScopes = legalFragments.length;
   const repairTurns = Math.min(
     MAX_TARGETED_REPAIRS_PER_REQUEST,
     potentialRepairScopes,
@@ -511,14 +500,39 @@ function paragraphRefinementUnits(
   unit: ParagraphFragmentUnit,
 ): ParagraphFragmentUnit[] {
   if (unit.paragraphs.length <= 1) return [];
-  return unit.paragraphs.map((paragraph, index) => {
-    const previous = unit.paragraphs[index - 1];
-    const next = unit.paragraphs[index + 1];
+  const weights = unit.paragraphs.map((paragraph) =>
+    Math.max(1, Array.from(paragraph.sourceText).length));
+  const totalWeight = weights.reduce((total, weight) => total + weight, 0);
+  let leftWeight = 0;
+  let splitIndex = 1;
+  let bestDistance = Number.POSITIVE_INFINITY;
+  for (let index = 1; index < unit.paragraphs.length; index += 1) {
+    leftWeight += weights[index - 1] ?? 0;
+    const distance = Math.abs(totalWeight - leftWeight * 2);
+    if (distance < bestDistance) {
+      bestDistance = distance;
+      splitIndex = index;
+    }
+  }
+  const groups = [
+    unit.paragraphs.slice(0, splitIndex),
+    unit.paragraphs.slice(splitIndex),
+  ];
+  return groups.map((paragraphs, index) => {
+    const first = paragraphs[0]!;
+    const last = paragraphs.at(-1)!;
+    const previous = index === 0
+      ? unit.leftSourceContext.at(-1)
+      : unit.paragraphs[splitIndex - 1];
+    const next = index === 0
+      ? unit.paragraphs[splitIndex]
+      : unit.rightSourceContext[0];
     const executionUnitId = `paragraph-refinement-${
       createHash("sha256")
         .update([
           unit.executionUnitId,
-          paragraph.paragraphId,
+          first.paragraphId,
+          last.paragraphId,
           String(index),
         ].join("\0"))
         .digest("hex")
@@ -528,14 +542,14 @@ function paragraphRefinementUnits(
       executionUnitId,
       planId: unit.planId,
       blockId: unit.blockId,
-      paragraphStart: paragraph.ordinal,
-      paragraphEnd: paragraph.ordinal + 1,
-      paragraphs: [paragraph],
+      paragraphStart: first.ordinal,
+      paragraphEnd: last.ordinal + 1,
+      paragraphs,
       leftSourceContext: previous === undefined
-        ? unit.leftSourceContext
+        ? []
         : [previous],
       rightSourceContext: next === undefined
-        ? unit.rightSourceContext
+        ? []
         : [next],
     };
   });
@@ -584,7 +598,10 @@ function admitParagraphFragmentPlan<
   if (block === undefined) {
     throw new Error(`paragraph plan references unknown block ${plan.blockId}`);
   }
-  return plan.units.map((unit) => {
+  const admitUnit = (
+    unit: ParagraphFragmentUnit,
+    refinementDepth: number,
+  ): AdmittedRequestFragment<TInput> => {
     const request = paragraphFragmentRequest(
       parentRequest,
       plan,
@@ -602,43 +619,21 @@ function admitParagraphFragmentPlan<
       input,
       runtime,
       estimator,
-      depth,
+      depth + refinementDepth,
       plan,
       unit,
     );
     const paragraphRefinements = paragraphRefinementUnits(unit).map(
-      (refinementUnit) => {
-        const refinementRequest = paragraphFragmentRequest(
-          parentRequest,
-          plan,
-          refinementUnit,
-          block,
-        );
-        const refinementInput =
-          narrowSelectedKnowledgeToTranslationWireInput({
-            ...buildInput(refinementRequest),
-            responseProtocol: "typed_tool" as const,
-            paragraphFragment: paragraphFragmentExecutionScope(
-              plan,
-              refinementUnit,
-            ),
-            previousActiveTail: PARAGRAPH_FRAGMENT_ORACLE_PLACEHOLDER,
-          } as TInput);
-        return assessPreparedTranslationFragment(
-          refinementRequest,
-          refinementInput,
-          runtime,
-          estimator,
-          depth,
-          plan,
-          refinementUnit,
-        );
-      },
+      (refinementUnit) => admitUnit(
+        refinementUnit,
+        refinementDepth + 1,
+      ),
     );
     return paragraphRefinements.length === 0
       ? admitted
       : { ...admitted, paragraphRefinements };
-  });
+  };
+  return plan.units.map((unit) => admitUnit(unit, 0));
 }
 
 function admitHighRiskParagraphFragments<
@@ -817,19 +812,39 @@ export function admitTranslationRequests<TInput extends TranslationRequestInput>
   buildInput: (request: PhysicalRequestPlan) => TInput,
 ): AdmittedTranslationRequest<TInput>[] {
   return requests.map((request) => {
-    const fragments = admitHighRiskParagraphFragments(
+    let fragments = admitHighRiskParagraphFragments(
       request,
       runtime,
       estimator,
       blockById,
       buildInput,
-    ) ?? admitTranslationFragments(
-        [request],
-        runtime,
-        estimator,
-        blockById,
-        buildInput,
-      );
+    );
+    if (fragments === undefined) {
+      try {
+        fragments = admitTranslationFragments(
+          [request],
+          runtime,
+          estimator,
+          blockById,
+          buildInput,
+        );
+      } catch (error) {
+        if (!(error instanceof BookRequestCapacityError)) {
+          throw error;
+        }
+        fragments = admitParagraphRecoveryFragments(
+          request,
+          runtime,
+          estimator,
+          blockById,
+          buildInput,
+          1,
+        );
+        if (fragments === undefined) {
+          throw error;
+        }
+      }
+    }
     const largest = fragments.reduce((current, fragment) =>
       fragment.assessment.totalReserved > current.assessment.totalReserved
         ? fragment
@@ -837,26 +852,12 @@ export function admitTranslationRequests<TInput extends TranslationRequestInput>
     );
     const refinementReserveFor = (
       candidates: readonly AdmittedRequestFragment<TInput>[],
-    ): number => {
-      const reserveByPlan = new Map<string, number>();
-      for (const fragment of candidates) {
-        const planId = fragment.paragraphPlan?.planId;
-        if (planId === undefined) continue;
-        const reserve = fragment.paragraphRefinements?.reduce(
-          (total, refinement) =>
-            total + refinement.assessment.totalReserved,
-          0,
-        ) ?? 0;
-        reserveByPlan.set(
-          planId,
-          Math.max(reserveByPlan.get(planId) ?? 0, reserve),
-        );
-      }
-      return [...reserveByPlan.values()].reduce(
-        (total, reserve) => total + reserve,
+    ): number => admittedFragmentTree(candidates)
+      .filter((fragment) => !candidates.includes(fragment))
+      .reduce(
+        (total, fragment) => total + fragment.assessment.totalReserved,
         0,
       );
-    };
     const paragraphRefinementReserveTokens =
       refinementReserveFor(fragments);
     const paragraphRecoveryFragments = fragments.some((fragment) =>
@@ -882,11 +883,8 @@ export function admitTranslationRequests<TInput extends TranslationRequestInput>
       ...fragments,
       ...paragraphRecoveryFragments,
     ]
-      .flatMap((fragment) => [
-        fragment.assessment.totalReserved,
-        ...(fragment.paragraphRefinements ?? []).map((refinement) =>
-          refinement.assessment.totalReserved),
-      ])
+      .flatMap((fragment) => admittedFragmentTree([fragment]))
+      .map((fragment) => fragment.assessment.totalReserved)
       .sort((left, right) => right - left)
       .slice(0, MAX_TARGETED_REPAIRS_PER_REQUEST)
       .reduce((total, reserve) => total + reserve, 0);
@@ -894,6 +892,7 @@ export function admitTranslationRequests<TInput extends TranslationRequestInput>
       request,
       fragments,
       assessment: largest.assessment,
+      paragraphRecoveryFragments,
       paragraphRecoveryReserveTokens,
       paragraphRefinementReserveTokens,
       targetedRepairReserveTokens,
@@ -1282,7 +1281,11 @@ export async function executePlannedTranslationRequest(
     onProviderResponse,
   } = deps;
   const {
-    admitted: { request, fragments },
+    admitted: {
+      request,
+      fragments,
+      paragraphRecoveryFragments = [],
+    },
     runtime: selectedRuntime,
     buildInput: selectedBuildInput,
     features,
@@ -1301,13 +1304,16 @@ export async function executePlannedTranslationRequest(
   // Fragments are one logical provider operation. Reusing the ledger
   // preserves the original hard ceilings instead of multiplying every
   // budget limit by the number of context-recovery fragments.
-  const budget = new BudgetLedger(executionBudgetLimits(fragments));
+  const budget = new BudgetLedger(executionBudgetLimits([
+    ...fragments,
+    ...paragraphRecoveryFragments,
+  ]));
   let observedContextOverflow = false;
   let contextSplitAttempts = 0;
   let protocolSplitAttempts = 0;
   let secondaryChargeOrdinal = 0;
   const targetedRepairScopeKeys = new Set<string>();
-  const refinedParagraphPlanIds = new Set<string>();
+  const refinedParagraphExecutionUnitIds = new Set<string>();
   const acceptedTailByBlockId = new Map<string, string>();
   const chargeSecondaryFragments = async (
     purpose:
@@ -1467,7 +1473,9 @@ export async function executePlannedTranslationRequest(
             && RECOVERABLE_PARAGRAPH_REFINEMENT_ERROR.test(
               window.error ?? "",
             ))
-          && !refinedParagraphPlanIds.has(paragraphScope.planId)
+          && !refinedParagraphExecutionUnitIds.has(
+            paragraphScope.executionUnitId,
+          )
           && (fragment.paragraphRefinements?.length ?? 0) > 0) {
           const failedRuns = [result.run, ...result.repairRuns];
           failedRuns.forEach((run) => recoveryRuns.add(run));
@@ -1477,7 +1485,9 @@ export async function executePlannedTranslationRequest(
             status: "failed",
             protocol: "typed_tool",
           });
-          refinedParagraphPlanIds.add(paragraphScope.planId);
+          refinedParagraphExecutionUnitIds.add(
+            paragraphScope.executionUnitId,
+          );
           const refinementExecutions = await chargeSecondaryFragments(
             "paragraph_fragment",
             fragment.paragraphRefinements ?? [],

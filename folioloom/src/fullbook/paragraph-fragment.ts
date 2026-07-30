@@ -8,10 +8,12 @@ import type { TranslationMemoryCandidate } from "../tools/candidate-collector.js
 export const PARAGRAPH_FRAGMENT_PLAN_VERSION =
   "paragraph-fragment-plan-v1" as const;
 export const PARAGRAPH_FRAGMENT_POLICY_VERSION =
-  "paragraph-fragment-policy-v1" as const;
-export const DEFAULT_MAX_TARGET_PARAGRAPHS_PER_FRAGMENT = 6;
-export const DEFAULT_MAX_SOURCE_TOKENS_PER_FRAGMENT = 480;
+  "paragraph-fragment-policy-v2" as const;
+export const DEFAULT_MAX_TARGET_PARAGRAPHS_PER_FRAGMENT = 10;
+export const DEFAULT_MAX_SOURCE_TOKENS_PER_FRAGMENT = 720;
 export const PARAGRAPH_FRAGMENT_FIRST_THRESHOLD = 12;
+const DEFAULT_TARGET_PARAGRAPHS_PER_FRAGMENT = 8;
+const DEFAULT_TARGET_SOURCE_TOKENS_PER_FRAGMENT = 640;
 
 export interface SourceParagraphSpan {
   readonly paragraphId: string;
@@ -256,7 +258,6 @@ export function planParagraphFragments(
     ]),
   ]);
   const planId = `paragraph-plan-${planHash.slice(0, 24)}`;
-  const units: ParagraphFragmentUnit[] = [];
   const blockScalarLength = Math.max(
     1,
     Array.from(input.block.sourceText).length,
@@ -280,25 +281,102 @@ export function planParagraphFragments(
       ),
     );
   };
-  for (let paragraphStart = 0; paragraphStart < paragraphs.length;) {
-    let paragraphEnd = paragraphStart + 1;
-    while (paragraphEnd < paragraphs.length
-      && paragraphEnd - paragraphStart < maxTargetParagraphs
-      && estimatedTokens(paragraphStart, paragraphEnd + 1)
-        <= maxSourceTokens) {
-      paragraphEnd += 1;
-    }
-    while (paragraphEnd < paragraphs.length) {
-      const left = paragraphs[paragraphEnd - 1];
-      const right = paragraphs[paragraphEnd];
-      if (left === undefined || right === undefined
-        || !protectedSourceRanges.some((range) =>
+  const legalCut = Array.from(
+    { length: paragraphs.length + 1 },
+    (_, index) => {
+      if (index === 0 || index === paragraphs.length) return true;
+      const left = paragraphs[index - 1];
+      const right = paragraphs[index];
+      return left !== undefined
+        && right !== undefined
+        && !protectedSourceRanges.some((range) =>
           range.sourceStart < right.scalarStart
-          && range.sourceEnd > left.scalarEnd)) {
-        break;
+          && range.sourceEnd > left.scalarEnd);
+    },
+  );
+  const legalCutPrefix = legalCut.reduce<number[]>((prefix, allowed, index) => {
+    prefix.push((prefix[index - 1] ?? 0) + (allowed ? 1 : 0));
+    return prefix;
+  }, []);
+  const hasInternalLegalCut = (start: number, end: number): boolean =>
+    (legalCutPrefix[end - 1] ?? 0) - (legalCutPrefix[start] ?? 0) > 0;
+  const targetParagraphs = Math.min(
+    maxTargetParagraphs,
+    DEFAULT_TARGET_PARAGRAPHS_PER_FRAGMENT,
+  );
+  const targetSourceTokens = Math.min(
+    maxSourceTokens,
+    DEFAULT_TARGET_SOURCE_TOKENS_PER_FRAGMENT,
+  );
+  type PartitionState = {
+    readonly groups: number;
+    readonly imbalance: number;
+    readonly previous: number;
+  };
+  const best: Array<PartitionState | undefined> =
+    Array.from({ length: paragraphs.length + 1 });
+  best[0] = { groups: 0, imbalance: 0, previous: -1 };
+  for (let end = 1; end <= paragraphs.length; end += 1) {
+    if (!legalCut[end]) continue;
+    for (let start = 0; start < end; start += 1) {
+      const prior = best[start];
+      if (prior === undefined || !legalCut[start]) continue;
+      const count = end - start;
+      const tokens = estimatedTokens(start, end);
+      const forcedAtomic = !hasInternalLegalCut(start, end);
+      if (
+        (count > maxTargetParagraphs
+          || (tokens > maxSourceTokens && count > 1))
+        && !forcedAtomic
+      ) {
+        continue;
       }
-      paragraphEnd += 1;
+      const paragraphDeviation = count - targetParagraphs;
+      const tokenDeviation = tokens / Math.max(1, targetSourceTokens) - 1;
+      const candidate: PartitionState = {
+        groups: prior.groups + 1,
+        imbalance: prior.imbalance
+          + paragraphDeviation * paragraphDeviation
+          + tokenDeviation * tokenDeviation,
+        previous: start,
+      };
+      const current = best[end];
+      if (
+        current === undefined
+        || candidate.groups < current.groups
+        || (
+          candidate.groups === current.groups
+          && (
+            candidate.imbalance < current.imbalance - Number.EPSILON
+            || (
+              Math.abs(candidate.imbalance - current.imbalance)
+                <= Number.EPSILON
+              && candidate.previous > current.previous
+            )
+          )
+        )
+      ) {
+        best[end] = candidate;
+      }
     }
+  }
+  if (best[paragraphs.length] === undefined) {
+    throw new Error("paragraph fragment policy could not produce an exact cover");
+  }
+  const boundaries: number[] = [paragraphs.length];
+  for (let end = paragraphs.length; end > 0;) {
+    const previous = best[end]?.previous;
+    if (previous === undefined || previous < 0) {
+      throw new Error("paragraph fragment partition lineage is incomplete");
+    }
+    boundaries.push(previous);
+    end = previous;
+  }
+  boundaries.reverse();
+  const units: ParagraphFragmentUnit[] = [];
+  for (let index = 0; index < boundaries.length - 1; index += 1) {
+    const paragraphStart = boundaries[index]!;
+    const paragraphEnd = boundaries[index + 1]!;
     const target = paragraphs.slice(paragraphStart, paragraphEnd);
     const executionUnitId = `paragraph-unit-${stableHash([
       planId,
@@ -322,7 +400,6 @@ export function planParagraphFragments(
         Math.min(paragraphs.length, paragraphEnd + 1),
       ),
     });
-    paragraphStart = paragraphEnd;
   }
   return {
     schemaVersion: PARAGRAPH_FRAGMENT_PLAN_VERSION,

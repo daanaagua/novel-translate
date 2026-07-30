@@ -637,7 +637,6 @@ test("a tx8-shaped single block runs typed paragraph fragments before any framed
             text: `这是第${index + 1}段完整译文，保留了当前源段落的全部普通信息与动作。`,
           })),
         })),
-        notes: [],
       }],
     }), { stopReason: "toolUse" });
   };
@@ -667,10 +666,9 @@ test("a tx8-shaped single block runs typed paragraph fragments before any framed
 
   assert.equal(result.status.humanRequiredWindows, 0);
   assert.equal(result.status.completedWindows + result.status.warningWindows, 1);
-  assert.equal(observedUnits.length, 4);
-  assert.equal(new Set(observedUnits).size, 4);
+  assert.equal(observedUnits.length, 3);
+  assert.equal(new Set(observedUnits).size, 3);
   assert.deepEqual(observedProtocols, [
-    "typed_tool",
     "typed_tool",
     "typed_tool",
     "typed_tool",
@@ -742,7 +740,6 @@ test("a high-risk block inside a multi-block window is fragmented without losing
             text: `这是第${index + 1}段完整标题译文，保留当前源段落的全部信息。`,
           })),
         })),
-        notes: [],
       }],
     }), { stopReason: "toolUse" });
   };
@@ -772,7 +769,7 @@ test("a high-risk block inside a multi-block window is fragmented without losing
   assert.equal(result.windows[0]?.blockIds.length, 2);
   assert.equal(result.status.humanRequiredWindows, 0, JSON.stringify(result.windows));
   assert.equal(result.status.completedWindows + result.status.warningWindows, 1);
-  assert.equal(paragraphCalls, 3);
+  assert.equal(paragraphCalls, 2);
   assert.equal(ordinaryCalls, 1);
   const store = new LosslessBookStore(fixture.options.storePath);
   try {
@@ -787,7 +784,7 @@ test("a high-risk block inside a multi-block window is fragmented without losing
   }
 });
 
-test("each paragraph plan in one logical window has one bounded refinement", async () => {
+test("each paragraph plan refines only failed nodes without forcing scalar leaves", async () => {
   const highRiskBlock = (label: string) => Array.from(
     { length: 13 },
     (_, index) =>
@@ -851,7 +848,6 @@ test("each paragraph plan in one logical window has one bounded refinement", asy
             text: `这是第${index + 1}段完整译文，保留当前源段落的全部信息与动作。`,
           })),
         }],
-        notes: [],
       }],
     }), { stopReason: "toolUse" });
   };
@@ -882,17 +878,17 @@ test("each paragraph plan in one logical window has one bounded refinement", asy
   assert.equal(result.status.humanRequiredWindows, 0, JSON.stringify(result.windows));
   assert.equal(collapseAttemptsByBlock.size, 2);
   assert.ok([...collapseAttemptsByBlock.values()].every((count) => count === 2));
-  assert.equal(singleParagraphCallsByBlock.size, 2);
-  assert.ok([...singleParagraphCallsByBlock.values()].every((count) => count > 1));
+  assert.equal(singleParagraphCallsByBlock.size, 0);
 });
 
-test("one failed paragraph unit refines once to ordered single-paragraph calls", async () => {
+test("failed paragraph units refine by local bisection without replaying valid siblings", async () => {
   const sourceParagraphs = Array.from(
     { length: 14 },
     (_, index) =>
-      `the quiet mechanism preserves all ordinary details in source paragraph ${index + 1}.`,
+      `ordinary source paragraph ${index + 1} preserves its complete sequence of actions, causes, and narrative details.`,
   );
   const fixture = losslessFixture(sourceParagraphs.join("\n\n"));
+  const requestedParagraphOrdinals: number[][] = [];
   const collapsed = (requestContext: Context) => {
     const match =
       /TARGET SOURCE FRAGMENT\n\n(\[[\s\S]*?\])\n\nCONTEXT-ONLY PARAGRAPHS/u.exec(
@@ -901,8 +897,17 @@ test("one failed paragraph unit refines once to ordered single-paragraph calls",
     assert.ok(match?.[1]);
     const windows = JSON.parse(match[1]) as Array<{
       windowId: string;
-      blocks: Array<{ blockId: string }>;
+      blocks: Array<{
+        blockId: string;
+        paragraphs: Array<{ paragraphId: string; ordinal: number }>;
+      }>;
     }>;
+    const ordinals = windows[0]?.blocks[0]?.paragraphs.map((paragraph) =>
+      Number.parseInt(paragraph.paragraphId.split(":").at(-1) ?? "", 10)) ?? [];
+    requestedParagraphOrdinals.push(ordinals);
+    if (ordinals.length <= 1 || ordinals[0] !== 0) {
+      return valid(requestContext);
+    }
     return fauxAssistantMessage(fauxToolCall("finalize_translation_batch", {
       windows: windows.map((window) => ({
         windowId: window.windowId,
@@ -910,7 +915,6 @@ test("one failed paragraph unit refines once to ordered single-paragraph calls",
           blockId: block.blockId,
           paragraphs: [{ text: "过短。" }],
         })),
-        notes: [],
       })),
     }), { stopReason: "toolUse" });
   };
@@ -937,7 +941,7 @@ test("one failed paragraph unit refines once to ordered single-paragraph calls",
       return fauxAssistantMessage(fauxToolCall(
         "finalize_paragraph_fragment",
         {
-          text: "这是完整的单段译文，保留当前源段落的全部动作、因果与叙述细节。",
+          text: "这是完整的单段译文，保留当前源段落的全部动作、因果、人物关系、时间顺序与叙述细节，没有遗漏任何场景信息，并保持表达清晰连贯。",
         },
       ), { stopReason: "toolUse" });
     }
@@ -947,18 +951,13 @@ test("one failed paragraph unit refines once to ordered single-paragraph calls",
         translations: [{
           blockId: block.blockId,
           paragraphs: block.paragraphs.map((_, index) => ({
-            text: `这是第 ${index + 1} 段完整译文，保留当前源段落的全部动作、因果与叙述细节。`,
+            text: `这是第 ${index + 1} 段完整译文，保留当前源段落的全部动作、因果、人物关系、时间顺序与叙述细节，没有遗漏任何场景信息，并保持表达清晰连贯。`,
           })),
         }],
-        notes: [],
       }],
     }), { stopReason: "toolUse" });
   };
-  fixture.faux.setResponses([
-    collapsed,
-    collapsed,
-    ...Array.from({ length: 8 }, () => valid),
-  ]);
+  fixture.faux.setResponses(Array.from({ length: 16 }, () => collapsed));
   const model = fixture.faux.getModel();
   const streamFn = fixture.faux.provider.streamSimple.bind(
     fixture.faux.provider,
@@ -980,7 +979,17 @@ test("one failed paragraph unit refines once to ordered single-paragraph calls",
     },
   } as never);
 
-  assert.equal(fixture.faux.state.callCount, 10);
+  assert.deepEqual(requestedParagraphOrdinals, [
+    [0, 1, 2, 3, 4, 5, 6],
+    [0, 1, 2, 3, 4, 5, 6],
+    [0, 1, 2],
+    [0, 1, 2],
+    [0],
+    [1, 2],
+    [3, 4, 5, 6],
+    [7, 8, 9, 10, 11, 12, 13],
+  ]);
+  assert.equal(fixture.faux.state.callCount, 8);
   assert.equal(result.status.humanRequiredWindows, 0);
   assert.equal(result.status.completedWindows + result.status.warningWindows, 1);
   const store = new LosslessBookStore(fixture.options.storePath);
@@ -988,7 +997,7 @@ test("one failed paragraph unit refines once to ordered single-paragraph calls",
     const ledgerEvents = store.loadTokenLedgerEvents("run-lossless");
     assert.equal(ledgerEvents.filter((event) =>
       event.type === "reserved"
-      && event.purpose === "paragraph_fragment").length, 1);
+      && event.purpose === "paragraph_fragment").length, 2);
     const translationBaseline = ledgerEvents
       .reduce((total, event) =>
         event.type === "baseline_added"
@@ -1070,7 +1079,6 @@ test("an already-fragmented structural failure never falls back to whole-block f
               text: `这是第 ${index + 1} 段完整译文，保留当前源段落的全部普通信息。`,
           })),
         })),
-        notes: [],
       }],
     }), { stopReason: "toolUse" });
   };
@@ -1099,7 +1107,7 @@ test("an already-fragmented structural failure never falls back to whole-block f
     },
   } as never);
 
-  assert.equal(protocols.length, 9);
+  assert.equal(protocols.length, 4);
   assert.ok(protocols.every((protocol) => protocol === "typed_tool"));
   assert.equal(result.status.humanRequiredWindows, 0);
   assert.equal(result.status.completedWindows + result.status.warningWindows, 1);
@@ -1160,7 +1168,6 @@ test("shape collapse on a smaller single block routes to typed fragments, not fr
               text: `这是恢复后的第${index + 1}段完整译文，包含源段落全部信息。`,
           })),
         })),
-        notes: [],
       }],
     }), { stopReason: "toolUse" });
   };
@@ -1192,7 +1199,7 @@ test("shape collapse on a smaller single block routes to typed fragments, not fr
 
   assert.equal(result.status.humanRequiredWindows, 0);
   assert.equal(result.status.completedWindows + result.status.warningWindows, 1);
-  assert.deepEqual(protocols, ["typed_tool", "typed_tool", "typed_tool"]);
+  assert.deepEqual(protocols, ["typed_tool", "typed_tool"]);
   const store = new LosslessBookStore(fixture.options.storePath);
   try {
     const events = store.loadTokenLedgerEvents("run-lossless");
@@ -1253,7 +1260,6 @@ test("resumed paragraph recovery allocates a fresh ledger attempt after a termin
             text: `这是恢复后的第 ${index + 1} 段完整译文，包含源段落全部信息。`,
           })),
         })),
-        notes: [],
       }],
     }), { stopReason: "toolUse" });
   };
@@ -1403,7 +1409,6 @@ test("paragraph fragments retain bounded repair credits across independent units
             }。`,
           })),
         })),
-        notes: [],
       }],
     }), { stopReason: "toolUse" });
   };
@@ -1457,7 +1462,7 @@ test("paragraph fragments retain bounded repair credits across independent units
   } as never);
 
   assert.equal(repairCalls, 2);
-  assert.equal(fixture.faux.state.callCount, 5);
+  assert.equal(fixture.faux.state.callCount, 4);
   assert.equal(result.status.humanRequiredWindows, 0, JSON.stringify({
     status: result.status,
     windows: result.windows,
@@ -3746,8 +3751,10 @@ test("long multi-paragraph revalidation descends through the shared paragraph re
         targetSurface: occurrence.canonicalTarget,
       }));
   };
+  const resumedPrompts: string[] = [];
   const collapsedOrRecovered = (context: Context) => {
     const prompt = userText(context);
+    resumedPrompts.push(prompt);
     if (prompt.includes("ordinary tail marker")) {
       return losslessBatchResponse(context);
     }
@@ -3787,7 +3794,6 @@ test("long multi-paragraph revalidation descends through the shared paragraph re
             paragraphs: translatedParagraphs,
           }],
           termUsages,
-          notes: [],
         }],
       }), { stopReason: "toolUse" });
     }
@@ -3838,6 +3844,11 @@ test("long multi-paragraph revalidation descends through the shared paragraph re
 
   assert.equal(resumed.status.humanRequiredWindows, 0);
   assert.equal(resumed.status.completedWindows, 2);
+  assert.match(
+    resumedPrompts[0] ?? "",
+    /ordinary tail marker/u,
+    "pending translation windows must finish before the final revalidation drain",
+  );
   const store = new LosslessBookStore(fixture.options.storePath);
   try {
     const tasks = store.revalidationTasks("run-lossless");

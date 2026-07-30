@@ -732,6 +732,44 @@ test("single-pass lexical anchor decisions remain preferred rather than hard-loc
   assert.equal(outcome.terms[0]?.policy, "preferred");
 });
 
+test("an uncorroborated capitalized common word stays a soft preference", async () => {
+  const faux = fauxProvider();
+  faux.setResponses([fauxAssistantMessage(fauxToolCall("submit_lexical_anchors", {
+    anchors: [{
+      sourceForm: "Ocean",
+      target: "海洋",
+      mode: "stable",
+      semanticClass: "proper_name",
+      confidence: 0.99,
+    }],
+    entityLinks: [],
+  }), { stopReason: "toolUse" })]);
+
+  const outcome = await new LexicalAnchorer(new PiRuntime()).run({
+    candidates: [{
+      sourceForm: "Ocean",
+      contexts: [
+        "They crossed the Ocean in silence.",
+        "The western edge of the Ocean was dark.",
+      ],
+      corpusFrequency: 9,
+      currentWaveOccurrences: 3,
+      documentFrequency: 3,
+    }],
+    stableTerms: [],
+    model: faux.getModel(),
+    streamFn: faux.provider.streamSimple.bind(faux.provider),
+    budget: new BudgetLedger(),
+    sourceLanguageProfile: getSourceLanguageProfile("en"),
+  });
+
+  assert.equal(outcome.anchors[0]?.semanticClass, "unclassified");
+  assert.equal(outcome.terms.length, 1);
+  assert.match(outcome.terms[0]?.conceptId ?? "", /^run-anchor-/u);
+  assert.equal(outcome.terms[0]?.policy, "preferred");
+  assert.equal(outcome.terms[0]?.locked, false);
+});
+
 test("contextual role anchor remains translator-visible without forcing one surface form", async () => {
   const faux = fauxProvider();
   faux.setResponses([fauxAssistantMessage(fauxToolCall("submit_lexical_anchors", {

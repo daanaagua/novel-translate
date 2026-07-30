@@ -2668,12 +2668,8 @@ async function runLosslessBook(
       }
       const snapshot = store.latestKnowledgeSnapshot(runId);
       if (snapshot.id !== work.task.toSnapshotId) {
-        const currentConceptIds = new Set(
-          stableTermsFromKnowledge(snapshot.revisions)
-            .map((term) => term.conceptId),
-        );
         if (work.task.conceptIds.some((conceptId) =>
-          !currentConceptIds.has(conceptId))) {
+          store.activeLexicalConcept(runId, conceptId) === undefined)) {
           throw new RevalidationOutputError(
             "latest snapshot no longer contains a changed concept",
           );
@@ -3023,17 +3019,7 @@ async function runLosslessBook(
       };
     };
 
-    while (processedWindows < maxWindows) {
-      if (options.shouldPause?.() === true) {
-        break;
-      }
-      throwIfAborted(options.signal);
-      assertSourceVersionUnchanged(context);
-      // A book or project catalog can be edited by another completed run while
-      // this run is paused. Synchronize only at the wave boundary, before any
-      // window is claimed, so the next request sees the newest durable user
-      // knowledge without ever changing a running/staged wave.
-      store.syncScopedKnowledge(runId);
+    const drainRevalidationAtFinalBarrier = async (): Promise<void> => {
       const revalidationOptions = {
         store,
         runId,
@@ -3063,8 +3049,23 @@ async function runLosslessBook(
         drainedRevalidation,
       );
       if (drainedRevalidation.modelCalls > 0) {
-        flushSchedulerProjection();
+        flushSchedulerProjection?.();
       }
+    };
+
+    let paused = false;
+    while (processedWindows < maxWindows) {
+      if (options.shouldPause?.() === true) {
+        paused = true;
+        break;
+      }
+      throwIfAborted(options.signal);
+      assertSourceVersionUnchanged(context);
+      // A book or project catalog can be edited by another completed run while
+      // this run is paused. Synchronize only at the wave boundary, before any
+      // window is claimed, so the next request sees the newest durable user
+      // knowledge without ever changing a running/staged wave.
+      store.syncScopedKnowledge(runId);
       const allWindows = store.allWindows(runId);
       const barrier = firstUncommitted(allWindows);
       if (barrier === undefined || barrier.status !== "pending") {
@@ -4222,6 +4223,18 @@ async function runLosslessBook(
       }
       if (providerFailure !== undefined) {
         throw providerFailure;
+      }
+    }
+
+    if (!paused) {
+      // Model revalidation is a final-watermark operation.  Knowledge may
+      // continue to change while untranslated windows remain, so draining at
+      // every wave repeats expensive work against snapshots that are already
+      // known to be provisional.  Pending tasks remain durable and stale
+      // bindings continue to block strict export until this barrier is reached.
+      store.syncScopedKnowledge(runId);
+      if (firstUncommitted(store.allWindows(runId)) === undefined) {
+        await drainRevalidationAtFinalBarrier();
       }
     }
 
