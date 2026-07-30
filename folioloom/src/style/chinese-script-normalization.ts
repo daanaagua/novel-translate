@@ -10,6 +10,9 @@ const compatibilityToChinese = OpenCC.CustomConverter([
   ["槪", "概"],
   ["衞", "衛"],
   ["敎", "教"],
+  ["愼", "慎"],
+  ["硏", "研"],
+  ["晄", "晃"],
 ]);
 const japaneseToChinese = OpenCC.Converter({ from: "jp", to: "cn" });
 const traditionalToSimplified = OpenCC.Converter({ from: "t", to: "cn" });

@@ -13,6 +13,8 @@ import { blockId as losslessBlockId } from "./source/block-builder.js";
 import { scalarLength } from "./source/types.js";
 import type { BookStore } from "./storage/book-store.js";
 import type { LosslessBookStore } from "./storage/lossless-book-store.js";
+import type { SchedulerRunReport } from "./fullbook/dynamic-scheduler.js";
+import { optimizationPolicy } from "./fullbook/optimization-policy.js";
 
 export interface PilotTranslation {
   blockId: string;
@@ -159,6 +161,19 @@ export interface LosslessBookAuditReport {
   runStatus: string;
   runMetadata: unknown;
   complete: boolean;
+  structurallyComplete: boolean;
+  knowledgeConverged: boolean;
+  strictExportable: boolean;
+  revalidation: {
+    pending: number;
+    validating: number;
+    stale: number;
+    warningStale: number;
+    coverageMissing: number;
+    resolvedNoop: number;
+    repaired: number;
+    retranslated: number;
+  };
   totalBlockCount: number;
   translatedBlockCount: number;
   missingBlockIds: string[];
@@ -310,7 +325,6 @@ export function auditLosslessBookStore(
     payloadRevisions: readonly KnowledgeRevision[],
     producingWindowId: string | null,
   ): KnowledgeStore => {
-    const target = new KnowledgeStore(payloadRevisions);
     const previous = projectedKnowledge ?? new KnowledgeStore();
     const selected: Array<{
       readonly index: number;
@@ -328,7 +342,7 @@ export function auditLosslessBookStore(
         }
       }
     } else {
-      for (const targetRevision of target.listRevisions()) {
+      for (const targetRevision of payloadRevisions) {
         const previousRevision = previous.latestRevision(
           targetRevision.normalizedSubject,
           targetRevision.kind,
@@ -363,7 +377,7 @@ export function auditLosslessBookStore(
     );
     const actual = createKnowledgeSnapshot(
       state.runId,
-      target.projectableRevisions(),
+      payloadRevisions,
       previousSnapshotId,
     );
     if (canonicalJson(expected) !== canonicalJson(actual)) {
@@ -467,7 +481,39 @@ export function auditLosslessBookStore(
   if (state.runStatus === "completed" && missingBlockIds.length > 0) {
     incidents.push("RUN_LINEAGE_INVALID");
   }
+  const structurallyComplete = missingBlockIds.length === 0
+    && incidents.length === 0;
+  const revalidation = {
+    pending: state.revalidationTasks.filter((task) =>
+      task.status === "pending").length,
+    validating: state.revalidationTasks.filter((task) =>
+      task.status === "validating").length,
+    stale: state.conceptBindings.filter((binding) =>
+      binding.validationStatus === "pending"
+      || binding.validationStatus === "validating"
+      || binding.validationStatus === "stale").length,
+    warningStale: state.conceptBindings.filter((binding) =>
+      binding.validationStatus === "warning_stale").length,
+    coverageMissing: state.missingConceptBindings.length,
+    resolvedNoop: state.revalidationTasks.filter((task) =>
+      task.status === "resolved_noop").length,
+    repaired: state.revalidationTasks.filter((task) =>
+      task.status === "resolved_repair").length,
+    retranslated: state.revalidationTasks.filter((task) =>
+      task.status === "resolved_retranslate").length,
+  };
+  const knowledgeConverged = revalidation.pending === 0
+    && revalidation.validating === 0
+    && revalidation.stale === 0
+    && revalidation.warningStale === 0
+    && revalidation.coverageMissing === 0
+    && state.revalidationTasks.every((task) =>
+      task.status !== "completed_with_warning");
+  if (!knowledgeConverged) {
+    incidents.push("STALE_KNOWLEDGE_BINDING");
+  }
   const incidentCodes = [...new Set(incidents)].sort();
+  const strictExportable = structurallyComplete && knowledgeConverged;
   return {
     schema: "v5-book-store-audit-1",
     runId: state.runId,
@@ -476,7 +522,11 @@ export function auditLosslessBookStore(
     modelId: state.modelId,
     runStatus: state.runStatus,
     runMetadata: state.runMetadata,
-    complete: missingBlockIds.length === 0 && incidentCodes.length === 0,
+    complete: strictExportable,
+    structurallyComplete,
+    knowledgeConverged,
+    strictExportable,
+    revalidation,
     totalBlockCount: blocks.length,
     translatedBlockCount: translatedBlockIds.size,
     missingBlockIds,
@@ -490,8 +540,10 @@ export function losslessBookLineage(
   runId: string,
 ): LosslessBookLineage {
   const audit = auditLosslessBookStore(store, runId);
-  if (audit.incidentCodes.length > 0) {
-    throw new Error(`lossless lineage audit failed: ${audit.incidentCodes.join(",")}`);
+  const integrityIncidents = audit.incidentCodes.filter((code) =>
+    code !== "STALE_KNOWLEDGE_BINDING");
+  if (integrityIncidents.length > 0) {
+    throw new Error(`lossless lineage audit failed: ${integrityIncidents.join(",")}`);
   }
   const state = store.auditState(runId);
   const active = new Map(store.activeTranslations(runId).map((item) => [item.blockId, item]));
@@ -568,6 +620,216 @@ export function losslessBookTranslations(
 export interface WriteLosslessBookArtifactsOptions {
   allowIncomplete?: boolean;
   fileStem?: string;
+  scheduler?: SchedulerRunReport;
+}
+
+export interface SchedulerMetricsReport {
+  readonly schema: "v5-book-scheduler-metrics-1";
+  readonly mode: SchedulerRunReport["mode"];
+  readonly profile: SchedulerRunReport["profile"];
+  readonly plannerStatus: SchedulerRunReport["planningStatus"];
+  readonly wallTime: {
+    readonly legacyEstimateMs: number;
+    readonly plannedEstimateMs: number;
+    readonly actualMs: number;
+  };
+  readonly tokenEnvelope: {
+    readonly baselineTokens: number;
+    readonly allowedTokens: number;
+    readonly predictedTokens: number;
+    readonly actualTokens: number;
+    readonly exceeded: boolean;
+  };
+  readonly selections: {
+    readonly contextProfiles: Readonly<Record<string, number>>;
+    readonly efforts: Readonly<Record<string, number>>;
+    readonly protocols: Readonly<Record<string, number>>;
+  };
+  readonly events: {
+    readonly plannerDeadlines: number;
+    readonly fallbacks: number;
+    readonly throttles: number;
+    readonly recoveries: number;
+  };
+  readonly decisions: number;
+  readonly tokenUsageComplete: boolean;
+}
+
+const METRIC_EFFORTS = new Set([
+  "off",
+  "on",
+  "minimal",
+  "low",
+  "medium",
+  "high",
+  "xhigh",
+  "max",
+]);
+
+function sortedPositiveCounts(
+  counts: Readonly<Record<string, number>>,
+  allowedKeys?: ReadonlySet<string>,
+): Record<string, number> {
+  const result: Record<string, number> = {};
+  for (const key of Object.keys(counts).sort((left, right) =>
+    left.localeCompare(right, "en"))) {
+    const count = counts[key] ?? 0;
+    if (!Number.isSafeInteger(count) || count < 0) {
+      throw new TypeError(`scheduler metric count must be non-negative: ${key}`);
+    }
+    if (count === 0) continue;
+    const safeKey = allowedKeys === undefined || allowedKeys.has(key)
+      ? key
+      : "unknown";
+    result[safeKey] = (result[safeKey] ?? 0) + count;
+  }
+  return result;
+}
+
+export function schedulerMetrics(
+  scheduler: SchedulerRunReport,
+): SchedulerMetricsReport {
+  const contextProfiles = { lean: 0, balanced: 0, rich: 0 };
+  for (const profile of Object.values(scheduler.contextProfiles)) {
+    contextProfiles[profile] += 1;
+  }
+  const selectedContextProfiles = sortedPositiveCounts(contextProfiles);
+  const efforts = sortedPositiveCounts(
+    scheduler.effortCounts,
+    METRIC_EFFORTS,
+  );
+  const protocols = sortedPositiveCounts(
+    scheduler.protocolCounts,
+    new Set(["typed_tool", "framed_text", "local"]),
+  );
+  return {
+    schema: "v5-book-scheduler-metrics-1",
+    mode: scheduler.mode,
+    profile: scheduler.profile,
+    plannerStatus: scheduler.planningStatus,
+    wallTime: {
+      legacyEstimateMs: scheduler.baselineWallTimeMs,
+      plannedEstimateMs: scheduler.predictedWallTimeMs,
+      actualMs: scheduler.actualWallTimeMs,
+    },
+    tokenEnvelope: {
+      baselineTokens: scheduler.baselineTokens,
+      allowedTokens: scheduler.allowedTokens,
+      predictedTokens: scheduler.predictedTokens,
+      actualTokens: scheduler.actualTokens,
+      exceeded: Math.max(
+        scheduler.predictedTokens,
+        scheduler.actualTokens,
+      ) > scheduler.allowedTokens,
+    },
+    selections: {
+      contextProfiles: selectedContextProfiles,
+      efforts,
+      protocols,
+    },
+    events: {
+      plannerDeadlines: scheduler.plannerDeadlines,
+      fallbacks: scheduler.fallbacks,
+      throttles: scheduler.throttles,
+      recoveries: scheduler.recoveries,
+    },
+    decisions: scheduler.decisions,
+    tokenUsageComplete: scheduler.tokenUsageComplete,
+  };
+}
+
+function schedulerMetricsProjection(
+  scheduler: SchedulerRunReport | undefined,
+): SchedulerMetricsReport | null {
+  if (scheduler === undefined) return null;
+  return schedulerMetrics(scheduler);
+}
+
+const TOKEN_LEDGER_EXPORT_INCIDENTS = new Set([
+  "TOKEN_LEDGER_PROJECTION_MISSING",
+  "TOKEN_LEDGER_PROJECTION_MISMATCH",
+  "TOKEN_LEDGER_OPEN_ATTEMPT",
+  "TOKEN_USAGE_INCOMPLETE",
+]);
+
+function sameLedgerProjection(
+  left: SchedulerRunReport,
+  right: SchedulerRunReport,
+): boolean {
+  return left.baselineTokens === right.baselineTokens
+    && left.allowedTokens === right.allowedTokens
+    && left.actualTokens === right.actualTokens
+    && left.tokenUsageComplete === right.tokenUsageComplete;
+}
+
+export function auditLosslessBookExport(
+  store: LosslessBookStore,
+  runId: string,
+  schedulerOverride?: SchedulerRunReport,
+): {
+  readonly audit: LosslessBookAuditReport;
+  readonly scheduler: SchedulerRunReport | undefined;
+} {
+  const baseAudit = auditLosslessBookStore(store, runId);
+  const ledgerEvents = store.loadTokenLedgerEvents(runId);
+  let storedProjection: SchedulerRunReport | undefined;
+  try {
+    storedProjection = store.loadSchedulerMetrics(runId);
+  } catch (error) {
+    if (!(error instanceof TypeError)
+      || !/requires TokenLedgerInit/u.test(error.message)) {
+      throw error;
+    }
+  }
+  const projection = schedulerOverride ?? storedProjection;
+  let scheduler = projection;
+  const ledgerIncidents: string[] = [];
+  if (ledgerEvents.length > 0) {
+    if (projection === undefined) {
+      ledgerIncidents.push("TOKEN_LEDGER_PROJECTION_MISSING");
+    } else {
+      const init = {
+        mode: projection.mode,
+        profile: projection.profile,
+        tokenIncreaseCap:
+          optimizationPolicy(projection.profile).tokenIncreaseCap,
+        enforceDispatchLifecycle: true,
+      };
+      const ledger = store.loadTokenLedger(runId, init);
+      const durableScheduler = store.loadSchedulerMetrics(runId, init);
+      if (durableScheduler === undefined) {
+        ledgerIncidents.push("TOKEN_LEDGER_PROJECTION_MISSING");
+      } else {
+        scheduler = durableScheduler;
+        if (!sameLedgerProjection(projection, durableScheduler)
+          || (storedProjection !== undefined
+            && !sameLedgerProjection(storedProjection, durableScheduler))) {
+          ledgerIncidents.push("TOKEN_LEDGER_PROJECTION_MISMATCH");
+        }
+        if (!durableScheduler.tokenUsageComplete) {
+          ledgerIncidents.push("TOKEN_USAGE_INCOMPLETE");
+        }
+      }
+      if (!ledger.reconcile().consistent) {
+        ledgerIncidents.push("TOKEN_LEDGER_OPEN_ATTEMPT");
+      }
+    }
+  }
+  const incidentCodes = [...new Set([
+    ...baseAudit.incidentCodes,
+    ...ledgerIncidents,
+  ])].sort();
+  const strictExportable = baseAudit.strictExportable
+    && ledgerIncidents.length === 0;
+  return {
+    audit: {
+      ...baseAudit,
+      complete: strictExportable,
+      strictExportable,
+      incidentCodes,
+    },
+    scheduler,
+  };
 }
 
 export function writeLosslessBookArtifacts(
@@ -576,11 +838,31 @@ export function writeLosslessBookArtifacts(
   outputDirectory: string,
   options: WriteLosslessBookArtifactsOptions = {},
 ): LosslessBookArtifactPaths {
-  const audit = auditLosslessBookStore(store, runId);
-  if (audit.incidentCodes.length > 0) {
-    throw new Error(`lossless export audit failed: ${audit.incidentCodes.join(",")}`);
+  const projection = auditLosslessBookExport(
+    store,
+    runId,
+    options.scheduler,
+  );
+  const audit = projection.audit;
+  const integrityIncidents = audit.incidentCodes.filter((code) =>
+    code !== "STALE_KNOWLEDGE_BINDING"
+    && !TOKEN_LEDGER_EXPORT_INCIDENTS.has(code));
+  if (integrityIncidents.length > 0) {
+    throw new Error(`lossless export audit failed: ${integrityIncidents.join(",")}`);
   }
-  if (!options.allowIncomplete && !audit.complete) {
+  if (!options.allowIncomplete && !audit.strictExportable) {
+    const ledgerIncidents = audit.incidentCodes.filter((code) =>
+      TOKEN_LEDGER_EXPORT_INCIDENTS.has(code));
+    if (ledgerIncidents.length > 0) {
+      throw new Error(
+        `strict book export requires reconciled token usage: ${ledgerIncidents.join(",")}`,
+      );
+    }
+    if (!audit.knowledgeConverged) {
+      throw new Error(
+        "strict book export requires knowledge convergence: STALE_KNOWLEDGE_BINDING",
+      );
+    }
     throw new Error(
       `strict book export requires ${audit.totalBlockCount} translated blocks; found ${audit.translatedBlockCount}`,
     );
@@ -593,6 +875,7 @@ export function writeLosslessBookArtifacts(
   }), "utf8");
   writeFileSync(paths.bilingual, renderBilingual(translations), "utf8");
   writeFileSync(paths.audit, `${JSON.stringify(audit, null, 2)}\n`, "utf8");
+  const schedulerReport = projection.scheduler;
   writeFileSync(paths.metrics, `${JSON.stringify({
     schema: "v5-book-metrics-1",
     runId: audit.runId,
@@ -601,11 +884,19 @@ export function writeLosslessBookArtifacts(
     modelId: audit.modelId,
     runMetadata: audit.runMetadata,
     complete: audit.complete,
+    structurallyComplete: audit.structurallyComplete,
+    knowledgeConverged: audit.knowledgeConverged,
+    strictExportable: audit.strictExportable,
+    revalidation: audit.revalidation,
     missingBlockIds: audit.missingBlockIds,
     missingBlockCount: audit.missingBlockCount,
     status: store.statusSummary(runId),
+    scheduler: schedulerMetricsProjection(schedulerReport),
   }, null, 2)}\n`, "utf8");
-  const lineageJson = `${JSON.stringify(losslessBookLineage(store, runId), null, 2)}\n`;
+  const lineageJson = `${JSON.stringify({
+    ...losslessBookLineage(store, runId),
+    complete: audit.complete,
+  }, null, 2)}\n`;
   writeFileSync(paths.translationLineage, lineageJson, "utf8");
   writeFileSync(paths.bilingualLineage, lineageJson, "utf8");
   writeFileSync(paths.auditLineage, lineageJson, "utf8");

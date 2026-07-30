@@ -17,6 +17,7 @@ import { planBookWindows } from "../src/fullbook/window-planner.js";
 import { createKnowledgeSnapshot } from "../src/knowledge/snapshot.js";
 import {
   renderTranslation,
+  schedulerMetrics,
   writeLosslessBookArtifacts,
   type LosslessBookArtifactPaths,
 } from "../src/report.js";
@@ -202,6 +203,122 @@ test("partial lineage is explicit and selected run never mixes another run", () 
     const translation = readFileSync(paths.translation, "utf8");
     assert.match(translation, /run-a-0/u);
     assert.doesNotMatch(translation, /run-b/u);
+    assert.equal(verifyExport(paths, item.store, "run-a").ok, true);
+  } finally {
+    item.store.close();
+    item.context.close();
+  }
+});
+
+test("partial scheduler report contains only aggregate execution metrics", () => {
+  const item = fixture();
+  try {
+    addRun(item.store, item.context, "run-a", 1);
+    const scheduler = {
+      mode: "shadow" as const,
+      profile: "balanced" as const,
+      planningStatus: "shadow" as const,
+      decisions: 2,
+      fallbacks: 0,
+      baselineWallTimeMs: 2_400,
+      predictedWallTimeMs: 1_200,
+      actualWallTimeMs: 1_350,
+      baselineTokens: 780,
+      allowedTokens: 858,
+      predictedTokens: 800,
+      actualTokens: 820,
+      tokenUsageComplete: true,
+      contextProfiles: { "window-a": "lean" as const },
+      effortCounts: { high: 1 },
+      protocolCounts: {
+        typed_tool: 1,
+        framed_text: 0,
+        local: 0,
+      },
+      plannerDeadlines: 0,
+      throttles: 0,
+      recoveries: 0,
+    };
+    const paths = writeLosslessBookArtifacts(
+      item.store,
+      "run-a",
+      item.output,
+      { allowIncomplete: true, scheduler },
+    );
+
+    const metrics = JSON.parse(readFileSync(paths.metrics, "utf8")) as {
+      scheduler?: unknown;
+    };
+    assert.deepEqual(metrics.scheduler, schedulerMetrics(scheduler));
+    assert.doesNotMatch(
+      JSON.stringify(metrics.scheduler),
+      /sourceText|prompt|translation/u,
+    );
+  } finally {
+    item.store.close();
+    item.context.close();
+  }
+});
+
+test("strict export fails closed when durable provider usage is incomplete", () => {
+  const item = fixture();
+  try {
+    addRun(item.store, item.context, "run-a", item.context.losslessBlocks.length);
+    item.store.appendTokenLedgerEvent("run-a", {
+      type: "baseline_added",
+      taskIds: ["translate-window:one"],
+      baselineTokens: 1_000,
+      source: "translate_horizon",
+      reason: "fixture",
+    });
+    item.store.appendTokenLedgerEvent("run-a", {
+      type: "reserved",
+      requestId: "attempt-one",
+      purpose: "translate",
+      taskIds: ["translate-window:one"],
+      predictedTokens: 300,
+      attempt: 0,
+    });
+    item.store.appendTokenLedgerEvent("run-a", {
+      type: "dispatched",
+      requestId: "attempt-one",
+    });
+    item.store.appendTokenLedgerEvent("run-a", {
+      type: "settled",
+      requestId: "attempt-one",
+      actualTokens: 120,
+      usageComplete: false,
+      outcome: "failed",
+    });
+    const ledger = item.store.loadTokenLedger("run-a", {
+      mode: "active",
+      profile: "balanced",
+      tokenIncreaseCap: 0.1,
+      enforceDispatchLifecycle: true,
+    });
+    item.store.saveSchedulerRunProjection(
+      "run-a",
+      ledger.toSchedulerRunReport(),
+    );
+
+    assert.throws(
+      () => writeLosslessBookArtifacts(item.store, "run-a", item.output),
+      /TOKEN_USAGE_INCOMPLETE/u,
+    );
+    const paths = writeLosslessBookArtifacts(
+      item.store,
+      "run-a",
+      item.output,
+      { allowIncomplete: true },
+    );
+    const audit = JSON.parse(readFileSync(paths.audit, "utf8")) as {
+      complete: boolean;
+      strictExportable: boolean;
+      incidentCodes: string[];
+    };
+    assert.equal(audit.complete, false);
+    assert.equal(audit.strictExportable, false);
+    assert.ok(audit.incidentCodes.includes("TOKEN_USAGE_INCOMPLETE"));
     assert.equal(verifyExport(paths, item.store, "run-a").ok, true);
   } finally {
     item.store.close();

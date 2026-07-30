@@ -34,6 +34,7 @@ import { createKnowledgeSnapshot } from "../src/knowledge/snapshot.js";
 import type { ModelProfile, ProviderEffort } from "../src/providers/types.js";
 import { scalarLength } from "../src/source/types.js";
 import { LosslessBookStore } from "../src/storage/lossless-book-store.js";
+import { RuntimeProfileStore } from "../src/storage/runtime-profile-store.js";
 
 function fixture(source = `${"A".repeat(3_500)}\n\n${"B".repeat(3_500)}`): {
   directory: string;
@@ -135,6 +136,57 @@ function runResult(
     status: status(),
     windows: [],
     wallTimeMs: 10,
+    revalidationOverhead: {
+      coverageScan: {
+        occurrenceDependencies: 0,
+        candidateTranslations: 0,
+        tasksCreated: 0,
+        bindingsCreated: 0,
+        wallTimeMs: 0,
+      },
+      drain: {
+        claimed: 0,
+        noop: 0,
+        repaired: 0,
+        retranslated: 0,
+        warning: 0,
+        modelCalls: 0,
+        modelDurationMs: 0,
+        inputTokens: 0,
+        outputTokens: 0,
+        cacheReadTokens: 0,
+        cacheWriteTokens: 0,
+        reasoningTokens: 0,
+        totalTokens: 0,
+        tokenUsageComplete: true,
+        wallTimeMs: 0,
+      },
+    },
+    scheduler: {
+      mode: "off",
+      profile: "balanced",
+      planningStatus: "disabled",
+      decisions: 0,
+      fallbacks: 0,
+      baselineWallTimeMs: 0,
+      predictedWallTimeMs: 0,
+      actualWallTimeMs: 0,
+      baselineTokens: 0,
+      allowedTokens: 0,
+      predictedTokens: 0,
+      actualTokens: 0,
+      tokenUsageComplete: true,
+      contextProfiles: {},
+      effortCounts: {},
+      protocolCounts: {
+        typed_tool: 0,
+        framed_text: 0,
+        local: 0,
+      },
+      plannerDeadlines: 0,
+      throttles: 0,
+      recoveries: 0,
+    },
     leaseReleased: true,
     artifacts: null,
     ...overrides,
@@ -149,6 +201,7 @@ function storedFullBookRun(options: {
   project: ReturnType<typeof fixture>;
   runId: string;
   mode?: "quality" | "fast";
+  optimizationProfile?: "economy" | "balanced" | "speed";
   completedWindows?: number;
   humanRequired?: boolean;
   runtime?: DesktopRuntimeResolver;
@@ -174,6 +227,9 @@ function storedFullBookRun(options: {
         desktopFullBook: {
           schema: "folioloom-desktop-fullbook-1",
           mode: options.mode ?? "quality",
+          ...(options.optimizationProfile === undefined
+            ? {}
+            : { optimizationProfile: options.optimizationProfile }),
           runtimeFingerprint: serializeDesktopRuntimeFingerprint(plan.fingerprint),
           styleProfileHash: "desktop-default-style-1",
         },
@@ -237,6 +293,9 @@ function storedFullBookRun(options: {
 
 test("desktop full-book start launches in background with formal run metadata", async () => {
   const project = fixture();
+  const runtimeProfileStore = new RuntimeProfileStore(
+    join(project.directory, "runtime-profiles.db"),
+  );
   const seen: LosslessBookRunOptions[] = [];
   let complete!: (result: LosslessBookRunResult) => void;
   const running = new Promise<LosslessBookRunResult>((resolve) => { complete = resolve; });
@@ -244,6 +303,7 @@ test("desktop full-book start launches in background with formal run metadata", 
   try {
     const service = new DesktopFullBookService({
       runtime: runtimeResolver(),
+      runtimeProfileStore,
       createRunId: () => "run-fullbook-start",
       runBook: async (options) => {
         seen.push(options);
@@ -255,7 +315,7 @@ test("desktop full-book start launches in background with formal run metadata", 
 
     const snapshot = await service.start(
       { manifestPath: project.manifestPath },
-      { mode: "quality" },
+      { optimizationProfile: "balanced" },
     );
 
     assert.equal(snapshot.activeRunId, "run-fullbook-start");
@@ -264,10 +324,14 @@ test("desktop full-book start launches in background with formal run metadata", 
     assert.equal(seen[0]?.storePath, project.storePath);
     assert.equal(seen[0]?.maxWindows, undefined);
     assert.equal(seen[0]?.runtimeSet?.mode, "quality");
+    assert.equal(seen[0]?.optimizationProfile, "balanced");
+    assert.equal(seen[0]?.schedulerMode, "active");
+    assert.equal(seen[0]?.runtimeProfileStore, runtimeProfileStore);
     assert.deepEqual(seen[0]?.runMeta.metadata, {
       desktopFullBook: {
         schema: "folioloom-desktop-fullbook-1",
         mode: "quality",
+        optimizationProfile: "balanced",
         runtimeFingerprint: serializeDesktopRuntimeFingerprint(
           buildDesktopRuntimePlan("quality", (await runtimeResolver().resolve())!).fingerprint,
         ),
@@ -276,9 +340,46 @@ test("desktop full-book start launches in background with formal run metadata", 
     });
     assert.ok(progress.some((item) => item.phase === "running"));
 
-    complete(runResult("run-fullbook-start"));
+    complete(runResult("run-fullbook-start", {
+      scheduler: {
+        mode: "active",
+        profile: "balanced",
+        planningStatus: "optimal",
+        decisions: 2,
+        fallbacks: 0,
+        baselineWallTimeMs: 2_000,
+        predictedWallTimeMs: 1_000,
+        actualWallTimeMs: 900,
+        baselineTokens: 100,
+        allowedTokens: 110,
+        predictedTokens: 100,
+        actualTokens: 95,
+        tokenUsageComplete: true,
+        contextProfiles: {},
+        effortCounts: { high: 1 },
+        protocolCounts: {
+          typed_tool: 1,
+          framed_text: 0,
+          local: 0,
+        },
+        plannerDeadlines: 0,
+        throttles: 0,
+        recoveries: 0,
+      },
+    }));
     await flushBackground();
+    assert.deepEqual(
+      service.snapshot({ manifestPath: project.manifestPath }).runs[0]?.scheduler,
+      {
+        estimatedRemainingMs: 0,
+        predictedTokenRange: { lower: 100, upper: 100 },
+        wallTimeDeviationPercent: -10,
+        tokenDeviationPercent: -5,
+        adjustment: "steady",
+      },
+    );
   } finally {
+    runtimeProfileStore.close();
     rmSync(project.directory, { recursive: true, force: true });
   }
 });
@@ -286,6 +387,7 @@ test("desktop full-book start launches in background with formal run metadata", 
 test("desktop full-book enforces one active task and pauses at the runner boundary", async () => {
   const project = fixture();
   let observedSignal: AbortSignal | undefined;
+  let shouldPause: (() => boolean) | undefined;
   let settle!: (result: LosslessBookRunResult) => void;
   const running = new Promise<LosslessBookRunResult>((resolve) => { settle = resolve; });
   try {
@@ -294,33 +396,83 @@ test("desktop full-book enforces one active task and pauses at the runner bounda
       createRunId: () => "run-fullbook-pause",
       runBook: async (options) => {
         observedSignal = options.signal;
-        options.signal?.addEventListener("abort", () => {
-          settle(runResult("run-fullbook-pause", {
-            outcome: "partial",
-            status: status({
-              pendingWindows: 2,
-              completedWindows: 0,
-              modelCalls: 0,
-            }),
-          }));
-        }, { once: true });
+        shouldPause = options.shouldPause;
         return running;
       },
       pollIntervalMs: 60_000,
     });
-    await service.start({ manifestPath: project.manifestPath }, { mode: "fast" });
+    await service.start(
+      { manifestPath: project.manifestPath },
+      { optimizationProfile: "speed" },
+    );
 
     await assert.rejects(
-      service.start({ manifestPath: project.manifestPath }, { mode: "fast" }),
+      service.start(
+        { manifestPath: project.manifestPath },
+        { optimizationProfile: "speed" },
+      ),
       (error: unknown) => error instanceof DesktopFullBookError
         && error.code === "DESKTOP_FULLBOOK_ALREADY_RUNNING",
     );
 
     const pausing = service.pause();
-    assert.equal(observedSignal?.aborted, true);
+    assert.equal(observedSignal?.aborted, false);
+    assert.equal(shouldPause?.(), true);
+    settle(runResult("run-fullbook-pause", {
+      outcome: "partial",
+      status: status({
+        pendingWindows: 2,
+        completedWindows: 0,
+        modelCalls: 0,
+      }),
+    }));
     const paused = await pausing;
     assert.equal(paused.activeRunId, undefined);
     assert.equal(paused.runs[0]?.phase, "paused");
+    assert.equal(service.hasActiveTask(), false);
+  } finally {
+    rmSync(project.directory, { recursive: true, force: true });
+  }
+});
+
+test("desktop shutdown aborts after a bounded cooperative pause grace period", async () => {
+  const project = fixture();
+  let observedSignal: AbortSignal | undefined;
+  let settle!: (result: LosslessBookRunResult) => void;
+  const running = new Promise<LosslessBookRunResult>((resolve) => {
+    settle = resolve;
+  });
+  try {
+    const service = new DesktopFullBookService({
+      runtime: runtimeResolver(),
+      createRunId: () => "run-fullbook-shutdown",
+      runBook: async (options) => {
+        observedSignal = options.signal;
+        return running;
+      },
+      pollIntervalMs: 60_000,
+      shutdownGraceMs: 5,
+    });
+    await service.start(
+      { manifestPath: project.manifestPath },
+      { optimizationProfile: "balanced" },
+    );
+
+    await Promise.race([
+      service.settleForShutdown(),
+      new Promise<never>((_resolve, reject) => {
+        setTimeout(() => reject(new Error("shutdown settlement was unbounded")), 500);
+      }),
+    ]);
+    assert.equal(observedSignal?.aborted, true);
+
+    settle(runResult("run-fullbook-shutdown", {
+      outcome: "partial",
+      status: status({ pendingWindows: 2, completedWindows: 0 }),
+    }));
+    for (let attempt = 0; attempt < 10 && service.hasActiveTask(); attempt += 1) {
+      await flushBackground();
+    }
     assert.equal(service.hasActiveTask(), false);
   } finally {
     rmSync(project.directory, { recursive: true, force: true });
@@ -344,12 +496,6 @@ test("desktop full-book resume reuses exact stored metadata and rejects a change
       runtime: storedRuntime,
       runBook: async (options) => {
         seen.push(options);
-        options.signal?.addEventListener("abort", () => {
-          settle(runResult("run-resume", {
-            outcome: "partial",
-            status: status({ pendingWindows: 2, completedWindows: 0 }),
-          }));
-        }, { once: true });
         return running;
       },
       pollIntervalMs: 60_000,
@@ -362,7 +508,14 @@ test("desktop full-book resume reuses exact stored metadata and rejects a change
     assert.equal(seen[0]?.runMeta.protocolVersion, "v5-book-3");
     assert.equal(seen[0]?.runMeta.modelId, "deepseek-v4-flash");
     assert.deepEqual(seen[0]?.runMeta.metadata, metadata);
-    await service.pause();
+    assert.equal(seen[0]?.optimizationProfile, "balanced");
+    assert.equal(seen[0]?.schedulerMode, "off");
+    const pausing = service.pause();
+    settle(runResult("run-resume", {
+      outcome: "partial",
+      status: status({ pendingWindows: 2, completedWindows: 0 }),
+    }));
+    await pausing;
 
     const changed = new DesktopFullBookService({
       runtime: runtimeResolver({
@@ -378,6 +531,34 @@ test("desktop full-book resume reuses exact stored metadata and rejects a change
       ),
       (error: unknown) => error instanceof DesktopFullBookError
         && error.code === "DESKTOP_FULLBOOK_RUNTIME_MISMATCH",
+    );
+  } finally {
+    rmSync(project.directory, { recursive: true, force: true });
+  }
+});
+
+test("desktop full-book rejects inconsistent persisted optimization metadata", async () => {
+  const project = fixture();
+  try {
+    await storedFullBookRun({
+      project,
+      runId: "run-inconsistent-profile",
+      mode: "quality",
+      optimizationProfile: "speed",
+    });
+    const service = new DesktopFullBookService({ runtime: runtimeResolver() });
+
+    assert.deepEqual(
+      service.snapshot({ manifestPath: project.manifestPath }),
+      { runs: [] },
+    );
+    await assert.rejects(
+      service.resume(
+        { manifestPath: project.manifestPath },
+        { runId: "run-inconsistent-profile" },
+      ),
+      (error: unknown) => error instanceof DesktopFullBookError
+        && error.code === "DESKTOP_FULLBOOK_RUN_NOT_FOUND",
     );
   } finally {
     rmSync(project.directory, { recursive: true, force: true });
@@ -475,7 +656,10 @@ test("desktop full-book rejects an unready model before reserving an active task
     const service = new DesktopFullBookService(options);
 
     await assert.rejects(
-      service.start({ manifestPath: project.manifestPath }, { mode: "quality" }),
+      service.start(
+        { manifestPath: project.manifestPath },
+        { optimizationProfile: "balanced" },
+      ),
       (error: unknown) => error instanceof DesktopFullBookError
         && error.code === "DESKTOP_FULLBOOK_MODEL_NOT_READY",
     );
@@ -500,7 +684,7 @@ test("desktop full-book rejects invalid modes before resolving the runtime", asy
     await assert.rejects(
       service.start(
         { manifestPath: project.manifestPath } satisfies DesktopProjectRequest,
-        { mode: "cheap" as never },
+        { optimizationProfile: "cheap" as never },
       ),
       (error: unknown) => error instanceof DesktopFullBookError
         && error.code === "DESKTOP_FULLBOOK_INPUT_INVALID",

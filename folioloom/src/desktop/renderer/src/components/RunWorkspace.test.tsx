@@ -19,6 +19,7 @@ function run(
     sourceVersion: "internal-source-version",
     modelId: "deepseek-v4",
     mode: "quality",
+    optimizationProfile: "balanced",
     phase,
     progress: {
       totalWindows: 100,
@@ -45,7 +46,7 @@ function snapshot(item?: DesktopFullBookRunSnapshot): DesktopFullBookSnapshot {
 }
 
 describe("RunWorkspace", () => {
-  it("starts idle books in quality mode by default and supports fast mode", async () => {
+  it("starts idle books with one of three optimization profiles", async () => {
     const user = userEvent.setup();
     const onStart = vi.fn();
     render(
@@ -61,13 +62,15 @@ describe("RunWorkspace", () => {
     );
 
     expect(screen.getByRole("heading", { name: "翻译运行" })).toBeTruthy();
-    expect((screen.getByRole("radio", { name: "质量模式" }) as HTMLInputElement).checked)
-      .toBe(true);
+    expect(screen.getByRole("button", { name: "经济" })).toBeTruthy();
+    expect(screen.getByRole("button", { name: "均衡" }).getAttribute("aria-pressed"))
+      .toBe("true");
+    expect(screen.getByRole("button", { name: "极速" })).toBeTruthy();
     expect(screen.getByRole("button", { name: "开始整本翻译" })).toBeTruthy();
 
-    await user.click(screen.getByRole("radio", { name: "快速模式" }));
+    await user.click(screen.getByRole("button", { name: "经济" }));
     await user.click(screen.getByRole("button", { name: "开始整本翻译" }));
-    expect(onStart).toHaveBeenCalledWith("fast");
+    expect(onStart).toHaveBeenCalledWith("economy");
   });
 
   it("shows durable progress and only the action allowed by the current phase", async () => {
@@ -78,7 +81,15 @@ describe("RunWorkspace", () => {
       <RunWorkspace
         title="示例小说"
         modelReady
-        snapshot={snapshot(run("running"))}
+        snapshot={snapshot(run("running", {
+          scheduler: {
+            estimatedRemainingMs: 90_001,
+            predictedTokenRange: { lower: 1_000, upper: 1_200 },
+            wallTimeDeviationPercent: 5,
+            tokenDeviationPercent: -2.5,
+            adjustment: "throttled",
+          },
+        }))}
         busy={false}
         onStart={vi.fn()}
         onPause={onPause}
@@ -87,6 +98,10 @@ describe("RunWorkspace", () => {
     );
 
     expect(screen.getByText("32 / 100 个文本块")).toBeTruthy();
+    expect(screen.getByText("2 分钟")).toBeTruthy();
+    expect(screen.getByText("1,000–1,200")).toBeTruthy();
+    expect(screen.getByText("耗时 +5.0% · Token -2.5%")).toBeTruthy();
+    expect(screen.getByText("正在因限流调整并发")).toBeTruthy();
     expect(screen.getByRole("progressbar").getAttribute("aria-valuenow")).toBe("32");
     expect(screen.queryByRole("button", { name: "开始整本翻译" })).toBeNull();
     await user.click(screen.getByRole("button", { name: "暂停" }));

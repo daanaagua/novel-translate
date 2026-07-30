@@ -39,7 +39,7 @@ function formEntries(
   const revisionIdsByForm = new Map<string, Set<string>>();
   for (const revision of revisions) {
     for (const raw of revision.forms) {
-      const form = profile.normalizeSourceForm(raw);
+      const form = profile.normalizeSourceLiteral(raw.trim());
       if ([...form].length < 2) continue;
       const revisionIds = revisionIdsByForm.get(form) ?? new Set<string>();
       revisionIds.add(revision.revisionId);
@@ -119,7 +119,7 @@ export function matchKnowledgeImpacts(
   const matches: MatchedKnowledgeImpact[] = [];
 
   for (const block of blocks) {
-    const source = profile.normalizeSourceForm(block.sourceText);
+    const source = profile.normalizeSourceLiteral(block.sourceText);
     const sourceTokens = new Set(profile.segment(block.sourceText)
       .filter((token) => token.isWordLike)
       .map((token) => token.normalized));

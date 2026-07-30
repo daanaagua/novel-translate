@@ -1,5 +1,7 @@
 import { randomUUID } from "node:crypto";
-import { resolve } from "node:path";
+import { mkdirSync } from "node:fs";
+import { homedir } from "node:os";
+import { dirname, join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 
 import {
@@ -27,6 +29,13 @@ import type {
   TranslationRuntimeSet,
 } from "./fullbook/types.js";
 import {
+  optimizationPolicy,
+  profileFromLegacyRunMode,
+  validateRuntimeVariants,
+  type OptimizationProfile,
+  type SchedulerMode,
+} from "./fullbook/optimization-policy.js";
+import {
   loadGlossary,
   type GlossaryImportReport,
   type LoadedGlossary,
@@ -34,7 +43,7 @@ import {
 import { planBookWindows, type WindowPlanOptions } from "./fullbook/window-planner.js";
 import { preflightPilot, runPilot } from "./pilot-runner.js";
 import { BudgetLedger } from "./kernel/budget.js";
-import { toInternalThinking } from "./providers/registry.js";
+import { providerRegistry, toInternalThinking } from "./providers/registry.js";
 import type { ProviderEffort } from "./providers/types.js";
 import { projectRecoveryRule, isIncidentCode } from "./recovery/registry.js";
 import {
@@ -61,6 +70,7 @@ import { buildLosslessBlocks } from "./source/block-builder.js";
 import { SourceIntegrityError, SourceLedger } from "./source/source-ledger.js";
 import { annotateStructure } from "./source/structure-annotator.js";
 import { LosslessBookStore } from "./storage/lossless-book-store.js";
+import { RuntimeProfileStore } from "./storage/runtime-profile-store.js";
 import {
   loadStyleProfile,
   type LoadedStyleProfile,
@@ -104,6 +114,9 @@ export interface CliOptions {
   prompt?: string;
   glossary?: string;
   runMode?: TranslationRunMode;
+  optimizationProfile?: OptimizationProfile;
+  schedulerMode?: SchedulerMode;
+  runtimeProfileStore?: string;
   maxInFlightTokens?: number;
 }
 
@@ -128,6 +141,7 @@ type RuntimeAwareBookRunOptions = LosslessBookRunOptions & {
 export interface CliRuntimeDependencies {
   createModel: typeof createDeepSeekModel;
   createStreamFn: typeof createDeepSeekStreamFn;
+  createRuntimeProfileStore?: (path: string) => RuntimeProfileStore;
   runBook?: (options: RuntimeAwareBookRunOptions) => Promise<LosslessBookRunResult>;
 }
 
@@ -301,6 +315,34 @@ function runModeFlag(
     throw new Error(`${name} must be quality or fast`);
   }
   return raw;
+}
+
+function optimizationProfileFlag(
+  values: ReadonlyMap<string, string>,
+  name: string,
+): OptimizationProfile | undefined {
+  const raw = values.get(name);
+  if (raw === undefined) return undefined;
+  if (raw !== "economy" && raw !== "balanced" && raw !== "speed") {
+    throw new Error(`${name} must be economy, balanced, or speed`);
+  }
+  return raw;
+}
+
+function schedulerModeFlag(
+  values: ReadonlyMap<string, string>,
+  name: string,
+): SchedulerMode {
+  const raw = values.get(name);
+  if (raw === undefined) return "off";
+  if (raw !== "off" && raw !== "shadow" && raw !== "active") {
+    throw new Error(`${name} must be off, shadow, or active`);
+  }
+  return raw;
+}
+
+function runModeForProfile(profile: OptimizationProfile): TranslationRunMode {
+  return profile === "speed" ? "fast" : "quality";
 }
 
 function parseFlags(
@@ -481,6 +523,40 @@ function runMetadataForGlossary(
   };
 }
 
+function runMetadataForScheduler(
+  metadata: unknown,
+  profile: OptimizationProfile,
+  schedulerMode: SchedulerMode,
+  resuming: boolean,
+): unknown {
+  const existing = metadataRecord(metadata);
+  const storedProfile = existing.optimizationProfile;
+  const storedMode = existing.schedulerMode;
+  if (resuming && storedProfile === undefined && storedMode === undefined) {
+    if (schedulerMode !== "off") {
+      throw new Error(
+        "legacy translation runs can only resume with scheduler mode off",
+      );
+    }
+    return metadata;
+  }
+  if (storedProfile !== undefined && storedProfile !== profile) {
+    throw new Error(
+      `translation run optimization profile is ${String(storedProfile)}, not ${profile}`,
+    );
+  }
+  if (storedMode !== undefined && storedMode !== schedulerMode) {
+    throw new Error(
+      `translation run scheduler mode is ${String(storedMode)}, not ${schedulerMode}`,
+    );
+  }
+  return {
+    ...existing,
+    optimizationProfile: profile,
+    schedulerMode,
+  };
+}
+
 export function parseArgs(argv: readonly string[]): CliOptions {
   if (argv[0] === "preview") {
     const { values, booleans } = parseFlags(
@@ -631,8 +707,28 @@ export function parseArgs(argv: readonly string[]): CliOptions {
         "--max-attempts", "--max-blocks", "--max-source-tokens",
         "--hard-deadline-ms", "--style-profile", "--prompt",
         "--glossary", "--run-mode", "--max-in-flight-tokens",
+        "--optimization-profile", "--scheduler-mode",
+        "--runtime-profile-store",
       ],
     );
+    const explicitProfile = optimizationProfileFlag(
+      values,
+      "--optimization-profile",
+    );
+    const explicitRunMode = values.has("--run-mode");
+    const runMode = explicitRunMode
+      ? runModeFlag(values, "--run-mode")
+      : explicitProfile === undefined
+        ? "quality"
+        : runModeForProfile(explicitProfile);
+    const legacyProfile = profileFromLegacyRunMode(runMode);
+    if (explicitRunMode
+      && explicitProfile !== undefined
+      && runModeForProfile(explicitProfile) !== runMode) {
+      throw new Error(
+        `optimization profile ${explicitProfile} conflicts with run mode ${runMode}`,
+      );
+    }
     return {
       command: "book-run",
       manifest: pathValue(values, "--manifest"),
@@ -644,7 +740,14 @@ export function parseArgs(argv: readonly string[]): CliOptions {
       runId: identifierValue(values, "--run"),
       maxWindows: positiveFlag(values, "--max-windows"),
       maxConcurrency: positiveFlag(values, "--max-concurrency"),
-      runMode: runModeFlag(values, "--run-mode"),
+      runMode,
+      optimizationProfile: explicitProfile ?? legacyProfile,
+      schedulerMode: schedulerModeFlag(values, "--scheduler-mode"),
+      runtimeProfileStore: pathValue(
+        values,
+        "--runtime-profile-store",
+        false,
+      ),
       maxInFlightTokens: positiveFlag(values, "--max-in-flight-tokens"),
       maxAttempts: positiveFlag(values, "--max-attempts"),
       hardDeadlineMs: positiveFlag(values, "--hard-deadline-ms"),
@@ -723,14 +826,36 @@ export function buildTranslationRuntimeSet(
       : toInternalThinking(candidate.reasoningEffort as ProviderEffort),
   });
   const qualityConfig = withReasoningEffort(config, config.reasoningEffort);
-  const primaryConfig = mode === "fast"
-    ? withReasoningEffort(qualityConfig, "off")
-    : qualityConfig;
-  const primary = makeRuntime(primaryConfig);
+  const supportedEfforts =
+    providerRegistry.get("deepseek").capabilities.efforts;
+  if (!supportedEfforts.includes(
+    qualityConfig.reasoningEffort as ProviderEffort,
+  )) {
+    throw new TypeError(
+      `deepseek does not support reasoning effort: ${qualityConfig.reasoningEffort}`,
+    );
+  }
+  const variantsByEffort = new Map(
+    supportedEfforts.map((effort) => [
+      effort,
+      makeRuntime(withReasoningEffort(qualityConfig, effort)),
+    ]),
+  );
+  const primaryEffort = mode === "fast"
+    ? "off"
+    : qualityConfig.reasoningEffort as ProviderEffort;
+  const primary = variantsByEffort.get(primaryEffort);
+  const escalation = variantsByEffort.get(
+    qualityConfig.reasoningEffort as ProviderEffort,
+  );
+  if (primary === undefined || escalation === undefined) {
+    throw new TypeError("translation runtime variants are incomplete");
+  }
   return {
     mode,
     primary,
-    escalation: mode === "quality" ? primary : makeRuntime(qualityConfig),
+    escalation,
+    variants: validateRuntimeVariants([...variantsByEffort.values()]),
   };
 }
 
@@ -929,9 +1054,18 @@ export async function main(
           : { legacyV4DbPath: options.legacyV4Db }),
         glossaryPath: options.glossary,
       });
-    const runMetadata = runMetadataForStyle(
+    const baseRunMetadata = runMetadataForStyle(
       style,
       runMetadataForGlossary(glossary, selectedRun?.metadata),
+    );
+    const optimizationProfile = options.optimizationProfile
+      ?? profileFromLegacyRunMode(options.runMode ?? "quality");
+    const schedulerMode = options.schedulerMode ?? "off";
+    const runMetadata = runMetadataForScheduler(
+      baseRunMetadata,
+      optimizationProfile,
+      schedulerMode,
+      selectedRun !== undefined,
     );
     const config = loadRuntimeConfig(options);
     const runtimeSet = buildTranslationRuntimeSet(
@@ -942,44 +1076,81 @@ export async function main(
     const bookRunner = dependencyOverrides.runBook
       ?? ((runOptions: RuntimeAwareBookRunOptions) => runBook(runOptions));
     const runId = selectedRunId ?? randomUUID();
-    const result = await bookRunner({
-      manifestPath: requireOption(options, "manifest"),
-      ...(options.legacyV4Db === undefined ? {} : { legacyV4DbPath: options.legacyV4Db }),
-      storePath: requireOption(options, "store"),
-      runMeta: selectedRun === undefined
-        ? {
-            runId,
-            protocolVersion: LOSSLESS_BOOK_PROTOCOL_VERSION,
-            modelId: config.model,
-            metadata: runMetadata,
-          }
-        : {
-            runId,
-            protocolVersion: selectedRun.protocolVersion,
-            modelId: selectedRun.modelId,
-            metadata: runMetadata,
-          },
-      model: runtimeSet.primary.model,
-      streamFn: runtimeSet.primary.streamFn,
-      runtimeSet,
-      styleState: style.styleState,
-      ...(glossary === undefined ? {} : { glossary }),
-      windowOptions: {
-        maxBlocks: options.maxBlocks,
-        maxSourceTokens: options.maxSourceTokens,
-      },
-      maxWindows: options.maxWindows,
-      maxConcurrency: options.maxConcurrency,
-      maxInFlightTokens: options.maxInFlightTokens,
-      maxAttempts: options.maxAttempts,
-      hardDeadlineMs: options.hardDeadlineMs,
-    });
+    const profileStorePath = options.runtimeProfileStore
+      ?? join(homedir(), ".folioloom", "runtime-profiles.db");
+    mkdirSync(dirname(profileStorePath), { recursive: true });
+    const runtimeProfileStore =
+      dependencyOverrides.createRuntimeProfileStore?.(profileStorePath)
+      ?? new RuntimeProfileStore(profileStorePath);
+    let result: LosslessBookRunResult;
+    try {
+      result = await bookRunner({
+        manifestPath: requireOption(options, "manifest"),
+        ...(options.legacyV4Db === undefined ? {} : { legacyV4DbPath: options.legacyV4Db }),
+        storePath: requireOption(options, "store"),
+        runMeta: selectedRun === undefined
+          ? {
+              runId,
+              protocolVersion: LOSSLESS_BOOK_PROTOCOL_VERSION,
+              modelId: config.model,
+              metadata: runMetadata,
+            }
+          : {
+              runId,
+              protocolVersion: selectedRun.protocolVersion,
+              modelId: selectedRun.modelId,
+              metadata: runMetadata,
+            },
+        model: runtimeSet.primary.model,
+        streamFn: runtimeSet.primary.streamFn,
+        runtimeSet,
+        optimizationProfile,
+        schedulerMode,
+        runtimeProfileStore,
+        styleState: style.styleState,
+        ...(glossary === undefined ? {} : { glossary }),
+        windowOptions: {
+          maxBlocks: options.maxBlocks,
+          maxSourceTokens: options.maxSourceTokens,
+        },
+        maxWindows: options.maxWindows,
+        maxConcurrency: options.maxConcurrency,
+        maxInFlightTokens: options.maxInFlightTokens,
+        maxAttempts: options.maxAttempts,
+        hardDeadlineMs: options.hardDeadlineMs,
+      });
+    } finally {
+      runtimeProfileStore.close();
+    }
+    if (result.scheduler !== undefined) {
+      const schedulerStore = new LosslessBookStore(
+        requireOption(options, "store"),
+      );
+      try {
+        const durableScheduler = schedulerStore.loadSchedulerMetrics(runId, {
+          mode: schedulerMode,
+          profile: optimizationProfile,
+          tokenIncreaseCap:
+            optimizationPolicy(optimizationProfile).tokenIncreaseCap,
+          enforceDispatchLifecycle: true,
+        });
+        if (durableScheduler !== undefined) {
+          result = {
+            ...result,
+            scheduler: durableScheduler,
+          };
+        }
+      } finally {
+        schedulerStore.close();
+      }
+    }
     let artifacts: BookArtifactPaths | null = result.artifacts;
     if (options.output !== undefined) {
       const store = new LosslessBookStore(requireOption(options, "store"));
       try {
         artifacts = writeLosslessBookArtifacts(store, runId, options.output, {
           allowIncomplete: true,
+          scheduler: result.scheduler,
         });
       } finally {
         store.close();

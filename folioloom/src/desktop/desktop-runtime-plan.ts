@@ -2,6 +2,7 @@ import type { StreamFn } from "@earendil-works/pi-agent-core";
 import type { Model } from "@earendil-works/pi-ai";
 
 import type { TranslationRuntime, TranslationRuntimeSet } from "../fullbook/types.js";
+import { validateRuntimeVariants } from "../fullbook/optimization-policy.js";
 import type { ModelProfile, ProviderEffort } from "../providers/types.js";
 import type { DesktopTrialMode } from "./contracts.js";
 import {
@@ -168,9 +169,28 @@ export function buildDesktopRuntimePlan(
   }
   const qualityProfile = normalizedProfile(qualityRuntime);
   const quality = translationRuntime(qualityRuntime);
+  const supportedEfforts = requireSupportedEfforts(qualityRuntime);
+  const candidateEfforts = new Set<ProviderEffort | undefined>([
+    ...supportedEfforts,
+    qualityRuntime.profile.reasoningEffort,
+  ]);
+  const variants = validateRuntimeVariants([...candidateEfforts].map((effort) => {
+    if (effort === qualityRuntime.profile.reasoningEffort) {
+      return quality;
+    }
+    return translationRuntime(derivedRuntime(
+      qualityRuntime,
+      profileWithEffort(qualityRuntime.profile, effort),
+    ));
+  }));
   if (mode === "quality") {
     return {
-      runtimeSet: { mode, primary: quality, escalation: quality },
+      runtimeSet: {
+        mode,
+        primary: quality,
+        escalation: quality,
+        variants,
+      },
       fingerprint: {
         schema: "folioloom-desktop-runtime-1",
         mode,
@@ -180,16 +200,18 @@ export function buildDesktopRuntimePlan(
     };
   }
 
-  const primaryEffort = lowestLegalFastEffort(requireSupportedEfforts(qualityRuntime));
+  const primaryEffort = lowestLegalFastEffort(supportedEfforts);
   const primaryProfile = profileWithEffort(qualityRuntime.profile, primaryEffort);
   const primaryRuntime = primaryEffort === qualityRuntime.profile.reasoningEffort
     ? qualityRuntime
     : derivedRuntime(qualityRuntime, primaryProfile);
+  const primary = translationRuntime(primaryRuntime);
   return {
     runtimeSet: {
       mode,
-      primary: translationRuntime(primaryRuntime),
+      primary,
       escalation: quality,
+      variants,
     },
     fingerprint: {
       schema: "folioloom-desktop-runtime-1",

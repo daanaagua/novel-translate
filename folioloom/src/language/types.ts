@@ -80,6 +80,11 @@ export interface SourceLanguageProfile {
   collectBoundaryCandidates(text: string): BoundaryCandidate[];
   collectScriptStats(text: string): ScriptStats;
   segment(text: string): SourceToken[];
+  /**
+   * Canonicalize spelling-only differences for exact source-span matching.
+   * Unlike normalizeSourceForm, this must not remove morphology.
+   */
+  normalizeSourceLiteral(text: string): string;
   normalizeSourceForm(text: string): string;
   normalizeAnchorSourceForm(text: string): string;
   hasExplicitEntityNamingCue(text: string): boolean;

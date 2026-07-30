@@ -11,6 +11,7 @@ import {
 import type { PhysicalRequestPlan } from "../src/fullbook/types.js";
 import { RequestBudgeter } from "../src/fullbook/request-budgeter.js";
 import { canonicalJson } from "../src/knowledge/knowledge-store.js";
+import { conceptFromAnchor } from "../src/knowledge/lexical-concept.js";
 import { getSourceLanguageProfile } from "../src/language/profiles.js";
 import { WeightedTokenEstimator } from "../src/source/token-estimator.js";
 import type { LosslessBlock } from "../src/source/types.js";
@@ -109,11 +110,107 @@ test("one request builder serializes all translator-visible projections and one 
   assert.deepEqual(prepared.tools.map((tool) => tool.name), ["finalize_translation_batch"]);
   assert.match(prepared.serializedToolSchemas, /finalize_translation_batch/u);
   assert.match(prepared.serializedToolSchemas, /styleObservation/u);
+  assert.match(prepared.serializedToolSchemas, /termUsages/u);
   const requestSection = prepared.sections.find((section) => section.kind === "request");
   assert.equal(
     (requestSection?.jsonPayload as { targetLanguage?: string } | undefined)?.targetLanguage,
     "zh-Hans",
   );
+});
+
+test("batch memory candidate kinds exclude reserved knowledge projector kinds", () => {
+  const prepared = prepareTranslationRequest(fixture());
+  const schemas = JSON.parse(prepared.serializedToolSchemas) as Array<{
+    parameters: {
+      properties: {
+        windows: {
+          items: {
+            properties: {
+              memoryCandidates: {
+                items: {
+                  properties: {
+                    kind: { anyOf?: Array<{ const?: string }> };
+                  };
+                };
+              };
+            };
+          };
+        };
+      };
+    };
+  }>;
+  const kindSchema = schemas[0]?.parameters.properties.windows.items
+    .properties.memoryCandidates.items.properties.kind;
+
+  assert.deepEqual(
+    kindSchema?.anyOf?.map((item) => item.const),
+    [
+      "entity_identity",
+      "entity_relation",
+      "term_sense",
+      "coreference",
+      "local_continuity",
+    ],
+  );
+  assert.doesNotMatch(JSON.stringify(kindSchema), /lexical_concept/u);
+});
+
+test("translation request projects exact contextual term occurrence receipts", () => {
+  const sourceBlock = block(
+    "block-role",
+    0,
+    "Der Prokurist sprach. Der Prokurist ging.",
+  );
+  const concept = conceptFromAnchor({
+    sourceForm: "Prokurist",
+    target: "主事",
+    mode: "contextual",
+    semanticClass: "role",
+    confidence: 0.95,
+  });
+  const prepared = prepareTranslationRequest({
+    request: {
+      requestId: "request-role",
+      sourceTokens: 10,
+      windows: [{
+        windowId: "window-role",
+        ordinal: 0,
+        chapterId: "chapter-role",
+        chapterTitle: null,
+        blockIds: [sourceBlock.id],
+        globalIndexes: [0],
+        sourceTokens: 10,
+        sourceChars: sourceBlock.sourceText.length,
+        oversized: false,
+      }],
+    },
+    blocks: [sourceBlock],
+    stableTerms: [{
+      conceptId: concept.conceptId,
+      lexemeId: `${concept.conceptId}-lexeme`,
+      sourceForm: concept.sourceForms[0]!,
+      canonicalSource: concept.normalizedSubject,
+      target: concept.canonicalTarget,
+      locked: false,
+      policy: concept.policy,
+      semanticClass: concept.semanticClass,
+      allowedTargets: concept.allowedRealizations,
+      revisionId: concept.revisionId,
+      renderFingerprint: concept.renderFingerprint,
+    }],
+    snapshot: { id: "snapshot-role", revisions: [] },
+    sourceLanguageProfile: getSourceLanguageProfile("de"),
+  });
+
+  assert.equal(prepared.expectedTermOccurrences.length, 2);
+  assert.ok(prepared.expectedTermOccurrences.every((occurrence) =>
+    occurrence.blockId === sourceBlock.id
+    && occurrence.conceptId === concept.conceptId));
+  assert.match(prepared.prompt, /TERM OCCURRENCES/u);
+  assert.match(prepared.prompt, new RegExp(
+    prepared.expectedTermOccurrences[0]!.occurrenceId,
+    "u",
+  ));
 });
 
 test("framed text requests expose exact nonce markers and no translation tool schema", () => {

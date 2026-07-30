@@ -46,6 +46,8 @@ import { providerRegistry } from "../../providers/registry.js";
 import type { ModelProfile } from "../../providers/types.js";
 import { GlobalKnowledgeStore } from "../../knowledge/global-knowledge-store.js";
 import { KnowledgeImportService } from "../../knowledge-import/knowledge-import-service.js";
+import { RuntimeProfileStore } from "../../storage/runtime-profile-store.js";
+import { runtimeProfilePath } from "../runtime-profile-path.js";
 import { registerDesktopIpc } from "./ipc.js";
 import { createDesktopProviderRegistryAdapter } from "./provider-model-adapter.js";
 import {
@@ -62,6 +64,7 @@ const desktopChrome = desktopWindowChrome();
 let trialServiceForShutdown: DesktopTrialService | undefined;
 let fullBookServiceForShutdown: DesktopFullBookService | undefined;
 let globalKnowledgeStoreForShutdown: GlobalKnowledgeStore | undefined;
+let runtimeProfileStoreForShutdown: RuntimeProfileStore | undefined;
 let quitAfterTrialSettles = false;
 let quitSettlementStarted = false;
 
@@ -132,6 +135,10 @@ function loadRecentRequest(preferences: DesktopPreferences): DesktopProjectReque
 void app.whenReady().then(() => {
   Menu.setApplicationMenu(desktopChrome.applicationMenu);
   const userDataPath = app.getPath("userData");
+  const runtimeProfileStore = new RuntimeProfileStore(
+    runtimeProfilePath(userDataPath),
+  );
+  runtimeProfileStoreForShutdown = runtimeProfileStore;
   const preferencesPath = join(userDataPath, "desktop-preferences.json");
   const preferences = new DesktopPreferences(preferencesPath);
   const diagnosticLogger = new DesktopDiagnosticLogger({
@@ -195,6 +202,7 @@ void app.whenReady().then(() => {
   });
   const fullBookService = new DesktopFullBookService({
     runtime: runtimeResolver,
+    runtimeProfileStore,
     onProgress(progress) {
       diagnosticLogger.record({
         event: "desktop.fullbook.progress",
@@ -406,6 +414,8 @@ app.on("window-all-closed", () => {
 app.on("will-quit", () => {
   globalKnowledgeStoreForShutdown?.close();
   globalKnowledgeStoreForShutdown = undefined;
+  runtimeProfileStoreForShutdown?.close();
+  runtimeProfileStoreForShutdown = undefined;
 });
 
 app.on("before-quit", (event) => {

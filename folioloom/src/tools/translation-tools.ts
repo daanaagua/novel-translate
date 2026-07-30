@@ -13,6 +13,7 @@ import { sourceTextForTranslation } from "../source/layout-separators.js";
 import { hasSemanticText } from "../text/semantic-text.js";
 import {
   CandidateCollector,
+  TRANSLATION_MEMORY_KINDS,
   type ResolutionCandidate,
   type TranslationCandidate,
   type TranslationMemoryCandidate,
@@ -291,13 +292,9 @@ export class TranslationTools {
           })),
           notes: Type.Array(Type.String()),
           memoryCandidates: Type.Optional(Type.Array(Type.Object({
-            kind: Type.Union([
-              Type.Literal("entity_identity"),
-              Type.Literal("entity_relation"),
-              Type.Literal("term_sense"),
-              Type.Literal("coreference"),
-              Type.Literal("local_continuity"),
-            ]),
+            kind: Type.Union(
+              TRANSLATION_MEMORY_KINDS.map((kind) => Type.Literal(kind)),
+            ),
             subjectForms: Type.Array(Type.String(), { minItems: 1, maxItems: 3 }),
             fact: Type.String(),
             confidence: Type.Number({ minimum: 0, maximum: 1 }),

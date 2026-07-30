@@ -17,9 +17,9 @@ test("batch impact matching scans and segments every translated block only once"
   );
   const profile: SourceLanguageProfile = {
     ...base,
-    normalizeSourceForm(text) {
+    normalizeSourceLiteral(text) {
       if (blockTexts.has(text)) normalizedBlocks += 1;
-      return base.normalizeSourceForm(text);
+      return base.normalizeSourceLiteral(text);
     },
     segment(text) {
       if (blockTexts.has(text)) segmentedBlocks += 1;
@@ -82,5 +82,48 @@ test("batch impact matching preserves word boundaries while matching CJK forms",
     revisionId: "mukhyang",
     sourceVersion: "source",
     blockId: "korean",
+  }]);
+});
+
+test("batch impact matching rejects short forms embedded inside longer words", () => {
+  const matches = matchKnowledgeImpacts(
+    [{ revisionId: "ai", forms: ["AI"] }],
+    [{
+      sourceVersion: "source",
+      blockId: "embedded-only",
+      sourceText: "The claim was appraised while she waits beside the main airlock.",
+    }, {
+      sourceVersion: "source",
+      blockId: "standalone",
+      sourceText: "The shipboard AI answered.",
+    }],
+    getSourceLanguageProfile("en"),
+  );
+
+  assert.deepEqual(matches, [{
+    revisionId: "ai",
+    sourceVersion: "source",
+    blockId: "standalone",
+  }]);
+});
+
+test("knowledge impacts preserve declared possessive source-form boundaries", () => {
+  const matches = matchKnowledgeImpacts([{
+    revisionId: "revision-earth-possessive",
+    forms: ["EARTH’S"],
+  }], [{
+    sourceVersion: "source",
+    blockId: "block-base",
+    sourceText: "Earth is distant.",
+  }, {
+    sourceVersion: "source",
+    blockId: "block-possessive",
+    sourceText: "Earth's orbit is changing.",
+  }], getSourceLanguageProfile("en"));
+
+  assert.deepEqual(matches, [{
+    revisionId: "revision-earth-possessive",
+    sourceVersion: "source",
+    blockId: "block-possessive",
   }]);
 });

@@ -10,6 +10,20 @@ test("traditional Chinese prose is normalized to simplified Chinese", () => {
   );
 });
 
+test("generic Chinese orthography normalizes cross-locale variant glyphs", () => {
+  assert.equal(
+    simplifyChineseTranslation("谨愼地硏究，双腿轻轻晄动"),
+    "谨慎地研究，双腿轻轻晃动",
+  );
+});
+
+test("locked variant orthography remains byte-identical", () => {
+  assert.equal(
+    simplifyChineseTranslation("谨愼地硏究，双腿轻轻晄动", ["硏究"]),
+    "谨慎地硏究，双腿轻轻晃动",
+  );
+});
+
 test("locked target forms survive script normalization verbatim", () => {
   assert.equal(
     simplifyChineseTranslation("龍與後來的龍同行。", ["龍"]),

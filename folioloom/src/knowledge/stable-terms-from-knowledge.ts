@@ -1,5 +1,8 @@
+import { createHash } from "node:crypto";
+
 import { entityLinkAsTerms, type EntityLink } from "../domain/entity-links.js";
 import type { StableTerm } from "../domain/types.js";
+import type { LexicalSemanticClass } from "./lexical-concept.js";
 import type { KnowledgeRevision } from "./knowledge-store.js";
 
 function record(value: unknown): Readonly<Record<string, unknown>> | undefined {
@@ -37,6 +40,62 @@ export function stableTermsFromKnowledge(
     const revision = raw as Partial<KnowledgeRevision>;
     if (revision.status !== "active") continue;
     const payload = record(revision.payload);
+    if (revision.kind === "lexical_concept" && payload !== undefined) {
+      const sourceForms = payload.sourceForms;
+      const semanticClass = payload.semanticClass;
+      const policy = payload.policy;
+      const allowedRealizations = payload.allowedRealizations;
+      const conceptId = payload.conceptId;
+      const revisionId = payload.revisionId;
+      const normalizedSubject = payload.normalizedSubject;
+      const canonicalTarget = payload.canonicalTarget;
+      const renderFingerprint = payload.renderFingerprint;
+      if (Array.isArray(sourceForms)
+        && sourceForms.length > 0
+        && sourceForms.every((value) =>
+          typeof value === "string" && value.trim().length > 0)
+        && typeof semanticClass === "string"
+        && ["proper_name", "unique_title", "technical_term", "role"]
+          .includes(semanticClass)
+        && typeof policy === "string"
+        && ["locked", "preferred", "contextual"].includes(policy)
+        && Array.isArray(allowedRealizations)
+        && allowedRealizations.length > 0
+        && allowedRealizations.every((value) =>
+          typeof value === "string" && value.trim().length > 0)
+        && typeof conceptId === "string"
+        && conceptId.trim().length > 0
+        && typeof revisionId === "string"
+        && revisionId.trim().length > 0
+        && typeof normalizedSubject === "string"
+        && normalizedSubject.trim().length > 0
+        && typeof canonicalTarget === "string"
+        && canonicalTarget.trim().length > 0
+        && typeof renderFingerprint === "string"
+        && /^[a-f0-9]{64}$/u.test(renderFingerprint)) {
+        terms.push(...sourceForms.map((sourceForm) => ({
+          conceptId,
+          lexemeId: `${conceptId}-lexeme-${createHash("sha256")
+            .update(sourceForm)
+            .digest("hex")
+            .slice(0, 12)}`,
+          sourceForm,
+          canonicalSource: normalizedSubject,
+          target: canonicalTarget,
+          locked: policy === "locked",
+          policy: policy as StableTerm["policy"],
+          semanticClass: semanticClass as LexicalSemanticClass,
+          allowedTargets: [...allowedRealizations] as string[],
+          revisionId,
+          renderFingerprint,
+          note: policy === "contextual"
+            ? "semantic concept; choose an allowed Chinese realization appropriate to context"
+            : "closed lexical concept",
+          origin: "knowledge" as const,
+        })));
+      }
+      continue;
+    }
     if (revision.kind === "lexical_anchor" && payload !== undefined) {
       if (typeof payload.sourceForm === "string"
         && typeof payload.canonicalSource === "string"

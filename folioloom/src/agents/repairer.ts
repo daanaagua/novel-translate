@@ -14,7 +14,11 @@ import {
   type ValidationFailure,
 } from "../tools/repair-tools.js";
 import { PARAGRAPH_INTEGRITY_INSTRUCTIONS } from "./paragraph-integrity.js";
-import { PiRuntime, type PiRunResult } from "./pi-runtime.js";
+import {
+  PiRuntime,
+  type PiAssistantResponseObservation,
+  type PiRunResult,
+} from "./pi-runtime.js";
 
 interface RepairInput {
   blocks: readonly V4Block[];
@@ -28,6 +32,9 @@ interface RepairInput {
   thinkingLevel?: ThinkingLevel;
   signal?: AbortSignal;
   deadlineMs?: number;
+  onAssistantResponse?: (
+    observation: PiAssistantResponseObservation,
+  ) => void | Promise<void>;
 }
 
 export interface RepairOutcome {
@@ -45,6 +52,9 @@ export interface BatchRepairInput {
   thinkingLevel?: ThinkingLevel;
   signal?: AbortSignal;
   deadlineMs?: number;
+  onAssistantResponse?: (
+    observation: PiAssistantResponseObservation,
+  ) => void | Promise<void>;
 }
 
 export class Repairer {
@@ -92,6 +102,7 @@ export class Repairer {
       signal: input.signal,
       deadlineMs: input.deadlineMs,
       thinkingLevel: input.thinkingLevel,
+      onAssistantResponse: input.onAssistantResponse,
     }, input.streamFn);
     const patch = input.collector.translations().slice(before).at(-1);
     return {

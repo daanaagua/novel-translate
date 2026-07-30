@@ -36,13 +36,15 @@ export interface CommitPromotion {
 
 export interface CommitCoordinatorHooks {
   /** Persist the whole promotion atomically in the existing book ledger. */
-  commitPromotion(promotion: CommitPromotion): void;
+  commitPromotion(
+    promotion: CommitPromotion,
+  ): void | "promoted" | "retry_latest_snapshot";
 }
 
 interface BoundWindow {
   readonly ordinal: number;
   readonly windowId: string;
-  readonly snapshotId: string;
+  snapshotId: string;
   staged?: StagedKnowledgeWindow;
   promoted: boolean;
 }
@@ -68,6 +70,7 @@ export class CommitCoordinator {
   readonly #windowsByOrdinal = new Map<number, BoundWindow>();
   readonly #windowIds = new Set<string>();
   readonly #snapshots = new Map<string, KnowledgeSnapshot>();
+  readonly #retryWindowIds = new Set<string>();
   #currentSnapshot: KnowledgeSnapshot;
   #nextOrdinal = 0;
 
@@ -205,7 +208,13 @@ export class CommitCoordinator {
       });
 
       // The hook is the transaction boundary. Failure leaves domain state staged.
-      this.#hooks?.commitPromotion(promotion);
+      const outcome = this.#hooks?.commitPromotion(promotion);
+      if (outcome === "retry_latest_snapshot") {
+        bound.staged = undefined;
+        bound.snapshotId = this.#currentSnapshot.id;
+        this.#retryWindowIds.add(bound.windowId);
+        break;
+      }
       this.knowledge.replaceWith(nextKnowledge);
       this.#snapshots.set(nextSnapshot.id, nextSnapshot);
       this.#currentSnapshot = nextSnapshot;
@@ -214,6 +223,12 @@ export class CommitCoordinator {
       this.#nextOrdinal += 1;
     }
     return promoted;
+  }
+
+  takeRetryWindowIds(): string[] {
+    const retryWindowIds = [...this.#retryWindowIds];
+    this.#retryWindowIds.clear();
+    return retryWindowIds;
   }
 
   activeKnowledge(

@@ -1,17 +1,31 @@
 import { createHash, randomUUID } from "node:crypto";
 import {
+  closeSync,
   copyFileSync,
+  existsSync,
+  fsyncSync,
   mkdirSync,
   mkdtempSync,
+  openSync,
+  renameSync,
   rmSync,
   statSync,
+  writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { DatabaseSync, type StatementSync } from "node:sqlite";
+import { gzipSync } from "node:zlib";
 
 import type { CommitPromotion } from "../fullbook/commit-coordinator.js";
 import type { AdaptiveSchedulerSnapshot } from "../fullbook/adaptive-scheduler.js";
+import type { SchedulerRunReport } from "../fullbook/dynamic-scheduler.js";
+import {
+  schedulerCountersPatch,
+  TokenLedger,
+  type LedgerEvent,
+  type TokenLedgerInit,
+} from "../fullbook/token-ledger.js";
 import type { BookWindowPlan, BookWindowStatus } from "../fullbook/types.js";
 import {
   classifyImport,
@@ -86,6 +100,32 @@ import {
   type KnowledgeSnapshot,
 } from "../knowledge/snapshot.js";
 import {
+  buildConceptOccurrenceIndex,
+  type ConceptOccurrence,
+  type ConceptOccurrenceSpan,
+} from "../knowledge/concept-occurrence-index.js";
+import {
+  evaluateRevalidationBindings,
+  evaluateStagedConceptBindings,
+  planSparseRevalidation,
+  type BindingGateDecision,
+  type RevalidationBindingState,
+} from "../knowledge/sparse-revalidation.js";
+import type {
+  LexicalConcept,
+  LexicalSemanticClass,
+} from "../knowledge/lexical-concept.js";
+import {
+  expectedTermOccurrences,
+  validateTermUsages,
+  type TermConceptProjection,
+  type TermUsageSubmission,
+} from "../knowledge/term-usage.js";
+/*
+ * Keep the runtime validators above in the storage commit gate.  A durable
+ * replacement must not trust that its caller used the same request harness.
+ */
+import {
   knowledgeRevisionMatchesSearch,
   type KnowledgeDiagnosticsSummary,
   type KnowledgeImpactView,
@@ -108,14 +148,22 @@ import {
   LOSSLESS_BOOK_SCHEMA_VERSION as LOSSLESS_BOOK_SCHEMA_V2_VERSION,
 } from "./book-schema-v2.js";
 import {
-  LOSSLESS_BOOK_SCHEMA_FINGERPRINT,
-  LOSSLESS_BOOK_SCHEMA_MARKER,
-  LOSSLESS_BOOK_SCHEMA_TABLES,
+  LOSSLESS_BOOK_SCHEMA_FINGERPRINT as LOSSLESS_BOOK_SCHEMA_V3_FINGERPRINT,
+  LOSSLESS_BOOK_SCHEMA_MARKER as LOSSLESS_BOOK_SCHEMA_V3_MARKER,
+  LOSSLESS_BOOK_SCHEMA_TABLES as LOSSLESS_BOOK_SCHEMA_V3_TABLES,
   LOSSLESS_BOOK_SCHEMA_V3,
   LOSSLESS_BOOK_SCHEMA_V3_EXTENSION,
   LOSSLESS_BOOK_SCHEMA_V3_KNOWLEDGE_RECORDS,
-  LOSSLESS_BOOK_SCHEMA_VERSION,
+  LOSSLESS_BOOK_SCHEMA_VERSION as LOSSLESS_BOOK_SCHEMA_V3_VERSION,
 } from "./book-schema-v3.js";
+import {
+  LOSSLESS_BOOK_SCHEMA_FINGERPRINT,
+  LOSSLESS_BOOK_SCHEMA_MARKER,
+  LOSSLESS_BOOK_SCHEMA_TABLES,
+  LOSSLESS_BOOK_SCHEMA_V4,
+  LOSSLESS_BOOK_SCHEMA_V4_EXTENSION,
+  LOSSLESS_BOOK_SCHEMA_VERSION,
+} from "./book-schema-v4.js";
 
 export interface CertifiedSourceRange {
   rangeId: string;
@@ -158,6 +206,18 @@ export interface TranslationRunMeta {
   initialSnapshotId: string;
   initialSnapshot?: KnowledgeSnapshot;
   metadata?: unknown;
+}
+
+export interface ProviderResponseEvidenceInput {
+  readonly runId: string;
+  readonly requestId: string;
+  readonly snapshotId: string;
+  readonly phase: "research" | "translation" | "repair" | "recovery";
+  readonly modelCallOrdinal: number;
+  readonly requestHash: string;
+  readonly responseProtocol: "typed_tool" | "framed_text";
+  readonly executionUnitId?: string;
+  readonly assistantMessage: unknown;
 }
 
 export interface LosslessBookStatusSummary {
@@ -222,6 +282,116 @@ export interface WindowStageInput {
   styleTail: string;
   budget: Readonly<Record<string, number>>;
   warnings: readonly string[];
+  conceptBindings?: WindowConceptBindingsInput;
+}
+
+export interface WindowConceptBindingsInput {
+  readonly usages: readonly TermUsageSubmission[];
+  readonly concepts: readonly TermConceptProjection[];
+}
+
+export interface LexicalConceptChange {
+  readonly conceptId: string;
+  readonly revision: number;
+  readonly previousRevisionId: string | null;
+  readonly revisionId: string;
+  readonly previousRenderFingerprint: string | null;
+  readonly renderFingerprint: string;
+  readonly renderChanged: boolean;
+}
+
+export interface StoredLexicalConcept extends LexicalConcept {
+  readonly revision: number;
+}
+
+export interface StoredConceptOccurrence extends ConceptOccurrence {
+  readonly sourceVersion: string;
+}
+
+export interface TranslationConceptBinding {
+  readonly translationId: number;
+  readonly conceptId: string;
+  readonly appliedRevisionId: string;
+  readonly appliedRenderFingerprint: string;
+  readonly termUsages: readonly TermUsageSubmission[];
+  readonly validationStatus:
+    | "clean"
+    | "pending"
+    | "validating"
+    | "stale"
+    | "warning_stale";
+  readonly validatedRevisionId: string;
+}
+
+export type WindowPromotionOutcome = "promoted" | "retry_latest_snapshot";
+
+export interface KnowledgeRevalidationTask {
+  readonly taskId: string;
+  readonly runId: string;
+  readonly translationId: number;
+  readonly blockId: string;
+  readonly changeSetHash: string;
+  readonly fromSnapshotId: string;
+  readonly toSnapshotId: string;
+  readonly conceptIds: readonly string[];
+  readonly status:
+    | "pending"
+    | "validating"
+    | "resolved_noop"
+    | "resolved_repair"
+    | "resolved_retranslate"
+    | "completed_with_warning";
+  readonly attempts: number;
+  readonly result: unknown;
+  readonly replacementTranslationId: number | null;
+}
+
+export interface ConceptCoverageRevalidationReport {
+  readonly occurrenceDependencies: number;
+  readonly candidateTranslations: number;
+  readonly tasksCreated: number;
+  readonly bindingsCreated: number;
+  readonly wallTimeMs: number;
+}
+
+export interface RevalidationTranslationRecord
+  extends ActiveLosslessTranslation {
+  readonly translationId: number;
+  readonly snapshotId: string;
+}
+
+export interface RevalidationSourceBlock {
+  readonly blockId: string;
+  readonly sourceVersion: string;
+  readonly sourceHash: string;
+  readonly sourceText: string;
+  readonly globalIndex: number;
+  readonly tokenCount: number;
+}
+
+export interface RevalidationConceptState extends RevalidationBindingState {
+  readonly appliedConcept: StoredLexicalConcept;
+  readonly currentConcept: StoredLexicalConcept;
+}
+
+export interface RevalidationWorkItem {
+  readonly task: KnowledgeRevalidationTask;
+  readonly translation: RevalidationTranslationRecord;
+  readonly source: RevalidationSourceBlock;
+  readonly window: PersistedLosslessWindow;
+  readonly concepts: readonly RevalidationConceptState[];
+}
+
+export interface RevalidationReplacementInput {
+  readonly runId: string;
+  readonly taskId: string;
+  readonly snapshotId: string;
+  readonly action: "repair" | "retranslate";
+  readonly text: string;
+  readonly resultStatus: "completed" | "completed_with_warnings";
+  readonly termUsages: readonly TermUsageSubmission[];
+  readonly concepts: readonly TermConceptProjection[];
+  readonly result: unknown;
 }
 
 export interface WindowFailureInput {
@@ -240,7 +410,8 @@ export type FaultCheckpoint =
   | "knowledge_import_stage_before_commit"
   | "knowledge_import_before_commit"
   | "knowledge_import_rollback_before_commit"
-  | "schema_v3_before_commit";
+  | "schema_v3_before_commit"
+  | "schema_v4_before_commit";
 
 export interface FaultInjector {
   checkpoint(name: FaultCheckpoint): void;
@@ -380,6 +551,18 @@ export interface LosslessAuditSnapshot {
   payload: unknown;
 }
 
+export interface LosslessAuditConceptBinding {
+  translationId: number;
+  conceptId: string;
+  validationStatus: TranslationConceptBinding["validationStatus"];
+}
+
+export interface LosslessAuditMissingConceptBinding {
+  translationId: number;
+  blockId: string;
+  conceptId: string;
+}
+
 export interface LosslessAuditState {
   runId: string;
   sourceVersion: string;
@@ -395,6 +578,9 @@ export interface LosslessAuditState {
   translations: LosslessAuditTranslation[];
   knowledgeRevisions: LosslessAuditKnowledgeRevision[];
   snapshots: LosslessAuditSnapshot[];
+  conceptBindings: LosslessAuditConceptBinding[];
+  missingConceptBindings: LosslessAuditMissingConceptBinding[];
+  revalidationTasks: KnowledgeRevalidationTask[];
 }
 
 type LosslessStoreOpenMode = "read-write" | "read-only";
@@ -415,6 +601,7 @@ interface ReadOnlySnapshot {
 }
 
 const READ_ONLY_SNAPSHOT_ATTEMPTS = 3;
+const DEFAULT_MAX_REVALIDATION_ATTEMPTS = 2;
 
 export class LosslessReadSnapshotError extends Error {
   readonly code = "LOSSLESS_READ_SNAPSHOT_UNSTABLE";
@@ -663,6 +850,48 @@ interface LogicalBlockRow {
   canonical_start: number;
   canonical_end: number;
   token_count: number;
+}
+
+interface LexicalConceptRow {
+  run_id: string;
+  concept_id: string;
+  revision: number;
+  revision_id: string;
+  normalized_subject: string;
+  source_forms_json: string;
+  semantic_class: string;
+  canonical_target: string;
+  policy: string;
+  allowed_realizations_json: string;
+  visibility: string;
+  confidence: number;
+  render_fingerprint: string;
+  active: number;
+}
+
+interface TranslationConceptBindingRow {
+  translation_id: number;
+  concept_id: string;
+  applied_revision_id: string;
+  applied_render_fingerprint: string;
+  term_usages_json: string;
+  validation_status: TranslationConceptBinding["validationStatus"];
+  validated_revision_id: string;
+}
+
+interface KnowledgeRevalidationTaskRow {
+  task_id: string;
+  run_id: string;
+  translation_id: number;
+  block_id: string;
+  change_set_hash: string;
+  from_snapshot_id: string;
+  to_snapshot_id: string;
+  concept_ids_json: string;
+  status: KnowledgeRevalidationTask["status"];
+  attempts: number;
+  result_json: string;
+  replacement_translation_id: number | null;
 }
 
 function all<T>(statement: StatementSync, ...values: any[]): T[] {
@@ -1031,6 +1260,135 @@ function validateWarnings(warnings: readonly string[]): string {
   return jsonText(warnings, "warnings");
 }
 
+function revalidationTaskFromRow(
+  row: KnowledgeRevalidationTaskRow,
+): KnowledgeRevalidationTask {
+  return {
+    taskId: row.task_id,
+    runId: row.run_id,
+    translationId: row.translation_id,
+    blockId: row.block_id,
+    changeSetHash: row.change_set_hash,
+    fromSnapshotId: row.from_snapshot_id,
+    toSnapshotId: row.to_snapshot_id,
+    conceptIds: stringArrayFromJson(
+      row.concept_ids_json,
+      "revalidation concept IDs",
+    ),
+    status: row.status,
+    attempts: row.attempts,
+    result: JSON.parse(row.result_json) as unknown,
+    replacementTranslationId: row.replacement_translation_id,
+  };
+}
+
+function lexicalConceptFromRow(row: LexicalConceptRow): StoredLexicalConcept {
+  const semanticClasses = new Set<LexicalSemanticClass>([
+    "proper_name",
+    "unique_title",
+    "technical_term",
+    "role",
+  ]);
+  if (!semanticClasses.has(row.semantic_class as LexicalSemanticClass)
+    || !["locked", "preferred", "contextual"].includes(row.policy)
+    || !["translator_global", "narrative_before_target"].includes(row.visibility)) {
+    throw new Error(`corrupt lexical concept ${row.concept_id}`);
+  }
+  return {
+    conceptId: row.concept_id,
+    revision: requireSafeInteger(row.revision, "lexical concept revision", 1),
+    revisionId: row.revision_id,
+    normalizedSubject: row.normalized_subject,
+    sourceForms: stringArrayFromJson(
+      row.source_forms_json,
+      "lexical source forms",
+    ),
+    semanticClass: row.semantic_class as LexicalSemanticClass,
+    canonicalTarget: row.canonical_target,
+    policy: row.policy as LexicalConcept["policy"],
+    allowedRealizations: stringArrayFromJson(
+      row.allowed_realizations_json,
+      "lexical allowed realizations",
+    ),
+    visibility: row.visibility as LexicalConcept["visibility"],
+    confidence: row.confidence,
+    renderFingerprint: row.render_fingerprint,
+  };
+}
+
+function lexicalConceptFromPayload(value: unknown): LexicalConcept {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error("corrupt lexical concept knowledge payload");
+  }
+  const payload = value as Partial<LexicalConcept>;
+  if (typeof payload.conceptId !== "string"
+    || typeof payload.revisionId !== "string"
+    || typeof payload.normalizedSubject !== "string"
+    || !Array.isArray(payload.sourceForms)
+    || payload.sourceForms.length === 0
+    || payload.sourceForms.some((item: unknown) =>
+      typeof item !== "string" || item.trim().length === 0)
+    || !["proper_name", "unique_title", "technical_term", "role"].includes(
+      payload.semanticClass ?? "",
+    )
+    || typeof payload.canonicalTarget !== "string"
+    || !["locked", "preferred", "contextual"].includes(payload.policy ?? "")
+    || !Array.isArray(payload.allowedRealizations)
+    || payload.allowedRealizations.length === 0
+    || payload.allowedRealizations.some((item: unknown) =>
+      typeof item !== "string" || item.trim().length === 0)
+    || typeof payload.confidence !== "number"
+    || !Number.isFinite(payload.confidence)
+    || payload.confidence < 0
+    || payload.confidence > 1
+    || !["translator_global", "narrative_before_target"].includes(
+      payload.visibility ?? "",
+    )
+    || typeof payload.renderFingerprint !== "string"
+    || !/^[a-f0-9]{64}$/u.test(payload.renderFingerprint)) {
+    throw new Error("corrupt lexical concept knowledge payload");
+  }
+  return {
+    conceptId: payload.conceptId,
+    revisionId: payload.revisionId,
+    normalizedSubject: payload.normalizedSubject,
+    sourceForms: [...payload.sourceForms] as string[],
+    semanticClass: payload.semanticClass as LexicalConcept["semanticClass"],
+    canonicalTarget: payload.canonicalTarget,
+    policy: payload.policy as LexicalConcept["policy"],
+    allowedRealizations: [...payload.allowedRealizations] as string[],
+    confidence: payload.confidence,
+    visibility: payload.visibility as LexicalConcept["visibility"],
+    renderFingerprint: payload.renderFingerprint,
+  };
+}
+
+function termUsagesFromJson(value: string): TermUsageSubmission[] {
+  const parsed = JSON.parse(value) as unknown;
+  if (!Array.isArray(parsed)) {
+    throw new Error("corrupt term usages JSON");
+  }
+  for (const item of parsed) {
+    if (item === null || typeof item !== "object" || Array.isArray(item)) {
+      throw new Error("corrupt term usages JSON");
+    }
+    const usage = item as Partial<TermUsageSubmission>;
+    if (typeof usage.occurrenceId !== "string"
+      || typeof usage.blockId !== "string"
+      || typeof usage.conceptId !== "string"
+      || typeof usage.sourceForm !== "string"
+      || !Number.isSafeInteger(usage.sourceStart)
+      || !Number.isSafeInteger(usage.sourceEnd)
+      || typeof usage.targetSurface !== "string"
+      || !["narrative", "vocative", "title", "other"].includes(
+        usage.discourseRole ?? "",
+      )) {
+      throw new Error("corrupt term usages JSON");
+    }
+  }
+  return parsed as TermUsageSubmission[];
+}
+
 function windowFromRow(row: WindowRow, blockIds: string[]): PersistedLosslessWindow {
   return {
     windowId: row.window_id,
@@ -1053,6 +1411,7 @@ function windowFromRow(row: WindowRow, blockIds: string[]): PersistedLosslessWin
 
 export class LosslessBookStore {
   readonly #database: DatabaseSync;
+  readonly #databasePath: string;
   readonly #faultInjector: FaultInjector | undefined;
   readonly #temporarySnapshotDirectory: string | undefined;
   readonly #schemaVersion: number;
@@ -1064,6 +1423,7 @@ export class LosslessBookStore {
     temporarySnapshotDirectory?: string,
   ) {
     const absolute = resolve(requireNonempty(path, "database path"));
+    this.#databasePath = absolute;
     this.#faultInjector = faultInjector;
     this.#temporarySnapshotDirectory = temporarySnapshotDirectory;
     if (mode === "read-write") {
@@ -1103,12 +1463,21 @@ export class LosslessBookStore {
         this.#verifyV2Schema(tables);
         if (mode === "read-write") {
           this.#migrateV2ToV3();
+          this.#migrateV3ToV4();
           this.#schemaVersion = LOSSLESS_BOOK_SCHEMA_VERSION;
         } else {
           this.#schemaVersion = LOSSLESS_BOOK_SCHEMA_V2_VERSION;
         }
-      } else {
+      } else if (userVersion === LOSSLESS_BOOK_SCHEMA_V3_VERSION) {
         this.#verifyV3Schema(userVersion, tables);
+        if (mode === "read-write") {
+          this.#migrateV3ToV4();
+          this.#schemaVersion = LOSSLESS_BOOK_SCHEMA_VERSION;
+        } else {
+          this.#schemaVersion = LOSSLESS_BOOK_SCHEMA_V3_VERSION;
+        }
+      } else {
+        this.#verifyV4Schema(userVersion, tables);
         this.#schemaVersion = LOSSLESS_BOOK_SCHEMA_VERSION;
       }
       if (mode === "read-write") {
@@ -1659,6 +2028,14 @@ export class LosslessBookStore {
           input.snapshotId,
         );
       }
+      if (input.conceptBindings !== undefined) {
+        this.#writeWindowConceptBindings(
+          input.runId,
+          input.windowId,
+          input.conceptBindings.usages,
+          input.conceptBindings.concepts,
+        );
+      }
 
       const insertKnowledgeCandidate = this.#database.prepare(`
         INSERT INTO knowledge_candidates(
@@ -1705,17 +2082,17 @@ export class LosslessBookStore {
     this.#faultInjector?.checkpoint("after_stage");
   }
 
-  promoteStagedWindow(promotion: CommitPromotion): void;
+  promoteStagedWindow(promotion: CommitPromotion): WindowPromotionOutcome;
   promoteStagedWindow(
     runId: string,
     windowId: string,
     nextSnapshot?: KnowledgeSnapshot,
-  ): void;
+  ): WindowPromotionOutcome;
   promoteStagedWindow(
     promotionOrRunId: CommitPromotion | string,
     legacyWindowId?: string,
     legacyNextSnapshot?: KnowledgeSnapshot,
-  ): void {
+  ): WindowPromotionOutcome {
     const promotion = typeof promotionOrRunId === "string"
       ? undefined
       : promotionOrRunId;
@@ -1725,7 +2102,7 @@ export class LosslessBookStore {
     requireNonempty(runId, "runId");
     requireNonempty(windowId, "windowId");
     this.#faultInjector?.checkpoint("before_promote");
-    this.#transaction(() => {
+    return this.#transaction((): WindowPromotionOutcome => {
       const row = one<WindowRow & { result_status: string | null }>(
         this.#database.prepare(`
           SELECT * FROM window_plans WHERE run_id=? AND window_id=?
@@ -1772,6 +2149,34 @@ export class LosslessBookStore {
         throw new Error(
           `earlier ordinal ${earlier.window_id} blocks promotion of ${windowId}`,
         );
+      }
+      const bindingGate = this.#evaluateStagedBindingGate(runId, windowId);
+      if (bindingGate.status === "retry_latest_snapshot") {
+        this.#database.prepare(`
+          DELETE FROM translations
+          WHERE run_id=? AND window_id=? AND stage_state='staged' AND active=0
+        `).run(runId, windowId);
+        this.#database.prepare(`
+          DELETE FROM knowledge_candidates
+          WHERE run_id=? AND window_id=? AND stage_state='staged'
+        `).run(runId, windowId);
+        const reset = this.#database.prepare(`
+          UPDATE window_plans
+          SET status='pending', result_status=NULL, snapshot_id=NULL,
+              style_tail='', warnings_json='[]',
+              last_error='staged concept binding requires the latest snapshot',
+              updated_at=datetime('now')
+          WHERE run_id=? AND window_id=? AND status='staged'
+        `).run(runId, windowId);
+        if (Number(reset.changes) !== 1) {
+          throw new Error(`failed to reset stale staged window ${runId}/${windowId}`);
+        }
+        this.#appendEvent(runId, "window_concept_binding_retry", {
+          runId,
+          windowId,
+          incompatibleConceptIds: bindingGate.incompatibleConceptIds,
+        });
+        return "retry_latest_snapshot";
       }
 
       const stagedCandidateRows = all<{
@@ -1977,6 +2382,11 @@ export class LosslessBookStore {
           undefined,
         );
       }
+      this.#projectLexicalConceptRevisions(
+        runId,
+        appendedRevisions,
+        nextSnapshot?.id ?? row.snapshot_id,
+      );
       if (appendedRevisions.length > 0) {
         const updatedKnowledgeState = this.#database.prepare(`
           UPDATE knowledge_state
@@ -2016,6 +2426,7 @@ export class LosslessBookStore {
         snapshotId: row.snapshot_id,
         nextSnapshotId: nextSnapshot?.id ?? null,
       });
+      return "promoted";
     });
   }
 
@@ -2223,6 +2634,987 @@ export class LosslessBookStore {
 
   pendingWindows(runId: string): PersistedLosslessWindow[] {
     return this.allWindows(runId).filter((window) => window.status === "pending");
+  }
+
+  upsertLexicalConcepts(
+    runId: string,
+    concepts: readonly LexicalConcept[],
+  ): LexicalConceptChange[] {
+    if (this.#schemaVersion !== LOSSLESS_BOOK_SCHEMA_VERSION) {
+      throw new Error("schema v4 write upgrade required");
+    }
+    this.#run(runId);
+    if (!Array.isArray(concepts)) {
+      throw new TypeError("concepts must be an array");
+    }
+    const seen = new Set<string>();
+    for (const concept of concepts) {
+      requireNonempty(concept.conceptId, "conceptId");
+      requireNonempty(concept.revisionId, "concept revisionId");
+      requireNonempty(concept.normalizedSubject, "concept normalizedSubject");
+      requireNonempty(concept.canonicalTarget, "concept canonicalTarget");
+      if (seen.has(concept.conceptId)) {
+        throw new Error(`duplicate lexical concept ${concept.conceptId}`);
+      }
+      seen.add(concept.conceptId);
+      if (!/^[0-9a-f]{64}$/u.test(concept.renderFingerprint)) {
+        throw new TypeError("concept renderFingerprint must be a SHA-256 hash");
+      }
+      if (!Array.isArray(concept.sourceForms)
+        || concept.sourceForms.length === 0
+        || concept.sourceForms.some((form: unknown) =>
+          typeof form !== "string" || form.trim().length === 0)) {
+        throw new TypeError("concept sourceForms must contain nonempty strings");
+      }
+      if (!Array.isArray(concept.allowedRealizations)
+        || concept.allowedRealizations.length === 0
+        || concept.allowedRealizations.some((surface: unknown) =>
+          typeof surface !== "string" || surface.trim().length === 0)) {
+        throw new TypeError(
+          "concept allowedRealizations must contain nonempty strings",
+        );
+      }
+    }
+    return this.#transaction(() =>
+      this.#upsertLexicalConceptRows(runId, concepts));
+  }
+
+  activeLexicalConcept(
+    runId: string,
+    conceptId: string,
+  ): StoredLexicalConcept | undefined {
+    if (this.#schemaVersion !== LOSSLESS_BOOK_SCHEMA_VERSION) return undefined;
+    this.#run(runId);
+    requireNonempty(conceptId, "conceptId");
+    const row = one<LexicalConceptRow>(this.#database.prepare(`
+      SELECT * FROM lexical_concepts
+      WHERE run_id=? AND concept_id=? AND active=1
+    `), runId, conceptId);
+    return row === undefined ? undefined : lexicalConceptFromRow(row);
+  }
+
+  replaceConceptOccurrences(
+    runId: string,
+    conceptId: string,
+    occurrences: readonly ConceptOccurrence[],
+  ): void {
+    if (this.#schemaVersion !== LOSSLESS_BOOK_SCHEMA_VERSION) {
+      throw new Error("schema v4 write upgrade required");
+    }
+    const run = this.#run(runId);
+    requireNonempty(conceptId, "conceptId");
+    if (!Array.isArray(occurrences)) {
+      throw new TypeError("occurrences must be an array");
+    }
+    if (this.activeLexicalConcept(runId, conceptId) === undefined) {
+      throw new Error(`unknown active lexical concept ${conceptId}`);
+    }
+    const normalized = occurrences.map((occurrence) => {
+      if (occurrence.conceptId !== conceptId) {
+        throw new Error(`occurrence concept mismatch for ${occurrence.blockId}`);
+      }
+      const blockIdValue = requireNonempty(occurrence.blockId, "occurrence blockId");
+      const block = one<{ source_text: string }>(this.#database.prepare(`
+        SELECT source_text FROM logical_blocks
+        WHERE source_version=? AND block_id=?
+      `), run.source_version, blockIdValue);
+      if (block === undefined) {
+        throw new Error(`unknown occurrence block ${blockIdValue}`);
+      }
+      if (!Array.isArray(occurrence.sourceSpans)
+        || occurrence.sourceSpans.length === 0) {
+        throw new Error(`occurrence ${blockIdValue} must contain source spans`);
+      }
+      const sourceScalars = Array.from(block.source_text);
+      const spanKeys = new Set<string>();
+      const spans = occurrence.sourceSpans.map((span: ConceptOccurrenceSpan) => {
+        requireSafeInteger(span.start, "occurrence start");
+        requireSafeInteger(span.end, "occurrence end", 1);
+        if (span.end <= span.start || span.end > sourceScalars.length) {
+          throw new Error(`invalid occurrence span in block ${blockIdValue}`);
+        }
+        const sourceForm = requireNonempty(
+          span.sourceForm,
+          "occurrence sourceForm",
+        );
+        if (sourceScalars.slice(span.start, span.end).join("") !== sourceForm) {
+          throw new Error(`occurrence source form mismatch in block ${blockIdValue}`);
+        }
+        const key = `${span.start}\0${span.end}`;
+        if (spanKeys.has(key)) {
+          throw new Error(`duplicate occurrence span in block ${blockIdValue}`);
+        }
+        spanKeys.add(key);
+        return { start: span.start, end: span.end, sourceForm };
+      }).sort((
+        left: ConceptOccurrenceSpan,
+        right: ConceptOccurrenceSpan,
+      ) => left.start - right.start || left.end - right.end);
+      return {
+        conceptId,
+        blockId: blockIdValue,
+        sourceVersion: run.source_version,
+        sourceSpans: spans,
+      };
+    });
+    if (new Set(normalized.map((item) => item.blockId)).size !== normalized.length) {
+      throw new Error(`duplicate occurrence block for ${conceptId}`);
+    }
+    this.#transaction(() => {
+      this.#database.prepare(`
+        DELETE FROM concept_occurrences WHERE run_id=? AND concept_id=?
+      `).run(runId, conceptId);
+      const insert = this.#database.prepare(`
+        INSERT INTO concept_occurrences(
+          run_id, concept_id, source_version, block_id,
+          occurrence_count, source_spans_json
+        ) VALUES(?, ?, ?, ?, ?, ?)
+      `);
+      for (const occurrence of normalized) {
+        insert.run(
+          runId,
+          conceptId,
+          occurrence.sourceVersion,
+          occurrence.blockId,
+          occurrence.sourceSpans.length,
+          jsonText(occurrence.sourceSpans, "concept occurrence spans"),
+        );
+      }
+    });
+  }
+
+  conceptOccurrences(
+    runId: string,
+    conceptId: string,
+  ): StoredConceptOccurrence[] {
+    if (this.#schemaVersion !== LOSSLESS_BOOK_SCHEMA_VERSION) return [];
+    this.#run(runId);
+    requireNonempty(conceptId, "conceptId");
+    return all<{
+      source_version: string;
+      block_id: string;
+      occurrence_count: number;
+      source_spans_json: string;
+    }>(this.#database.prepare(`
+      SELECT source_version, block_id, occurrence_count, source_spans_json
+      FROM concept_occurrences
+      WHERE run_id=? AND concept_id=?
+      ORDER BY block_id
+    `), runId, conceptId).map((row) => {
+      const spans = JSON.parse(row.source_spans_json) as ConceptOccurrenceSpan[];
+      if (!Array.isArray(spans) || spans.length !== row.occurrence_count) {
+        throw new Error(`corrupt concept occurrences for ${conceptId}`);
+      }
+      return {
+        conceptId,
+        blockId: row.block_id,
+        sourceVersion: row.source_version,
+        sourceSpans: spans,
+      };
+    });
+  }
+
+  stageWindowConceptBindings(
+    runId: string,
+    windowId: string,
+    usages: readonly TermUsageSubmission[],
+    concepts: readonly TermConceptProjection[],
+  ): void {
+    if (this.#schemaVersion !== LOSSLESS_BOOK_SCHEMA_VERSION) {
+      throw new Error("schema v4 write upgrade required");
+    }
+    this.#run(runId);
+    requireNonempty(windowId, "windowId");
+    this.#transaction(() => {
+      const window = this.#window(runId, windowId);
+      if (window === undefined || window.status !== "staged") {
+        throw new Error(`window is not staged: ${runId}/${windowId}`);
+      }
+      this.#writeWindowConceptBindings(runId, windowId, usages, concepts);
+    });
+  }
+
+  activeTranslationBindings(
+    runId: string,
+    blockId: string,
+  ): TranslationConceptBinding[] {
+    if (this.#schemaVersion !== LOSSLESS_BOOK_SCHEMA_VERSION) return [];
+    this.#run(runId);
+    requireNonempty(blockId, "blockId");
+    return all<TranslationConceptBindingRow>(this.#database.prepare(`
+      SELECT b.*
+      FROM translations AS t
+      JOIN translation_concept_bindings AS b
+        ON b.translation_id=t.translation_id
+      WHERE t.run_id=? AND t.block_id=? AND t.active=1
+      ORDER BY b.concept_id
+    `), runId, blockId).map((row) => ({
+      translationId: row.translation_id,
+      conceptId: row.concept_id,
+      appliedRevisionId: row.applied_revision_id,
+      appliedRenderFingerprint: row.applied_render_fingerprint,
+      termUsages: termUsagesFromJson(row.term_usages_json),
+      validationStatus: row.validation_status,
+      validatedRevisionId: row.validated_revision_id,
+    }));
+  }
+
+  ensureConceptCoverageRevalidationTasks(
+    runId: string,
+    toSnapshotId: string,
+  ): ConceptCoverageRevalidationReport {
+    if (this.#schemaVersion !== LOSSLESS_BOOK_SCHEMA_VERSION) {
+      throw new Error("schema v4 write upgrade required");
+    }
+    const run = this.#run(runId);
+    requireNonempty(toSnapshotId, "toSnapshotId");
+    const snapshot = one<{ present: number }>(this.#database.prepare(`
+      SELECT 1 AS present FROM knowledge_snapshots
+      WHERE run_id=? AND snapshot_id=?
+    `), runId, toSnapshotId);
+    if (snapshot === undefined) {
+      throw new Error(`unknown knowledge snapshot ${runId}/${toSnapshotId}`);
+    }
+    return this.#transaction(() => {
+      const concepts = all<LexicalConceptRow>(this.#database.prepare(`
+        SELECT * FROM lexical_concepts
+        WHERE run_id=? AND active=1
+        ORDER BY concept_id
+      `), runId).map(lexicalConceptFromRow);
+      const sourcePayload = JSON.parse(
+        this.#source(run.source_version).source_payload_json,
+      ) as { sourceLanguage?: unknown };
+      const profile = getSourceLanguageProfile(
+        typeof sourcePayload.sourceLanguage === "string"
+          ? sourcePayload.sourceLanguage
+          : undefined,
+      );
+      const blocks = all<{ block_id: string; source_text: string }>(
+        this.#database.prepare(`
+          SELECT block_id, source_text FROM logical_blocks
+          WHERE source_version=? ORDER BY global_index
+        `),
+        run.source_version,
+      ).map((block) => ({
+        blockId: block.block_id,
+        sourceText: block.source_text,
+      }));
+      const occurrences = buildConceptOccurrenceIndex(
+        blocks,
+        concepts,
+        profile,
+      );
+      this.#database.prepare(`
+        DELETE FROM concept_occurrences WHERE run_id=?
+      `).run(runId);
+      const insertOccurrence = this.#database.prepare(`
+        INSERT INTO concept_occurrences(
+          run_id, concept_id, source_version, block_id,
+          occurrence_count, source_spans_json
+        ) VALUES(?, ?, ?, ?, ?, ?)
+      `);
+      for (const occurrence of occurrences) {
+        insertOccurrence.run(
+          runId,
+          occurrence.conceptId,
+          run.source_version,
+          occurrence.blockId,
+          occurrence.sourceSpans.length,
+          jsonText(occurrence.sourceSpans, "concept occurrence spans"),
+        );
+      }
+      const occurrenceKeys = new Set(occurrences.map((occurrence) =>
+        `${occurrence.conceptId}\0${occurrence.blockId}`));
+      const openTasks = all<KnowledgeRevalidationTaskRow>(
+        this.#database.prepare(`
+          SELECT * FROM knowledge_revalidation_tasks
+          WHERE run_id=? AND status IN ('pending','validating')
+          ORDER BY created_at, task_id
+        `),
+        runId,
+      ).map(revalidationTaskFromRow);
+      for (const task of openTasks) {
+        if (task.conceptIds.every((conceptId) =>
+          occurrenceKeys.has(`${conceptId}\0${task.blockId}`))) {
+          continue;
+        }
+        for (const conceptId of task.conceptIds) {
+          this.#database.prepare(`
+            DELETE FROM translation_concept_bindings
+            WHERE translation_id=? AND concept_id=?
+              AND term_usages_json='[]'
+              AND validation_status IN ('stale','validating')
+          `).run(task.translationId, conceptId);
+        }
+        const retired = this.#database.prepare(`
+          UPDATE knowledge_revalidation_tasks
+          SET status='resolved_noop', result_json=?, resolved_at=datetime('now')
+          WHERE run_id=? AND task_id=? AND status IN ('pending','validating')
+        `).run(
+          jsonText(
+            { reason: "source_occurrence_obsolete" },
+            "revalidation result",
+          ),
+          runId,
+          task.taskId,
+        );
+        if (Number(retired.changes) === 1) {
+          this.#appendEvent(runId, "sparse_revalidation_resolved_noop", {
+            runId,
+            taskId: task.taskId,
+            reason: "source_occurrence_obsolete",
+          });
+        }
+      }
+      this.#database.prepare(`
+        DELETE FROM translation_concept_bindings
+        WHERE translation_id IN (
+          SELECT translation_id FROM translations
+          WHERE run_id=? AND active=1
+        )
+        AND NOT EXISTS (
+          SELECT 1
+          FROM translations AS translation
+          JOIN concept_occurrences AS occurrence
+            ON occurrence.run_id=translation.run_id
+           AND occurrence.block_id=translation.block_id
+           AND occurrence.concept_id=translation_concept_bindings.concept_id
+          WHERE translation.translation_id=
+            translation_concept_bindings.translation_id
+        )
+      `).run(runId);
+      return this.#createSparseRevalidationTasks(
+        runId,
+        concepts,
+        occurrences,
+        toSnapshotId,
+      );
+    });
+  }
+
+  revalidationTasks(runId: string): KnowledgeRevalidationTask[] {
+    if (this.#schemaVersion !== LOSSLESS_BOOK_SCHEMA_VERSION) return [];
+    this.#run(runId);
+    return all<KnowledgeRevalidationTaskRow>(this.#database.prepare(`
+      SELECT * FROM knowledge_revalidation_tasks
+      WHERE run_id=? ORDER BY created_at, task_id
+    `), runId).map(revalidationTaskFromRow);
+  }
+
+  claimRevalidationTask(
+    runId: string,
+    taskId: string,
+    maxAttempts = DEFAULT_MAX_REVALIDATION_ATTEMPTS,
+    expectedAttempts = 0,
+  ): KnowledgeRevalidationTask | undefined {
+    if (this.#schemaVersion !== LOSSLESS_BOOK_SCHEMA_VERSION) return undefined;
+    this.#run(runId);
+    requireNonempty(taskId, "taskId");
+    requireSafeInteger(maxAttempts, "maxAttempts", 1);
+    requireSafeInteger(expectedAttempts, "expectedAttempts");
+    return this.#transaction(() => {
+      const row = one<KnowledgeRevalidationTaskRow & { translation_active: number }>(
+        this.#database.prepare(`
+          SELECT task.*, translation.active AS translation_active
+          FROM knowledge_revalidation_tasks AS task
+          JOIN translations AS translation
+            ON translation.translation_id=task.translation_id
+          WHERE task.run_id=? AND task.task_id=?
+        `),
+        runId,
+        taskId,
+      );
+      if (row === undefined
+        || row.attempts !== expectedAttempts
+        || (row.status !== "pending" && row.status !== "validating")) {
+        return undefined;
+      }
+      const task = revalidationTaskFromRow(row);
+      if (row.translation_active === 0) {
+        this.#finishRevalidationTask(
+          task,
+          "resolved_noop",
+          { reason: "translation_superseded" },
+          null,
+          "clean",
+        );
+        return undefined;
+      }
+      if (row.attempts >= maxAttempts) {
+        if (row.status === "validating") {
+          this.#finishRevalidationTask(
+            task,
+            "completed_with_warning",
+            { code: "REVALIDATION_ATTEMPTS_EXHAUSTED" },
+            null,
+            "warning_stale",
+          );
+        }
+        return undefined;
+      }
+      const claimed = this.#database.prepare(`
+        UPDATE knowledge_revalidation_tasks
+        SET status='validating', attempts=attempts+1
+        WHERE run_id=? AND task_id=?
+          AND status IN ('pending','validating') AND attempts=?
+      `).run(runId, taskId, row.attempts);
+      if (Number(claimed.changes) !== 1) {
+        return undefined;
+      }
+      const result = this.#revalidationTask(runId, taskId);
+      for (const conceptId of result.conceptIds) {
+        this.#database.prepare(`
+          UPDATE translation_concept_bindings
+          SET validation_status='validating', updated_at=datetime('now')
+          WHERE translation_id=? AND concept_id=?
+        `).run(result.translationId, conceptId);
+      }
+      this.#appendEvent(runId, "sparse_revalidation_claimed", {
+        runId,
+        taskId: result.taskId,
+        attempt: result.attempts,
+      });
+      return result;
+    });
+  }
+
+  claimNextRevalidationTask(
+    runId: string,
+    maxAttempts = DEFAULT_MAX_REVALIDATION_ATTEMPTS,
+  ): KnowledgeRevalidationTask | undefined {
+    if (this.#schemaVersion !== LOSSLESS_BOOK_SCHEMA_VERSION) return undefined;
+    this.#run(runId);
+    requireSafeInteger(maxAttempts, "maxAttempts", 1);
+    return this.#transaction(() => {
+      const abandoned = all<KnowledgeRevalidationTaskRow>(
+        this.#database.prepare(`
+          SELECT task.*
+          FROM knowledge_revalidation_tasks AS task
+          JOIN translations AS translation
+            ON translation.translation_id=task.translation_id
+          WHERE task.run_id=?
+            AND task.status IN ('pending','validating')
+            AND translation.active=0
+          ORDER BY task.created_at, task.task_id
+        `),
+        runId,
+      );
+      for (const row of abandoned) {
+        this.#finishRevalidationTask(
+          revalidationTaskFromRow(row),
+          "resolved_noop",
+          { reason: "translation_superseded" },
+          null,
+          "clean",
+        );
+      }
+
+      const exhausted = all<KnowledgeRevalidationTaskRow>(
+        this.#database.prepare(`
+          SELECT task.*
+          FROM knowledge_revalidation_tasks AS task
+          JOIN translations AS translation
+            ON translation.translation_id=task.translation_id
+          WHERE task.run_id=? AND task.status='validating'
+            AND task.attempts>=? AND translation.active=1
+          ORDER BY task.created_at, task.task_id
+        `),
+        runId,
+        maxAttempts,
+      );
+      for (const row of exhausted) {
+        this.#finishRevalidationTask(
+          revalidationTaskFromRow(row),
+          "completed_with_warning",
+          { code: "REVALIDATION_ATTEMPTS_EXHAUSTED" },
+          null,
+          "warning_stale",
+        );
+      }
+
+      const row = one<KnowledgeRevalidationTaskRow>(
+        this.#database.prepare(`
+          SELECT task.*
+          FROM knowledge_revalidation_tasks AS task
+          JOIN translations AS translation
+            ON translation.translation_id=task.translation_id
+          WHERE task.run_id=?
+            AND task.status IN ('pending','validating')
+            AND task.attempts<?
+            AND translation.active=1
+          ORDER BY task.created_at, task.task_id
+          LIMIT 1
+        `),
+        runId,
+        maxAttempts,
+      );
+      if (row === undefined) return undefined;
+      const claimed = this.#database.prepare(`
+        UPDATE knowledge_revalidation_tasks
+        SET status='validating', attempts=attempts+1
+        WHERE run_id=? AND task_id=?
+          AND status IN ('pending','validating') AND attempts=?
+      `).run(runId, row.task_id, row.attempts);
+      if (Number(claimed.changes) !== 1) {
+        throw new Error(`failed to claim revalidation task ${row.task_id}`);
+      }
+      const task = this.#revalidationTask(runId, row.task_id);
+      for (const conceptId of task.conceptIds) {
+        this.#database.prepare(`
+          UPDATE translation_concept_bindings
+          SET validation_status='validating', updated_at=datetime('now')
+          WHERE translation_id=? AND concept_id=?
+        `).run(task.translationId, conceptId);
+      }
+      this.#appendEvent(runId, "sparse_revalidation_claimed", {
+        runId,
+        taskId: task.taskId,
+        attempt: task.attempts,
+      });
+      return task;
+    });
+  }
+
+  revalidationWorkItem(
+    runId: string,
+    taskId: string,
+  ): RevalidationWorkItem {
+    if (this.#schemaVersion !== LOSSLESS_BOOK_SCHEMA_VERSION) {
+      throw new Error("schema v4 write upgrade required");
+    }
+    this.#run(runId);
+    requireNonempty(taskId, "taskId");
+    const task = this.#revalidationTask(runId, taskId);
+    if (task.status !== "validating") {
+      throw new Error(`revalidation task is not validating: ${taskId}`);
+    }
+    const translation = one<{
+      translation_id: number;
+      run_id: string;
+      window_id: string;
+      block_id: string;
+      source_version: string;
+      source_hash: string;
+      text: string;
+      result_status: ActiveLosslessTranslation["status"];
+      version: number;
+      snapshot_id: string;
+      source_text: string;
+      global_index: number;
+      token_count: number;
+    }>(this.#database.prepare(`
+      SELECT t.translation_id, t.run_id, t.window_id, t.block_id,
+             t.source_version, t.source_hash, t.text, t.result_status,
+             t.version, t.snapshot_id, b.source_text, b.global_index,
+             b.token_count
+      FROM translations AS t
+      JOIN logical_blocks AS b
+        ON b.source_version=t.source_version AND b.block_id=t.block_id
+      WHERE t.translation_id=? AND t.run_id=? AND t.active=1
+    `), task.translationId, runId);
+    if (translation === undefined || translation.block_id !== task.blockId) {
+      throw new Error(`revalidation task translation is no longer active: ${taskId}`);
+    }
+    const window = this.#window(runId, translation.window_id);
+    if (window === undefined) {
+      throw new Error(`revalidation task window is missing: ${taskId}`);
+    }
+    const bindingRows = all<TranslationConceptBindingRow>(
+      this.#database.prepare(`
+        SELECT * FROM translation_concept_bindings
+        WHERE translation_id=? ORDER BY concept_id
+      `),
+      task.translationId,
+    );
+    const bindingByConcept = new Map(bindingRows.map((binding) => [
+      binding.concept_id,
+      binding,
+    ]));
+    const concepts = task.conceptIds.map((conceptId): RevalidationConceptState => {
+      const binding = bindingByConcept.get(conceptId);
+      if (binding === undefined) {
+        throw new Error(`revalidation binding is missing: ${taskId}/${conceptId}`);
+      }
+      const applied = one<LexicalConceptRow>(this.#database.prepare(`
+        SELECT * FROM lexical_concepts
+        WHERE run_id=? AND concept_id=? AND revision_id=?
+      `), runId, conceptId, binding.applied_revision_id);
+      const current = one<LexicalConceptRow>(this.#database.prepare(`
+        SELECT * FROM lexical_concepts
+        WHERE run_id=? AND concept_id=? AND active=1
+      `), runId, conceptId);
+      if (applied === undefined || current === undefined) {
+        throw new Error(`revalidation concept revision is missing: ${taskId}/${conceptId}`);
+      }
+      return {
+        conceptId,
+        appliedConcept: lexicalConceptFromRow(applied),
+        currentConcept: lexicalConceptFromRow(current),
+        termUsages: termUsagesFromJson(binding.term_usages_json),
+      };
+    });
+    return {
+      task,
+      translation: {
+        translationId: translation.translation_id,
+        runId: translation.run_id,
+        windowId: translation.window_id,
+        blockId: translation.block_id,
+        sourceVersion: translation.source_version,
+        sourceHash: translation.source_hash,
+        text: translation.text,
+        status: translation.result_status,
+        version: translation.version,
+        snapshotId: translation.snapshot_id,
+      },
+      source: {
+        blockId: translation.block_id,
+        sourceVersion: translation.source_version,
+        sourceHash: translation.source_hash,
+        sourceText: translation.source_text,
+        globalIndex: translation.global_index,
+        tokenCount: translation.token_count,
+      },
+      window,
+      concepts,
+    };
+  }
+
+  resolveRevalidationNoop(
+    runId: string,
+    taskId: string,
+    result: unknown,
+  ): void {
+    requireNonempty(runId, "runId");
+    requireNonempty(taskId, "taskId");
+    const resultJson = jsonText(result, "revalidation result");
+    this.#transaction(() => {
+      const work = this.revalidationWorkItem(runId, taskId);
+      const decision = evaluateRevalidationBindings(work.concepts);
+      if (decision.action !== "noop") {
+        throw new Error(`revalidation task ${taskId} is not a local noop`);
+      }
+      for (const state of work.concepts) {
+        const updated = this.#database.prepare(`
+          UPDATE translation_concept_bindings
+          SET applied_revision_id=?, applied_render_fingerprint=?,
+              validation_status='clean', validated_revision_id=?,
+              updated_at=datetime('now')
+          WHERE translation_id=? AND concept_id=?
+        `).run(
+          state.currentConcept.revisionId,
+          state.currentConcept.renderFingerprint,
+          state.currentConcept.revisionId,
+          work.translation.translationId,
+          state.conceptId,
+        );
+        if (Number(updated.changes) !== 1) {
+          throw new Error(`failed to resolve revalidation binding ${state.conceptId}`);
+        }
+      }
+      const completed = this.#database.prepare(`
+        UPDATE knowledge_revalidation_tasks
+        SET status='resolved_noop', result_json=?, resolved_at=datetime('now')
+        WHERE run_id=? AND task_id=? AND status='validating'
+      `).run(resultJson, runId, taskId);
+      if (Number(completed.changes) !== 1) {
+        throw new Error(`failed to resolve revalidation task ${taskId}`);
+      }
+      this.#appendEvent(runId, "sparse_revalidation_resolved_noop", {
+        runId,
+        taskId,
+      });
+    });
+  }
+
+  replaceTranslationForRevalidation(
+    input: RevalidationReplacementInput,
+  ): number {
+    requireNonempty(input.runId, "runId");
+    requireNonempty(input.taskId, "taskId");
+    requireNonempty(input.snapshotId, "snapshotId");
+    requireNonempty(input.text, "revalidation translation text");
+    if (input.action !== "repair" && input.action !== "retranslate") {
+      throw new TypeError("revalidation action must be repair or retranslate");
+    }
+    if (input.resultStatus !== "completed"
+      && input.resultStatus !== "completed_with_warnings") {
+      throw new TypeError("invalid revalidation result status");
+    }
+    const resultJson = jsonText(input.result, "revalidation result");
+    return this.#transaction(() => {
+      const work = this.revalidationWorkItem(input.runId, input.taskId);
+      const snapshot = one<{ present: number }>(this.#database.prepare(`
+        SELECT 1 AS present FROM knowledge_snapshots
+        WHERE run_id=? AND snapshot_id=?
+      `), input.runId, input.snapshotId);
+      if (snapshot === undefined) {
+        throw new Error(
+          `revalidation snapshot does not belong to run ${input.runId}`,
+        );
+      }
+      const decision = evaluateRevalidationBindings(work.concepts);
+      if (decision.action !== input.action) {
+        throw new Error(
+          `revalidation action mismatch: expected ${decision.action}, got ${input.action}`,
+        );
+      }
+      const currentById = new Map(input.concepts.map((concept) => [
+        concept.conceptId,
+        concept,
+      ]));
+      for (const concept of input.concepts) {
+        const active = this.activeLexicalConcept(input.runId, concept.conceptId);
+        if (active === undefined
+          || active.revisionId !== concept.revisionId
+          || active.renderFingerprint !== concept.renderFingerprint) {
+          throw new Error(
+            `replacement uses a stale lexical concept ${concept.conceptId}`,
+          );
+        }
+      }
+      for (const conceptId of work.task.conceptIds) {
+        if (!currentById.has(conceptId)) {
+          throw new Error(`replacement omitted changed concept ${conceptId}`);
+        }
+      }
+      const run = this.#run(input.runId);
+      const sourcePayload = JSON.parse(
+        this.#source(run.source_version).source_payload_json,
+      ) as { sourceLanguage?: unknown };
+      const profile = getSourceLanguageProfile(
+        typeof sourcePayload.sourceLanguage === "string"
+          ? sourcePayload.sourceLanguage
+          : undefined,
+      );
+      const expected = expectedTermOccurrences(
+        [{ id: work.source.blockId, sourceText: work.source.sourceText }],
+        input.concepts,
+        profile,
+      );
+      const failures = validateTermUsages(
+        expected,
+        input.termUsages,
+        { [work.source.blockId]: input.text },
+      );
+      if (failures.length > 0) {
+        throw new Error(
+          `replacement term usage validation failed: ${failures
+            .map((failure) => failure.code)
+            .join(",")}`,
+        );
+      }
+      for (const conceptId of work.task.conceptIds) {
+        if (!expected.some((occurrence) => occurrence.conceptId === conceptId)) {
+          throw new Error(`replacement source occurrence missing for ${conceptId}`);
+        }
+      }
+      const staged = one<{ count: number }>(this.#database.prepare(`
+        SELECT COUNT(*) AS count FROM translations
+        WHERE run_id=? AND window_id=? AND stage_state='staged' AND active=0
+      `), input.runId, work.translation.windowId)?.count ?? 0;
+      if (staged !== 0) {
+        throw new Error(
+          `revalidation window already contains staged translations: ${work.translation.windowId}`,
+        );
+      }
+      if (work.window.status !== "completed"
+        && work.window.status !== "completed_with_warnings") {
+        throw new Error(
+          `revalidation window is not committed: ${work.translation.windowId}`,
+        );
+      }
+      const effectiveResultStatus =
+        work.window.status === "completed_with_warnings"
+        || input.resultStatus === "completed_with_warnings"
+          ? "completed_with_warnings"
+          : "completed";
+      const inserted = this.#database.prepare(`
+        INSERT INTO translations(
+          run_id, window_id, source_version, block_id, version, source_hash,
+          text, result_status, stage_state, active, snapshot_id
+        ) VALUES(?, ?, ?, ?,
+          COALESCE((
+            SELECT MAX(version)+1 FROM translations
+            WHERE run_id=? AND block_id=?
+          ), 1),
+          ?, ?, ?, 'staged', 0, ?)
+      `).run(
+        input.runId,
+        work.translation.windowId,
+        work.source.sourceVersion,
+        work.source.blockId,
+        input.runId,
+        work.source.blockId,
+        work.source.sourceHash,
+        input.text,
+        effectiveResultStatus,
+        input.snapshotId,
+      );
+      const replacementTranslationId = Number(inserted.lastInsertRowid);
+      if (!Number.isSafeInteger(replacementTranslationId)
+        || replacementTranslationId < 1) {
+        throw new Error(`failed to insert revalidation replacement ${input.taskId}`);
+      }
+      this.#writeWindowConceptBindings(
+        input.runId,
+        work.translation.windowId,
+        input.termUsages,
+        input.concepts,
+      );
+      const insertCoverageBinding = this.#database.prepare(`
+        INSERT OR IGNORE INTO translation_concept_bindings(
+          translation_id, concept_id, applied_revision_id,
+          applied_render_fingerprint, term_usages_json, validation_status,
+          validated_revision_id
+        ) VALUES(?, ?, ?, ?, '[]', 'clean', ?)
+      `);
+      for (const conceptId of [...new Set(
+        expected.map((occurrence) => occurrence.conceptId),
+      )].sort(compareText)) {
+        const concept = currentById.get(conceptId);
+        if (concept === undefined) {
+          throw new Error(
+            `replacement occurrence references unknown concept ${conceptId}`,
+          );
+        }
+        insertCoverageBinding.run(
+          replacementTranslationId,
+          concept.conceptId,
+          concept.revisionId,
+          concept.renderFingerprint,
+          concept.revisionId,
+        );
+      }
+      const deactivated = this.#database.prepare(`
+        UPDATE translations SET active=0
+        WHERE translation_id=? AND run_id=? AND active=1
+      `).run(work.translation.translationId, input.runId);
+      if (Number(deactivated.changes) !== 1) {
+        throw new Error(`active translation changed during revalidation ${input.taskId}`);
+      }
+      const activated = this.#database.prepare(`
+        UPDATE translations SET active=1, stage_state='promoted'
+        WHERE translation_id=? AND run_id=? AND active=0 AND stage_state='staged'
+      `).run(replacementTranslationId, input.runId);
+      if (Number(activated.changes) !== 1) {
+        throw new Error(`failed to activate revalidation replacement ${input.taskId}`);
+      }
+      if (effectiveResultStatus !== work.window.status) {
+        const updatedWindow = this.#database.prepare(`
+          UPDATE window_plans SET status=?
+          WHERE run_id=? AND window_id=? AND status=?
+        `).run(
+          effectiveResultStatus,
+          input.runId,
+          work.translation.windowId,
+          work.window.status,
+        );
+        if (Number(updatedWindow.changes) !== 1) {
+          throw new Error(
+            `revalidation window status changed concurrently: ${work.translation.windowId}`,
+          );
+        }
+        this.#database.prepare(`
+          UPDATE translations SET result_status=?
+          WHERE run_id=? AND window_id=? AND active=1
+        `).run(
+          effectiveResultStatus,
+          input.runId,
+          work.translation.windowId,
+        );
+      }
+      const terminalStatus = input.action === "repair"
+        ? "resolved_repair"
+        : "resolved_retranslate";
+      const completed = this.#database.prepare(`
+        UPDATE knowledge_revalidation_tasks
+        SET status=?, result_json=?, replacement_translation_id=?,
+            resolved_at=datetime('now')
+        WHERE run_id=? AND task_id=? AND status='validating'
+      `).run(
+        terminalStatus,
+        resultJson,
+        replacementTranslationId,
+        input.runId,
+        input.taskId,
+      );
+      if (Number(completed.changes) !== 1) {
+        throw new Error(`failed to complete revalidation task ${input.taskId}`);
+      }
+      this.#appendEvent(input.runId, "sparse_revalidation_replaced", {
+        runId: input.runId,
+        taskId: input.taskId,
+        action: input.action,
+        oldTranslationId: work.translation.translationId,
+        replacementTranslationId,
+      });
+      return replacementTranslationId;
+    });
+  }
+
+  completeRevalidationWithWarning(
+    runId: string,
+    taskId: string,
+    result: unknown,
+  ): void {
+    requireNonempty(runId, "runId");
+    requireNonempty(taskId, "taskId");
+    this.#transaction(() => {
+      const task = this.#revalidationTask(runId, taskId);
+      if (task.status !== "validating") {
+        throw new Error(`revalidation task is not validating: ${taskId}`);
+      }
+      this.#finishRevalidationTask(
+        task,
+        "completed_with_warning",
+        result,
+        null,
+        "warning_stale",
+      );
+      this.#appendEvent(runId, "sparse_revalidation_warning", {
+        runId,
+        taskId,
+      });
+    });
+  }
+
+  deferRevalidationTask(
+    runId: string,
+    taskId: string,
+    result: unknown,
+  ): void {
+    requireNonempty(runId, "runId");
+    requireNonempty(taskId, "taskId");
+    const resultJson = jsonText(result, "revalidation defer result");
+    this.#transaction(() => {
+      const task = this.#revalidationTask(runId, taskId);
+      if (task.status !== "validating" || task.attempts < 1) {
+        throw new Error(`revalidation task is not deferrable: ${taskId}`);
+      }
+      for (const conceptId of task.conceptIds) {
+        this.#database.prepare(`
+          UPDATE translation_concept_bindings
+          SET validation_status='stale', updated_at=datetime('now')
+          WHERE translation_id=? AND concept_id=?
+            AND validation_status='validating'
+        `).run(task.translationId, conceptId);
+      }
+      const deferred = this.#database.prepare(`
+        UPDATE knowledge_revalidation_tasks
+        SET status='pending', attempts=attempts-1, result_json=?,
+            resolved_at=NULL
+        WHERE run_id=? AND task_id=? AND status='validating' AND attempts>0
+      `).run(resultJson, runId, taskId);
+      if (Number(deferred.changes) !== 1) {
+        throw new Error(`failed to defer revalidation task ${taskId}`);
+      }
+      this.#appendEvent(runId, "sparse_revalidation_deferred", {
+        runId,
+        taskId,
+        result,
+      });
+    });
   }
 
   knowledgeState(runId: string): KnowledgeStateView {
@@ -4160,6 +5552,53 @@ export class LosslessBookStore {
       contentHash: row.content_hash,
       payload: JSON.parse(row.payload_json) as unknown,
     }));
+    const conceptBindings = this.#schemaVersion === LOSSLESS_BOOK_SCHEMA_VERSION
+      ? all<{
+          translation_id: number;
+          concept_id: string;
+          validation_status: TranslationConceptBinding["validationStatus"];
+        }>(this.#database.prepare(`
+          SELECT binding.translation_id, binding.concept_id,
+                 binding.validation_status
+          FROM translation_concept_bindings AS binding
+          JOIN translations AS translation
+            ON translation.translation_id=binding.translation_id
+          WHERE translation.run_id=? AND translation.active=1
+          ORDER BY binding.translation_id, binding.concept_id
+        `), runId).map((row) => ({
+          translationId: row.translation_id,
+          conceptId: row.concept_id,
+          validationStatus: row.validation_status,
+        }))
+      : [];
+    const missingConceptBindings = this.#schemaVersion === LOSSLESS_BOOK_SCHEMA_VERSION
+      ? all<{
+          translation_id: number;
+          block_id: string;
+          concept_id: string;
+        }>(this.#database.prepare(`
+          SELECT translation.translation_id, translation.block_id,
+                 occurrence.concept_id
+          FROM translations AS translation
+          JOIN concept_occurrences AS occurrence
+            ON occurrence.run_id=translation.run_id
+           AND occurrence.block_id=translation.block_id
+          JOIN lexical_concepts AS concept
+            ON concept.run_id=occurrence.run_id
+           AND concept.concept_id=occurrence.concept_id
+           AND concept.active=1
+          LEFT JOIN translation_concept_bindings AS binding
+            ON binding.translation_id=translation.translation_id
+           AND binding.concept_id=occurrence.concept_id
+          WHERE translation.run_id=? AND translation.active=1
+            AND binding.translation_id IS NULL
+          ORDER BY translation.translation_id, occurrence.concept_id
+        `), runId).map((row) => ({
+          translationId: row.translation_id,
+          blockId: row.block_id,
+          conceptId: row.concept_id,
+        }))
+      : [];
     return {
       runId: run.run_id,
       sourceVersion: run.source_version,
@@ -4175,6 +5614,9 @@ export class LosslessBookStore {
       translations,
       knowledgeRevisions,
       snapshots,
+      conceptBindings,
+      missingConceptBindings,
+      revalidationTasks: this.revalidationTasks(runId),
     };
   }
 
@@ -4215,10 +5657,213 @@ export class LosslessBookStore {
     });
   }
 
+  appendTokenLedgerEvent(runId: string, event: LedgerEvent): void {
+    this.#run(runId);
+    validateLedgerEvent(event);
+    this.#transaction(() => {
+      this.#appendEvent(runId, ledgerEventKind(event.type), {
+        event,
+        ts: new Date().toISOString(),
+      });
+    });
+  }
+
+  loadTokenLedgerEvents(runId: string): LedgerEvent[] {
+    this.#run(runId);
+    const rows = this.#database.prepare(`
+      SELECT kind, payload_json FROM events
+      WHERE run_id=? AND kind IN (
+        'token_ledger_baseline_added',
+        'token_ledger_reserved',
+        'token_ledger_dispatched',
+        'token_ledger_settled',
+        'token_ledger_released',
+        'token_ledger_counters_patched'
+      )
+      ORDER BY sequence ASC
+    `).all(runId) as Array<{ kind: string; payload_json: string }>;
+    return rows.map((row) => parseLedgerEventPayload(row.kind, row.payload_json));
+  }
+
+  loadTokenLedger(runId: string, init: TokenLedgerInit): TokenLedger {
+    return TokenLedger.fromEvents(init, this.loadTokenLedgerEvents(runId));
+  }
+
+  saveSchedulerRunProjection(runId: string, report: SchedulerRunReport): void {
+    this.#run(runId);
+    validateSchedulerRunReport(report);
+    this.#transaction(() => {
+      this.#appendEvent(runId, "scheduler_run_projection", {
+        report,
+        ts: new Date().toISOString(),
+      });
+    });
+  }
+
+  loadSchedulerMetrics(
+    runId: string,
+    init?: TokenLedgerInit,
+  ): SchedulerRunReport | undefined {
+    this.#run(runId);
+    const projection = one<{ payload_json: string }>(this.#database.prepare(`
+      SELECT payload_json FROM events
+      WHERE run_id=? AND kind='scheduler_run_projection'
+      ORDER BY sequence DESC LIMIT 1
+    `), runId);
+    let projectedReport: SchedulerRunReport | undefined;
+    if (projection !== undefined) {
+      const payload = JSON.parse(projection.payload_json) as { report?: unknown };
+      if (
+        payload === null
+        || typeof payload !== "object"
+        || payload.report === undefined
+      ) {
+        throw new Error(`corrupt scheduler run projection for ${runId}`);
+      }
+      validateSchedulerRunReport(payload.report);
+      projectedReport = structuredClone(payload.report) as SchedulerRunReport;
+    }
+
+    const events = this.loadTokenLedgerEvents(runId);
+    if (events.length === 0) {
+      return projectedReport;
+    }
+    if (init !== undefined) {
+      const ledger = TokenLedger.fromEvents(init, events);
+      if (projectedReport !== undefined) {
+        ledger.apply({
+          type: "counters_patched",
+          patch: schedulerCountersPatch(projectedReport),
+        });
+      }
+      return ledger.toSchedulerRunReport();
+    }
+    if (projectedReport !== undefined) {
+      return projectedReport;
+    }
+    throw new TypeError(
+      "loadSchedulerMetrics requires TokenLedgerInit when rebuilding from ledger events",
+    );
+  }
+
+  appendProviderResponseEvidence(
+    input: ProviderResponseEvidenceInput,
+  ): void {
+    const runId = requireNonempty(input.runId, "provider evidence runId");
+    this.#run(runId);
+    const requestId = requireNonempty(
+      input.requestId,
+      "provider evidence requestId",
+    );
+    const snapshotId = requireNonempty(
+      input.snapshotId,
+      "provider evidence snapshotId",
+    );
+    if (!Number.isSafeInteger(input.modelCallOrdinal)
+      || input.modelCallOrdinal < 1) {
+      throw new TypeError(
+        "provider evidence modelCallOrdinal must be a positive safe integer",
+      );
+    }
+    if (!/^[0-9a-f]{64}$/u.test(input.requestHash)) {
+      throw new TypeError("provider evidence requestHash must be sha256 hex");
+    }
+    const assistantJson = JSON.stringify(input.assistantMessage);
+    if (assistantJson === undefined) {
+      throw new TypeError("provider evidence assistantMessage must be JSON-serializable");
+    }
+    const responseHash = hashText(assistantJson);
+    const runDirectory = `run-${hashText(runId).slice(0, 24)}`;
+    const evidenceDirectory = join(
+      dirname(this.#databasePath),
+      "evidence",
+      runDirectory,
+    );
+    mkdirSync(evidenceDirectory, { recursive: true });
+    const filename = `${responseHash}.json.gz`;
+    const absoluteLocator = join(evidenceDirectory, filename);
+    if (!existsSync(absoluteLocator)) {
+      const temporary = join(
+        evidenceDirectory,
+        `.${filename}.${randomUUID()}.tmp`,
+      );
+      const envelope = JSON.stringify({
+        schema: "folioloom-provider-response-evidence-1",
+        responseHash,
+        assistantMessage: JSON.parse(assistantJson) as unknown,
+      });
+      const descriptor = openSync(temporary, "wx");
+      try {
+        writeFileSync(descriptor, gzipSync(envelope));
+        fsyncSync(descriptor);
+      } finally {
+        closeSync(descriptor);
+      }
+      try {
+        renameSync(temporary, absoluteLocator);
+      } catch (error) {
+        rmSync(temporary, { force: true });
+        if (!existsSync(absoluteLocator)) {
+          throw error;
+        }
+      }
+    }
+    const assistant = input.assistantMessage !== null
+        && typeof input.assistantMessage === "object"
+      ? input.assistantMessage as Record<string, unknown>
+      : {};
+    const locator = [
+      "evidence",
+      runDirectory,
+      filename,
+    ].join("/");
+    const metadata = {
+      schema: "folioloom-provider-response-evidence-ref-1",
+      requestId,
+      snapshotId,
+      phase: input.phase,
+      modelCallOrdinal: input.modelCallOrdinal,
+      requestHash: input.requestHash,
+      responseHash,
+      responseProtocol: input.responseProtocol,
+      locator,
+      compressedBytes: statSync(absoluteLocator).size,
+      ...(input.executionUnitId === undefined
+        ? {}
+        : {
+          executionUnitId: requireNonempty(
+            input.executionUnitId,
+            "provider evidence executionUnitId",
+          ),
+        }),
+      ...(typeof assistant.id === "string"
+        ? { providerResponseId: assistant.id }
+        : {}),
+      ...(typeof assistant.provider === "string"
+        ? { provider: assistant.provider }
+        : {}),
+      ...(typeof assistant.model === "string"
+        ? { model: assistant.model }
+        : {}),
+      ...(typeof assistant.api === "string"
+        ? { api: assistant.api }
+        : {}),
+      ...(typeof assistant.stopReason === "string"
+        ? { stopReason: assistant.stopReason }
+        : {}),
+      ...(assistant.usage !== undefined
+        ? { usage: assistant.usage }
+        : {}),
+    };
+    this.#transaction(() => {
+      this.#appendEvent(runId, "provider_response_evidence", metadata);
+    });
+  }
+
   #initializeSchema(): void {
     this.#database.exec("BEGIN IMMEDIATE");
     try {
-      this.#database.exec(LOSSLESS_BOOK_SCHEMA_V3);
+      this.#database.exec(LOSSLESS_BOOK_SCHEMA_V4);
       this.#database.prepare(`
         INSERT INTO project_knowledge_state(singleton, generation) VALUES(1, 0)
       `).run();
@@ -4265,12 +5910,12 @@ export class LosslessBookStore {
 
   #verifyV3Schema(userVersion: number, tables: readonly string[]): void {
     this.#verifyNoLegacySchema(tables);
-    if (userVersion !== LOSSLESS_BOOK_SCHEMA_VERSION) {
+    if (userVersion !== LOSSLESS_BOOK_SCHEMA_V3_VERSION) {
       throw new Error(
-        `unsupported schema user_version ${userVersion}; expected ${LOSSLESS_BOOK_SCHEMA_VERSION}`,
+        `unsupported schema user_version ${userVersion}; expected ${LOSSLESS_BOOK_SCHEMA_V3_VERSION}`,
       );
     }
-    const expected = [...LOSSLESS_BOOK_SCHEMA_TABLES];
+    const expected = [...LOSSLESS_BOOK_SCHEMA_V3_TABLES];
     if (tables.length !== expected.length
       || tables.some((table, index) => table !== expected[index])) {
       throw new Error("schema v3 table set is incomplete or contains unknown tables");
@@ -4281,9 +5926,33 @@ export class LosslessBookStore {
         WHERE key IN ('marker', 'fingerprint')
       `),
     ).map((row) => [row.key, row.value]));
+    if (markers.get("marker") !== LOSSLESS_BOOK_SCHEMA_V3_MARKER
+      || markers.get("fingerprint") !== LOSSLESS_BOOK_SCHEMA_V3_FINGERPRINT) {
+      throw new Error("schema v3 marker or fingerprint mismatch");
+    }
+  }
+
+  #verifyV4Schema(userVersion: number, tables: readonly string[]): void {
+    this.#verifyNoLegacySchema(tables);
+    if (userVersion !== LOSSLESS_BOOK_SCHEMA_VERSION) {
+      throw new Error(
+        `unsupported schema user_version ${userVersion}; expected ${LOSSLESS_BOOK_SCHEMA_VERSION}`,
+      );
+    }
+    const expected = [...LOSSLESS_BOOK_SCHEMA_TABLES];
+    if (tables.length !== expected.length
+      || tables.some((table, index) => table !== expected[index])) {
+      throw new Error("schema v4 table set is incomplete or contains unknown tables");
+    }
+    const markers = new Map(all<{ key: string; value: string }>(
+      this.#database.prepare(`
+        SELECT key, value FROM lossless_schema_meta
+        WHERE key IN ('marker', 'fingerprint')
+      `),
+    ).map((row) => [row.key, row.value]));
     if (markers.get("marker") !== LOSSLESS_BOOK_SCHEMA_MARKER
       || markers.get("fingerprint") !== LOSSLESS_BOOK_SCHEMA_FINGERPRINT) {
-      throw new Error("schema v3 marker or fingerprint mismatch");
+      throw new Error("schema v4 marker or fingerprint mismatch");
     }
   }
 
@@ -4319,10 +5988,28 @@ export class LosslessBookStore {
       const updateMarker = this.#database.prepare(`
         UPDATE lossless_schema_meta SET value=? WHERE key=?
       `);
+      updateMarker.run(LOSSLESS_BOOK_SCHEMA_V3_MARKER, "marker");
+      updateMarker.run(LOSSLESS_BOOK_SCHEMA_V3_FINGERPRINT, "fingerprint");
+      this.#database.exec(`PRAGMA user_version=${LOSSLESS_BOOK_SCHEMA_V3_VERSION}`);
+      this.#faultInjector?.checkpoint("schema_v3_before_commit");
+      this.#database.exec("COMMIT");
+    } catch (error) {
+      this.#database.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
+  #migrateV3ToV4(): void {
+    this.#database.exec("BEGIN IMMEDIATE");
+    try {
+      this.#database.exec(LOSSLESS_BOOK_SCHEMA_V4_EXTENSION);
+      const updateMarker = this.#database.prepare(`
+        UPDATE lossless_schema_meta SET value=? WHERE key=?
+      `);
       updateMarker.run(LOSSLESS_BOOK_SCHEMA_MARKER, "marker");
       updateMarker.run(LOSSLESS_BOOK_SCHEMA_FINGERPRINT, "fingerprint");
       this.#database.exec(`PRAGMA user_version=${LOSSLESS_BOOK_SCHEMA_VERSION}`);
-      this.#faultInjector?.checkpoint("schema_v3_before_commit");
+      this.#faultInjector?.checkpoint("schema_v4_before_commit");
       this.#database.exec("COMMIT");
     } catch (error) {
       this.#database.exec("ROLLBACK");
@@ -4657,6 +6344,675 @@ export class LosslessBookStore {
     }
     if (seen.size !== expected.size) {
       throw new Error(`window requires ${expected.size} translations but received ${seen.size}`);
+    }
+  }
+
+  #evaluateStagedBindingGate(
+    runId: string,
+    windowId: string,
+  ): BindingGateDecision {
+    const rows = all<TranslationConceptBindingRow>(this.#database.prepare(`
+      SELECT b.*
+      FROM translations AS t
+      JOIN translation_concept_bindings AS b
+        ON b.translation_id=t.translation_id
+      WHERE t.run_id=? AND t.window_id=?
+        AND t.stage_state='staged' AND t.active=0
+      ORDER BY b.concept_id, b.translation_id
+    `), runId, windowId);
+    if (rows.length === 0) {
+      return {
+        status: "compatible",
+        updates: [],
+        incompatibleConceptIds: [],
+      };
+    }
+    const conceptIds = [...new Set(rows.map((row) => row.concept_id))];
+    const concepts = conceptIds.flatMap((conceptId) => {
+      const row = one<LexicalConceptRow>(this.#database.prepare(`
+        SELECT * FROM lexical_concepts
+        WHERE run_id=? AND concept_id=? AND active=1
+      `), runId, conceptId);
+      return row === undefined ? [] : [lexicalConceptFromRow(row)];
+    });
+    const decision = evaluateStagedConceptBindings({
+      concepts,
+      bindings: rows.map((row) => ({
+        conceptId: row.concept_id,
+        appliedRevisionId: row.applied_revision_id,
+        appliedRenderFingerprint: row.applied_render_fingerprint,
+        termUsages: termUsagesFromJson(row.term_usages_json),
+      })),
+    });
+    if (decision.status !== "compatible") return decision;
+    for (const update of decision.updates) {
+      this.#database.prepare(`
+        UPDATE translation_concept_bindings
+        SET applied_revision_id=?, applied_render_fingerprint=?,
+            validation_status='clean', validated_revision_id=?,
+            updated_at=datetime('now')
+        WHERE concept_id=? AND translation_id IN (
+          SELECT translation_id FROM translations
+          WHERE run_id=? AND window_id=?
+            AND stage_state='staged' AND active=0
+        )
+      `).run(
+        update.revisionId,
+        update.renderFingerprint,
+        update.revisionId,
+        update.conceptId,
+        runId,
+        windowId,
+      );
+    }
+    return decision;
+  }
+
+  #projectLexicalConceptRevisions(
+    runId: string,
+    revisions: readonly KnowledgeRevision[],
+    toSnapshotId: string,
+  ): void {
+    const concepts = revisions
+      .filter((revision) =>
+        revision.kind === "lexical_concept" && revision.status === "active")
+      .map((revision) => lexicalConceptFromPayload(revision.payload));
+    if (concepts.length === 0) return;
+    const changes = this.#upsertLexicalConceptRows(runId, concepts);
+    for (const change of changes) {
+      if (change.renderChanged) continue;
+      this.#database.prepare(`
+        UPDATE translation_concept_bindings
+        SET applied_revision_id=?,
+            validated_revision_id=?,
+            validation_status='clean',
+            updated_at=datetime('now')
+        WHERE concept_id=?
+          AND applied_render_fingerprint=?
+          AND translation_id IN (
+            SELECT translation_id FROM translations
+            WHERE run_id=? AND active=1
+          )
+      `).run(
+        change.revisionId,
+        change.revisionId,
+        change.conceptId,
+        change.renderFingerprint,
+        runId,
+      );
+    }
+    const renderChanged = new Set(changes
+      .filter((change) => change.renderChanged)
+      .map((change) => change.conceptId));
+    if (renderChanged.size === 0) return;
+    const changedConcepts = concepts.filter((concept) =>
+      renderChanged.has(concept.conceptId));
+    const run = this.#run(runId);
+    const source = this.#source(run.source_version);
+    const sourcePayload = JSON.parse(source.source_payload_json) as {
+      sourceLanguage?: unknown;
+    };
+    const profile = getSourceLanguageProfile(
+      typeof sourcePayload.sourceLanguage === "string"
+        ? sourcePayload.sourceLanguage
+        : undefined,
+    );
+    const blocks = all<{ block_id: string; source_text: string }>(
+      this.#database.prepare(`
+        SELECT block_id, source_text FROM logical_blocks
+        WHERE source_version=? ORDER BY global_index
+      `),
+      run.source_version,
+    ).map((block) => ({
+      blockId: block.block_id,
+      sourceText: block.source_text,
+    }));
+    const occurrences = buildConceptOccurrenceIndex(
+      blocks,
+      changedConcepts,
+      profile,
+    );
+    const insert = this.#database.prepare(`
+      INSERT INTO concept_occurrences(
+        run_id, concept_id, source_version, block_id,
+        occurrence_count, source_spans_json
+      ) VALUES(?, ?, ?, ?, ?, ?)
+    `);
+    for (const concept of changedConcepts) {
+      this.#database.prepare(`
+        DELETE FROM concept_occurrences WHERE run_id=? AND concept_id=?
+      `).run(runId, concept.conceptId);
+    }
+    for (const occurrence of occurrences) {
+      insert.run(
+        runId,
+        occurrence.conceptId,
+        run.source_version,
+        occurrence.blockId,
+        occurrence.sourceSpans.length,
+        jsonText(occurrence.sourceSpans, "concept occurrence spans"),
+      );
+    }
+    this.#createSparseRevalidationTasks(
+      runId,
+      changedConcepts,
+      occurrences,
+      toSnapshotId,
+    );
+  }
+
+  #createSparseRevalidationTasks(
+    runId: string,
+    concepts: readonly LexicalConcept[],
+    occurrences: readonly ConceptOccurrence[],
+    toSnapshotId: string,
+  ): ConceptCoverageRevalidationReport {
+    const startedAt = performance.now();
+    if (concepts.length === 0 || occurrences.length === 0) {
+      return {
+        occurrenceDependencies: 0,
+        candidateTranslations: 0,
+        tasksCreated: 0,
+        bindingsCreated: 0,
+        wallTimeMs: performance.now() - startedAt,
+      };
+    }
+    const conceptIds = new Set(concepts.map((concept) => concept.conceptId));
+    const conceptById = new Map(concepts.map((concept) => [
+      concept.conceptId,
+      concept,
+    ]));
+    const occurrenceDependencies = new Set(occurrences
+      .filter((occurrence) => conceptIds.has(occurrence.conceptId))
+      .map((occurrence) =>
+        `${occurrence.conceptId}\0${occurrence.blockId}`));
+    const occurrenceBlockIds = [...new Set(occurrences
+      .filter((occurrence) => conceptIds.has(occurrence.conceptId))
+      .map((occurrence) => occurrence.blockId))];
+    const rows: Array<{
+      translation_id: number;
+      block_id: string;
+      snapshot_id: string;
+      concept_id: string | null;
+      applied_revision_id: string | null;
+      applied_render_fingerprint: string | null;
+    }> = [];
+    const blockBatchSize = 400;
+    for (let offset = 0; offset < occurrenceBlockIds.length; offset += blockBatchSize) {
+      const blockIds = occurrenceBlockIds.slice(offset, offset + blockBatchSize);
+      const placeholders = blockIds.map(() => "?").join(",");
+      rows.push(...all<{
+        translation_id: number;
+        block_id: string;
+        snapshot_id: string;
+        concept_id: string | null;
+        applied_revision_id: string | null;
+        applied_render_fingerprint: string | null;
+      }>(this.#database.prepare(`
+        SELECT t.translation_id, t.block_id, t.snapshot_id,
+               b.concept_id, b.applied_revision_id,
+               b.applied_render_fingerprint
+        FROM translations AS t
+        LEFT JOIN translation_concept_bindings AS b
+          ON b.translation_id=t.translation_id
+        WHERE t.run_id=? AND t.active=1
+          AND t.block_id IN (${placeholders})
+        ORDER BY t.translation_id, b.concept_id
+      `), runId, ...blockIds));
+    }
+    const dependencies = new Map<number, {
+      translationId: number;
+      blockId: string;
+      snapshotId: string;
+      bindings: Array<{
+        conceptId: string;
+        appliedRevisionId: string;
+        appliedRenderFingerprint: string;
+      }>;
+    }>();
+    for (const row of rows) {
+      const dependency = dependencies.get(row.translation_id) ?? {
+        translationId: row.translation_id,
+        blockId: row.block_id,
+        snapshotId: row.snapshot_id,
+        bindings: [],
+      };
+      if (row.concept_id !== null
+        && row.applied_revision_id !== null
+        && row.applied_render_fingerprint !== null
+        && conceptIds.has(row.concept_id)) {
+        dependency.bindings.push({
+          conceptId: row.concept_id,
+          appliedRevisionId: row.applied_revision_id,
+          appliedRenderFingerprint: row.applied_render_fingerprint,
+        });
+      }
+      dependencies.set(row.translation_id, dependency);
+    }
+    const candidates = planSparseRevalidation({
+      concepts,
+      occurrences,
+      translations: [...dependencies.values()],
+      toSnapshotId,
+    });
+    const insert = this.#database.prepare(`
+      INSERT OR IGNORE INTO knowledge_revalidation_tasks(
+        task_id, run_id, translation_id, block_id, change_set_hash,
+        from_snapshot_id, to_snapshot_id, concept_ids_json, status
+      ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, 'pending')
+    `);
+    const insertPlaceholderBinding = this.#database.prepare(`
+      INSERT OR IGNORE INTO translation_concept_bindings(
+        translation_id, concept_id, applied_revision_id,
+        applied_render_fingerprint, term_usages_json, validation_status,
+        validated_revision_id
+      ) VALUES(?, ?, ?, ?, '[]', 'stale', ?)
+    `);
+    const createdTaskIds: string[] = [];
+    let bindingsCreated = 0;
+    for (const candidate of candidates) {
+      const taskId = `revalidation-${hashText([
+        runId,
+        String(candidate.translationId),
+        candidate.changeSetHash,
+      ].join("\0")).slice(0, 32)}`;
+      const inserted = insert.run(
+        taskId,
+        runId,
+        candidate.translationId,
+        candidate.blockId,
+        candidate.changeSetHash,
+        candidate.fromSnapshotId,
+        candidate.toSnapshotId,
+        jsonText(candidate.conceptIds, "revalidation concept IDs"),
+      );
+      const existingTask = Number(inserted.changes) === 1
+        ? undefined
+        : one<{ status: KnowledgeRevalidationTask["status"] }>(
+            this.#database.prepare(`
+              SELECT status FROM knowledge_revalidation_tasks
+              WHERE run_id=? AND task_id=?
+            `),
+            runId,
+            taskId,
+          );
+      const activeTask = Number(inserted.changes) === 1
+        || existingTask?.status === "pending"
+        || existingTask?.status === "validating";
+      if (Number(inserted.changes) === 1) {
+        createdTaskIds.push(taskId);
+      }
+      if (!activeTask) continue;
+      for (const conceptId of candidate.conceptIds) {
+        const concept = conceptById.get(conceptId);
+        if (concept === undefined) {
+          throw new Error(`revalidation concept is missing: ${conceptId}`);
+        }
+        const placeholder = insertPlaceholderBinding.run(
+          candidate.translationId,
+          conceptId,
+          concept.revisionId,
+          concept.renderFingerprint,
+          concept.revisionId,
+        );
+        bindingsCreated += Number(placeholder.changes);
+        this.#database.prepare(`
+          UPDATE translation_concept_bindings
+          SET validation_status='stale', updated_at=datetime('now')
+          WHERE translation_id=? AND concept_id=?
+        `).run(candidate.translationId, conceptId);
+      }
+    }
+    if (createdTaskIds.length > 0) {
+      this.#appendEvent(runId, "sparse_revalidation_planned", {
+        runId,
+        toSnapshotId,
+        taskIds: createdTaskIds,
+      });
+    }
+    return {
+      occurrenceDependencies: occurrenceDependencies.size,
+      candidateTranslations: candidates.length,
+      tasksCreated: createdTaskIds.length,
+      bindingsCreated,
+      wallTimeMs: performance.now() - startedAt,
+    };
+  }
+
+  #upsertLexicalConceptRows(
+    runId: string,
+    concepts: readonly LexicalConcept[],
+  ): LexicalConceptChange[] {
+    const changes: LexicalConceptChange[] = [];
+    for (const concept of [...concepts].sort((left, right) =>
+      compareText(left.conceptId, right.conceptId))) {
+      const active = one<LexicalConceptRow>(this.#database.prepare(`
+        SELECT * FROM lexical_concepts
+        WHERE run_id=? AND concept_id=? AND active=1
+      `), runId, concept.conceptId);
+      if (active?.revision_id === concept.revisionId) {
+        continue;
+      }
+      const stored = one<LexicalConceptRow>(this.#database.prepare(`
+        SELECT * FROM lexical_concepts
+        WHERE run_id=? AND revision_id=?
+      `), runId, concept.revisionId);
+      if (stored !== undefined && stored.concept_id !== concept.conceptId) {
+        throw new Error(
+          `lexical revision ${concept.revisionId} belongs to another concept`,
+        );
+      }
+      this.#database.prepare(`
+        UPDATE lexical_concepts SET active=0
+        WHERE run_id=? AND concept_id=? AND active=1
+      `).run(runId, concept.conceptId);
+      let revision: number;
+      if (stored !== undefined) {
+        revision = stored.revision;
+        const activated = this.#database.prepare(`
+          UPDATE lexical_concepts SET active=1
+          WHERE run_id=? AND concept_id=? AND revision=?
+        `).run(runId, concept.conceptId, revision);
+        if (Number(activated.changes) !== 1) {
+          throw new Error(`failed to reactivate lexical concept ${concept.conceptId}`);
+        }
+      } else {
+        revision = (one<{ next_revision: number }>(this.#database.prepare(`
+          SELECT COALESCE(MAX(revision), 0) + 1 AS next_revision
+          FROM lexical_concepts WHERE run_id=? AND concept_id=?
+        `), runId, concept.conceptId)?.next_revision) ?? 1;
+        this.#database.prepare(`
+          INSERT INTO lexical_concepts(
+            run_id, concept_id, revision, revision_id, normalized_subject,
+            source_forms_json, semantic_class, canonical_target, policy,
+            allowed_realizations_json, visibility, confidence,
+            render_fingerprint, active
+          ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
+        `).run(
+          runId,
+          concept.conceptId,
+          revision,
+          concept.revisionId,
+          concept.normalizedSubject,
+          jsonText(concept.sourceForms, "concept source forms"),
+          concept.semanticClass,
+          concept.canonicalTarget,
+          concept.policy,
+          jsonText(
+            concept.allowedRealizations,
+            "concept allowed realizations",
+          ),
+          concept.visibility,
+          concept.confidence,
+          concept.renderFingerprint,
+        );
+      }
+      changes.push({
+        conceptId: concept.conceptId,
+        revision,
+        previousRevisionId: active?.revision_id ?? null,
+        revisionId: concept.revisionId,
+        previousRenderFingerprint: active?.render_fingerprint ?? null,
+        renderFingerprint: concept.renderFingerprint,
+        renderChanged: active?.render_fingerprint !== concept.renderFingerprint,
+      });
+    }
+    return changes;
+  }
+
+  #writeWindowConceptBindings(
+    runId: string,
+    windowId: string,
+    usages: readonly TermUsageSubmission[],
+    concepts: readonly TermConceptProjection[],
+  ): void {
+    if (!Array.isArray(usages) || !Array.isArray(concepts)) {
+      throw new TypeError("concept bindings must contain usage and concept arrays");
+    }
+    const conceptById = new Map<string, TermConceptProjection>();
+    for (const concept of concepts) {
+      const conceptId = requireNonempty(concept.conceptId, "binding conceptId");
+      requireNonempty(concept.revisionId, "binding revisionId");
+      if (!/^[0-9a-f]{64}$/u.test(concept.renderFingerprint)) {
+        throw new TypeError(
+          `binding renderFingerprint for ${conceptId} must be a SHA-256 hash`,
+        );
+      }
+      const previous = conceptById.get(conceptId);
+      if (previous !== undefined) {
+        if (previous.revisionId !== concept.revisionId
+          || previous.renderFingerprint !== concept.renderFingerprint) {
+          throw new Error(`conflicting binding concept ${conceptId}`);
+        }
+        continue;
+      }
+      conceptById.set(conceptId, concept);
+    }
+    const translations = all<{
+      translation_id: number;
+      block_id: string;
+      text: string;
+      source_text: string;
+    }>(this.#database.prepare(`
+      SELECT translation.translation_id, translation.block_id,
+             translation.text, block.source_text
+      FROM translations AS translation
+      JOIN logical_blocks AS block
+        ON block.source_version=translation.source_version
+       AND block.block_id=translation.block_id
+      WHERE translation.run_id=? AND translation.window_id=?
+        AND translation.stage_state='staged' AND translation.active=0
+      ORDER BY translation.translation_id
+    `), runId, windowId);
+    const translationByBlock = new Map(translations.map((translation) => [
+      translation.block_id,
+      translation,
+    ]));
+    if (translationByBlock.size !== translations.length) {
+      throw new Error(`duplicate staged translation block in ${runId}/${windowId}`);
+    }
+    const membership = this.#membership(runId, windowId);
+    const seenOccurrenceIds = new Set<string>();
+    const grouped = new Map<string, {
+      translationId: number;
+      concept: TermConceptProjection;
+      usages: TermUsageSubmission[];
+    }>();
+    const run = this.#run(runId);
+    const sourcePayload = JSON.parse(
+      this.#source(run.source_version).source_payload_json,
+    ) as { sourceLanguage?: unknown };
+    const profile = getSourceLanguageProfile(
+      typeof sourcePayload.sourceLanguage === "string"
+        ? sourcePayload.sourceLanguage
+        : undefined,
+    );
+    const expected = expectedTermOccurrences(
+      translations.map((translation) => ({
+        id: translation.block_id,
+        sourceText: translation.source_text,
+      })),
+      concepts,
+      profile,
+    );
+    const failures = validateTermUsages(
+      expected,
+      usages,
+      new Map(translations.map((translation) => [
+        translation.block_id,
+        translation.text,
+      ])),
+    );
+    if (failures.length > 0) {
+      throw new Error(
+        `staged term usage validation failed: ${failures
+          .map((failure) => failure.code)
+          .join(",")}`,
+      );
+    }
+    for (const usage of usages) {
+      const occurrenceId = requireNonempty(
+        usage.occurrenceId,
+        "term usage occurrenceId",
+      );
+      if (seenOccurrenceIds.has(occurrenceId)) {
+        throw new Error(`duplicate term usage ${occurrenceId}`);
+      }
+      seenOccurrenceIds.add(occurrenceId);
+      const concept = conceptById.get(
+        requireNonempty(usage.conceptId, "term usage conceptId"),
+      );
+      if (concept === undefined) {
+        throw new Error(`term usage references unknown concept ${usage.conceptId}`);
+      }
+      const translation = translationByBlock.get(
+        requireNonempty(usage.blockId, "term usage blockId"),
+      );
+      const block = membership.get(usage.blockId);
+      if (translation === undefined || block === undefined) {
+        throw new Error(
+          `term usage references a block outside ${runId}/${windowId}`,
+        );
+      }
+      requireSafeInteger(usage.sourceStart, "term usage sourceStart");
+      requireSafeInteger(usage.sourceEnd, "term usage sourceEnd", 1);
+      if (usage.sourceEnd <= usage.sourceStart) {
+        throw new Error(`invalid term usage source span ${occurrenceId}`);
+      }
+      const source = one<{ source_text: string }>(this.#database.prepare(`
+        SELECT source_text FROM logical_blocks
+        WHERE source_version=? AND block_id=?
+      `), block.source_version, block.block_id);
+      const sourceScalars = Array.from(source?.source_text ?? "");
+      if (usage.sourceEnd > sourceScalars.length
+        || sourceScalars.slice(usage.sourceStart, usage.sourceEnd).join("")
+          !== usage.sourceForm) {
+        throw new Error(`term usage source mismatch ${occurrenceId}`);
+      }
+      const targetSurface = requireNonempty(
+        usage.targetSurface,
+        "term usage targetSurface",
+      );
+      if (!translation.text.includes(targetSurface)) {
+        throw new Error(`term usage target missing from translation ${occurrenceId}`);
+      }
+      if (!["narrative", "vocative", "title", "other"].includes(
+        usage.discourseRole,
+      )) {
+        throw new Error(`invalid term usage discourse role ${occurrenceId}`);
+      }
+      const key = `${usage.blockId}\0${usage.conceptId}`;
+      const item = grouped.get(key) ?? {
+        translationId: translation.translation_id,
+        concept,
+        usages: [],
+      };
+      item.usages.push({ ...usage, targetSurface });
+      grouped.set(key, item);
+    }
+    for (const occurrence of expected) {
+      const key = `${occurrence.blockId}\0${occurrence.conceptId}`;
+      if (grouped.has(key)) continue;
+      const translation = translationByBlock.get(occurrence.blockId);
+      const concept = conceptById.get(occurrence.conceptId);
+      if (translation === undefined || concept === undefined) {
+        throw new Error(
+          `term occurrence references unknown staged coverage ${occurrence.occurrenceId}`,
+        );
+      }
+      grouped.set(key, {
+        translationId: translation.translation_id,
+        concept,
+        usages: [],
+      });
+    }
+    if (translations.length > 0) {
+      this.#database.prepare(`
+        DELETE FROM translation_concept_bindings
+        WHERE translation_id IN (
+          SELECT translation_id FROM translations
+          WHERE run_id=? AND window_id=? AND stage_state='staged' AND active=0
+        )
+      `).run(runId, windowId);
+    }
+    const insert = this.#database.prepare(`
+      INSERT INTO translation_concept_bindings(
+        translation_id, concept_id, applied_revision_id,
+        applied_render_fingerprint, term_usages_json, validation_status,
+        validated_revision_id
+      ) VALUES(?, ?, ?, ?, ?, 'clean', ?)
+    `);
+    for (const item of [...grouped.values()].sort((left, right) =>
+      left.translationId - right.translationId
+      || compareText(left.concept.conceptId, right.concept.conceptId))) {
+      const orderedUsages = item.usages.sort((left, right) =>
+        left.sourceStart - right.sourceStart
+        || left.sourceEnd - right.sourceEnd
+        || compareText(left.occurrenceId, right.occurrenceId));
+      insert.run(
+        item.translationId,
+        item.concept.conceptId,
+        item.concept.revisionId,
+        item.concept.renderFingerprint,
+        jsonText(orderedUsages, "term usages"),
+        item.concept.revisionId,
+      );
+    }
+  }
+
+  #revalidationTask(
+    runId: string,
+    taskId: string,
+  ): KnowledgeRevalidationTask {
+    const row = one<KnowledgeRevalidationTaskRow>(
+      this.#database.prepare(`
+        SELECT * FROM knowledge_revalidation_tasks
+        WHERE run_id=? AND task_id=?
+      `),
+      runId,
+      taskId,
+    );
+    if (row === undefined) {
+      throw new Error(`unknown revalidation task ${runId}/${taskId}`);
+    }
+    return revalidationTaskFromRow(row);
+  }
+
+  #finishRevalidationTask(
+    task: KnowledgeRevalidationTask,
+    status: Extract<
+      KnowledgeRevalidationTask["status"],
+      "resolved_noop" | "completed_with_warning"
+    >,
+    result: unknown,
+    replacementTranslationId: number | null,
+    bindingStatus: Extract<
+      TranslationConceptBinding["validationStatus"],
+      "clean" | "warning_stale"
+    >,
+  ): void {
+    const resultJson = jsonText(result, "revalidation result");
+    for (const conceptId of task.conceptIds) {
+      this.#database.prepare(`
+        UPDATE translation_concept_bindings
+        SET validation_status=?, updated_at=datetime('now')
+        WHERE translation_id=? AND concept_id=?
+      `).run(bindingStatus, task.translationId, conceptId);
+    }
+    const completed = this.#database.prepare(`
+      UPDATE knowledge_revalidation_tasks
+      SET status=?, result_json=?, replacement_translation_id=?,
+          resolved_at=datetime('now')
+      WHERE run_id=? AND task_id=? AND status IN ('pending','validating')
+    `).run(
+      status,
+      resultJson,
+      replacementTranslationId,
+      task.runId,
+      task.taskId,
+    );
+    if (Number(completed.changes) !== 1) {
+      throw new Error(`failed to finish revalidation task ${task.taskId}`);
     }
   }
 
@@ -6232,6 +8588,121 @@ export class LosslessBookStore {
     } catch (error) {
       this.#database.exec("ROLLBACK");
       throw error;
+    }
+  }
+}
+
+const LEDGER_EVENT_KINDS = {
+  baseline_added: "token_ledger_baseline_added",
+  reserved: "token_ledger_reserved",
+  dispatched: "token_ledger_dispatched",
+  settled: "token_ledger_settled",
+  released: "token_ledger_released",
+  counters_patched: "token_ledger_counters_patched",
+} as const;
+
+function ledgerEventKind(type: LedgerEvent["type"]): string {
+  const kind = LEDGER_EVENT_KINDS[type];
+  if (kind === undefined) {
+    throw new TypeError(`unknown ledger event type: ${String(type)}`);
+  }
+  return kind;
+}
+
+function validateLedgerEvent(event: LedgerEvent): void {
+  if (event === null || typeof event !== "object" || !("type" in event)) {
+    throw new TypeError("ledger event must be an object with type");
+  }
+  // Round-trip through TokenLedger validates numeric and sequence rules for
+  // standalone checks; store only needs structural presence for append.
+  switch (event.type) {
+    case "baseline_added":
+      if (!Array.isArray(event.taskIds) || event.taskIds.length === 0) {
+        throw new TypeError("baseline_added.taskIds must be non-empty");
+      }
+      if (!Number.isSafeInteger(event.baselineTokens) || event.baselineTokens < 0) {
+        throw new TypeError("baseline_added.baselineTokens invalid");
+      }
+      return;
+    case "reserved":
+      if (typeof event.requestId !== "string" || event.requestId.trim() === "") {
+        throw new TypeError("reserved.requestId invalid");
+      }
+      if (!Number.isSafeInteger(event.predictedTokens) || event.predictedTokens < 0) {
+        throw new TypeError("reserved.predictedTokens invalid");
+      }
+      return;
+    case "dispatched":
+      if (typeof event.requestId !== "string" || event.requestId.trim() === "") {
+        throw new TypeError("dispatched.requestId invalid");
+      }
+      return;
+    case "settled":
+      if (typeof event.requestId !== "string" || event.requestId.trim() === "") {
+        throw new TypeError("settled.requestId invalid");
+      }
+      if (!Number.isSafeInteger(event.actualTokens) || event.actualTokens < 0) {
+        throw new TypeError("settled.actualTokens invalid");
+      }
+      return;
+    case "released":
+      if (typeof event.requestId !== "string" || event.requestId.trim() === "") {
+        throw new TypeError("released.requestId invalid");
+      }
+      return;
+    case "counters_patched":
+      if (event.patch === null || typeof event.patch !== "object") {
+        throw new TypeError("counters_patched.patch invalid");
+      }
+      return;
+    default: {
+      const _exhaustive: never = event;
+      throw new TypeError(`unknown ledger event: ${JSON.stringify(_exhaustive)}`);
+    }
+  }
+}
+
+function parseLedgerEventPayload(kind: string, payloadJson: string): LedgerEvent {
+  const payload = JSON.parse(payloadJson) as { event?: unknown };
+  if (payload === null || typeof payload !== "object" || payload.event === undefined) {
+    throw new Error(`corrupt token ledger event payload for kind ${kind}`);
+  }
+  const event = payload.event as LedgerEvent;
+  validateLedgerEvent(event);
+  const expected = LEDGER_EVENT_KINDS[event.type];
+  if (expected !== kind) {
+    throw new Error(
+      `token ledger event kind mismatch: row ${kind} payload ${event.type}`,
+    );
+  }
+  return event;
+}
+
+function validateSchedulerRunReport(report: unknown): asserts report is SchedulerRunReport {
+  if (report === null || typeof report !== "object") {
+    throw new TypeError("scheduler run report must be an object");
+  }
+  const value = report as Record<string, unknown>;
+  for (const key of [
+    "mode",
+    "profile",
+    "planningStatus",
+    "decisions",
+    "fallbacks",
+    "baselineWallTimeMs",
+    "predictedWallTimeMs",
+    "actualWallTimeMs",
+    "baselineTokens",
+    "allowedTokens",
+    "predictedTokens",
+    "actualTokens",
+    "tokenUsageComplete",
+    "plannerDeadlines",
+    "throttles",
+    "recoveries",
+  ] as const) {
+    if (!(key in value)) {
+      throw new TypeError(`scheduler run report missing ${key}`);
     }
   }
 }

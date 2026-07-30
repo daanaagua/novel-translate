@@ -8,6 +8,7 @@ import {
 import {
   stableTermsFromKnowledge,
 } from "../src/knowledge/stable-terms-from-knowledge.js";
+import { conceptFromAnchor } from "../src/knowledge/lexical-concept.js";
 import {
   persistedStyleFromKnowledge,
 } from "../src/knowledge/persisted-style.js";
@@ -190,4 +191,46 @@ test("official term, style, and positioned memory imports all reach the translat
   assert.match(prepared.prompt, /保持疏离的回忆距离/u);
   assert.match(prepared.prompt, /正式场合克制[,，]私下自然/u);
   assert.match(prepared.prompt, /皮亚顿仍控制着这具身体的心跳/u);
+});
+
+test("stable terms from knowledge project a closed contextual lexical concept", () => {
+  const concept = conceptFromAnchor({
+    sourceForm: "Prokurist",
+    target: "主事",
+    mode: "contextual",
+    semanticClass: "role",
+    confidence: 0.95,
+    allowedRealizations: ["主事", "公司代表"],
+  });
+  const terms = stableTermsFromKnowledge([{
+    revisionId: concept.revisionId,
+    revision: 1,
+    normalizedSubject: concept.normalizedSubject,
+    kind: "lexical_concept",
+    payload: concept,
+    alternatives: [concept],
+    status: "active",
+    candidateIds: [],
+    sourceWindowIds: [],
+  } satisfies KnowledgeRevision]);
+
+  assert.deepEqual(terms.map((term) => ({
+    sourceForm: term.sourceForm,
+    canonicalSource: term.canonicalSource,
+    target: term.target,
+    policy: term.policy,
+    semanticClass: term.semanticClass,
+    allowedTargets: term.allowedTargets,
+    revisionId: term.revisionId,
+    renderFingerprint: term.renderFingerprint,
+  })), [{
+    sourceForm: "Prokurist",
+    canonicalSource: "prokurist",
+    target: "主事",
+    policy: "contextual",
+    semanticClass: "role",
+    allowedTargets: ["主事", "公司代表"],
+    revisionId: concept.revisionId,
+    renderFingerprint: concept.renderFingerprint,
+  }]);
 });

@@ -22,6 +22,7 @@ function streamFrom(faux: ReturnType<typeof fauxProvider>) {
 test("Pi executes an allowlisted tool and stops on terminating submit", async () => {
   const faux = fauxProvider();
   const executed: string[] = [];
+  const evidenceOrdinals: number[] = [];
   const tools: TypedToolSpec[] = [
     {
       name: "search_mentions",
@@ -65,11 +66,15 @@ test("Pi executes an allowlisted tool and stops on terminating submit", async ()
       tools,
       budget: new BudgetLedger(),
       terminateTools: ["finish_research"],
+      onAssistantResponse: (observation) => {
+        evidenceOrdinals.push(observation.modelCallOrdinal);
+      },
   }, streamFrom(faux));
 
   assert.deepEqual(executed, ["search_mentions", "finish_research"]);
   assert.deepEqual(result.toolNames, ["search_mentions", "finish_research"]);
   assert.equal(result.modelCalls, 2);
+  assert.deepEqual(evidenceOrdinals, [1, 2]);
   assert.equal(result.stopReason, "toolUse");
   assert.ok(result.usage.totalTokens > 0);
 });
@@ -163,6 +168,12 @@ test("Pi refuses a pre-aborted session before a model call", async () => {
 
 test("Pi surfaces provider errors instead of misclassifying them as human review", async () => {
   const faux = fauxProvider();
+  const evidence: Array<{
+    phase: string;
+    modelCallOrdinal: number;
+    requestHash: string;
+    stopReason: string;
+  }> = [];
   faux.setResponses([
     fauxAssistantMessage([], {
       stopReason: "error",
@@ -178,9 +189,24 @@ test("Pi surfaces provider errors instead of misclassifying them as human review
       model: faux.getModel(),
       tools: [],
       budget: new BudgetLedger(),
+      onAssistantResponse: (observation) => {
+        evidence.push({
+          phase: observation.phase,
+          modelCallOrdinal: observation.modelCallOrdinal,
+          requestHash: observation.requestHash,
+          stopReason: observation.assistantMessage.stopReason,
+        });
+      },
     }, streamFrom(faux)),
     /authentication failed/i,
   );
+  assert.deepEqual(evidence, [{
+    phase: "translation",
+    modelCallOrdinal: 1,
+    requestHash: evidence[0]?.requestHash ?? "",
+    stopReason: "error",
+  }]);
+  assert.match(evidence[0]?.requestHash ?? "", /^[0-9a-f]{64}$/u);
 });
 
 test("Pi classifies provider failures for bounded runtime recovery", async () => {
@@ -190,6 +216,8 @@ test("Pi classifies provider failures for bounded runtime recovery", async () =>
     { message: "429: rate limit exceeded", kind: "throttled", retryable: true },
     { message: "request timed out while reading the stream", kind: "timeout", retryable: true },
     { message: "503: service unavailable", kind: "busy", retryable: true },
+    { message: "terminated", kind: "busy", retryable: true },
+    { message: "unterminated JSON payload", kind: "protocol", retryable: false },
     { message: "input exceeds the context window", kind: "context", retryable: false },
     { message: "malformed tool-call stream", kind: "protocol", retryable: false },
     { message: "fixture mystery failure", kind: "unknown", retryable: false },
@@ -215,6 +243,9 @@ test("Pi classifies provider failures for bounded runtime recovery", async () =>
       assert.ok(error instanceof ModelProviderError);
       assert.equal(error.kind, fixture.kind);
       assert.equal(error.retryable, fixture.retryable);
+      assert.ok(error.run !== undefined);
+      assert.equal(error.run.stopReason, "error");
+      assert.ok(error.run.usage.totalTokens > 0);
     }
   }
 });

@@ -499,6 +499,35 @@ test("validator preserves exact isolated source identifiers without allowing cop
     failure.code === "untranslated_latin" && failure.message.includes("sailors")));
 });
 
+test("validator preserves a source-authored scientific binomial without allowing nearby prose", () => {
+  const block = chapterBlock(
+    0,
+    "Science has named her Portia labiata, a species of jumping spider.",
+  );
+  const preserved = new TranslationValidator().validate([block], {
+    translations: [{
+      blockId: block.id,
+      text: "科学界将她命名为 Portia labiata，一种跳蛛。",
+    }],
+    notes: [],
+    repaired: false,
+  });
+  assert.ok(!preserved.failures.some((failure) =>
+    failure.code === "untranslated_latin"));
+
+  const copied = new TranslationValidator().validate([block], {
+    translations: [{
+      blockId: block.id,
+      text: "Science has 将她命名为 Portia labiata，一种跳蛛。",
+    }],
+    notes: [],
+    repaired: false,
+  });
+  assert.ok(copied.failures.some((failure) =>
+    failure.code === "untranslated_latin"
+    && failure.message.includes("Science")));
+});
+
 test("deterministic validator delegates French residue to its language profile", () => {
   const block = chapterBlock(0, "Il répondit puis partit.");
   const validation = new TranslationValidator().validate([block], {

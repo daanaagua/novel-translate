@@ -8,18 +8,21 @@ import {
   type LosslessBookRunOptions,
   type LosslessBookRunResult,
 } from "../fullbook/book-runner.js";
+import { profileFromLegacyRunMode } from "../fullbook/optimization-policy.js";
 import { SourceLedger } from "../source/source-ledger.js";
 import {
   LosslessBookStore,
   type LosslessBookStatusSummary,
   type StoredTranslationRun,
 } from "../storage/lossless-book-store.js";
+import type { RuntimeProfileStore } from "../storage/runtime-profile-store.js";
 import type {
   DesktopError,
   DesktopFullBookPhase,
   DesktopFullBookProgress,
   DesktopFullBookRunSnapshot,
   DesktopFullBookSnapshot,
+  DesktopOptimizationProfile,
   DesktopProjectRequest,
   DesktopResumeFullBookRequest,
   DesktopStartFullBookRequest,
@@ -57,10 +60,12 @@ export class DesktopFullBookError extends Error {
 
 export interface DesktopFullBookServiceOptions {
   runtime: DesktopRuntimeResolver;
+  runtimeProfileStore?: RuntimeProfileStore;
   runBook?: (options: LosslessBookRunOptions) => Promise<LosslessBookRunResult>;
   createRunId?: () => string;
   onProgress?: (progress: DesktopFullBookProgress) => void;
   pollIntervalMs?: number;
+  shutdownGraceMs?: number;
 }
 
 interface NormalizedProject {
@@ -74,6 +79,8 @@ interface NormalizedProject {
 interface FullBookMetadata {
   schema: typeof FULLBOOK_SCHEMA;
   mode: DesktopTrialMode;
+  optimizationProfile: DesktopOptimizationProfile;
+  dynamicScheduler: boolean;
   runtimeFingerprint: string;
   styleProfileHash: string;
 }
@@ -84,8 +91,10 @@ interface RunOverlay {
   sourceVersion: string;
   modelId: string;
   mode: DesktopTrialMode;
+  optimizationProfile: DesktopOptimizationProfile;
   phase: DesktopFullBookPhase;
   progress: DesktopFullBookRunSnapshot["progress"];
+  scheduler?: DesktopFullBookRunSnapshot["scheduler"];
   error?: DesktopError;
 }
 
@@ -94,8 +103,11 @@ interface ActiveFullBookTask {
   project: NormalizedProject;
   runId: string;
   mode: DesktopTrialMode;
+  optimizationProfile: DesktopOptimizationProfile;
+  schedulerMode: "off" | "active";
   controller: AbortController;
   phase: "preparing" | "running" | "pausing";
+  pauseRequested: boolean;
   modelId: string;
   settled: Promise<void>;
   poller?: ReturnType<typeof setInterval>;
@@ -144,14 +156,22 @@ function validRunId(value: unknown): value is string {
     && !/[\u0000-\u001f]/u.test(value);
 }
 
-function requireMode(value: unknown): DesktopTrialMode {
-  if (value !== "quality" && value !== "fast") {
+function requireOptimizationProfile(
+  value: unknown,
+): DesktopOptimizationProfile {
+  if (value !== "economy" && value !== "balanced" && value !== "speed") {
     throw new DesktopFullBookError(
       "DESKTOP_FULLBOOK_INPUT_INVALID",
-      "full-book mode must be quality or fast",
+      "optimizationProfile must be economy, balanced, or speed",
     );
   }
   return value;
+}
+
+function modeForOptimizationProfile(
+  profile: DesktopOptimizationProfile,
+): DesktopTrialMode {
+  return profile === "speed" ? "fast" : "quality";
 }
 
 function normalizeProject(project: DesktopProjectRequest): NormalizedProject {
@@ -194,17 +214,30 @@ function normalizeProject(project: DesktopProjectRequest): NormalizedProject {
 function fullBookMetadata(value: unknown): FullBookMetadata | undefined {
   const root = record(value);
   const item = record(root?.desktopFullBook);
+  const optimizationProfile = item?.optimizationProfile === undefined
+    ? item?.mode === "quality" || item?.mode === "fast"
+      ? profileFromLegacyRunMode(item.mode)
+      : undefined
+    : item.optimizationProfile;
   if (item?.schema !== FULLBOOK_SCHEMA
     || (item.mode !== "quality" && item.mode !== "fast")
+    || (optimizationProfile !== "economy"
+      && optimizationProfile !== "balanced"
+      && optimizationProfile !== "speed")
     || typeof item.runtimeFingerprint !== "string"
     || item.runtimeFingerprint.length === 0
     || typeof item.styleProfileHash !== "string"
     || item.styleProfileHash.length === 0) {
     return undefined;
   }
+  if (modeForOptimizationProfile(optimizationProfile) !== item.mode) {
+    return undefined;
+  }
   return {
     schema: FULLBOOK_SCHEMA,
     mode: item.mode,
+    optimizationProfile,
+    dynamicScheduler: item.optimizationProfile !== undefined,
     runtimeFingerprint: item.runtimeFingerprint,
     styleProfileHash: item.styleProfileHash,
   };
@@ -212,15 +245,64 @@ function fullBookMetadata(value: unknown): FullBookMetadata | undefined {
 
 function runMetadata(
   mode: DesktopTrialMode,
+  optimizationProfile: DesktopOptimizationProfile,
   fingerprint: DesktopRuntimeFingerprint,
-): { desktopFullBook: FullBookMetadata } {
+): { desktopFullBook: Omit<FullBookMetadata, "dynamicScheduler"> } {
   return {
     desktopFullBook: {
       schema: FULLBOOK_SCHEMA,
       mode,
+      optimizationProfile,
       runtimeFingerprint: serializeDesktopRuntimeFingerprint(fingerprint),
       styleProfileHash: DEFAULT_STYLE_PROFILE_HASH,
     },
+  };
+}
+
+function deviationPercent(actual: number, predicted: number): number | undefined {
+  if (!Number.isFinite(actual)
+    || !Number.isFinite(predicted)
+    || actual < 0
+    || predicted <= 0) {
+    return undefined;
+  }
+  return Math.round(((actual - predicted) / predicted) * 10_000) / 100;
+}
+
+function schedulerSummary(
+  scheduler: LosslessBookRunResult["scheduler"],
+  status: LosslessBookStatusSummary,
+): NonNullable<DesktopFullBookRunSnapshot["scheduler"]> {
+  const wallTimeDeviationPercent = deviationPercent(
+    scheduler.actualWallTimeMs,
+    scheduler.predictedWallTimeMs,
+  );
+  const tokenDeviationPercent = deviationPercent(
+    scheduler.actualTokens,
+    scheduler.predictedTokens,
+  );
+  return {
+    estimatedRemainingMs: status.pendingWindows === 0
+      && status.runningWindows === 0
+      && status.stagedWindows === 0
+      ? 0
+      : Math.max(
+        0,
+        Math.round(
+          scheduler.predictedWallTimeMs - scheduler.actualWallTimeMs,
+        ),
+      ),
+    predictedTokenRange: {
+      lower: scheduler.predictedTokens,
+      upper: scheduler.predictedTokens,
+    },
+    ...(wallTimeDeviationPercent === undefined
+      ? {}
+      : { wallTimeDeviationPercent }),
+    ...(tokenDeviationPercent === undefined
+      ? {}
+      : { tokenDeviationPercent }),
+    adjustment: scheduler.fallbacks > 0 ? "recovering" : "steady",
   };
 }
 
@@ -260,7 +342,7 @@ function capabilities(
 
 function publicRun(
   run: StoredTranslationRun,
-  mode: DesktopTrialMode,
+  metadata: FullBookMetadata,
   progress: DesktopFullBookRunSnapshot["progress"],
   overlay?: RunOverlay,
 ): DesktopFullBookRunSnapshot {
@@ -269,9 +351,13 @@ function publicRun(
     runId: run.runId,
     sourceVersion: run.sourceVersion,
     modelId: run.modelId,
-    mode,
+    mode: metadata.mode,
+    optimizationProfile: metadata.optimizationProfile,
     phase,
     progress: overlay?.progress ?? progress,
+    ...(overlay?.scheduler === undefined
+      ? {}
+      : { scheduler: overlay.scheduler }),
     ...capabilities(phase, overlay?.progress ?? progress),
     ...(overlay?.error === undefined ? {} : { error: overlay.error }),
   };
@@ -283,8 +369,10 @@ function overlayRun(overlay: RunOverlay): DesktopFullBookRunSnapshot {
     sourceVersion: overlay.sourceVersion,
     modelId: overlay.modelId,
     mode: overlay.mode,
+    optimizationProfile: overlay.optimizationProfile,
     phase: overlay.phase,
     progress: overlay.progress,
+    ...(overlay.scheduler === undefined ? {} : { scheduler: overlay.scheduler }),
     ...capabilities(overlay.phase, overlay.progress),
     ...(overlay.error === undefined ? {} : { error: overlay.error }),
   };
@@ -315,23 +403,34 @@ function runtimePlan(
 
 export class DesktopFullBookService {
   readonly #runtime: DesktopRuntimeResolver;
+  readonly #runtimeProfileStore: RuntimeProfileStore | undefined;
   readonly #runBook: (options: LosslessBookRunOptions) => Promise<LosslessBookRunResult>;
   readonly #createRunId: () => string;
   readonly #onProgress: ((progress: DesktopFullBookProgress) => void) | undefined;
   readonly #pollIntervalMs: number;
+  readonly #shutdownGraceMs: number;
   readonly #overlays = new Map<string, RunOverlay>();
   #lastProject: NormalizedProject | undefined;
 
   constructor(options: DesktopFullBookServiceOptions) {
     this.#runtime = options.runtime;
+    this.#runtimeProfileStore = options.runtimeProfileStore;
     this.#runBook = options.runBook ?? runBook;
     this.#createRunId = options.createRunId ?? randomUUID;
     this.#onProgress = options.onProgress;
     this.#pollIntervalMs = options.pollIntervalMs ?? DEFAULT_POLL_INTERVAL_MS;
+    this.#shutdownGraceMs = options.shutdownGraceMs ?? 5_000;
     if (!Number.isSafeInteger(this.#pollIntervalMs) || this.#pollIntervalMs <= 0) {
       throw new DesktopFullBookError(
         "DESKTOP_FULLBOOK_INPUT_INVALID",
         "pollIntervalMs must be a positive safe integer",
+      );
+    }
+    if (!Number.isSafeInteger(this.#shutdownGraceMs)
+      || this.#shutdownGraceMs <= 0) {
+      throw new DesktopFullBookError(
+        "DESKTOP_FULLBOOK_INPUT_INVALID",
+        "shutdownGraceMs must be a positive safe integer",
       );
     }
   }
@@ -350,7 +449,7 @@ export class DesktopFullBookService {
           if (metadata === undefined) continue;
           const progress = publicProgress(store.statusSummary(run.runId));
           const overlay = this.#overlays.get(run.runId);
-          persisted.push(publicRun(run, metadata.mode, progress, overlay));
+          persisted.push(publicRun(run, metadata, progress, overlay));
           seen.add(run.runId);
         }
       } finally {
@@ -375,7 +474,10 @@ export class DesktopFullBookService {
     projectRequest: DesktopProjectRequest,
     request: DesktopStartFullBookRequest,
   ): Promise<DesktopFullBookSnapshot> {
-    const mode = requireMode(request?.mode);
+    const optimizationProfile = requireOptimizationProfile(
+      request?.optimizationProfile,
+    );
+    const mode = modeForOptimizationProfile(optimizationProfile);
     const project = normalizeProject(projectRequest);
     const runId = this.#createRunId();
     if (!validRunId(runId)) {
@@ -384,7 +486,13 @@ export class DesktopFullBookService {
         "the generated full-book run id is invalid",
       );
     }
-    const task = this.#reserve(project, runId, mode);
+    const task = this.#reserve(
+      project,
+      runId,
+      mode,
+      optimizationProfile,
+      "active",
+    );
     try {
       const beforeVersion = project.sourceVersion;
       const plan = runtimePlan(mode, await this.#runtime.resolve());
@@ -397,7 +505,11 @@ export class DesktopFullBookService {
         );
       }
       task.modelId = plan.runtimeSet.primary.model.id;
-      const metadata = runMetadata(mode, plan.fingerprint);
+      const metadata = runMetadata(
+        mode,
+        optimizationProfile,
+        plan.fingerprint,
+      );
       return this.#launch(task, plan, {
         runId,
         protocolVersion: LOSSLESS_BOOK_PROTOCOL_VERSION,
@@ -444,7 +556,14 @@ export class DesktopFullBookService {
         "the selected run is not a resumable desktop full-book translation",
       );
     }
-    const task = this.#reserve(project, storedRun.runId, metadata.mode, storedRun.modelId);
+    const task = this.#reserve(
+      project,
+      storedRun.runId,
+      metadata.mode,
+      metadata.optimizationProfile,
+      metadata.dynamicScheduler ? "active" : "off",
+      storedRun.modelId,
+    );
     try {
       const plan = runtimePlan(metadata.mode, await this.#runtime.resolve());
       task.controller.signal.throwIfAborted();
@@ -481,14 +600,17 @@ export class DesktopFullBookService {
         ? { runs: [] }
         : this.snapshot(this.#lastProject.request);
     }
+    const priorPhase = task.phase;
     task.phase = "pausing";
     this.#setOverlay(task, "pausing");
     this.#emit(task);
-    if (!task.controller.signal.aborted) {
+    if (priorPhase === "preparing" && !task.controller.signal.aborted) {
       task.controller.abort(new DesktopFullBookError(
         "DESKTOP_FULLBOOK_PAUSED",
-        "full-book translation paused at a durable boundary",
+        "full-book translation paused before execution",
       ));
+    } else {
+      task.pauseRequested = true;
     }
     await task.settled;
     return this.snapshot(task.project.request);
@@ -499,8 +621,32 @@ export class DesktopFullBookService {
   }
 
   async settleForShutdown(): Promise<void> {
-    if (ACTIVE_FULLBOOK_TASK !== undefined) {
-      await this.pause();
+    const task = ACTIVE_FULLBOOK_TASK;
+    if (task === undefined) return;
+    const cooperativePause = this.pause();
+    let abortTimer: ReturnType<typeof setTimeout> | undefined;
+    let giveUpTimer: ReturnType<typeof setTimeout> | undefined;
+    const boundedShutdown = new Promise<void>((resolve) => {
+      abortTimer = setTimeout(() => {
+        if (!task.controller.signal.aborted) {
+          task.controller.abort(new DesktopFullBookError(
+            "DESKTOP_FULLBOOK_PAUSED",
+            "full-book translation aborted after the shutdown grace period",
+          ));
+        }
+        giveUpTimer = setTimeout(resolve, this.#shutdownGraceMs);
+        giveUpTimer.unref?.();
+      }, this.#shutdownGraceMs);
+      abortTimer.unref?.();
+    });
+    try {
+      await Promise.race([
+        cooperativePause.then(() => undefined),
+        boundedShutdown,
+      ]);
+    } finally {
+      if (abortTimer !== undefined) clearTimeout(abortTimer);
+      if (giveUpTimer !== undefined) clearTimeout(giveUpTimer);
     }
   }
 
@@ -508,6 +654,8 @@ export class DesktopFullBookService {
     project: NormalizedProject,
     runId: string,
     mode: DesktopTrialMode,
+    optimizationProfile: DesktopOptimizationProfile,
+    schedulerMode: "off" | "active",
     modelId = "",
   ): ActiveFullBookTask {
     if (ACTIVE_FULLBOOK_TASK !== undefined) {
@@ -521,14 +669,23 @@ export class DesktopFullBookService {
       project,
       runId,
       mode,
+      optimizationProfile,
+      schedulerMode,
       controller: new AbortController(),
+      pauseRequested: false,
       phase: "preparing",
       modelId,
       settled: Promise.resolve(),
     };
     ACTIVE_FULLBOOK_TASK = task;
     this.#lastProject = project;
-    this.#setOverlay(task, "preparing");
+    this.#setOverlay(
+      task,
+      "preparing",
+      undefined,
+      undefined,
+      { adjustment: "planning" },
+    );
     this.#emit(task);
     return task;
   }
@@ -553,7 +710,13 @@ export class DesktopFullBookService {
         model: plan.runtimeSet.primary.model,
         streamFn: plan.runtimeSet.primary.streamFn,
         runtimeSet: plan.runtimeSet,
+        optimizationProfile: task.optimizationProfile,
+        schedulerMode: task.schedulerMode,
+        ...(this.#runtimeProfileStore === undefined
+          ? {}
+          : { runtimeProfileStore: this.#runtimeProfileStore }),
         signal: task.controller.signal,
+        shouldPause: () => task.pauseRequested,
       });
     } catch (error) {
       running = Promise.reject(error);
@@ -561,14 +724,26 @@ export class DesktopFullBookService {
     task.settled = running.then(
       (result) => {
         if (task.controller.signal.aborted) {
-          this.#setOverlay(task, "paused", result.status);
+          this.#setOverlay(
+            task,
+            "paused",
+            result.status,
+            undefined,
+            schedulerSummary(result.scheduler, result.status),
+          );
         } else {
           const phase: DesktopFullBookPhase = result.outcome === "human_required"
             ? "needs_attention"
             : result.outcome === "partial"
               ? "paused"
               : "completed";
-          this.#setOverlay(task, phase, result.status);
+          this.#setOverlay(
+            task,
+            phase,
+            result.status,
+            undefined,
+            schedulerSummary(result.scheduler, result.status),
+          );
         }
       },
       (error: unknown) => {
@@ -605,8 +780,10 @@ export class DesktopFullBookService {
     phase: DesktopFullBookPhase,
     status?: LosslessBookStatusSummary,
     error?: DesktopError,
+    scheduler?: DesktopFullBookRunSnapshot["scheduler"],
   ): void {
     let progress = status === undefined ? emptyProgress() : publicProgress(status);
+    let adaptiveCongestion = false;
     if (status === undefined && existsSync(task.project.storePath)) {
       try {
         const store = LosslessBookStore.openReadOnly(task.project.storePath);
@@ -614,6 +791,8 @@ export class DesktopFullBookService {
           const run = store.listTranslationRuns().find((item) => item.runId === task.runId);
           if (run !== undefined) {
             progress = publicProgress(store.statusSummary(task.runId));
+            adaptiveCongestion =
+              (store.latestSchedulerSnapshot(task.runId)?.congestionEvents ?? 0) > 0;
           }
         } finally {
           store.close();
@@ -624,14 +803,26 @@ export class DesktopFullBookService {
         progress = this.#overlays.get(task.runId)?.progress ?? progress;
       }
     }
+    const priorScheduler = this.#overlays.get(task.runId)?.scheduler;
+    const projectedScheduler = scheduler
+      ?? (adaptiveCongestion
+        ? {
+          ...priorScheduler,
+          adjustment: "throttled" as const,
+        }
+        : priorScheduler);
     this.#overlays.set(task.runId, {
       projectKey: task.project.projectDirectory,
       runId: task.runId,
       sourceVersion: task.project.sourceVersion,
       modelId: task.modelId,
       mode: task.mode,
+      optimizationProfile: task.optimizationProfile,
       phase,
       progress,
+      ...(projectedScheduler === undefined
+        ? {}
+        : { scheduler: projectedScheduler }),
       ...(error === undefined ? {} : { error }),
     });
   }

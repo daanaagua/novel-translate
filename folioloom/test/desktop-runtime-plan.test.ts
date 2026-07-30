@@ -44,12 +44,20 @@ test("desktop runtime plan keeps quality effort and lowers only the fast primary
   const quality = buildDesktopRuntimePlan("quality", runtime);
   assert.equal(quality.runtimeSet.primary.effort, "high");
   assert.equal(quality.runtimeSet.escalation.effort, "high");
+  assert.deepEqual(
+    quality.runtimeSet.variants?.map((candidate) => candidate.effort),
+    ["off", "high", "max"],
+  );
   assert.equal(quality.fingerprint.mode, "quality");
 
   const fast = buildDesktopRuntimePlan("fast", runtime);
   assert.equal(fast.runtimeSet.primary.effort, "off");
   assert.equal(fast.runtimeSet.primary.thinkingLevel, "off");
   assert.equal(fast.runtimeSet.escalation.effort, "high");
+  assert.deepEqual(
+    fast.runtimeSet.variants?.map((candidate) => candidate.effort),
+    ["off", "high", "max"],
+  );
   assert.equal(fast.fingerprint.primary.reasoningEffort, "off");
   assert.equal(
     serializeDesktopRuntimeFingerprint(fast.fingerprint),

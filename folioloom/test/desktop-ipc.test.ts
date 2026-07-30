@@ -377,6 +377,7 @@ function registerFixtureHandlers(options: IpcFixtureOptions = {}): IpcFixture {
             sourceVersion: "source-v1",
             modelId: "desktop-test-model",
             mode: "quality" as const,
+            optimizationProfile: "balanced" as const,
             phase: "paused" as const,
             progress: {
               totalWindows: 2,
@@ -950,12 +951,12 @@ test("full-book IPC owns project paths and validates start, pause, and existing-
 
     const started = await handler(fixture, "folioloom:start-fullbook")(
       fixture.trustedEvent,
-      { mode: "quality" },
+      { optimizationProfile: "balanced" },
     ) as DesktopResult<DesktopFullBookSnapshot>;
     assert.equal(started.ok, true);
     assert.deepEqual(fixture.fullBookCalls.starts, [{
       project: { manifestPath: fixture.manifestPath },
-      request: { mode: "quality" },
+      request: { optimizationProfile: "balanced" },
     }]);
 
     const resumed = await handler(fixture, "folioloom:resume-fullbook")(
@@ -982,7 +983,10 @@ test("full-book IPC owns project paths and validates start, pause, and existing-
     assert.equal(fixture.fullBookCalls.pauses, 1);
 
     for (const [channel, payload] of [
-      ["folioloom:start-fullbook", { mode: "fast", manifestPath: "C:\\outside\\source_manifest.json" }],
+      ["folioloom:start-fullbook", {
+        optimizationProfile: "speed",
+        manifestPath: "C:\\outside\\source_manifest.json",
+      }],
       ["folioloom:resume-fullbook", { runId: "run-a", storePath: "C:\\outside\\book.db" }],
     ] as const) {
       const result = await handler(fixture, channel)(
@@ -1121,7 +1125,10 @@ test("choose-source imports a selected manuscript without exposing a path-taking
     assert.equal(result.ok, true);
     if (result.ok) assert.equal(result.value.status, "ready");
     assert.deepEqual(fixture.sourceImports, [fixture.sourcePath]);
-    assert.equal(fixture.currentRequest?.manifestPath.endsWith("Imported\\source_manifest.json"), true);
+    assert.equal(
+      fixture.currentRequest?.manifestPath,
+      join(fixture.directory, "Imported", "source_manifest.json"),
+    );
   } finally {
     rmSync(fixture.directory, { recursive: true, force: true });
   }
@@ -1187,7 +1194,10 @@ test("ambiguous source selection exposes an opaque encoding choice and confirms 
       pendingImportId: selected.value.pendingImportId,
       encoding: "euc-kr",
     }]);
-    assert.equal(fixture.currentRequest?.manifestPath.endsWith("Imported\\source_manifest.json"), true);
+    assert.equal(
+      fixture.currentRequest?.manifestPath,
+      join(fixture.directory, "Imported", "source_manifest.json"),
+    );
 
     const injected = await handler(fixture, "folioloom:confirm-source-encoding")(
       fixture.trustedEvent,
