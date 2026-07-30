@@ -1,3 +1,4 @@
+import { readFileSync } from "node:fs";
 import { basename } from "node:path";
 
 import {
@@ -6,12 +7,15 @@ import {
   type PilotTranslation,
 } from "../report.js";
 import type { LosslessBookStore } from "../storage/lossless-book-store.js";
+import { stripEpubStructuralMarkers } from "../source/epub-structure.js";
 import { writeStoredZip, type StoredZipInput } from "./stored-zip.js";
+import { writeTranslatedEpubTemplate } from "./epub-template-writer.js";
 
 export interface LosslessEpubOptions {
   title: string;
   language: "zh-CN";
   fallbackSectionChars?: number;
+  sourceManifestPath?: string;
 }
 
 interface EpubSection {
@@ -29,7 +33,9 @@ function escapeXml(value: string): string {
 }
 
 function paragraphMarkup(text: string): string {
-  const normalized = text.replace(/\r\n?/gu, "\n").trim();
+  const normalized = stripEpubStructuralMarkers(text)
+    .replace(/\r\n?/gu, "\n")
+    .trim();
   if (normalized.length === 0) {
     return "";
   }
@@ -97,15 +103,28 @@ ${body}
 `;
 }
 
-export function writeLosslessBookEpub(
+export async function writeLosslessBookEpub(
   store: LosslessBookStore,
   runId: string,
   outputPath: string,
   options: LosslessEpubOptions,
-): string {
+): Promise<string> {
   const translations = losslessBookTranslations(store, runId);
   if (translations.length === 0) {
     throw new Error("EPUB export requires at least one translated block");
+  }
+  if (options.sourceManifestPath !== undefined) {
+    const manifest = JSON.parse(
+      readFileSync(options.sourceManifestPath, "utf8"),
+    ) as Record<string, unknown>;
+    if (manifest.source_format === ".epub") {
+      return writeTranslatedEpubTemplate({
+        sourceManifestPath: options.sourceManifestPath,
+        translations,
+        lineage: losslessBookLineage(store, runId),
+        outputPath,
+      });
+    }
   }
   const sections = groupSections(
     translations,

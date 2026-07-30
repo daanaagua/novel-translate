@@ -11,6 +11,7 @@ import { createKnowledgeSnapshot } from "../src/knowledge/snapshot.js";
 import { auditLosslessBookStore } from "../src/report.js";
 import { auditSourceCoverage } from "../src/source/auditor.js";
 import { buildLosslessBlocks } from "../src/source/block-builder.js";
+import { epubStructuralTranslationError } from "../src/source/epub-structure.js";
 import { annotateStructure } from "../src/source/structure-annotator.js";
 import {
   WeightedTokenEstimator,
@@ -306,5 +307,22 @@ test("property: eight acceptance shapes traverse ledger through schema audit wit
       store.close();
       context.close();
     }
+  }
+});
+
+test("block construction never cuts through an EPUB structural slot pair", () => {
+  const source = [
+    "Short prefix.",
+    `⟦E0.0.0⟧${"structured link label ".repeat(30)}⟦/E0.0.0⟧`,
+    "Short suffix.",
+  ].join("\n\n");
+  const blocks = buildLosslessBlocks(source, [], { maxSourceTokens: 8 });
+  assert.equal(blocks.map((block) => block.sourceText).join(""), source);
+  for (const block of blocks) {
+    assert.equal(
+      epubStructuralTranslationError(block.sourceText, block.sourceText),
+      undefined,
+      block.sourceText,
+    );
   }
 });

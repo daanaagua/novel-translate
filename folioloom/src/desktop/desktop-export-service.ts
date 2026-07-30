@@ -371,9 +371,10 @@ export class DesktopExportService {
         fileStem: stem,
       });
       const epubPath = join(temporaryDirectory, `${stem}.epub`);
-      this.#writeEpub(store, run.runId, epubPath, {
+      await this.#writeEpub(store, run.runId, epubPath, {
         title: project.title,
         language: "zh-CN",
+        sourceManifestPath: project.manifestPath,
       });
       const allPaths: LosslessBookArtifactPaths = { ...paths, epub: epubPath };
       const verification = this.#verify(allPaths, store, run.runId);

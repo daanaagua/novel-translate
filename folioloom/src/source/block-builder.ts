@@ -202,6 +202,25 @@ function scalarLayoutSpans(
   }));
 }
 
+function scalarEpubSlotSpans(
+  text: string,
+  coordinates: UnicodeScalarMap,
+): ScalarLayoutSpan[] {
+  const spans: ScalarLayoutSpan[] = [];
+  const opening = /⟦(E\d+\.\d+\.\d+)⟧/gu;
+  for (const match of text.matchAll(opening)) {
+    const startUtf16 = match.index;
+    const closeMarker = `⟦/${match[1] ?? ""}⟧`;
+    const closeUtf16 = text.indexOf(closeMarker, startUtf16 + match[0].length);
+    if (closeUtf16 < 0) continue;
+    spans.push({
+      start: coordinates.toScalarIndex(startUtf16),
+      end: coordinates.toScalarIndex(closeUtf16 + closeMarker.length),
+    });
+  }
+  return spans;
+}
+
 function protectLayoutCut(
   end: number,
   spans: readonly ScalarLayoutSpan[],
@@ -430,6 +449,7 @@ export function buildLosslessBlocks(
   const cuts = candidateCuts(source, annotations, profile);
   const softCuts = cuts.filter((candidate) => candidate.kind !== "layout");
   const layoutSpans = scalarLayoutSpans(text, coordinates);
+  const epubSlotSpans = scalarEpubSlotSpans(text, coordinates);
   const semanticIndex = buildSemanticScalarIndex(text, layoutSpans);
   const layoutEnds = [...new Set(
     cuts.filter((candidate) => candidate.kind === "layout")
@@ -500,6 +520,7 @@ export function buildLosslessBlocks(
       ?? preferredCandidateEnd(softCuts, candidateIndex, cursor, maximumEnd)
       ?? maximumEnd;
     end = protectLayoutCut(end, layoutSpans, semanticIndex, coordinates.length);
+    end = protectLayoutCut(end, epubSlotSpans, semanticIndex, coordinates.length);
     if (!semanticRangeHasContent(semanticIndex, cursor, end)) {
       const nextSemanticEnd = semanticIndex.nextSemanticEnds[end] as number;
       if (nextSemanticEnd < 0) {
@@ -508,6 +529,12 @@ export function buildLosslessBlocks(
       end = protectLayoutCut(
         nextSemanticEnd,
         layoutSpans,
+        semanticIndex,
+        coordinates.length,
+      );
+      end = protectLayoutCut(
+        end,
+        epubSlotSpans,
         semanticIndex,
         coordinates.length,
       );

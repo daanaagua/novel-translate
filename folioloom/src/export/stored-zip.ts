@@ -1,9 +1,11 @@
 import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname } from "node:path";
+import { deflateRawSync } from "node:zlib";
 
 export interface StoredZipInput {
   name: string;
   data: Buffer | string;
+  method?: 0 | 8;
 }
 
 export interface StoredZipEntry {
@@ -74,31 +76,33 @@ export function writeStoredZip(
     if (name.length > 0xffff || payload.length > 0xffffffff) {
       throw new Error(`stored ZIP entry is too large: ${input.name}`);
     }
+    const method = input.method ?? 0;
+    const compressed = method === 8 ? deflateRawSync(payload) : payload;
     const checksum = crc32(payload);
     const local = Buffer.alloc(30);
     local.writeUInt32LE(LOCAL_FILE_HEADER, 0);
     local.writeUInt16LE(20, 4);
     local.writeUInt16LE(UTF8_FLAG, 6);
-    local.writeUInt16LE(0, 8);
+    local.writeUInt16LE(method, 8);
     local.writeUInt16LE(0, 10);
     local.writeUInt16LE(0, 12);
     local.writeUInt32LE(checksum, 14);
-    local.writeUInt32LE(payload.length, 18);
+    local.writeUInt32LE(compressed.length, 18);
     local.writeUInt32LE(payload.length, 22);
     local.writeUInt16LE(name.length, 26);
     local.writeUInt16LE(0, 28);
-    localParts.push(local, name, payload);
+    localParts.push(local, name, compressed);
 
     const central = Buffer.alloc(46);
     central.writeUInt32LE(CENTRAL_DIRECTORY_HEADER, 0);
     central.writeUInt16LE(20, 4);
     central.writeUInt16LE(20, 6);
     central.writeUInt16LE(UTF8_FLAG, 8);
-    central.writeUInt16LE(0, 10);
+    central.writeUInt16LE(method, 10);
     central.writeUInt16LE(0, 12);
     central.writeUInt16LE(0, 14);
     central.writeUInt32LE(checksum, 16);
-    central.writeUInt32LE(payload.length, 20);
+    central.writeUInt32LE(compressed.length, 20);
     central.writeUInt32LE(payload.length, 24);
     central.writeUInt16LE(name.length, 28);
     central.writeUInt16LE(0, 30);
@@ -109,7 +113,7 @@ export function writeStoredZip(
     central.writeUInt32LE(localOffset, 42);
     centralParts.push(central, name);
 
-    localOffset += local.length + name.length + payload.length;
+    localOffset += local.length + name.length + compressed.length;
     if (localOffset > 0xffffffff) {
       throw new Error("stored ZIP is too large for ZIP32");
     }

@@ -607,6 +607,7 @@ export function translationBatchSystemPrompt(
     `The source language is ${profile.displayName} (${profile.id}); the target language is ${targetLanguageLabel()}.`,
     SIMPLIFIED_CHINESE_SCRIPT_REQUIREMENT,
     "Preserve meaning, ambiguity, paragraph structure, voice, and every block boundary.",
+    "When source text contains paired ⟦E…⟧ and ⟦/E…⟧ EPUB structural-slot markers, copy every marker byte-for-byte in the same order, translate only text inside each pair, and emit no prose outside those pairs in that paragraph.",
     ...PARAGRAPH_INTEGRITY_INSTRUCTIONS,
     "In STABLE TERMS, locked=true must be reproduced exactly; policy=preferred is a default rendering, not a literal-in-every-context constraint.",
     "TERM OCCURRENCES are harness-computed source facts. Apply each referenced concept at that exact source occurrence; contextual concepts may use a context-appropriate allowed surface.",

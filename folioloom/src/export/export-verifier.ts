@@ -28,7 +28,8 @@ export type ExportVerificationIncidentCode =
   | "EPUB_INVALID"
   | "EPUB_MIMETYPE_INVALID"
   | "EPUB_PACKAGE_INVALID"
-  | "EPUB_NAVIGATION_INVALID";
+  | "EPUB_NAVIGATION_INVALID"
+  | "EPUB_LINK_INVALID";
 
 export interface ExportVerificationResult {
   schema: "v5-export-verification-1";
@@ -94,12 +95,36 @@ function attribute(value: unknown, name: string): string | undefined {
 function safeEntryPath(basePath: string, reference: string): string | undefined {
   if (reference.length === 0
     || reference.startsWith("/")
-    || reference.includes("\\")
-    || reference.split("/").includes("..")) {
+    || reference.includes("\\")) {
     return undefined;
   }
   const resolved = posix.normalize(posix.join(posix.dirname(basePath), reference));
   return resolved.startsWith("../") || resolved === ".." ? undefined : resolved;
+}
+
+function resolvedEpubHref(
+  basePath: string,
+  href: string,
+): { readonly path: string; readonly fragment?: string } | "external" | undefined {
+  if (/^[A-Za-z][A-Za-z0-9+.-]*:/u.test(href) || href.startsWith("//")) {
+    return "external";
+  }
+  const hashAt = href.indexOf("#");
+  const rawPath = (hashAt < 0 ? href : href.slice(0, hashAt)).split("?", 1)[0] ?? "";
+  let reference: string;
+  let fragment: string | undefined;
+  try {
+    reference = decodeURIComponent(rawPath);
+    if (hashAt >= 0) fragment = decodeURIComponent(href.slice(hashAt + 1));
+  } catch {
+    return undefined;
+  }
+  const path = reference.length === 0 ? basePath : safeEntryPath(basePath, reference);
+  if (path === undefined) return undefined;
+  return {
+    path,
+    ...(fragment === undefined || fragment.length === 0 ? {} : { fragment }),
+  };
 }
 
 function collectElements(value: unknown, tag: string, target: unknown[] = []): unknown[] {
@@ -184,10 +209,13 @@ function verifyEpub(
       const rootPaths = rootfiles
         .map((rootfile) => attribute(rootfile, "full-path"))
         .filter((item): item is string => item !== undefined);
-      if (rootPaths.length !== 1 || rootPaths[0] !== "EPUB/package.opf") {
+      const rootPath = rootPaths.length === 1
+        ? safeEntryPath("package.opf", rootPaths[0] ?? "")
+        : undefined;
+      if (rootPath === undefined || !byName.has(rootPath)) {
         incidents.add("EPUB_PACKAGE_INVALID");
       } else {
-        packagePath = rootPaths[0];
+        packagePath = rootPath;
       }
     } catch {
       incidents.add("EPUB_PACKAGE_INVALID");
@@ -202,6 +230,7 @@ function verifyEpub(
   }
   let manifestById = new Map<string, { path: string; mediaType: string; properties: string }>();
   let spinePaths: string[] = [];
+  let xhtmlPaths: string[] = [];
   let navPath: string | undefined;
   try {
     const packageDocument = epubXmlParser.parse(packageText) as unknown;
@@ -221,6 +250,9 @@ function verifyEpub(
         continue;
       }
       manifestById.set(id, { path: resolved, mediaType, properties });
+      if (mediaType === "application/xhtml+xml") {
+        xhtmlPaths.push(resolved);
+      }
       if (properties.split(/\s+/u).includes("nav")) {
         if (navPath !== undefined || mediaType !== "application/xhtml+xml") {
           incidents.add("EPUB_PACKAGE_INVALID");
@@ -258,6 +290,55 @@ function verifyEpub(
       } catch {
         incidents.add("EPUB_INVALID");
       }
+    }
+  }
+
+  const idsByPath = new Map<string, Set<string>>();
+  const links: Array<{ readonly basePath: string; readonly href: string }> = [];
+  const collectGraph = (value: unknown, basePath: string): void => {
+    if (Array.isArray(value)) {
+      for (const item of value) collectGraph(item, basePath);
+      return;
+    }
+    const node = xmlObject(value);
+    if (node === undefined) return;
+    const id = attribute(node, "id");
+    if (id !== undefined) {
+      const ids = idsByPath.get(basePath) ?? new Set<string>();
+      if (ids.has(id)) {
+        incidents.add("EPUB_LINK_INVALID");
+      }
+      ids.add(id);
+      idsByPath.set(basePath, ids);
+    }
+    const href = attribute(node, "href");
+    if (href !== undefined) links.push({ basePath, href });
+    for (const [key, item] of Object.entries(node)) {
+      if (!key.startsWith("@_")) collectGraph(item, basePath);
+    }
+  };
+  for (const xhtmlPath of xhtmlPaths) {
+    const payload = byName.get(xhtmlPath)?.data.toString("utf8");
+    if (payload === undefined || !validXml(payload)) {
+      incidents.add("EPUB_INVALID");
+      continue;
+    }
+    try {
+      collectGraph(epubXmlParser.parse(payload), xhtmlPath);
+    } catch {
+      incidents.add("EPUB_INVALID");
+    }
+  }
+  for (const link of links) {
+    const resolved = resolvedEpubHref(link.basePath, link.href);
+    if (resolved === "external") continue;
+    if (resolved === undefined || !byName.has(resolved.path)) {
+      incidents.add("EPUB_LINK_INVALID");
+      continue;
+    }
+    if (resolved.fragment !== undefined
+      && !idsByPath.get(resolved.path)?.has(resolved.fragment)) {
+      incidents.add("EPUB_LINK_INVALID");
     }
   }
 
