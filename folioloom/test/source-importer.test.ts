@@ -13,6 +13,7 @@ import { deflateRawSync } from "node:zlib";
 import test from "node:test";
 
 import { SourceLedger } from "../src/source/source-ledger.js";
+import { stripEpubStructuralMarkers } from "../src/source/epub-structure.js";
 import {
   SourceImportError,
   SourceImporter,
@@ -542,9 +543,10 @@ test("source importer preserves EPUB inline order and nested visible blocks exac
     });
     const ledger = SourceLedger.open(result.manifestPath);
     assert.equal(
-      ledger.sourceText,
+      stripEpubStructuralMarkers(ledger.sourceText),
       "Hello beautiful world\n\nNested block\n\nPre formatted\n line\n\nCell one\n\nCell two",
     );
+    assert.match(ledger.sourceText, /⟦E0\.0\.0⟧Hello /u);
   } finally {
     rmSync(fixture.directory, { recursive: true, force: true });
   }

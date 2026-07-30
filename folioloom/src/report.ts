@@ -11,6 +11,7 @@ import {
 } from "./knowledge/knowledge-store.js";
 import { blockId as losslessBlockId } from "./source/block-builder.js";
 import { scalarLength } from "./source/types.js";
+import { stripEpubStructuralMarkers } from "./source/epub-structure.js";
 import type { BookStore } from "./storage/book-store.js";
 import type { LosslessBookStore } from "./storage/lossless-book-store.js";
 import type { SchedulerRunReport } from "./fullbook/dynamic-scheduler.js";
@@ -23,6 +24,8 @@ export interface PilotTranslation {
   chapterTitle: string | null;
   sourceText: string;
   text: string;
+  canonicalStart?: number;
+  canonicalEnd?: number;
 }
 
 export interface RenderTranslationOptions {
@@ -45,7 +48,7 @@ export function renderTranslation(
         "",
       );
     }
-    lines.push(item.text.trim(), "");
+    lines.push(stripEpubStructuralMarkers(item.text).trim(), "");
   }
   return `${lines.join("\n").trim()}\n`;
 }
@@ -57,10 +60,10 @@ export function renderBilingual(translations: readonly PilotTranslation[]): stri
       `## ${item.blockId} · global ${item.globalIndex}`,
       "",
       "[SOURCE]",
-      item.sourceText.trim(),
+      stripEpubStructuralMarkers(item.sourceText).trim(),
       "",
       "[TRANSLATION]",
-      item.text.trim(),
+      stripEpubStructuralMarkers(item.text).trim(),
       "",
     );
   }
@@ -613,6 +616,8 @@ export function losslessBookTranslations(
         chapterTitle: window?.chapterTitle ?? null,
         sourceText: block.sourceText,
         text: translation.text,
+        canonicalStart: block.canonicalStart,
+        canonicalEnd: block.canonicalEnd,
       };
     });
 }

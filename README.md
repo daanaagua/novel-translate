@@ -4,9 +4,9 @@
 
 FolioLoom 是一个面向长篇小说的开源 AI 翻译引擎。它把原文完整性、叙事记忆、实体别名、术语连续性、局部风格和失败恢复作为同一条可审计流水线处理，目标是让复杂小说在分块、并行和长时间运行后仍保持可追溯的一致性。
 
-当前版本为 **FolioLoom v1.5.1**。正式内核位于 [`folioloom/`](folioloom/)，以 TypeScript 编写；仓库根目录的 Python 代码主要承担 TXT、Markdown、DOCX、EPUB 输入适配，并保留 V1–V4 的研究历史。
+当前版本为 **FolioLoom v1.5.2**。正式内核位于 [`folioloom/`](folioloom/)，以 TypeScript 编写；仓库根目录的 Python 代码主要承担 TXT、Markdown、DOCX、EPUB 输入适配，并保留 V1–V4 的研究历史。
 
-## V1.5.1 能做什么
+## V1.5.2 能做什么
 
 - 为原始文本建立带哈希和位置映射的无损账本；
 - 按逻辑窗口串行或有限并行翻译，并在中断后恢复；
@@ -15,6 +15,7 @@ FolioLoom 是一个面向长篇小说的开源 AI 翻译引擎。它把原文完
 - 组合书级风格约束、人物声音、语体权重和衰减的局部状态；
 - 对漏译、异常残留和结构错误执行确定性校验与一次局部修复；
 - 从 SQLite 状态库导出中文 TXT、双语 TXT、EPUB 和审计报告；
+- 对新导入的 EPUB 以原书为导出模板，保留脚注、返回链接、跨章节链接、外部 URL、OPF/spine/nav、样式及其他资源；结构槽或内部链接异常时拒绝发布损坏文件；
 - 通过 Electron 桌面端完成书稿导入、模型连接、试译、整本运行、暂停恢复、导出、术语与叙事记忆维护；
 - 导入 JSON、YAML、CSV 或 XLSX 术语数据，并在写入前处理字段映射和冲突；
 - 针对英语、德语、法语、西班牙语、俄语、日语和韩语提供语言画像，并支持常见 Unicode、Windows-1252 及日韩传统编码；
@@ -23,7 +24,7 @@ FolioLoom 是一个面向长篇小说的开源 AI 翻译引擎。它把原文完
 
 ## V4 Flash 100K 实测
 
-FolioLoom v1.5.1 使用当前 `deepseek-v4-flash` 模型、Active/Balanced 调度和 3 路并发，在全新项目数据库上的前 100K 字符实测如下：
+FolioLoom v1.5.1 使用当前 `deepseek-v4-flash` 模型、Active/Balanced 调度和 3 路并发，在全新项目数据库上的前 100K 字符实测如下；v1.5.2 只增加 EPUB 结构保真，不改变该翻译调度内核：
 
 - 德语《变形记》：**10 分 55 秒**；
 - 英语《时间之子》第一部：**18 分 56 秒**。
@@ -37,6 +38,7 @@ FolioLoom v1.5.1 使用当前 `deepseek-v4-flash` 模型、Active/Balanced 调�
 - 已完成离线回归和真实模型的一窗口、三窗口门禁，尚未发布最新版架构的全书质量基准；
 - 桌面端已接通书稿导入、模型兼容性检查、单片段试译、整本开始、暂停、恢复和严格导出；批量审阅队列仍是后续工作；
 - 桌面端内置 DeepSeek、Kimi、阿里云百炼、火山方舟、OpenAI、硅基流动及自定义 OpenAI-compatible 接口入口；DeepSeek 只接受 V4 Flash/Pro，各模型仍须通过真实兼容性检查。
+- EPUB 原模板保真只适用于由 v1.5.2 重新导入的项目；旧项目不会用模糊对齐猜测链接位置，需重新导入原 EPUB 后再翻译。
 
 ## 安装
 
@@ -54,7 +56,7 @@ npm.cmd ci
 Set-Location ..
 ```
 
-复制示例配置。V1.5.1 可以把真实 API Key 写入不会被 Git 跟踪的 `config/config.yaml`，也可以在运行命令中使用 `--opencode-auth` 从本机 OpenCode 的认证文件读取：
+复制示例配置。V1.5.2 可以把真实 API Key 写入不会被 Git 跟踪的 `config/config.yaml`，也可以在运行命令中使用 `--opencode-auth` 从本机 OpenCode 的认证文件读取：
 
 ```powershell
 Copy-Item config\config.example.yaml config\config.yaml

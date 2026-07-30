@@ -20,6 +20,10 @@ import {
   type SourceEncodingDecision,
 } from "./encoding-policy.js";
 import { detectLanguage, type DetectedLanguage } from "./language-detector.js";
+import {
+  analyzeEpubXhtml,
+  stripEpubStructuralMarkers,
+} from "./epub-structure.js";
 import { SourceLedger } from "./source-ledger.js";
 import { scalarLength, type CanonicalSegment, type ExcludedRawRange } from "./types.js";
 
@@ -551,62 +555,10 @@ async function extractDocx(raw: Buffer): Promise<ExtractedSource> {
 
 function resolveArchiveReference(parentPath: string, reference: string): string {
   const normalizedReference = reference.replaceAll("\\", "/");
-  if (normalizedReference.startsWith("/") || normalizedReference.split("/").some((part) => part === "..")) {
+  if (normalizedReference.startsWith("/")) {
     return sourceError("ARCHIVE_ENTRY_INVALID", `archive reference escapes root: ${reference}`);
   }
   return safeArchivePath(posix.normalize(posix.join(posix.dirname(parentPath), normalizedReference)));
-}
-
-const XHTML_BLOCK_BOUNDARY = "\u0000folioloom-xhtml-block\u0000";
-const XHTML_BLOCK_TAGS = new Set([
-  "address", "article", "aside", "blockquote", "caption", "dd", "details", "div", "dl", "dt",
-  "fieldset", "figcaption", "figure", "footer", "form", "h1", "h2", "h3", "h4", "h5", "h6",
-  "header", "hr", "li", "main", "nav", "ol", "p", "pre", "section", "table", "tbody", "td",
-  "tfoot", "th", "thead", "tr", "ul",
-]);
-const XHTML_IGNORED_TAGS = new Set(["script", "style", "template"]);
-
-function xhtmlText(document: OrderedXmlNodes): string {
-  const body = firstOrderedElement(document, "body");
-  if (body === undefined) {
-    return "";
-  }
-  const parts: string[] = [];
-  const visit = (nodes: OrderedXmlNodes): void => {
-    for (const node of nodes) {
-      const directText = node["#text"];
-      if (typeof directText === "string") {
-        parts.push(directText);
-        continue;
-      }
-      const element = orderedElement(node);
-      if (element === undefined) {
-        continue;
-      }
-      const tag = localName(element.name);
-      if (XHTML_IGNORED_TAGS.has(tag)) {
-        continue;
-      }
-      if (tag === "br") {
-        parts.push("\n");
-        continue;
-      }
-      const isBlock = XHTML_BLOCK_TAGS.has(tag);
-      if (isBlock) {
-        parts.push(XHTML_BLOCK_BOUNDARY);
-      }
-      visit(element.children);
-      if (isBlock) {
-        parts.push(XHTML_BLOCK_BOUNDARY);
-      }
-    }
-  };
-  visit(body);
-  return normalizeNewlines(parts.join(""))
-    .replaceAll(XHTML_BLOCK_BOUNDARY, "\n\n")
-    .replace(/\s*\n\n\s*/gu, "\n\n")
-    .replace(/\n{3,}/gu, "\n\n")
-    .trim();
 }
 
 async function extractEpub(raw: Buffer): Promise<ExtractedSource> {
@@ -654,32 +606,55 @@ async function extractEpub(raw: Buffer): Promise<ExtractedSource> {
     if (manifest === undefined || spine === undefined) {
       return sourceError("EPUB_SPINE_INVALID", "OPF requires manifest and spine");
     }
-    const members = new Map<string, string>();
+    const members = new Map<string, {
+      path: string;
+      mediaType: string;
+      properties: string;
+    }>();
     for (const item of values(child(record(manifest, "EPUB_SPINE_INVALID", "manifest"), "item"))) {
       const itemRecord = record(item, "EPUB_SPINE_INVALID", "manifest item");
       const id = attribute(itemRecord, "id");
       const href = attribute(itemRecord, "href");
-      if (id !== undefined && href !== undefined) {
-        members.set(id, resolveArchiveReference(safeOpfPath, href));
+      const mediaType = attribute(itemRecord, "media-type");
+      if (id !== undefined && href !== undefined && mediaType !== undefined) {
+        members.set(id, {
+          path: resolveArchiveReference(safeOpfPath, href),
+          mediaType,
+          properties: attribute(itemRecord, "properties") ?? "",
+        });
       }
     }
-    const parts: ExtractedPart[] = [];
+    const spinePaths: string[] = [];
     for (const itemref of values(child(record(spine, "EPUB_SPINE_INVALID", "spine"), "itemref"))) {
       const idref = attribute(record(itemref, "EPUB_SPINE_INVALID", "spine itemref"), "idref");
-      const memberPath = idref === undefined ? undefined : members.get(idref);
-      if (memberPath === undefined) {
+      const member = idref === undefined ? undefined : members.get(idref);
+      if (member === undefined || member.mediaType !== "application/xhtml+xml") {
         return sourceError("EPUB_SPINE_INVALID", `spine reference is not in manifest: ${String(idref)}`);
       }
-      const xhtml = parseOrderedXml(
-        await readArchiveMember(archive, memberPath, "EPUB_SPINE_INVALID"),
-        "EPUB_SPINE_INVALID",
-        memberPath,
-      );
+      spinePaths.push(member.path);
+    }
+    const seenPaths = new Set(spinePaths);
+    const additionalXhtmlPaths = [...members.values()]
+      .filter((member) =>
+        member.mediaType === "application/xhtml+xml"
+        && !member.properties.split(/\s+/u).includes("nav")
+        && !seenPaths.has(member.path))
+      .map((member) => member.path);
+    const documentPaths = [...spinePaths, ...additionalXhtmlPaths];
+    const parts: ExtractedPart[] = [];
+    for (const memberPath of documentPaths) {
+      const xhtmlPayload = await readArchiveMember(archive, memberPath, "EPUB_SPINE_INVALID");
+      const xhtml = decodeXml(xhtmlPayload, "EPUB_SPINE_INVALID", memberPath);
+      // Keep the XML parser as the authority for well-formedness and entity
+      // policy; the structural analyzer then records deterministic text slots.
+      parseOrderedXml(xhtmlPayload, "EPUB_SPINE_INVALID", memberPath);
       parts.push({
-        text: xhtmlText(xhtml),
-        originKind: "epub_spine_member",
+        text: analyzeEpubXhtml(xhtml, parts.length).canonicalText,
+        originKind: seenPaths.has(memberPath)
+          ? "epub_spine_member"
+          : "epub_xhtml_member",
         originRef: memberPath,
-        transformation: "xhtml-text+spine-separator",
+        transformation: "xhtml-structural-slots+spine-separator",
       });
     }
     if (parts.length === 0) {
@@ -688,7 +663,7 @@ async function extractEpub(raw: Buffer): Promise<ExtractedSource> {
     return {
       ...scalarSegments(parts),
       encoding: "zip-container",
-      extractor: "epub-spine-v1",
+      extractor: "epub-spine-v2",
       excludedRawRanges: [{ rawStart: 0, rawEnd: raw.length, policy: "EPUB_NON_SPINE_DATA" }],
     };
   } finally {
@@ -791,7 +766,9 @@ export class SourceImporter {
       request.explicitEncoding,
       requestedLanguage === "auto" ? undefined : requestedLanguage,
     );
-    const detectedLanguage = detectLanguage(extracted.sourceText);
+    const detectedLanguage = detectLanguage(
+      stripEpubStructuralMarkers(extracted.sourceText),
+    );
     const language = sourceLanguage(request.sourceLanguage, detectedLanguage);
     const parent = dirname(projectDirectory);
     await mkdir(parent, { recursive: true });

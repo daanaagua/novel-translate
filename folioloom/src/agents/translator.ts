@@ -242,6 +242,7 @@ export class Translator {
         `The source language is ${sourceLanguageProfile.displayName} (${sourceLanguageProfile.id}); the target language is ${targetLanguageLabel()}.`,
         SIMPLIFIED_CHINESE_SCRIPT_REQUIREMENT,
         "Preserve meaning, ambiguity, paragraph structure, voice, and all block boundaries.",
+        "When source text contains paired ⟦E…⟧ and ⟦/E…⟧ EPUB structural-slot markers, copy every marker byte-for-byte in the same order, translate only text inside each pair, and emit no prose outside those pairs in that paragraph.",
         ...PARAGRAPH_INTEGRITY_INSTRUCTIONS,
         "For supplied terms, locked=true must be reproduced exactly; policy=preferred is a default rendering, not a literal-in-every-context constraint.",
         "Use translator-global facts only to disambiguate wording; do not add facts unavailable to the narrator.",

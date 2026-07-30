@@ -346,13 +346,13 @@ test("verifier rejects lineage from a different run", () => {
   }
 });
 
-test("verifier checks the EPUB embedded lineage projection", () => {
+test("verifier checks the EPUB embedded lineage projection", async () => {
   const item = fixture();
   try {
     addRun(item.store, item.context, "run-a", item.context.losslessBlocks.length);
     const paths = writeLosslessBookArtifacts(item.store, "run-a", item.output);
     const epub = join(item.output, "book.epub");
-    writeLosslessBookEpub(item.store, "run-a", epub, {
+    await writeLosslessBookEpub(item.store, "run-a", epub, {
       title: "Verified export",
       language: "zh-CN",
     });
@@ -374,13 +374,13 @@ test("verifier checks the EPUB embedded lineage projection", () => {
   }
 });
 
-test("verifier rejects malformed EPUB mimetype, package, and navigation", () => {
+test("verifier rejects malformed EPUB mimetype, package, and navigation", async () => {
   const item = fixture();
   try {
     addRun(item.store, item.context, "run-a", item.context.losslessBlocks.length);
     const paths = writeLosslessBookArtifacts(item.store, "run-a", item.output);
     const epub = join(item.output, "book.epub");
-    writeLosslessBookEpub(item.store, "run-a", epub, {
+    await writeLosslessBookEpub(item.store, "run-a", epub, {
       title: "Verified export",
       language: "zh-CN",
     });
@@ -415,6 +415,17 @@ test("verifier rejects malformed EPUB mimetype, package, and navigation", () => 
     assert.ok(
       verifyExport({ ...paths, epub }, item.store, "run-a").incidentCodes
         .includes("EPUB_NAVIGATION_INVALID"),
+    );
+
+    writeStoredZip(epub, original.map((entry) => ({
+      name: entry.name,
+      data: /^EPUB\/section-\d+\.xhtml$/u.test(entry.name)
+        ? entry.data.toString("utf8").replace('href="styles.css"', 'href="missing.css"')
+        : entry.data,
+    })));
+    assert.ok(
+      verifyExport({ ...paths, epub }, item.store, "run-a").incidentCodes
+        .includes("EPUB_LINK_INVALID"),
     );
   } finally {
     item.store.close();

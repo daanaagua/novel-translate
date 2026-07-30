@@ -456,6 +456,34 @@ test("source layout tokens cannot migrate into a neighboring translated block", 
     failure.code === "source_layout_token_leak" && failure.blockId === first.id));
 });
 
+test("EPUB structural slots must survive translation exactly and in order", () => {
+  const source = chapterBlock(
+    0,
+    "⟦E0.0.0⟧Read ⟦/E0.0.0⟧⟦E0.0.1⟧this note⟦/E0.0.1⟧⟦E0.0.2⟧.⟦/E0.0.2⟧",
+  );
+  const missing = new TranslationValidator().validate([source], {
+    translations: [{
+      blockId: source.id,
+      text: "⟦E0.0.0⟧阅读 ⟦/E0.0.0⟧这条注释⟦/E0.0.1⟧⟦E0.0.2⟧。⟦/E0.0.2⟧",
+    }],
+    notes: [],
+    repaired: false,
+  });
+  assert.ok(missing.failures.some((failure) =>
+    failure.code === "epub_structural_slot_mismatch"));
+
+  const valid = new TranslationValidator().validate([source], {
+    translations: [{
+      blockId: source.id,
+      text: "⟦E0.0.0⟧阅读 ⟦/E0.0.0⟧⟦E0.0.1⟧这条注释⟦/E0.0.1⟧⟦E0.0.2⟧。⟦/E0.0.2⟧",
+    }],
+    notes: [],
+    repaired: false,
+  });
+  assert.ok(!valid.failures.some((failure) =>
+    failure.code === "epub_structural_slot_mismatch"));
+});
+
 test("short formulas and symbolic identifiers may remain unchanged", () => {
   const source = chapterBlock(0, "F=ma");
   const validation = new TranslationValidator().validate([source], {

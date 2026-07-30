@@ -11,6 +11,10 @@ import {
   sourceTextForTranslation,
 } from "../source/layout-separators.js";
 import {
+  epubStructuralTranslationError,
+  stripEpubStructuralMarkers,
+} from "../source/epub-structure.js";
+import {
   alignmentFingerprint,
   hanGraphemeLength,
   hasSemanticText,
@@ -34,7 +38,8 @@ export interface TranslationValidationPolicy {
 }
 
 function semanticParagraphs(text: string, sourceLayout: boolean): string[] {
-  return (sourceLayout ? normalizeSourceSceneSeparators(text) : text)
+  const withoutEpubMarkers = stripEpubStructuralMarkers(text);
+  return (sourceLayout ? normalizeSourceSceneSeparators(withoutEpubMarkers) : withoutEpubMarkers)
     .split(/(?:\r?\n)[\t ]*(?:\r?\n)+/u)
     .filter(hasSemanticText);
 }
@@ -334,15 +339,16 @@ export class TranslationValidator {
           repairable: true,
         });
       }
-      const untranslated = profile.detectSourceResidue(translation.text, {
+      const semanticTargetText = stripEpubStructuralMarkers(translation.text);
+      const untranslated = profile.detectSourceResidue(semanticTargetText, {
         preservedSourceForms: [
           ...(policy.allowedLatinTokens ?? []),
           ...(source === undefined ? [] : isolatedSourceIdentifiers(source.sourceText)),
           ...(source === undefined
             ? []
             : scientificBinomialSourceForms(
-                source.sourceText,
-                translation.text,
+                stripEpubStructuralMarkers(source.sourceText),
+                semanticTargetText,
               )),
         ],
       });
@@ -359,6 +365,18 @@ export class TranslationValidator {
       if (source === undefined) {
         continue;
       }
+      const epubSlotError = epubStructuralTranslationError(
+        source.sourceText,
+        translation.text,
+      );
+      if (epubSlotError !== undefined) {
+        failures.push({
+          code: "epub_structural_slot_mismatch",
+          blockId: translation.blockId,
+          message: epubSlotError,
+          repairable: true,
+        });
+      }
       const sourceClosingExcess = sourceClosingExcessByBlock.get(source.id) ?? 0;
       const targetClosingExcess = doubleQuoteClosingBoundaryExcess([translation.text]);
       if (targetClosingExcess > sourceClosingExcess) {
@@ -370,7 +388,7 @@ export class TranslationValidator {
         });
       }
       for (const term of policy.requiredTerms ?? []) {
-        if (source.sourceText.toLocaleLowerCase().includes(
+        if (stripEpubStructuralMarkers(source.sourceText).toLocaleLowerCase().includes(
           term.sourceForm.toLocaleLowerCase(),
         ) && !translation.text.includes(term.target)) {
           failures.push({
@@ -455,9 +473,11 @@ export class TranslationValidator {
           repairable: true,
         });
       }
-      const semanticSourceText = sourceTextForTranslation(source.sourceText);
+      const semanticSourceText = stripEpubStructuralMarkers(
+        sourceTextForTranslation(source.sourceText),
+      );
       const blockSourceLength = meaningfulLength(semanticSourceText);
-      const blockTargetLength = meaningfulLength(translation.text);
+      const blockTargetLength = meaningfulLength(semanticTargetText);
       const ratioBounds = ratioBoundsForLength(profile, blockSourceLength);
       if (ratioBounds !== undefined) {
         const ratio = blockTargetLength / blockSourceLength;
@@ -477,7 +497,7 @@ export class TranslationValidator {
           });
         }
         const sourceLetterLength = letterGraphemeLength(semanticSourceText);
-        const targetLetterLength = letterGraphemeLength(translation.text);
+        const targetLetterLength = letterGraphemeLength(semanticTargetText);
         if (sourceLetterLength >= 1
           && targetLetterLength / sourceLetterLength < ratioBounds.min * 0.5) {
           failures.push({
@@ -487,12 +507,13 @@ export class TranslationValidator {
             repairable: true,
           });
         }
-        const isolatedIdentifiers = isolatedSourceIdentifiers(source.sourceText);
-        const sourceIsIdentifierOnly = isolatedIdentifiers.includes(source.sourceText.trim());
+        const semanticOriginalSource = stripEpubStructuralMarkers(source.sourceText);
+        const isolatedIdentifiers = isolatedSourceIdentifiers(semanticOriginalSource);
+        const sourceIsIdentifierOnly = isolatedIdentifiers.includes(semanticOriginalSource.trim());
         if (sourceLetterLength >= 8
           && !sourceIsIdentifierOnly
           && targetLetterLength > 0
-          && hanGraphemeLength(translation.text) / targetLetterLength < 0.5) {
+          && hanGraphemeLength(semanticTargetText) / targetLetterLength < 0.5) {
           failures.push({
             code: "target_script_mismatch",
             blockId: translation.blockId,
