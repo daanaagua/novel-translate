@@ -1,19 +1,27 @@
 import { createHash, randomUUID } from "node:crypto";
 import {
+  closeSync,
   copyFileSync,
+  existsSync,
+  fsyncSync,
   mkdirSync,
   mkdtempSync,
+  openSync,
+  renameSync,
   rmSync,
   statSync,
+  writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { DatabaseSync, type StatementSync } from "node:sqlite";
+import { gzipSync } from "node:zlib";
 
 import type { CommitPromotion } from "../fullbook/commit-coordinator.js";
 import type { AdaptiveSchedulerSnapshot } from "../fullbook/adaptive-scheduler.js";
 import type { SchedulerRunReport } from "../fullbook/dynamic-scheduler.js";
 import {
+  schedulerCountersPatch,
   TokenLedger,
   type LedgerEvent,
   type TokenLedgerInit,
@@ -198,6 +206,18 @@ export interface TranslationRunMeta {
   initialSnapshotId: string;
   initialSnapshot?: KnowledgeSnapshot;
   metadata?: unknown;
+}
+
+export interface ProviderResponseEvidenceInput {
+  readonly runId: string;
+  readonly requestId: string;
+  readonly snapshotId: string;
+  readonly phase: "research" | "translation" | "repair" | "recovery";
+  readonly modelCallOrdinal: number;
+  readonly requestHash: string;
+  readonly responseProtocol: "typed_tool" | "framed_text";
+  readonly executionUnitId?: string;
+  readonly assistantMessage: unknown;
 }
 
 export interface LosslessBookStatusSummary {
@@ -1391,6 +1411,7 @@ function windowFromRow(row: WindowRow, blockIds: string[]): PersistedLosslessWin
 
 export class LosslessBookStore {
   readonly #database: DatabaseSync;
+  readonly #databasePath: string;
   readonly #faultInjector: FaultInjector | undefined;
   readonly #temporarySnapshotDirectory: string | undefined;
   readonly #schemaVersion: number;
@@ -1402,6 +1423,7 @@ export class LosslessBookStore {
     temporarySnapshotDirectory?: string,
   ) {
     const absolute = resolve(requireNonempty(path, "database path"));
+    this.#databasePath = absolute;
     this.#faultInjector = faultInjector;
     this.#temporarySnapshotDirectory = temporarySnapshotDirectory;
     if (mode === "read-write") {
@@ -2844,7 +2866,7 @@ export class LosslessBookStore {
     if (this.#schemaVersion !== LOSSLESS_BOOK_SCHEMA_VERSION) {
       throw new Error("schema v4 write upgrade required");
     }
-    this.#run(runId);
+    const run = this.#run(runId);
     requireNonempty(toSnapshotId, "toSnapshotId");
     const snapshot = one<{ present: number }>(this.#database.prepare(`
       SELECT 1 AS present FROM knowledge_snapshots
@@ -2859,32 +2881,108 @@ export class LosslessBookStore {
         WHERE run_id=? AND active=1
         ORDER BY concept_id
       `), runId).map(lexicalConceptFromRow);
-      const occurrences = all<{
-        concept_id: string;
-        block_id: string;
-        occurrence_count: number;
-        source_spans_json: string;
-      }>(this.#database.prepare(`
-        SELECT concept_id, block_id, occurrence_count, source_spans_json
-        FROM concept_occurrences
-        WHERE run_id=?
-        ORDER BY concept_id, block_id
-      `), runId).map((row): ConceptOccurrence => {
-        const sourceSpans = JSON.parse(
-          row.source_spans_json,
-        ) as ConceptOccurrence["sourceSpans"];
-        if (!Array.isArray(sourceSpans)
-          || sourceSpans.length !== row.occurrence_count) {
-          throw new Error(
-            `corrupt concept occurrences for ${row.concept_id}/${row.block_id}`,
-          );
+      const sourcePayload = JSON.parse(
+        this.#source(run.source_version).source_payload_json,
+      ) as { sourceLanguage?: unknown };
+      const profile = getSourceLanguageProfile(
+        typeof sourcePayload.sourceLanguage === "string"
+          ? sourcePayload.sourceLanguage
+          : undefined,
+      );
+      const blocks = all<{ block_id: string; source_text: string }>(
+        this.#database.prepare(`
+          SELECT block_id, source_text FROM logical_blocks
+          WHERE source_version=? ORDER BY global_index
+        `),
+        run.source_version,
+      ).map((block) => ({
+        blockId: block.block_id,
+        sourceText: block.source_text,
+      }));
+      const occurrences = buildConceptOccurrenceIndex(
+        blocks,
+        concepts,
+        profile,
+      );
+      this.#database.prepare(`
+        DELETE FROM concept_occurrences WHERE run_id=?
+      `).run(runId);
+      const insertOccurrence = this.#database.prepare(`
+        INSERT INTO concept_occurrences(
+          run_id, concept_id, source_version, block_id,
+          occurrence_count, source_spans_json
+        ) VALUES(?, ?, ?, ?, ?, ?)
+      `);
+      for (const occurrence of occurrences) {
+        insertOccurrence.run(
+          runId,
+          occurrence.conceptId,
+          run.source_version,
+          occurrence.blockId,
+          occurrence.sourceSpans.length,
+          jsonText(occurrence.sourceSpans, "concept occurrence spans"),
+        );
+      }
+      const occurrenceKeys = new Set(occurrences.map((occurrence) =>
+        `${occurrence.conceptId}\0${occurrence.blockId}`));
+      const openTasks = all<KnowledgeRevalidationTaskRow>(
+        this.#database.prepare(`
+          SELECT * FROM knowledge_revalidation_tasks
+          WHERE run_id=? AND status IN ('pending','validating')
+          ORDER BY created_at, task_id
+        `),
+        runId,
+      ).map(revalidationTaskFromRow);
+      for (const task of openTasks) {
+        if (task.conceptIds.every((conceptId) =>
+          occurrenceKeys.has(`${conceptId}\0${task.blockId}`))) {
+          continue;
         }
-        return {
-          conceptId: row.concept_id,
-          blockId: row.block_id,
-          sourceSpans,
-        };
-      });
+        for (const conceptId of task.conceptIds) {
+          this.#database.prepare(`
+            DELETE FROM translation_concept_bindings
+            WHERE translation_id=? AND concept_id=?
+              AND term_usages_json='[]'
+              AND validation_status IN ('stale','validating')
+          `).run(task.translationId, conceptId);
+        }
+        const retired = this.#database.prepare(`
+          UPDATE knowledge_revalidation_tasks
+          SET status='resolved_noop', result_json=?, resolved_at=datetime('now')
+          WHERE run_id=? AND task_id=? AND status IN ('pending','validating')
+        `).run(
+          jsonText(
+            { reason: "source_occurrence_obsolete" },
+            "revalidation result",
+          ),
+          runId,
+          task.taskId,
+        );
+        if (Number(retired.changes) === 1) {
+          this.#appendEvent(runId, "sparse_revalidation_resolved_noop", {
+            runId,
+            taskId: task.taskId,
+            reason: "source_occurrence_obsolete",
+          });
+        }
+      }
+      this.#database.prepare(`
+        DELETE FROM translation_concept_bindings
+        WHERE translation_id IN (
+          SELECT translation_id FROM translations
+          WHERE run_id=? AND active=1
+        )
+        AND NOT EXISTS (
+          SELECT 1
+          FROM translations AS translation
+          JOIN concept_occurrences AS occurrence
+            ON occurrence.run_id=translation.run_id
+           AND occurrence.block_id=translation.block_id
+           AND occurrence.concept_id=translation_concept_bindings.concept_id
+          WHERE translation.translation_id=
+            translation_concept_bindings.translation_id
+        )
+      `).run(runId);
       return this.#createSparseRevalidationTasks(
         runId,
         concepts,
@@ -3364,6 +3462,30 @@ export class LosslessBookStore {
         input.termUsages,
         input.concepts,
       );
+      const insertCoverageBinding = this.#database.prepare(`
+        INSERT OR IGNORE INTO translation_concept_bindings(
+          translation_id, concept_id, applied_revision_id,
+          applied_render_fingerprint, term_usages_json, validation_status,
+          validated_revision_id
+        ) VALUES(?, ?, ?, ?, '[]', 'clean', ?)
+      `);
+      for (const conceptId of [...new Set(
+        expected.map((occurrence) => occurrence.conceptId),
+      )].sort(compareText)) {
+        const concept = currentById.get(conceptId);
+        if (concept === undefined) {
+          throw new Error(
+            `replacement occurrence references unknown concept ${conceptId}`,
+          );
+        }
+        insertCoverageBinding.run(
+          replacementTranslationId,
+          concept.conceptId,
+          concept.revisionId,
+          concept.renderFingerprint,
+          concept.revisionId,
+        );
+      }
       const deactivated = this.#database.prepare(`
         UPDATE translations SET active=0
         WHERE translation_id=? AND run_id=? AND active=1
@@ -3453,6 +3575,44 @@ export class LosslessBookStore {
       this.#appendEvent(runId, "sparse_revalidation_warning", {
         runId,
         taskId,
+      });
+    });
+  }
+
+  deferRevalidationTask(
+    runId: string,
+    taskId: string,
+    result: unknown,
+  ): void {
+    requireNonempty(runId, "runId");
+    requireNonempty(taskId, "taskId");
+    const resultJson = jsonText(result, "revalidation defer result");
+    this.#transaction(() => {
+      const task = this.#revalidationTask(runId, taskId);
+      if (task.status !== "validating" || task.attempts < 1) {
+        throw new Error(`revalidation task is not deferrable: ${taskId}`);
+      }
+      for (const conceptId of task.conceptIds) {
+        this.#database.prepare(`
+          UPDATE translation_concept_bindings
+          SET validation_status='stale', updated_at=datetime('now')
+          WHERE translation_id=? AND concept_id=?
+            AND validation_status='validating'
+        `).run(task.translationId, conceptId);
+      }
+      const deferred = this.#database.prepare(`
+        UPDATE knowledge_revalidation_tasks
+        SET status='pending', attempts=attempts-1, result_json=?,
+            resolved_at=NULL
+        WHERE run_id=? AND task_id=? AND status='validating' AND attempts>0
+      `).run(resultJson, runId, taskId);
+      if (Number(deferred.changes) !== 1) {
+        throw new Error(`failed to defer revalidation task ${taskId}`);
+      }
+      this.#appendEvent(runId, "sparse_revalidation_deferred", {
+        runId,
+        taskId,
+        result,
       });
     });
   }
@@ -5515,6 +5675,7 @@ export class LosslessBookStore {
       WHERE run_id=? AND kind IN (
         'token_ledger_baseline_added',
         'token_ledger_reserved',
+        'token_ledger_dispatched',
         'token_ledger_settled',
         'token_ledger_released',
         'token_ledger_counters_patched'
@@ -5549,6 +5710,7 @@ export class LosslessBookStore {
       WHERE run_id=? AND kind='scheduler_run_projection'
       ORDER BY sequence DESC LIMIT 1
     `), runId);
+    let projectedReport: SchedulerRunReport | undefined;
     if (projection !== undefined) {
       const payload = JSON.parse(projection.payload_json) as { report?: unknown };
       if (
@@ -5559,19 +5721,143 @@ export class LosslessBookStore {
         throw new Error(`corrupt scheduler run projection for ${runId}`);
       }
       validateSchedulerRunReport(payload.report);
-      return structuredClone(payload.report) as SchedulerRunReport;
+      projectedReport = structuredClone(payload.report) as SchedulerRunReport;
     }
 
     const events = this.loadTokenLedgerEvents(runId);
     if (events.length === 0) {
-      return undefined;
+      return projectedReport;
     }
-    if (init === undefined) {
+    if (init !== undefined) {
+      const ledger = TokenLedger.fromEvents(init, events);
+      if (projectedReport !== undefined) {
+        ledger.apply({
+          type: "counters_patched",
+          patch: schedulerCountersPatch(projectedReport),
+        });
+      }
+      return ledger.toSchedulerRunReport();
+    }
+    if (projectedReport !== undefined) {
+      return projectedReport;
+    }
+    throw new TypeError(
+      "loadSchedulerMetrics requires TokenLedgerInit when rebuilding from ledger events",
+    );
+  }
+
+  appendProviderResponseEvidence(
+    input: ProviderResponseEvidenceInput,
+  ): void {
+    const runId = requireNonempty(input.runId, "provider evidence runId");
+    this.#run(runId);
+    const requestId = requireNonempty(
+      input.requestId,
+      "provider evidence requestId",
+    );
+    const snapshotId = requireNonempty(
+      input.snapshotId,
+      "provider evidence snapshotId",
+    );
+    if (!Number.isSafeInteger(input.modelCallOrdinal)
+      || input.modelCallOrdinal < 1) {
       throw new TypeError(
-        "loadSchedulerMetrics requires TokenLedgerInit when rebuilding from ledger events",
+        "provider evidence modelCallOrdinal must be a positive safe integer",
       );
     }
-    return TokenLedger.fromEvents(init, events).toSchedulerRunReport();
+    if (!/^[0-9a-f]{64}$/u.test(input.requestHash)) {
+      throw new TypeError("provider evidence requestHash must be sha256 hex");
+    }
+    const assistantJson = JSON.stringify(input.assistantMessage);
+    if (assistantJson === undefined) {
+      throw new TypeError("provider evidence assistantMessage must be JSON-serializable");
+    }
+    const responseHash = hashText(assistantJson);
+    const runDirectory = `run-${hashText(runId).slice(0, 24)}`;
+    const evidenceDirectory = join(
+      dirname(this.#databasePath),
+      "evidence",
+      runDirectory,
+    );
+    mkdirSync(evidenceDirectory, { recursive: true });
+    const filename = `${responseHash}.json.gz`;
+    const absoluteLocator = join(evidenceDirectory, filename);
+    if (!existsSync(absoluteLocator)) {
+      const temporary = join(
+        evidenceDirectory,
+        `.${filename}.${randomUUID()}.tmp`,
+      );
+      const envelope = JSON.stringify({
+        schema: "folioloom-provider-response-evidence-1",
+        responseHash,
+        assistantMessage: JSON.parse(assistantJson) as unknown,
+      });
+      const descriptor = openSync(temporary, "wx");
+      try {
+        writeFileSync(descriptor, gzipSync(envelope));
+        fsyncSync(descriptor);
+      } finally {
+        closeSync(descriptor);
+      }
+      try {
+        renameSync(temporary, absoluteLocator);
+      } catch (error) {
+        rmSync(temporary, { force: true });
+        if (!existsSync(absoluteLocator)) {
+          throw error;
+        }
+      }
+    }
+    const assistant = input.assistantMessage !== null
+        && typeof input.assistantMessage === "object"
+      ? input.assistantMessage as Record<string, unknown>
+      : {};
+    const locator = [
+      "evidence",
+      runDirectory,
+      filename,
+    ].join("/");
+    const metadata = {
+      schema: "folioloom-provider-response-evidence-ref-1",
+      requestId,
+      snapshotId,
+      phase: input.phase,
+      modelCallOrdinal: input.modelCallOrdinal,
+      requestHash: input.requestHash,
+      responseHash,
+      responseProtocol: input.responseProtocol,
+      locator,
+      compressedBytes: statSync(absoluteLocator).size,
+      ...(input.executionUnitId === undefined
+        ? {}
+        : {
+          executionUnitId: requireNonempty(
+            input.executionUnitId,
+            "provider evidence executionUnitId",
+          ),
+        }),
+      ...(typeof assistant.id === "string"
+        ? { providerResponseId: assistant.id }
+        : {}),
+      ...(typeof assistant.provider === "string"
+        ? { provider: assistant.provider }
+        : {}),
+      ...(typeof assistant.model === "string"
+        ? { model: assistant.model }
+        : {}),
+      ...(typeof assistant.api === "string"
+        ? { api: assistant.api }
+        : {}),
+      ...(typeof assistant.stopReason === "string"
+        ? { stopReason: assistant.stopReason }
+        : {}),
+      ...(assistant.usage !== undefined
+        ? { usage: assistant.usage }
+        : {}),
+    };
+    this.#transaction(() => {
+      this.#appendEvent(runId, "provider_response_evidence", metadata);
+    });
   }
 
   #initializeSchema(): void {
@@ -6506,11 +6792,17 @@ export class LosslessBookStore {
       translation_id: number;
       block_id: string;
       text: string;
+      source_text: string;
     }>(this.#database.prepare(`
-      SELECT translation_id, block_id, text
-      FROM translations
-      WHERE run_id=? AND window_id=? AND stage_state='staged' AND active=0
-      ORDER BY translation_id
+      SELECT translation.translation_id, translation.block_id,
+             translation.text, block.source_text
+      FROM translations AS translation
+      JOIN logical_blocks AS block
+        ON block.source_version=translation.source_version
+       AND block.block_id=translation.block_id
+      WHERE translation.run_id=? AND translation.window_id=?
+        AND translation.stage_state='staged' AND translation.active=0
+      ORDER BY translation.translation_id
     `), runId, windowId);
     const translationByBlock = new Map(translations.map((translation) => [
       translation.block_id,
@@ -6526,6 +6818,38 @@ export class LosslessBookStore {
       concept: TermConceptProjection;
       usages: TermUsageSubmission[];
     }>();
+    const run = this.#run(runId);
+    const sourcePayload = JSON.parse(
+      this.#source(run.source_version).source_payload_json,
+    ) as { sourceLanguage?: unknown };
+    const profile = getSourceLanguageProfile(
+      typeof sourcePayload.sourceLanguage === "string"
+        ? sourcePayload.sourceLanguage
+        : undefined,
+    );
+    const expected = expectedTermOccurrences(
+      translations.map((translation) => ({
+        id: translation.block_id,
+        sourceText: translation.source_text,
+      })),
+      concepts,
+      profile,
+    );
+    const failures = validateTermUsages(
+      expected,
+      usages,
+      new Map(translations.map((translation) => [
+        translation.block_id,
+        translation.text,
+      ])),
+    );
+    if (failures.length > 0) {
+      throw new Error(
+        `staged term usage validation failed: ${failures
+          .map((failure) => failure.code)
+          .join(",")}`,
+      );
+    }
     for (const usage of usages) {
       const occurrenceId = requireNonempty(
         usage.occurrenceId,
@@ -6585,6 +6909,22 @@ export class LosslessBookStore {
       };
       item.usages.push({ ...usage, targetSurface });
       grouped.set(key, item);
+    }
+    for (const occurrence of expected) {
+      const key = `${occurrence.blockId}\0${occurrence.conceptId}`;
+      if (grouped.has(key)) continue;
+      const translation = translationByBlock.get(occurrence.blockId);
+      const concept = conceptById.get(occurrence.conceptId);
+      if (translation === undefined || concept === undefined) {
+        throw new Error(
+          `term occurrence references unknown staged coverage ${occurrence.occurrenceId}`,
+        );
+      }
+      grouped.set(key, {
+        translationId: translation.translation_id,
+        concept,
+        usages: [],
+      });
     }
     if (translations.length > 0) {
       this.#database.prepare(`
@@ -8255,6 +8595,7 @@ export class LosslessBookStore {
 const LEDGER_EVENT_KINDS = {
   baseline_added: "token_ledger_baseline_added",
   reserved: "token_ledger_reserved",
+  dispatched: "token_ledger_dispatched",
   settled: "token_ledger_settled",
   released: "token_ledger_released",
   counters_patched: "token_ledger_counters_patched",
@@ -8289,6 +8630,11 @@ function validateLedgerEvent(event: LedgerEvent): void {
       }
       if (!Number.isSafeInteger(event.predictedTokens) || event.predictedTokens < 0) {
         throw new TypeError("reserved.predictedTokens invalid");
+      }
+      return;
+    case "dispatched":
+      if (typeof event.requestId !== "string" || event.requestId.trim() === "") {
+        throw new TypeError("dispatched.requestId invalid");
       }
       return;
     case "settled":

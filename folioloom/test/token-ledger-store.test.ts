@@ -268,6 +268,52 @@ test("loadSchedulerMetrics rebuilds from ledger when projection missing", () => 
   }
 });
 
+test("loadSchedulerMetrics with ledger init reconciles a stale projection from durable events", () => {
+  const { store, runId } = openRunStore();
+  try {
+    store.appendTokenLedgerEvent(runId, {
+      type: "baseline_added",
+      taskIds: ["task-reconcile"],
+      baselineTokens: 1_000,
+      source: "translate_horizon",
+      reason: "wave",
+    });
+    const before = store.loadTokenLedger(runId, LEDGER_INIT);
+    before.apply({
+      type: "counters_patched",
+      patch: {
+        decisions: 4,
+        predictedTokens: 500,
+      },
+    });
+    store.saveSchedulerRunProjection(runId, before.toSchedulerRunReport());
+
+    store.appendTokenLedgerEvent(runId, {
+      type: "reserved",
+      requestId: "req-after-projection",
+      purpose: "translate",
+      taskIds: ["task-reconcile"],
+      predictedTokens: 200,
+      attempt: 0,
+    });
+    store.appendTokenLedgerEvent(runId, {
+      type: "settled",
+      requestId: "req-after-projection",
+      actualTokens: 275,
+      usageComplete: true,
+      outcome: "success",
+    });
+
+    const reconciled = store.loadSchedulerMetrics(runId, LEDGER_INIT);
+    assert.ok(reconciled);
+    assert.equal(reconciled.actualTokens, 275);
+    assert.equal(reconciled.decisions, 4);
+    assert.equal(reconciled.predictedTokens, 500);
+  } finally {
+    store.close();
+  }
+});
+
 test("export loads scheduler metrics from store without options.scheduler", () => {
   const { store, runId, snapshotId } = openRunStore();
   try {

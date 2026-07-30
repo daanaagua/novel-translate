@@ -4,14 +4,12 @@ import type { Model } from "@earendil-works/pi-ai";
 import type { V4Block } from "../domain/types.js";
 import type { BudgetLedger } from "../kernel/budget.js";
 import {
-  conceptsFromStableTerms,
-  expectedTermOccurrences,
+  completeTermUsagesFromTarget,
   inferTermUsages,
   validateTermUsages,
   type ExpectedTermOccurrence,
   type TermUsageSubmission,
 } from "../knowledge/term-usage.js";
-import { getSourceLanguageProfile } from "../language/profiles.js";
 import type { LosslessBlock } from "../source/types.js";
 import { normalizeTranslatedSceneSeparators } from "../source/layout-separators.js";
 import { hasSemanticText } from "../text/semantic-text.js";
@@ -21,14 +19,20 @@ import {
 } from "../style/chinese-quote-normalization.js";
 import { simplifyChineseTranslation } from "../style/chinese-script-normalization.js";
 import type { StyleObservationSubmission } from "../style/types.js";
-import type {
-  TranslationCandidate,
-  TranslationMemoryCandidate,
+import {
+  sanitizeTranslationMemoryCandidates,
+  type TranslationCandidate,
+  type TranslationMemoryCandidate,
 } from "../tools/candidate-collector.js";
 import type { ValidationFailure } from "../tools/repair-tools.js";
-import { PiRuntime, type PiRunResult } from "./pi-runtime.js";
+import {
+  PiRuntime,
+  type PiAssistantResponseObservation,
+  type PiRunResult,
+} from "./pi-runtime.js";
 import { Repairer } from "./repairer.js";
 import {
+  expectedTermOccurrencesForTranslationInput,
   prepareTranslationRequest,
   type FinalizeTranslationBatchArgs,
   type TranslationBatchSnapshot,
@@ -55,6 +59,22 @@ export interface TranslationBatchInput extends TranslationRequestInput {
   budget: BudgetLedger;
   signal?: AbortSignal;
   deadlineMs?: number;
+  additionalValidationFailures?: (
+    window: TranslationBatchWindowResult,
+  ) => readonly ValidationFailure[];
+  /** A window recovery epoch owns one shared credit; false forbids a model repair. */
+  repairEnabled?: boolean;
+  onProviderResponse?: (
+    evidence: TranslationProviderResponseEvidence,
+  ) => void | Promise<void>;
+}
+
+export interface TranslationProviderResponseEvidence
+  extends PiAssistantResponseObservation {
+  readonly requestId: string;
+  readonly snapshotId: string;
+  readonly responseProtocol: "typed_tool" | "framed_text";
+  readonly executionUnitId?: string;
 }
 
 export interface TranslationBatchWindowResult {
@@ -62,6 +82,7 @@ export interface TranslationBatchWindowResult {
   ordinal: number;
   status: "completed" | "completed_with_warnings" | "failed";
   translations: Array<{ blockId: string; text: string }>;
+  paragraphs?: Array<{ paragraphId: string; text: string }>;
   termUsages: TermUsageSubmission[];
   notes: string[];
   memoryCandidates: TranslationMemoryCandidate[];
@@ -88,10 +109,7 @@ function nonempty(value: string, label: string): string {
 function copyMemories(
   values: readonly TranslationMemoryCandidate[] | undefined,
 ): TranslationMemoryCandidate[] {
-  return (values ?? []).map((candidate) => ({
-    ...candidate,
-    subjectForms: [...candidate.subjectForms],
-  }));
+  return sanitizeTranslationMemoryCandidates(values).candidates;
 }
 
 function copyTermUsages(
@@ -100,85 +118,12 @@ function copyTermUsages(
   return (values ?? []).map((usage) => ({ ...usage }));
 }
 
-const CANONICAL_BLOCK_ID = /^block-[0-9a-f]{20}$/u;
-
-interface BlockIdCorrection {
-  blockId: string;
-  hexOffset: number;
-  submittedCharacter: string;
-  canonicalCharacter: string;
-}
-
-function singleCharacterDifferenceIndex(left: string, right: string): number | undefined {
-  if (left.length !== right.length) {
-    return undefined;
-  }
-  let differenceIndex: number | undefined;
-  for (let index = 0; index < left.length; index += 1) {
-    if (left[index] !== right[index]) {
-      if (differenceIndex !== undefined) {
-        return undefined;
-      }
-      differenceIndex = index;
-    }
-  }
-  return differenceIndex;
-}
-
-/**
- * Model output occasionally copies one hexadecimal character of an opaque
- * lossless block ID incorrectly.  This is deliberately a very narrow repair:
- * the submitted value itself must not name any real block, and exactly one
- * real ID in the whole input may be one character away. That target must be
- * canonical and expected by the current logical window.
- */
-function correctUnknownCanonicalBlockId(
-  submittedId: string,
-  expectedIds: ReadonlySet<string>,
-  realBlockIds: ReadonlySet<string>,
-): BlockIdCorrection | undefined {
-  if (!CANONICAL_BLOCK_ID.test(submittedId) || realBlockIds.has(submittedId)) {
-    return undefined;
-  }
-  let candidate: { blockId: string; differenceIndex: number } | undefined;
-  for (const realBlockId of realBlockIds) {
-    const differenceIndex = singleCharacterDifferenceIndex(submittedId, realBlockId);
-    if (differenceIndex === undefined) {
-      continue;
-    }
-    if (candidate !== undefined) {
-      return undefined;
-    }
-    candidate = { blockId: realBlockId, differenceIndex };
-  }
-  if (
-    candidate === undefined
-    || !CANONICAL_BLOCK_ID.test(candidate.blockId)
-    || !expectedIds.has(candidate.blockId)
-  ) {
-    return undefined;
-  }
-  return {
-    blockId: candidate.blockId,
-    hexOffset: candidate.differenceIndex - "block-".length + 1,
-    submittedCharacter: submittedId.charAt(candidate.differenceIndex),
-    canonicalCharacter: candidate.blockId.charAt(candidate.differenceIndex),
-  };
-}
-
-function correctedBlockIdWarning(windowId: string, correction: BlockIdCorrection): string {
-  return "warning: mechanically corrected opaque blockId"
-    + ` in window ${windowId} at hex offset ${correction.hexOffset}`
-    + ` (${correction.submittedCharacter} -> ${correction.canonicalCharacter})`;
-}
-
 function validateSubmission(
   input: TranslationBatchInput,
   submission: FinalizeTranslationBatchArgs | undefined,
 ): Pick<TranslationBatchResult, "windows" | "responseErrors"> {
   const expected = new Map(input.request.windows.map((window) => [window.windowId, window]));
   const blockById = new Map(input.blocks.map((block) => [block.id, block]));
-  const realBlockIds = new Set(blockById.keys());
   const entries = submission?.windows ?? [];
   const byWindow = new Map<string, FinalizeTranslationBatchArgs["windows"]>();
   const responseErrors: string[] = [];
@@ -211,19 +156,14 @@ function validateSubmission(
       return failed(`duplicate windowId: ${window.windowId}`);
     }
     const candidate = submitted[0] as FinalizeTranslationBatchArgs["windows"][number];
+    const paragraphScope = input.paragraphFragment;
     const expectedIds = new Set(window.blockIds);
     const seen = new Set<string>();
     const translations: Array<{ blockId: string; text: string }> = [];
-    const correctionWarnings: string[] = [];
+    let paragraphTranslations:
+      Array<{ paragraphId: string; text: string }> | undefined;
     for (const translation of candidate.translations) {
-      const correction = expectedIds.has(translation.blockId)
-        ? undefined
-        : correctUnknownCanonicalBlockId(
-          translation.blockId,
-          expectedIds,
-          realBlockIds,
-        );
-      const blockId = correction?.blockId ?? translation.blockId;
+      const blockId = translation.blockId;
       if (!expectedIds.has(blockId) || !blockById.has(blockId)) {
         return failed(`unknown blockId for ${window.windowId}: ${translation.blockId}`);
       }
@@ -234,24 +174,45 @@ function validateSubmission(
       if (!hasSemanticText(translation.text)) {
         return failed(`empty translation for block ${blockId}`);
       }
-      translations.push({ blockId, text: translation.text });
-      if (correction !== undefined) {
-        correctionWarnings.push(correctedBlockIdWarning(window.windowId, correction));
+      if (paragraphScope !== undefined) {
+        const targetParagraphs = translation.text
+          .split(/(?:\r?\n)[\t ]*(?:\r?\n)+/u)
+          .filter(hasSemanticText);
+        if (targetParagraphs.length !== paragraphScope.paragraphs.length) {
+          return failed(
+            `paragraph count mismatch for ${paragraphScope.executionUnitId}: `
+            + `expected ${paragraphScope.paragraphs.length}, `
+            + `received ${targetParagraphs.length}`,
+          );
+        }
+        paragraphTranslations = targetParagraphs.map((text, index) => ({
+          paragraphId:
+            (paragraphScope.paragraphs[index] as { paragraphId: string })
+              .paragraphId,
+          text,
+        }));
       }
+      translations.push({ blockId, text: translation.text });
     }
     const missing = window.blockIds.filter((blockId) => !seen.has(blockId));
     if (missing.length > 0 || candidate.translations.length !== window.blockIds.length) {
       return failed(`block set mismatch for ${window.windowId}: missing ${missing.join(", ")}`);
     }
-    responseErrors.push(...correctionWarnings);
+    const memories = sanitizeTranslationMemoryCandidates(
+      candidate.memoryCandidates as readonly unknown[] | undefined,
+    );
+    const notes = [...candidate.notes, ...memories.warnings];
     return {
       windowId: window.windowId,
       ordinal: window.ordinal,
-      status: candidate.notes.length > 0 ? "completed_with_warnings" : "completed",
+      status: notes.length > 0 ? "completed_with_warnings" : "completed",
       translations,
       termUsages: copyTermUsages(candidate.termUsages),
-      notes: [...candidate.notes],
-      memoryCandidates: copyMemories(candidate.memoryCandidates),
+      notes,
+      memoryCandidates: memories.candidates,
+      ...(paragraphTranslations === undefined
+        ? {}
+        : { paragraphs: paragraphTranslations }),
       ...(candidate.styleObservation === undefined
         ? {}
         : { styleObservation: structuredClone(candidate.styleObservation) }),
@@ -264,20 +225,19 @@ function validateSubmission(
   );
   const expectedOccurrences = termOccurrencesForInput(input);
   return {
-    windows: input.responseProtocol === "framed_text"
-      ? normalized.map((window) => ({
-          ...window,
-          termUsages: inferTermUsages(
-            expectedOccurrences.filter((occurrence) =>
-              window.translations.some((translation) =>
-                translation.blockId === occurrence.blockId)),
-            new Map(window.translations.map((translation) => [
-              translation.blockId,
-              translation.text,
-            ])),
-          ),
-        }))
-      : normalized,
+    windows: normalized.map((window) => ({
+      ...window,
+      termUsages: completeTermUsagesFromTarget(
+        expectedOccurrences.filter((occurrence) =>
+          window.translations.some((translation) =>
+            translation.blockId === occurrence.blockId)),
+        window.termUsages,
+        new Map(window.translations.map((translation) => [
+          translation.blockId,
+          translation.text,
+        ])),
+      ),
+    })),
     responseErrors,
   };
 }
@@ -308,12 +268,25 @@ function candidateFor(window: TranslationBatchWindowResult): TranslationCandidat
 function termOccurrencesForInput(
   input: TranslationBatchInput,
 ): ExpectedTermOccurrence[] {
-  const requested = new Set(input.request.windows.flatMap((window) => window.blockIds));
-  return expectedTermOccurrences(
-    input.blocks.filter((block) => requested.has(block.id)),
-    conceptsFromStableTerms(input.stableTerms),
-    input.sourceLanguageProfile ?? getSourceLanguageProfile("en"),
-  );
+  return expectedTermOccurrencesForTranslationInput(input);
+}
+
+function validationSourceBlocks(
+  input: TranslationBatchInput,
+): LosslessBlock[] {
+  const scope = input.paragraphFragment;
+  if (scope === undefined) return [...input.blocks];
+  return input.blocks.map((block) => block.id !== scope.blockId
+    ? block
+    : {
+      ...block,
+      sourceText: scope.paragraphs.map((paragraph) =>
+        paragraph.sourceText).join("\n\n"),
+      canonicalStart: scope.paragraphs[0]?.utf16Start
+        ?? block.canonicalStart,
+      canonicalEnd: scope.paragraphs.at(-1)?.utf16End
+        ?? block.canonicalEnd,
+    });
 }
 
 function termFailuresForWindow(
@@ -386,6 +359,22 @@ function normalizeWindowTypography(
           preservedTargetForms,
         ),
       })),
+      ...(window.paragraphs === undefined
+        ? {}
+        : {
+          paragraphs: (() => {
+            const normalized = simplifyChineseTranslation(
+              normalizedTexts[0] ?? window.translations[0]?.text ?? "",
+              preservedTargetForms,
+            ).split(/(?:\r?\n)[\t ]*(?:\r?\n)+/u);
+            return normalized.length === window.paragraphs.length
+              ? window.paragraphs.map((paragraph, index) => ({
+                paragraphId: paragraph.paragraphId,
+                text: normalized[index] ?? paragraph.text,
+              }))
+              : window.paragraphs;
+          })(),
+        }),
       termUsages: window.termUsages.map((usage) => ({
         ...usage,
         targetSurface: simplifyChineseTranslation(
@@ -447,7 +436,11 @@ async function validateAndRepair(
   initial: Pick<TranslationBatchResult, "windows" | "responseErrors">,
 ): Promise<Pick<TranslationBatchResult, "windows" | "responseErrors" | "repairRuns">> {
   const validator = new TranslationValidator();
-  const blockById = new Map(input.blocks.map((block) => [block.id, losslessAsV4(block)]));
+  const validationBlocks = validationSourceBlocks(input);
+  const blockById = new Map(validationBlocks.map((block) => [
+    block.id,
+    losslessAsV4(block),
+  ]));
   const validationPolicy = {
     allowedLatinTokens: input.stableTerms.flatMap((term) => [
       term.sourceForm,
@@ -497,6 +490,7 @@ async function validateAndRepair(
     addFailures(window, [
       ...validation.failures,
       ...termFailuresForWindow(window, expectedOccurrences),
+      ...(input.additionalValidationFailures?.(window) ?? []),
     ]);
   }
   const successfulWindows = initial.windows.filter((window) => window.status !== "failed");
@@ -520,6 +514,44 @@ async function validateAndRepair(
   const invalid = [...invalidByWindowId.values()];
   if (invalid.length === 0) {
     return { ...initial, repairRuns: [] };
+  }
+  const invalidIds = new Set(invalid.map((item) => item.window.windowId));
+  const failWithoutRepair = (
+    prefix: string,
+  ): Pick<
+    TranslationBatchResult,
+    "windows" | "responseErrors" | "repairRuns"
+  > => ({
+    responseErrors: initial.responseErrors,
+    repairRuns: [],
+    windows: initial.windows.map((window) => {
+      const item = invalidByWindowId.get(window.windowId);
+      return item === undefined
+        ? window
+        : {
+          ...window,
+          status: "failed" as const,
+          translations: [],
+          termUsages: [],
+          memoryCandidates: [],
+          error: `${prefix}: ${failureMessage(item.failures)}`,
+        };
+    }),
+  });
+  const shapeCollapse = invalid.some((item) => {
+    const codes = new Set(item.failures.map((failure) => failure.code));
+    return codes.has("paragraph_count_incompatible")
+      && (
+        codes.has("abnormal_block_shortening")
+        || codes.has("abnormal_shortening")
+        || codes.has("insufficient_lexical_content")
+      );
+  });
+  if (shapeCollapse) {
+    return failWithoutRepair("shape collapse");
+  }
+  if (input.repairEnabled === false) {
+    return failWithoutRepair("validation failed without targeted repair");
   }
 
   const repairBlockIds = new Set<string>();
@@ -559,10 +591,23 @@ async function validateAndRepair(
       thinkingLevel: repairRuntime.thinkingLevel,
       signal: input.signal,
       deadlineMs: input.deadlineMs,
+      onAssistantResponse: input.onProviderResponse === undefined
+        ? undefined
+        : (observation) => input.onProviderResponse?.({
+          ...observation,
+          requestId: input.request.requestId,
+          snapshotId: input.snapshot.id,
+          responseProtocol: input.responseProtocol ?? "typed_tool",
+          ...(input.paragraphFragment === undefined
+            ? {}
+            : {
+              executionUnitId:
+                input.paragraphFragment.executionUnitId,
+            }),
+        }),
     });
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
-    const invalidIds = new Set(invalid.map((item) => item.window.windowId));
     return {
       responseErrors: initial.responseErrors,
       repairRuns: [],
@@ -612,7 +657,7 @@ async function validateAndRepair(
   const windows = normalizeWindowTypography(
     patchedWindows,
     input.stableTerms.filter((term) => term.locked).map((term) => term.target),
-    new Map(input.blocks.map((block) => [block.id, block.sourceText])),
+    new Map(validationBlocks.map((block) => [block.id, block.sourceText])),
   );
   const validatedWindows = windows.map((window): TranslationBatchWindowResult => {
     const item = invalidById.get(window.windowId);
@@ -625,7 +670,11 @@ async function validateAndRepair(
       validationPolicy,
     );
     const termFailures = termFailuresForWindow(window, expectedOccurrences);
-    if (validation.valid && termFailures.length === 0) {
+    const additionalFailures =
+      input.additionalValidationFailures?.(window) ?? [];
+    if (validation.valid
+      && termFailures.length === 0
+      && additionalFailures.length === 0) {
       return window;
     }
     return {
@@ -635,7 +684,11 @@ async function validateAndRepair(
       termUsages: [],
       memoryCandidates: [],
       error: `validation failed after one targeted repair: ${
-        failureMessage([...validation.failures, ...termFailures])
+        failureMessage([
+          ...validation.failures,
+          ...termFailures,
+          ...additionalFailures,
+        ])
       }`,
     };
   });
@@ -676,6 +729,19 @@ async function validateAndRepair(
   };
 }
 
+export async function validateTranslationBatchCandidate(
+  input: TranslationBatchInput,
+  initial: Pick<TranslationBatchResult, "windows" | "responseErrors">,
+): Promise<Pick<
+  TranslationBatchResult,
+  "windows" | "responseErrors" | "repairRuns"
+>> {
+  return validateAndRepair(
+    { ...input, repairEnabled: false },
+    initial,
+  );
+}
+
 export async function runTranslationBatch(
   input: TranslationBatchInput,
 ): Promise<TranslationBatchResult> {
@@ -702,13 +768,28 @@ export async function runTranslationBatch(
     model: input.model,
     tools: prepared.tools,
     budget: input.budget,
-    terminateTools: responseProtocol === "typed_tool" ? ["finalize_translation_batch"] : [],
+    terminateTools: responseProtocol === "typed_tool"
+      ? prepared.tools.map((tool) => tool.name)
+      : [],
     // A malformed typed-tool call gets one corrective turn. More turns have no
     // new evidence and only turn a provider-format error into a long stall.
     maxTurns: responseProtocol === "typed_tool" ? 2 : 1,
     signal: input.signal,
     deadlineMs: input.deadlineMs,
     thinkingLevel: input.thinkingLevel,
+    onAssistantResponse: input.onProviderResponse === undefined
+      ? undefined
+      : (observation) => input.onProviderResponse?.({
+        ...observation,
+        requestId: input.request.requestId,
+        snapshotId: input.snapshot.id,
+        responseProtocol,
+        ...(input.paragraphFragment === undefined
+          ? {}
+          : {
+            executionUnitId: input.paragraphFragment.executionUnitId,
+          }),
+      }),
   }, input.streamFn);
   const framedErrors: string[] = [];
   if (responseProtocol === "framed_text") {

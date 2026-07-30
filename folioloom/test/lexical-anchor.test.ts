@@ -491,7 +491,13 @@ test("lexical anchoring rejects a plain-text completion that never submits decis
       streamFn: faux.provider.streamSimple.bind(faux.provider),
       budget: new BudgetLedger(),
     }),
-    (error: unknown) => error instanceof ModelProviderError && error.kind === "protocol",
+    (error: unknown) => {
+      assert.ok(error instanceof ModelProviderError);
+      assert.equal(error.kind, "protocol");
+      assert.ok(error.run !== undefined);
+      assert.ok(error.run.usage.totalTokens > 0);
+      return true;
+    },
   );
 });
 

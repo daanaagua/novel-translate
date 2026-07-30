@@ -118,6 +118,43 @@ test("one request builder serializes all translator-visible projections and one 
   );
 });
 
+test("batch memory candidate kinds exclude reserved knowledge projector kinds", () => {
+  const prepared = prepareTranslationRequest(fixture());
+  const schemas = JSON.parse(prepared.serializedToolSchemas) as Array<{
+    parameters: {
+      properties: {
+        windows: {
+          items: {
+            properties: {
+              memoryCandidates: {
+                items: {
+                  properties: {
+                    kind: { anyOf?: Array<{ const?: string }> };
+                  };
+                };
+              };
+            };
+          };
+        };
+      };
+    };
+  }>;
+  const kindSchema = schemas[0]?.parameters.properties.windows.items
+    .properties.memoryCandidates.items.properties.kind;
+
+  assert.deepEqual(
+    kindSchema?.anyOf?.map((item) => item.const),
+    [
+      "entity_identity",
+      "entity_relation",
+      "term_sense",
+      "coreference",
+      "local_continuity",
+    ],
+  );
+  assert.doesNotMatch(JSON.stringify(kindSchema), /lexical_concept/u);
+});
+
 test("translation request projects exact contextual term occurrence receipts", () => {
   const sourceBlock = block(
     "block-role",

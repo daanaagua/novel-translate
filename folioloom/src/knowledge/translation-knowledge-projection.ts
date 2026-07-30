@@ -62,6 +62,7 @@ export interface TranslationKnowledgeCandidate {
   readonly kind: ContextEvidenceBundle["kind"];
   readonly evidenceDistance?: number;
   readonly tokenCost: number;
+  readonly entryCost: number;
   readonly utility: number;
   readonly coverage: readonly RiskDimension[];
   readonly requires: readonly string[];
@@ -657,6 +658,7 @@ function translationKnowledgeCandidate(
       payload,
       profile,
     ).tokens,
+    entryCost: 1,
     utility: candidateUtility(candidate),
     coverage: explicitCoverage(candidate),
     requires: [],
@@ -702,6 +704,46 @@ export function collectTranslationKnowledgeCandidates(
     candidateGroups(revisions, sourceTexts, profile, options),
     resolved,
   ).map((candidate) => translationKnowledgeCandidate(candidate, profile));
+}
+
+/**
+ * Narrow a planner-owned selection after an internal execution transform has
+ * reduced the exact source sent to the provider.  This never adds knowledge:
+ * it only removes revisions that are no longer applicable to the wire input.
+ * Missing revision ids remain a hard error so the operation cannot conceal a
+ * stale or corrupt planner decision.
+ */
+export function retainApplicableTranslationKnowledgeRevisionIds(
+  revisions: readonly unknown[],
+  sourceTexts: readonly string[],
+  profile: SourceLanguageProfile,
+  selectedRevisionIds: readonly string[],
+  options: Omit<
+    TranslationKnowledgeProjectionOptions,
+    "selectedRevisionIds"
+  > = {},
+): readonly string[] {
+  const resolved = resolvedOptions(options);
+  const selected = selectedRevisionIdSet(new Set(selectedRevisionIds))
+    ?? new Set<string>();
+  const groups = candidateGroups(revisions, sourceTexts, profile, options);
+  for (const revisionId of selected) {
+    if (!groups.validRevisionIds.has(revisionId)) {
+      throw new Error(
+        `selected knowledge revision does not exist: ${revisionId}`,
+      );
+    }
+  }
+  if (selected.size > resolved.maxEntries) {
+    throw new RangeError("selected knowledge revisions exceed entry budget");
+  }
+  const applicableIds = new Set(
+    eligibleCandidates(groups, resolved).map((candidate) =>
+      candidate.revision.revisionId),
+  );
+  return [...selected]
+    .filter((revisionId) => applicableIds.has(revisionId))
+    .sort(compareText);
 }
 
 /**

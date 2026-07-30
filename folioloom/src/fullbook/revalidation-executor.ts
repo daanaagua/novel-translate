@@ -49,6 +49,11 @@ export interface RevalidationTranslationOutput
 
 export interface RevalidationTaskStore {
   revalidationWorkItem(runId: string, taskId: string): RevalidationWorkItem;
+  deferRevalidationTask(
+    runId: string,
+    taskId: string,
+    result: unknown,
+  ): void;
   resolveRevalidationNoop(
     runId: string,
     taskId: string,
@@ -116,6 +121,7 @@ export interface RevalidationExecutionOptions {
     action: Exclude<RevalidationBindingDecision["action"], "noop">,
   ) => Promise<RevalidationTranslationOutput>;
   readonly isExpectedFailure: (error: unknown) => boolean;
+  readonly isRunBlockingFailure?: (error: unknown) => boolean;
   readonly shouldRetryFailure?: (
     error: unknown,
     task: KnowledgeRevalidationTask,
@@ -133,6 +139,8 @@ export interface RevalidationDrainOptions {
   readonly maxAttempts: number;
   readonly translate: RevalidationExecutionOptions["translate"];
   readonly isExpectedFailure: RevalidationExecutionOptions["isExpectedFailure"];
+  readonly isRunBlockingFailure?:
+    RevalidationExecutionOptions["isRunBlockingFailure"];
   readonly shouldRetryFailure?:
     RevalidationExecutionOptions["shouldRetryFailure"];
 }
@@ -401,6 +409,8 @@ export async function executeOneRevalidationTask(
     readonly translate: RevalidationExecutionOptions["translate"];
     readonly isExpectedFailure:
       RevalidationExecutionOptions["isExpectedFailure"];
+    readonly isRunBlockingFailure?:
+      RevalidationExecutionOptions["isRunBlockingFailure"];
     readonly shouldRetryFailure?:
       RevalidationExecutionOptions["shouldRetryFailure"];
   },
@@ -448,6 +458,14 @@ export async function executeOneRevalidationTask(
       tokenUsageComplete: true,
     };
   } catch (error) {
+    if (options.isRunBlockingFailure?.(error) === true) {
+      options.store.deferRevalidationTask(
+        options.runId,
+        task.taskId,
+        { code: revalidationFailureCode(error) },
+      );
+      throw error;
+    }
     if (!options.isExpectedFailure(error)) {
       throw error;
     }

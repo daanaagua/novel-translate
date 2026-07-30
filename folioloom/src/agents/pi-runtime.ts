@@ -5,6 +5,7 @@ import {
   type StreamFn,
   type ThinkingLevel,
 } from "@earendil-works/pi-agent-core";
+import { createHash } from "node:crypto";
 import {
   type Api,
   type AssistantMessage,
@@ -65,6 +66,16 @@ export interface PiSessionSpec {
   maxTurns?: number;
   eventLog?: MemoryEventLog;
   thinkingLevel?: ThinkingLevel;
+  onAssistantResponse?: (
+    observation: PiAssistantResponseObservation,
+  ) => void | Promise<void>;
+}
+
+export interface PiAssistantResponseObservation {
+  readonly phase: AgentPhase;
+  readonly modelCallOrdinal: number;
+  readonly requestHash: string;
+  readonly assistantMessage: AssistantMessage;
 }
 
 export interface PiToolError {
@@ -89,8 +100,22 @@ export class ModelProviderError extends Error {
     message: string,
     public readonly kind: ModelProviderErrorKind = classifyProviderErrorMessage(message),
     public readonly retryable: boolean = retryableProviderErrorKind(kind),
+    public run?: PiRunResult,
   ) {
     super(message);
+  }
+
+  get code(): `PROVIDER_${Uppercase<ModelProviderErrorKind>}` {
+    return `PROVIDER_${this.kind.toUpperCase() as Uppercase<ModelProviderErrorKind>}`;
+  }
+
+  /**
+   * Preserve provider usage even when a higher protocol layer rejects the
+   * response after the model call has completed.
+   */
+  withRun(run: PiRunResult): this {
+    this.run ??= run;
+    return this;
   }
 }
 
@@ -230,6 +255,21 @@ export class PiRuntime {
     let turnStarts = 0;
     let deadlineExceeded = false;
     let turnLimitReached = false;
+    const assistantResponses: Array<{
+      readonly modelCallOrdinal: number;
+      readonly message: AssistantMessage;
+    }> = [];
+    const requestHash = createHash("sha256")
+      .update(spec.phase, "utf8")
+      .update("\0")
+      .update(spec.model.provider, "utf8")
+      .update("\0")
+      .update(spec.model.id, "utf8")
+      .update("\0")
+      .update(spec.systemPrompt, "utf8")
+      .update("\0")
+      .update(spec.prompt, "utf8")
+      .digest("hex");
 
     const boundedStreamFn: StreamFn = (model, context, options) => {
       if (!turnLimitReached) {
@@ -312,6 +352,14 @@ export class PiRuntime {
         case "turn_end":
           if (assistant(event.message)) {
             addUsage(usage, event.message.usage);
+            assistantResponses.push({
+              // Agent event delivery can start the next turn before publishing
+              // the preceding turn_end.  The response list itself is ordered,
+              // so derive evidence ordinals from accepted responses instead of
+              // sampling the mutable turn_start counter.
+              modelCallOrdinal: assistantResponses.length + 1,
+              message: event.message,
+            });
           }
           break;
         case "tool_execution_start":
@@ -360,14 +408,7 @@ export class PiRuntime {
 
     const messages = [...agent.state.messages];
     const lastAssistant = messages.findLast(assistant);
-    if (lastAssistant?.stopReason === "error") {
-      const providerMessage = lastAssistant.errorMessage ?? "unknown provider failure";
-      throw new ModelProviderError(
-        `model provider error: ${providerMessage}`,
-        classifyProviderAssistantError(lastAssistant),
-      );
-    }
-    return {
+    const result: PiRunResult = {
       modelCalls,
       toolNames,
       toolErrors,
@@ -380,6 +421,33 @@ export class PiRuntime {
       deadlineExceeded,
       turnLimitReached,
     };
+    if (spec.onAssistantResponse !== undefined) {
+      try {
+        for (const response of assistantResponses) {
+          await spec.onAssistantResponse({
+            phase: spec.phase,
+            modelCallOrdinal: response.modelCallOrdinal,
+            requestHash,
+            assistantMessage: response.message,
+          });
+        }
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        throw new ModelProviderError(
+          `provider evidence persistence failed: ${message}`,
+          "unknown",
+          false,
+        ).withRun(result);
+      }
+    }
+    if (lastAssistant?.stopReason === "error") {
+      const providerMessage = lastAssistant.errorMessage ?? "unknown provider failure";
+      throw new ModelProviderError(
+        `model provider error: ${providerMessage}`,
+        classifyProviderAssistantError(lastAssistant),
+      ).withRun(result);
+    }
+    return result;
   }
 }
 

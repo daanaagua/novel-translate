@@ -153,6 +153,28 @@ function isolatedSourceIdentifiers(sourceText: string): string[] {
   });
 }
 
+const SCIENTIFIC_EPITHET_ENDING =
+  /(?:a|us|um|is|ae|ii|ensis|ense|oides|opsis|ella|iana|ianus|ianae|icus|ica|icum)$/u;
+
+function scientificBinomialSourceForms(
+  sourceText: string,
+  translationText: string,
+): string[] {
+  const forms = new Set<string>();
+  const pattern =
+    /\b(?:\p{Lu}[\p{Ll}\p{M}]{2,}|\p{Lu}\.)[ \t]+\p{Ll}[\p{Ll}\p{M}-]{2,}\b/gu;
+  for (const match of sourceText.matchAll(pattern)) {
+    const form = match[0];
+    const epithet = form.split(/[ \t]+/u).at(-1);
+    if (epithet !== undefined
+      && SCIENTIFIC_EPITHET_ENDING.test(epithet)
+      && translationText.includes(form)) {
+      forms.add(form);
+    }
+  }
+  return [...forms];
+}
+
 export class TranslationValidator {
   validateCrossBlockAlignment(
     blocks: readonly V4Block[],
@@ -316,6 +338,12 @@ export class TranslationValidator {
         preservedSourceForms: [
           ...(policy.allowedLatinTokens ?? []),
           ...(source === undefined ? [] : isolatedSourceIdentifiers(source.sourceText)),
+          ...(source === undefined
+            ? []
+            : scientificBinomialSourceForms(
+                source.sourceText,
+                translation.text,
+              )),
         ],
       });
       if (untranslated.length > 0) {

@@ -12,6 +12,11 @@ export interface ContextEvidenceBundle {
     | "style"
     | "recovery";
   readonly tokenCost: number;
+  /**
+   * Number of bounded wire entries consumed by this atomic bundle.  Context
+   * users without an entry-shaped wire format may omit it (the default is 1).
+   */
+  readonly entryCost?: number;
   readonly utility: number;
   readonly coverage: readonly RiskDimension[];
   readonly requires: readonly string[];
@@ -24,12 +29,15 @@ export interface ContextPlanningInput {
   readonly bundles: readonly ContextEvidenceBundle[];
   readonly requiredCoverage: readonly RiskDimension[];
   readonly budgets: Readonly<Record<ContextProfileName, number>>;
+  /** Hard entry cap shared with the downstream wire projector. */
+  readonly maxEntries?: number;
 }
 
 export interface ContextProfile {
   readonly name: ContextProfileName;
   readonly bundleIds: readonly string[];
   readonly tokenCost: number;
+  readonly entryCost: number;
   readonly utility: number;
   readonly coveredRisks: readonly RiskDimension[];
 }
@@ -44,6 +52,7 @@ interface NormalizedBundle {
   readonly index: number;
   readonly value: ContextEvidenceBundle;
   readonly effectiveUtility: number;
+  readonly entryCost: number;
   readonly coverageMask: number;
   readonly requirementMask: bigint;
   readonly bit: bigint;
@@ -57,6 +66,7 @@ interface ContextSelection {
 interface ContextState {
   readonly tokenCost: number;
   readonly tokenBucket: number;
+  readonly entryCost: number;
   readonly coverageMask: number;
   readonly selectedMask: bigint;
   readonly selection?: ContextSelection;
@@ -100,6 +110,13 @@ function nonempty(value: string, label: string): string {
 function tokenCount(value: number, label: string): number {
   if (!Number.isSafeInteger(value) || value < 0) {
     throw new TypeError(`${label} must be a non-negative safe integer`);
+  }
+  return value;
+}
+
+function positiveEntryCount(value: number, label: string): number {
+  if (!Number.isSafeInteger(value) || value < 1) {
+    throw new TypeError(`${label} must be a positive safe integer`);
   }
   return value;
 }
@@ -198,6 +215,9 @@ function normalizedBundles(
       throw new TypeError(`unknown context evidence kind: ${String(rawBundle.kind)}`);
     }
     tokenCount(rawBundle.tokenCost, `${bundleId} token cost`);
+    if (rawBundle.entryCost !== undefined) {
+      positiveEntryCount(rawBundle.entryCost, `${bundleId} entry cost`);
+    }
     utility(rawBundle.utility, `${bundleId} utility`);
     coverageMask(rawBundle.coverage, `${bundleId} coverage`);
     if (!Array.isArray(rawBundle.requires)) {
@@ -322,10 +342,14 @@ function stateDominates(
   right: ContextState,
   bundles: readonly NormalizedBundle[],
 ): boolean {
-  if (left.tokenCost > right.tokenCost || left.utility < right.utility) {
+  if (left.tokenCost > right.tokenCost
+    || left.entryCost > right.entryCost
+    || left.utility < right.utility) {
     return false;
   }
-  if (left.tokenCost < right.tokenCost || left.utility > right.utility) {
+  if (left.tokenCost < right.tokenCost
+    || left.entryCost < right.entryCost
+    || left.utility > right.utility) {
     return true;
   }
   return compareIdSequences(
@@ -408,6 +432,7 @@ function planIndependentStates(
   bundles: readonly NormalizedBundle[],
   mandatoryIds: ReadonlySet<string>,
   maximumBudget: number,
+  maximumEntries: number,
 ): ContextState[] {
   const mandatoryBundles = bundles
     .filter((bundle) => mandatoryIds.has(bundle.value.bundleId));
@@ -415,12 +440,18 @@ function planIndependentStates(
     (total, bundle) => total + bundle.value.tokenCost,
     0,
   );
-  if (mandatoryCost > maximumBudget) {
+  const mandatoryEntryCost = mandatoryBundles.reduce(
+    (total, bundle) => total + bundle.entryCost,
+    0,
+  );
+  if (mandatoryCost > maximumBudget
+    || mandatoryEntryCost > maximumEntries) {
     return [];
   }
   const mandatoryState: ContextState = {
     tokenCost: mandatoryCost,
     tokenBucket: Math.floor(mandatoryCost / TOKEN_BUCKET_SIZE),
+    entryCost: mandatoryEntryCost,
     coverageMask: mandatoryBundles.reduce(
       (mask, bundle) => mask | bundle.coverageMask,
       0,
@@ -451,7 +482,11 @@ function planIndependentStates(
     if (mandatoryIds.has(bundle.value.bundleId)) {
       continue;
     }
-    const key = `${bundle.value.tokenCost}:${bundle.coverageMask}`;
+    const key = [
+      bundle.value.tokenCost,
+      bundle.entryCost,
+      bundle.coverageMask,
+    ].join(":");
     const group = bundleGroups.get(key) ?? [];
     group.push(bundle);
     bundleGroups.set(key, group);
@@ -465,20 +500,24 @@ function planIndependentStates(
       right.effectiveUtility - left.effectiveUtility
       || compareText(left.value.bundleId, right.value.bundleId));
     const unitCost = group[0]!.value.tokenCost;
-    const maximumCount = unitCost === 0
-      ? group.length
-      : Math.min(
-        group.length,
-        Math.floor((maximumBudget - mandatoryCost) / unitCost),
-      );
+    const unitEntryCost = group[0]!.entryCost;
+    const maximumCount = Math.min(
+      group.length,
+      Math.floor((maximumEntries - mandatoryEntryCost) / unitEntryCost),
+      ...(unitCost === 0
+        ? []
+        : [Math.floor((maximumBudget - mandatoryCost) / unitCost)]),
+    );
     const choices: {
       readonly count: number;
       readonly cost: number;
+      readonly entryCost: number;
       readonly utility: number;
       readonly bundleIndexes: readonly number[];
     }[] = [{
       count: 0,
       cost: 0,
+      entryCost: 0,
       utility: 0,
       bundleIndexes: [],
     }];
@@ -491,6 +530,7 @@ function planIndependentStates(
       choices.push({
         count,
         cost: unitCost * count,
+        entryCost: unitEntryCost * count,
         utility: prefixUtility,
         bundleIndexes: [...prefixIndexes],
       });
@@ -501,12 +541,15 @@ function planIndependentStates(
       for (const state of frontier) {
         for (const choice of choices) {
           const nextCost = state.tokenCost + choice.cost;
-          if (nextCost > maximumBudget) {
+          const nextEntryCost = state.entryCost + choice.entryCost;
+          if (nextCost > maximumBudget
+            || nextEntryCost > maximumEntries) {
             break;
           }
           const candidate: ContextState = {
             tokenCost: nextCost,
             tokenBucket: Math.floor(nextCost / TOKEN_BUCKET_SIZE),
+            entryCost: nextEntryCost,
             coverageMask: choice.count === 0
               ? state.coverageMask
               : state.coverageMask | group[0]!.coverageMask,
@@ -546,6 +589,7 @@ function profileFromState(
     name,
     bundleIds: selectedBundleIds(state, bundles),
     tokenCost: state.tokenCost,
+    entryCost: state.entryCost,
     utility: state.utility,
     coveredRisks: RISK_DIMENSIONS.filter((_risk, index) =>
       (state.coverageMask & (1 << index)) !== 0),
@@ -563,6 +607,9 @@ export function planContextProfiles(
     input.requiredCoverage,
     "required context coverage",
   );
+  const maximumEntries = input.maxEntries === undefined
+    ? Number.MAX_SAFE_INTEGER
+    : tokenCount(input.maxEntries, "maximum context entries");
   const { bundles: orderedBundles, byId } = normalizedBundles(input);
   const mandatoryIds = mandatoryClosure(orderedBundles, byId);
   const utilities = effectiveUtilities(orderedBundles);
@@ -574,6 +621,7 @@ export function planContextProfiles(
     index,
     value: bundle,
     effectiveUtility: utilities.get(bundle.bundleId)!,
+    entryCost: bundle.entryCost ?? 1,
     coverageMask: coverageMask(bundle.coverage, `${bundle.bundleId} coverage`),
     requirementMask: bundle.requires.reduce(
       (mask, requirementId) => mask | bitById.get(requirementId)!,
@@ -592,11 +640,17 @@ export function planContextProfiles(
   const maximumBudget = Math.max(...Object.values(budgets));
   let states: ContextState[];
   if (bundles.every((bundle) => bundle.requirementMask === 0n)) {
-    states = planIndependentStates(bundles, mandatoryIds, maximumBudget);
+    states = planIndependentStates(
+      bundles,
+      mandatoryIds,
+      maximumBudget,
+      maximumEntries,
+    );
   } else {
     states = [{
       tokenCost: 0,
       tokenBucket: 0,
+      entryCost: 0,
       coverageMask: 0,
       selectedMask: 0n,
       utility: 0,
@@ -612,12 +666,15 @@ export function planContextProfiles(
           continue;
         }
         const nextCost = state.tokenCost + bundle.value.tokenCost;
-        if (nextCost > maximumBudget) {
+        const nextEntryCost = state.entryCost + bundle.entryCost;
+        if (nextCost > maximumBudget
+          || nextEntryCost > maximumEntries) {
           continue;
         }
         candidates.push({
           tokenCost: nextCost,
           tokenBucket: Math.floor(nextCost / TOKEN_BUCKET_SIZE),
+          entryCost: nextEntryCost,
           coverageMask: state.coverageMask | bundle.coverageMask,
           selectedMask: state.selectedMask | bundle.bit,
           utility: state.utility + bundle.effectiveUtility,
@@ -638,6 +695,7 @@ export function planContextProfiles(
   for (const name of PROFILE_NAMES) {
     const feasible = states.filter((state) =>
       state.tokenCost <= budgets[name]
+      && state.entryCost <= maximumEntries
       && (state.coverageMask & requiredMask) === requiredMask);
     feasible.sort((left, right) => finalStateOrder(left, right, bundles));
     result[name] = feasible[0] === undefined

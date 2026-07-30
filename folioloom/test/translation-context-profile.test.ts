@@ -2,7 +2,15 @@ import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import test from "node:test";
 
-import { prepareTranslationRequest } from "../src/agents/translation-request.js";
+import {
+  narrowSelectedKnowledgeToTranslationWireInput,
+  prepareTranslationRequest,
+} from "../src/agents/translation-request.js";
+import {
+  paragraphFragmentExecutionScope,
+  planParagraphFragments,
+} from "../src/fullbook/paragraph-fragment.js";
+import { admitTranslationRequests } from "../src/fullbook/execution-worker.js";
 import type { PhysicalRequestPlan } from "../src/fullbook/types.js";
 import {
   collectTranslationKnowledgeCandidates,
@@ -254,5 +262,102 @@ test("selected revisions fail when missing, inapplicable, or over entry budget",
       },
     ),
     /selected knowledge revisions exceed entry budget/u,
+  );
+});
+
+test("paragraph execution narrows planned knowledge to the exact wire fragment", () => {
+  const sourceBlock = block(
+    "block-fragment-knowledge",
+    0,
+    [
+      ...Array.from(
+        { length: 12 },
+        (_, index) => `Ordinary source paragraph ${index + 1}.`,
+      ),
+      "Brin appears only in the final source paragraph.",
+    ].join("\n\n"),
+  );
+  const plan = planParagraphFragments({
+    windowId: "window-context-profile",
+    block: sourceBlock,
+    snapshotId: "snapshot-context-profile",
+  });
+  const brin = revision("revision-brin", "brin", "lexical_concept", {
+    sourceForms: ["Brin"],
+    canonicalTarget: "布林",
+  });
+  const base = {
+    request: requestFor(sourceBlock),
+    blocks: [sourceBlock],
+    stableTerms: [],
+    snapshot: {
+      id: "snapshot-context-profile",
+      revisions: [brin],
+    },
+    sourceLanguageProfile: getSourceLanguageProfile("en"),
+    selectedKnowledgeRevisionIds: ["revision-brin"],
+    contextProfileName: "rich" as const,
+    responseProtocol: "typed_tool" as const,
+  };
+  const first = {
+    ...base,
+    paragraphFragment: paragraphFragmentExecutionScope(
+      plan,
+      plan.units[0]!,
+    ),
+  };
+  assert.throws(
+    () => prepareTranslationRequest(first),
+    /selected knowledge revision is not applicable/u,
+  );
+  const narrowedFirst =
+    narrowSelectedKnowledgeToTranslationWireInput(first);
+  assert.deepEqual(narrowedFirst.selectedKnowledgeRevisionIds, []);
+  assert.deepEqual(
+    (prepareTranslationRequest(narrowedFirst).sections
+      .find((section) => section.kind === "memory")
+      ?.jsonPayload as { revisions: readonly unknown[] }).revisions,
+    [],
+  );
+
+  const final = narrowSelectedKnowledgeToTranslationWireInput({
+    ...base,
+    paragraphFragment: paragraphFragmentExecutionScope(
+      plan,
+      plan.units.at(-1)!,
+    ),
+  });
+  assert.deepEqual(final.selectedKnowledgeRevisionIds, ["revision-brin"]);
+  const memory = prepareTranslationRequest(final).sections
+    .find((section) => section.kind === "memory")
+    ?.jsonPayload as { revisions: readonly { revisionId: string }[] };
+  assert.deepEqual(
+    memory.revisions.map((item) => item.revisionId),
+    ["revision-brin"],
+  );
+
+  const admitted = admitTranslationRequests(
+    [base.request],
+    {
+      model: {
+        id: "fragment-knowledge-test",
+        contextWindow: 128_000,
+        maxTokens: 16_000,
+      },
+      streamFn: (() => {
+        throw new Error("admission must not call the provider");
+      }) as never,
+      effort: "high",
+      thinkingLevel: "high",
+    } as never,
+    new WeightedTokenEstimator(),
+    new Map([[sourceBlock.id, sourceBlock]]),
+    () => base,
+  )[0];
+  assert.ok(admitted);
+  assert.deepEqual(
+    admitted.fragments.map((fragment) =>
+      fragment.input.selectedKnowledgeRevisionIds),
+    [[], [], ["revision-brin"]],
   );
 });

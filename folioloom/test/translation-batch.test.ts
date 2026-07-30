@@ -16,7 +16,10 @@ import {
 import { prepareTranslationRequest } from "../src/agents/translation-request.js";
 import type { PhysicalRequestPlan } from "../src/fullbook/types.js";
 import { BudgetLedger } from "../src/kernel/budget.js";
-import { conceptFromAnchor } from "../src/knowledge/lexical-concept.js";
+import {
+  conceptFromAnchor,
+  reviseConcept,
+} from "../src/knowledge/lexical-concept.js";
 import { getSourceLanguageProfile } from "../src/language/profiles.js";
 import type { LosslessBlock } from "../src/source/types.js";
 import { createBookStyleConstitution, composeEffectiveStyle } from "../src/style/effective-style.js";
@@ -138,6 +141,122 @@ test("batch runtime uses the same prepared prompt as complete-request budgeting"
 
   assert.equal(prompt, prepared.prompt);
   assert.deepEqual(result.run.toolNames, prepared.tools.map((tool) => tool.name));
+});
+
+test("batch canonicalizes unambiguous single-window metadata placed at the tool envelope", async () => {
+  const sourceBlocks = [block("block-single-envelope", 0, "Alpha.")];
+  const sourceRequest = singleWindowRequest(sourceBlocks);
+  const faux = fauxProvider();
+  faux.setResponses([fauxAssistantMessage(fauxToolCall(
+    "finalize_translation_batch",
+    {
+      windows: [{
+        windowId: sourceRequest.windows[0]!.windowId,
+        translations: [{
+          blockId: sourceBlocks[0]!.id,
+          text: "阿尔法。",
+        }],
+      }],
+      termUsages: [],
+      notes: ["metadata was emitted at the envelope"],
+      memoryCandidates: [],
+      styleObservation: {
+        activeRegister: "克制",
+      },
+    },
+  ), { stopReason: "toolUse" })]);
+
+  const result = await runTranslationBatch({
+    request: sourceRequest,
+    blocks: sourceBlocks,
+    stableTerms: [],
+    snapshot: { id: "snapshot-single-envelope", revisions: [] },
+    model: faux.getModel(),
+    streamFn: faux.provider.streamSimple.bind(faux.provider),
+    budget: new BudgetLedger(),
+  });
+
+  assert.equal(faux.state.callCount, 1);
+  assert.equal(result.windows[0]?.status, "completed_with_warnings");
+  assert.deepEqual(result.windows[0]?.termUsages, []);
+  assert.deepEqual(result.windows[0]?.notes, ["metadata was emitted at the envelope"]);
+  assert.deepEqual(result.windows[0]?.memoryCandidates, []);
+  assert.equal(result.windows[0]?.styleObservation?.activeRegister, "克制");
+});
+
+test("batch never guesses tool-envelope metadata ownership across logical windows", async () => {
+  const validWindows = request.windows.map((window) => ({
+    windowId: window.windowId,
+    translations: window.blockIds.map((blockId) => ({
+      blockId,
+      text: window.ordinal === 0 ? "阿尔法。" : "贝塔。",
+    })),
+  }));
+  const faux = fauxProvider();
+  faux.setResponses([
+    fauxAssistantMessage(fauxToolCall("finalize_translation_batch", {
+      windows: validWindows,
+      notes: ["ambiguous owner"],
+    }), { stopReason: "toolUse" }),
+    fauxAssistantMessage(fauxToolCall("finalize_translation_batch", {
+      windows: validWindows.map((window) => ({ ...window, notes: [] })),
+    }), { stopReason: "toolUse" }),
+  ]);
+
+  const result = await runTranslationBatch({
+    request,
+    blocks,
+    stableTerms: [],
+    snapshot: { id: "snapshot-ambiguous-envelope", revisions: [] },
+    model: faux.getModel(),
+    streamFn: faux.provider.streamSimple.bind(faux.provider),
+    budget: new BudgetLedger(),
+  });
+
+  assert.equal(faux.state.callCount, 2);
+  assert.ok(result.windows.every((window) => window.status === "completed"));
+});
+
+test("reserved knowledge kinds in optional memory are corrected before submission", async () => {
+  const faux = fauxProvider();
+  const validWindows = request.windows.map((window) => ({
+    windowId: window.windowId,
+    translations: window.blockIds.map((blockId) => ({
+      blockId,
+      text: window.ordinal === 0 ? "阿尔法。" : "贝塔。",
+    })),
+    notes: [],
+  }));
+  faux.setResponses([
+    fauxAssistantMessage(fauxToolCall("finalize_translation_batch", {
+      windows: validWindows.map((window) => ({
+        ...window,
+        memoryCandidates: [{
+          kind: "lexical_concept",
+          subjectForms: ["Sentry Pod"],
+          fact: "This is a generic continuity fact, not a lexical concept.",
+          confidence: 0.95,
+        }],
+      })),
+    }), { stopReason: "toolUse" }),
+    fauxAssistantMessage(fauxToolCall("finalize_translation_batch", {
+      windows: validWindows,
+    }), { stopReason: "toolUse" }),
+  ]);
+
+  const result = await runTranslationBatch({
+    request,
+    blocks,
+    stableTerms: [],
+    snapshot: { id: "snapshot-0", revisions: [] },
+    model: faux.getModel(),
+    streamFn: faux.provider.streamSimple.bind(faux.provider),
+    budget: new BudgetLedger(),
+  });
+
+  assert.equal(faux.state.callCount, 2);
+  assert.ok(result.windows.every((window) => window.status === "completed"));
+  assert.ok(result.windows.every((window) => window.memoryCandidates.length === 0));
 });
 
 test("batch isolates one malformed logical window without discarding its valid sibling", async () => {
@@ -398,7 +517,7 @@ test("batch normalizes traditional prose before validation and preserves locked 
   assert.equal(result.windows[0]?.translations[0]?.text, "龍完成了黑杀队的训练。");
 });
 
-test("batch mechanically corrects one unknown canonical block-id character typo", async () => {
+test("batch rejects one-character canonical block-id typos without local salvage", async () => {
   const expected = block("block-1f85f23a483f9edef746", 0, "Alpha.");
   const mistyped = "block-1f85a23a483f9edef746";
   const canonicalRequest = singleWindowRequest([expected]);
@@ -423,12 +542,10 @@ test("batch mechanically corrects one unknown canonical block-id character typo"
   });
 
   assert.equal(faux.state.callCount, 1);
-  assert.equal(result.windows[0]?.status, "completed");
-  assert.equal(result.windows[0]?.translations[0]?.blockId, expected.id);
-  assert.equal(result.windows[0]?.translations[0]?.text, "阿尔法。");
-  assert.deepEqual(result.responseErrors, [
-    "warning: mechanically corrected opaque blockId in window window-canonical-id-fixture at hex offset 5 (a -> f)",
-  ]);
+  assert.equal(result.windows[0]?.status, "failed");
+  assert.deepEqual(result.windows[0]?.translations, []);
+  assert.match(result.windows[0]?.error ?? "", /unknown blockId/u);
+  assert.deepEqual(result.responseErrors, []);
 });
 
 test("batch never corrects a submitted identifier that is a real other block", async () => {
@@ -788,27 +905,27 @@ test("batch validation repairs only the invalid block once and preserves its val
   );
 });
 
-test("batch repairs a disallowed contextual term surface and binds the repaired usage", async () => {
+test("batch repairs a disallowed locked term surface and binds the repaired usage", async () => {
   const sourceBlocks = [block(
     "block-role",
     0,
     "Der Prokurist trat ein und erklärte Gregor ruhig, warum er am frühen Morgen gekommen war.",
   )];
   const sourceRequest = singleWindowRequest(sourceBlocks);
-  const concept = conceptFromAnchor({
+  const concept = reviseConcept(conceptFromAnchor({
     sourceForm: "Prokurist",
     target: "主事",
     mode: "contextual",
     semanticClass: "role",
     confidence: 0.95,
-  });
+  }), { policy: "locked" });
   const stableTerms = [{
     conceptId: concept.conceptId,
     lexemeId: `${concept.conceptId}-lexeme`,
     sourceForm: concept.sourceForms[0]!,
     canonicalSource: concept.normalizedSubject,
     target: concept.canonicalTarget,
-    locked: false,
+    locked: true,
     policy: concept.policy,
     semanticClass: concept.semanticClass,
     allowedTargets: concept.allowedRealizations,
@@ -877,6 +994,123 @@ test("batch repairs a disallowed contextual term surface and binds the repaired 
   assert.match(repairPrompts[0] ?? "", /block-role/u);
 });
 
+test("batch deterministically completes an omitted valid term receipt without repair", async () => {
+  const sourceBlocks = [block(
+    "block-role-inferred",
+    0,
+    "Der Prokurist trat ein und erklärte ruhig den Grund seines Besuchs.",
+  )];
+  const sourceRequest = singleWindowRequest(sourceBlocks);
+  const concept = conceptFromAnchor({
+    sourceForm: "Prokurist",
+    target: "主事",
+    mode: "contextual",
+    semanticClass: "role",
+    confidence: 0.95,
+  });
+  const stableTerms = [{
+    conceptId: concept.conceptId,
+    lexemeId: `${concept.conceptId}-lexeme`,
+    sourceForm: concept.sourceForms[0]!,
+    canonicalSource: concept.normalizedSubject,
+    target: concept.canonicalTarget,
+    locked: false,
+    policy: concept.policy,
+    semanticClass: concept.semanticClass,
+    allowedTargets: concept.allowedRealizations,
+    revisionId: concept.revisionId,
+    renderFingerprint: concept.renderFingerprint,
+  }];
+  const faux = fauxProvider();
+  faux.setResponses([
+    fauxAssistantMessage(fauxToolCall("finalize_translation_batch", {
+      windows: [{
+        windowId: sourceRequest.windows[0]!.windowId,
+        translations: [{
+          blockId: sourceBlocks[0]!.id,
+          text: "主事走进屋来，平静地说明了来访的缘由。",
+        }],
+        termUsages: [],
+        notes: [],
+      }],
+    }), { stopReason: "toolUse" }),
+  ]);
+
+  const result = await runTranslationBatch({
+    request: sourceRequest,
+    blocks: sourceBlocks,
+    stableTerms,
+    snapshot: { id: "snapshot-role-inferred", revisions: [] },
+    sourceLanguageProfile: getSourceLanguageProfile("de"),
+    model: faux.getModel(),
+    streamFn: faux.provider.streamSimple.bind(faux.provider),
+    budget: new BudgetLedger(),
+  });
+
+  assert.equal(faux.state.callCount, 1);
+  assert.equal(result.windows[0]?.status, "completed");
+  assert.equal(result.windows[0]?.termUsages.length, 1);
+  assert.equal(result.windows[0]?.termUsages[0]?.targetSurface, "主事");
+});
+
+test("batch leaves an omitted soft term unbound when the target uses a natural variant", async () => {
+  const sourceBlocks = [block(
+    "block-role-soft-variant",
+    0,
+    "Der Prokurist trat ein und erklärte ruhig den Grund seines Besuchs.",
+  )];
+  const sourceRequest = singleWindowRequest(sourceBlocks);
+  const concept = conceptFromAnchor({
+    sourceForm: "Prokurist",
+    target: "主事",
+    mode: "contextual",
+    semanticClass: "role",
+    confidence: 0.95,
+  });
+  const stableTerms = [{
+    conceptId: concept.conceptId,
+    lexemeId: `${concept.conceptId}-lexeme`,
+    sourceForm: concept.sourceForms[0]!,
+    canonicalSource: concept.normalizedSubject,
+    target: concept.canonicalTarget,
+    locked: false,
+    policy: concept.policy,
+    semanticClass: concept.semanticClass,
+    allowedTargets: concept.allowedRealizations,
+    revisionId: concept.revisionId,
+    renderFingerprint: concept.renderFingerprint,
+  }];
+  const faux = fauxProvider();
+  faux.setResponses([
+    fauxAssistantMessage(fauxToolCall("finalize_translation_batch", {
+      windows: [{
+        windowId: sourceRequest.windows[0]!.windowId,
+        translations: [{
+          blockId: sourceBlocks[0]!.id,
+          text: "公司代表走进屋来，平静地说明了来访的缘由。",
+        }],
+        termUsages: [],
+        notes: [],
+      }],
+    }), { stopReason: "toolUse" }),
+  ]);
+
+  const result = await runTranslationBatch({
+    request: sourceRequest,
+    blocks: sourceBlocks,
+    stableTerms,
+    snapshot: { id: "snapshot-role-soft-variant", revisions: [] },
+    sourceLanguageProfile: getSourceLanguageProfile("de"),
+    model: faux.getModel(),
+    streamFn: faux.provider.streamSimple.bind(faux.provider),
+    budget: new BudgetLedger(),
+  });
+
+  assert.equal(faux.state.callCount, 1);
+  assert.equal(result.windows[0]?.status, "completed");
+  assert.deepEqual(result.windows[0]?.termUsages, []);
+});
+
 test("batch normalizes a targeted repair before its final validation", async () => {
   const faux = fauxProvider();
   faux.setResponses([
@@ -919,6 +1153,67 @@ test("batch normalizes a targeted repair before its final validation", async () 
   assert.equal(result.windows[0]?.translations[0]?.text, "他说：“阿尔法”。");
   assert.equal(/["‛‟〝〞„]/u.test(result.windows[0]?.translations[0]?.text ?? ""), false);
   assert.equal(result.windows[1]?.status, "completed");
+});
+
+test("committed-boundary failures enter the targeted repair loop", async () => {
+  const sourceBlocks = [block(
+    "block-boundary",
+    0,
+    "The scout crossed the empty chamber and reported that the passage was clear.",
+  )];
+  const sourceRequest = singleWindowRequest(sourceBlocks);
+  const repairPrompts: string[] = [];
+  const faux = fauxProvider();
+  faux.setResponses([
+    fauxAssistantMessage(fauxToolCall("finalize_translation_batch", {
+      windows: [{
+        windowId: sourceRequest.windows[0]!.windowId,
+        translations: [{
+          blockId: sourceBlocks[0]!.id,
+          text: "侦察员穿过空荡的舱室，报告通道安全。相邻块的整段译文被错误重复。",
+        }],
+        notes: [],
+      }],
+    }), { stopReason: "toolUse" }),
+    (context) => {
+      repairPrompts.push(promptText(context));
+      return fauxAssistantMessage(fauxToolCall("submit_repaired_translation", {
+        translations: [{
+          blockId: sourceBlocks[0]!.id,
+          text: "侦察员穿过空荡的舱室，报告通道安全。",
+        }],
+        notes: [],
+      }), { stopReason: "toolUse" });
+    },
+  ]);
+
+  const result = await runTranslationBatch({
+    request: sourceRequest,
+    blocks: sourceBlocks,
+    stableTerms: [],
+    snapshot: { id: "snapshot-boundary", revisions: [] },
+    model: faux.getModel(),
+    streamFn: faux.provider.streamSimple.bind(faux.provider),
+    budget: new BudgetLedger(),
+    additionalValidationFailures: (window) =>
+      window.translations[0]?.text.includes("相邻块的整段译文被错误重复")
+        ? [{
+            code: "cross_block_translation_overlap",
+            blockId: sourceBlocks[0]!.id,
+            message: "candidate repeats committed adjacent-block content",
+            repairable: true,
+          }]
+        : [],
+  });
+
+  assert.equal(faux.state.callCount, 2);
+  assert.equal(result.windows[0]?.status, "completed");
+  assert.equal(
+    result.windows[0]?.translations[0]?.text,
+    "侦察员穿过空荡的舱室，报告通道安全。",
+  );
+  assert.match(repairPrompts[0] ?? "", /cross_block_translation_overlap/u);
+  assert.match(repairPrompts[0] ?? "", /committed adjacent-block content/u);
 });
 
 test("batch uses the explicit escalation runtime only for targeted repair", async () => {
@@ -1012,12 +1307,14 @@ test("one invalid repair fails only that logical window and never triggers a sec
 });
 
 test("framed text batch parses raw assistant prose without a tool call", async () => {
+  const framedNonce = "1".repeat(32);
   const prepared = prepareTranslationRequest({
     request,
     blocks,
     stableTerms: [],
     snapshot: { id: "snapshot-0", revisions: [] },
     responseProtocol: "framed_text",
+    framedNonce,
   });
   const frames = prepared.framedProtocol?.frames ?? [];
   assert.equal(frames.length, 2);
@@ -1038,6 +1335,7 @@ test("framed text batch parses raw assistant prose without a tool call", async (
     stableTerms: [],
     snapshot: { id: "snapshot-0", revisions: [] },
     responseProtocol: "framed_text",
+    framedNonce,
     model: faux.getModel(),
     streamFn: faux.provider.streamSimple.bind(faux.provider),
     budget,
@@ -1053,6 +1351,7 @@ test("framed text batch parses raw assistant prose without a tool call", async (
 test("Japanese mixed kanji-kana residue triggers one targeted repair", async () => {
   const sourceBlocks = [block("block-0", 0, "背後から拝み討ちを放った。")];
   const sourceRequest = singleWindowRequest(sourceBlocks);
+  const framedNonce = "2".repeat(32);
   const prepared = prepareTranslationRequest({
     request: sourceRequest,
     blocks: sourceBlocks,
@@ -1060,6 +1359,7 @@ test("Japanese mixed kanji-kana residue triggers one targeted repair", async () 
     snapshot: { id: "snapshot-ja", revisions: [] },
     sourceLanguageProfile: getSourceLanguageProfile("ja"),
     responseProtocol: "framed_text",
+    framedNonce,
   });
   const frame = prepared.framedProtocol?.frames[0];
   assert.ok(frame);
@@ -1083,6 +1383,7 @@ test("Japanese mixed kanji-kana residue triggers one targeted repair", async () 
     snapshot: { id: "snapshot-ja", revisions: [] },
     sourceLanguageProfile: getSourceLanguageProfile("ja"),
     responseProtocol: "framed_text",
+    framedNonce,
     model: faux.getModel(),
     streamFn: faux.provider.streamSimple.bind(faux.provider),
     budget: new BudgetLedger(),

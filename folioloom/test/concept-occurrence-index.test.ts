@@ -34,9 +34,9 @@ test("concept occurrence index scans and segments every block once for a large c
   let blockSegmentations = 0;
   const profile: SourceLanguageProfile = {
     ...base,
-    normalizeSourceForm(text) {
+    normalizeSourceLiteral(text) {
       if (blockTexts.has(text)) blockNormalizations += 1;
-      return base.normalizeSourceForm(text);
+      return base.normalizeSourceLiteral(text);
     },
     segment(text) {
       if (blockTexts.has(text)) blockSegmentations += 1;
@@ -84,6 +84,62 @@ test("concept occurrence index groups repeated exact spans by concept and block"
   }]);
 });
 
+test("concept occurrence index does not broaden a short word to embedded substrings", () => {
+  const concept = conceptFromAnchor({
+    sourceForm: "AI",
+    target: "人工智能",
+    mode: "stable",
+    semanticClass: "technical_term",
+    confidence: 0.95,
+  });
+  const sourceText = "AI acted; claim, appraised, waits, and brain are ordinary words.";
+  const occurrences = buildConceptOccurrenceIndex([{
+    blockId: "block-ai",
+    sourceText,
+  }], [concept], getSourceLanguageProfile("en"));
+
+  assert.deepEqual(occurrences, [{
+    conceptId: concept.conceptId,
+    blockId: "block-ai",
+    sourceSpans: [{
+      start: 0,
+      end: 2,
+      sourceForm: "AI",
+    }],
+  }]);
+});
+
+test("concept occurrence index does not broaden a possessive source form to its base lemma", () => {
+  const concept = conceptFromAnchor({
+    sourceForm: "EARTH’S",
+    target: "地球的",
+    mode: "stable",
+    semanticClass: "proper_name",
+    confidence: 0.95,
+  });
+  const occurrences = buildConceptOccurrenceIndex([{
+    blockId: "block-base",
+    sourceText: "Earth is distant.",
+  }, {
+    blockId: "block-possessive",
+    sourceText: "Earth’s remaining children and EARTH'S orbit.",
+  }], [concept], getSourceLanguageProfile("en"));
+
+  assert.deepEqual(occurrences, [{
+    conceptId: concept.conceptId,
+    blockId: "block-possessive",
+    sourceSpans: [{
+      start: 0,
+      end: 7,
+      sourceForm: "Earth’s",
+    }, {
+      start: 31,
+      end: 38,
+      sourceForm: "EARTH'S",
+    }],
+  }]);
+});
+
 test("three-million-character occurrence indexing stays one-pass and revision-stable", (t) => {
   const heapBefore = process.memoryUsage().heapUsed;
   let observedHeap = heapBefore;
@@ -117,9 +173,9 @@ test("three-million-character occurrence indexing stays one-pass and revision-st
   let segmentedBlocks = 0;
   const measuredProfile: SourceLanguageProfile = {
     ...base,
-    normalizeSourceForm(text) {
+    normalizeSourceLiteral(text) {
       if (blockTexts.has(text)) normalizedBlocks += 1;
-      return base.normalizeSourceForm(text);
+      return base.normalizeSourceLiteral(text);
     },
     segment(text) {
       if (blockTexts.has(text)) segmentedBlocks += 1;

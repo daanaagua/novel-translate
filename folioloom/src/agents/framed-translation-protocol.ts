@@ -1,4 +1,4 @@
-import { createHash } from "node:crypto";
+import { randomBytes } from "node:crypto";
 
 import { hasSemanticText } from "../text/semantic-text.js";
 
@@ -22,6 +22,7 @@ export interface FramedTranslationProtocolInput {
   readonly requestId: string;
   readonly snapshotId: string;
   readonly blockIds: readonly string[];
+  readonly nonce?: string;
 }
 
 export interface FramedTranslationParseResult {
@@ -37,17 +38,13 @@ function requireNonempty(value: string, label: string): string {
 }
 
 function protocolNonce(input: FramedTranslationProtocolInput): string {
-  const hash = createHash("sha256");
-  hash.update(FRAMED_TRANSLATION_PROTOCOL_VERSION);
-  hash.update("\0");
-  hash.update(input.requestId);
-  hash.update("\0");
-  hash.update(input.snapshotId);
-  for (const blockId of input.blockIds) {
-    hash.update("\0");
-    hash.update(blockId);
+  if (input.nonce !== undefined) {
+    if (!/^[0-9a-f]{32}$/u.test(input.nonce)) {
+      throw new TypeError("framed nonce must be 128-bit lowercase hexadecimal");
+    }
+    return input.nonce;
   }
-  return hash.digest("hex").slice(0, 24);
+  return randomBytes(16).toString("hex");
 }
 
 function marker(

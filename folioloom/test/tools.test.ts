@@ -6,6 +6,7 @@ import { EvidenceIndex } from "../src/index/evidence-index.js";
 import { BudgetExceeded, BudgetLedger } from "../src/kernel/budget.js";
 import {
   CandidateCollector,
+  sanitizeTranslationMemoryCandidates,
   type ResearchQuestion,
 } from "../src/tools/candidate-collector.js";
 import { RepairTools } from "../src/tools/repair-tools.js";
@@ -35,6 +36,39 @@ function question(): ResearchQuestion {
     channel: "narrative_before_target",
   };
 }
+
+test("optional translation memory drops reserved or malformed candidates", () => {
+  const valid = {
+    kind: "local_continuity",
+    subjectForms: ["Sentry Pod"],
+    fact: "Sentry Pod is the name of Avrana Kern's habitat.",
+    confidence: 0.95,
+  } as const;
+  const sanitized = sanitizeTranslationMemoryCandidates([
+    valid,
+    {
+      kind: "lexical_concept",
+      subjectForms: ["Sentry Pod"],
+      fact: "This generic fact is not a lexical concept payload.",
+      confidence: 0.95,
+    },
+    {
+      kind: "entity_identity",
+      subjectForms: [],
+      fact: "No subject form.",
+      confidence: 0.95,
+    },
+  ]);
+
+  assert.deepEqual(sanitized.candidates, [{
+    ...valid,
+    subjectForms: ["Sentry Pod"],
+  }]);
+  assert.deepEqual(sanitized.warnings, [
+    "INVALID_TRANSLATION_MEMORY_CANDIDATE_IGNORED: index=1; reason=kind; value=lexical_concept",
+    "INVALID_TRANSLATION_MEMORY_CANDIDATE_IGNORED: index=2; reason=subject_forms",
+  ]);
+});
 
 test("submit_resolution rejects evidence outside the question channel", async () => {
   const index = EvidenceIndex.fromBlocks([

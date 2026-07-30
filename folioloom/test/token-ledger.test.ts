@@ -11,6 +11,15 @@ function createLedger(cap = 0.1) {
   });
 }
 
+function createTransactionalLedger(cap = 0.1) {
+  return TokenLedger.create({
+    mode: "active",
+    profile: "balanced",
+    tokenIncreaseCap: cap,
+    enforceDispatchLifecycle: true,
+  });
+}
+
 test("empty ledger starts at zero", () => {
   const ledger = createLedger();
   const state = ledger.state();
@@ -154,6 +163,73 @@ test("missing usage settles reserved amount and marks incomplete", () => {
   assert.equal(ledger.state().tokenUsageComplete, false);
 });
 
+test("partial unknown usage never charges less than the observed usage", () => {
+  const ledger = createLedger();
+  ledger.apply({
+    type: "baseline_added",
+    taskIds: ["t1"],
+    baselineTokens: 1000,
+    source: "translate_horizon",
+    reason: "wave",
+  });
+  ledger.apply({
+    type: "reserved",
+    requestId: "r1",
+    purpose: "repair",
+    taskIds: ["t1"],
+    predictedTokens: 150,
+    attempt: 1,
+  });
+  ledger.apply({
+    type: "settled",
+    requestId: "r1",
+    actualTokens: 220,
+    usageComplete: false,
+    outcome: "failed",
+  });
+  assert.equal(ledger.state().spentTokens, 220);
+  assert.equal(ledger.state().tokenUsageComplete, false);
+});
+
+test("reconciliation reports every open and dispatched attempt", () => {
+  const ledger = TokenLedger.create({
+    mode: "active",
+    profile: "balanced",
+    tokenIncreaseCap: 0.1,
+    enforceDispatchLifecycle: true,
+  });
+  ledger.apply({
+    type: "baseline_added",
+    taskIds: ["t1"],
+    baselineTokens: 1000,
+    source: "translate_horizon",
+    reason: "wave",
+  });
+  ledger.apply({
+    type: "reserved",
+    requestId: "r-open",
+    purpose: "translate",
+    taskIds: ["t1"],
+    predictedTokens: 100,
+    attempt: 0,
+  });
+  ledger.apply({
+    type: "dispatched",
+    requestId: "r-open",
+  });
+
+  assert.deepEqual(ledger.reconcile(), {
+    consistent: false,
+    openRequestIds: ["r-open"],
+    dispatchedOpenRequestIds: ["r-open"],
+    orphanDispatchedRequestIds: [],
+  });
+  assert.throws(
+    () => ledger.assertReconciled(),
+    /TOKEN_LEDGER_RECONCILIATION_FAILED/u,
+  );
+});
+
 test("release drops reserved without spending", () => {
   const ledger = createLedger();
   ledger.apply({
@@ -227,6 +303,92 @@ test("double settle is rejected", () => {
       outcome: "success",
     }),
     /already|double|not open|unknown request/i,
+  );
+});
+
+test("transactional ledger requires dispatch before settlement", () => {
+  const ledger = createTransactionalLedger();
+  ledger.apply({
+    type: "reserved",
+    requestId: "attempt-1",
+    purpose: "translate",
+    taskIds: ["task-1"],
+    predictedTokens: 100,
+    attempt: 0,
+  });
+  assert.throws(
+    () => ledger.apply({
+      type: "settled",
+      requestId: "attempt-1",
+      actualTokens: 80,
+      usageComplete: true,
+      outcome: "success",
+    }),
+    /dispatch/i,
+  );
+  ledger.apply({
+    type: "dispatched",
+    requestId: "attempt-1",
+  });
+  ledger.apply({
+    type: "settled",
+    requestId: "attempt-1",
+    actualTokens: 80,
+    usageComplete: true,
+    outcome: "success",
+  });
+  assert.equal(ledger.state().spentTokens, 80);
+});
+
+test("dispatched attempts cannot be released as unlaunched", () => {
+  const ledger = createTransactionalLedger();
+  ledger.apply({
+    type: "reserved",
+    requestId: "attempt-2",
+    purpose: "anchor",
+    taskIds: ["task-2"],
+    predictedTokens: 120,
+    attempt: 0,
+  });
+  ledger.apply({
+    type: "dispatched",
+    requestId: "attempt-2",
+  });
+  assert.throws(
+    () => ledger.apply({
+      type: "released",
+      requestId: "attempt-2",
+      reason: "run_cancelled",
+    }),
+    /dispatch|unlaunched/i,
+  );
+});
+
+test("terminal attempt ids cannot be reserved again", () => {
+  const ledger = createTransactionalLedger();
+  ledger.apply({
+    type: "reserved",
+    requestId: "attempt-3",
+    purpose: "translate",
+    taskIds: ["task-3"],
+    predictedTokens: 100,
+    attempt: 0,
+  });
+  ledger.apply({
+    type: "released",
+    requestId: "attempt-3",
+    reason: "not_launched",
+  });
+  assert.throws(
+    () => ledger.apply({
+      type: "reserved",
+      requestId: "attempt-3",
+      purpose: "translate",
+      taskIds: ["task-3"],
+      predictedTokens: 100,
+      attempt: 1,
+    }),
+    /terminal|already/i,
   );
 });
 

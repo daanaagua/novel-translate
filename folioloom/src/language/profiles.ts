@@ -195,10 +195,13 @@ function normalizeApostrophes(value: string): string {
   return value.replace(/[’‘`]/gu, "'");
 }
 
-function normalizeForm(value: string, definition: ProfileDefinition): string {
-  let normalized = normalizeApostrophes(value.normalize("NFKC"))
-    .trim()
+function normalizeLiteral(value: string, definition: ProfileDefinition): string {
+  return normalizeApostrophes(value.normalize("NFKC"))
     .toLocaleLowerCase(definition.locale);
+}
+
+function normalizeForm(value: string, definition: ProfileDefinition): string {
+  let normalized = normalizeLiteral(value, definition).trim();
   if (definition.id === "en") {
     normalized = normalized.replace(/'s$/u, "");
   }
@@ -855,6 +858,9 @@ function buildProfile(definition: ProfileDefinition): SourceLanguageProfile {
     },
     segment(text: string): SourceToken[] {
       return segmentText(text, definition);
+    },
+    normalizeSourceLiteral(text: string): string {
+      return normalizeLiteral(text, definition);
     },
     normalizeSourceForm(text: string): string {
       return normalizeForm(text, definition);

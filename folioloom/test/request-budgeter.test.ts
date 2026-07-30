@@ -6,6 +6,11 @@ import {
   RequestBudgeter,
   type RequestTokenEstimator,
 } from "../src/fullbook/request-budgeter.js";
+import {
+  outputReserveTokens,
+  reasoningReserveTokens,
+} from "../src/fullbook/execution-worker.js";
+import type { TranslationRuntime } from "../src/fullbook/types.js";
 import type { PhysicalRequestPlan } from "../src/fullbook/types.js";
 import { getSourceLanguageProfile } from "../src/language/profiles.js";
 import { WeightedTokenEstimator } from "../src/source/token-estimator.js";
@@ -182,5 +187,40 @@ test("request budgeting applies usage calibration only to the matching model sco
   assert.equal(
     new RequestBudgeter(estimator, options).assess(fixture()).inputTokens,
     unrelated.inputTokens,
+  );
+});
+
+test("high-effort cold start reserves the observed DeepSeek reasoning envelope", () => {
+  const runtime = {
+    model: {
+      id: "deepseek-v4-flash",
+      maxTokens: 37_200,
+    },
+    effort: "high",
+    thinkingLevel: "high",
+  } as unknown as TranslationRuntime;
+
+  assert.ok(reasoningReserveTokens(runtime) >= 18_958);
+  assert.ok(reasoningReserveTokens(runtime) <= runtime.model.maxTokens);
+});
+
+test("visible output plus reasoning never exceeds model completion capacity", () => {
+  const runtime = {
+    model: {
+      id: "deepseek-v4-flash",
+      maxTokens: 37_200,
+    },
+    effort: "max",
+    thinkingLevel: "high",
+  } as unknown as TranslationRuntime;
+  const request = {
+    requestId: "completion-cap",
+    sourceTokens: 100_000,
+    windows: [],
+  };
+
+  assert.ok(
+    outputReserveTokens(request, runtime) + reasoningReserveTokens(runtime)
+      <= runtime.model.maxTokens,
   );
 });

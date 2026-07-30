@@ -3,6 +3,7 @@ import { createHash } from "node:crypto";
 import type { StableTerm, StableTermPolicy } from "../domain/types.js";
 import type { LexicalConcept } from "./lexical-concept.js";
 import type { SourceLanguageProfile } from "../language/types.js";
+import { buildConceptOccurrenceIndex } from "./concept-occurrence-index.js";
 
 export type TermUsageDiscourseRole =
   | "narrative"
@@ -105,14 +106,6 @@ export function conceptsFromStableTerms(
   return [...grouped.values()];
 }
 
-function scalarOffset(value: string, utf16Offset: number): number {
-  return Array.from(value.slice(0, utf16Offset)).length;
-}
-
-function escapedPattern(value: string): string {
-  return value.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&");
-}
-
 function occurrenceId(
   blockId: string,
   conceptId: string,
@@ -130,50 +123,43 @@ export function expectedTermOccurrences(
   concepts: readonly TermConceptProjection[],
   profile: SourceLanguageProfile,
 ): ExpectedTermOccurrence[] {
+  const conceptById = new Map(concepts.map((concept) => [
+    concept.conceptId,
+    concept,
+  ]));
+  const indexed = buildConceptOccurrenceIndex(
+    blocks.map((block) => ({
+      blockId: block.id,
+      sourceText: block.sourceText,
+    })),
+    concepts,
+    profile,
+  );
   const results: ExpectedTermOccurrence[] = [];
-  for (const block of blocks) {
-    for (const concept of concepts) {
-      const seenSpans = new Set<string>();
-      const forms = [...new Set(concept.sourceForms
-        .map((form) => form.normalize("NFKC").trim())
-        .filter((form) => form.length > 0))]
-        .sort((left, right) => right.length - left.length || left.localeCompare(right));
-      const normalizedForms = new Set(forms.map((form) =>
-        profile.normalizeSourceForm(form)));
-      for (const form of forms) {
-        const matcher = new RegExp(escapedPattern(form), "giu");
-        for (const match of block.sourceText.matchAll(matcher)) {
-          const index = match.index;
-          const matched = match[0];
-          if (index === undefined
-            || !normalizedForms.has(profile.normalizeSourceForm(matched))) {
-            continue;
-          }
-          const sourceStart = scalarOffset(block.sourceText, index);
-          const sourceEnd = sourceStart + Array.from(matched).length;
-          const spanKey = `${sourceStart}\0${sourceEnd}`;
-          if (seenSpans.has(spanKey)) continue;
-          seenSpans.add(spanKey);
-          results.push({
-            occurrenceId: occurrenceId(
-              block.id,
-              concept.conceptId,
-              sourceStart,
-              sourceEnd,
-            ),
-            blockId: block.id,
-            conceptId: concept.conceptId,
-            revisionId: concept.revisionId,
-            renderFingerprint: concept.renderFingerprint,
-            sourceForm: matched,
-            sourceStart,
-            sourceEnd,
-            canonicalTarget: concept.canonicalTarget,
-            allowedRealizations: [...concept.allowedRealizations],
-            policy: concept.policy,
-          });
-        }
-      }
+  for (const occurrence of indexed) {
+    const concept = conceptById.get(occurrence.conceptId);
+    if (concept === undefined) {
+      throw new Error(`indexed unknown term concept ${occurrence.conceptId}`);
+    }
+    for (const span of occurrence.sourceSpans) {
+      results.push({
+        occurrenceId: occurrenceId(
+          occurrence.blockId,
+          concept.conceptId,
+          span.start,
+          span.end,
+        ),
+        blockId: occurrence.blockId,
+        conceptId: concept.conceptId,
+        revisionId: concept.revisionId,
+        renderFingerprint: concept.renderFingerprint,
+        sourceForm: span.sourceForm,
+        sourceStart: span.start,
+        sourceEnd: span.end,
+        canonicalTarget: concept.canonicalTarget,
+        allowedRealizations: [...concept.allowedRealizations],
+        policy: concept.policy,
+      });
     }
   }
   return results.sort((left, right) => {
@@ -209,6 +195,17 @@ export function termSurfaceAllowed(
   return expected.allowedRealizations.some((allowed) =>
     surface.includes(allowed)
     && Array.from(surface).length - Array.from(allowed).length <= 4);
+}
+
+export function termReceiptSurfaceAccepted(
+  expected: Pick<ExpectedTermOccurrence, "allowedRealizations" | "policy">,
+  surface: string,
+): boolean {
+  if (expected.policy === "locked") {
+    return termSurfaceAllowed(expected, surface);
+  }
+  return Array.from(surface).length <= 12
+    && /^[\p{L}\p{M}\p{N}\p{Pc}·・.'’\-]+$/u.test(surface);
 }
 
 export function validateTermUsages(
@@ -252,7 +249,7 @@ export function validateTermUsages(
       fail("TERM_USAGE_SOURCE_MISMATCH", submission.occurrenceId);
       continue;
     }
-    if (!termSurfaceAllowed(known, submission.targetSurface)) {
+    if (!termReceiptSurfaceAccepted(known, submission.targetSurface)) {
       fail("TERM_USAGE_TARGET_NOT_ALLOWED", submission.occurrenceId);
       continue;
     }
@@ -266,7 +263,9 @@ export function validateTermUsages(
   }
   const submittedIds = new Set(submissions.map((item) => item.occurrenceId));
   return expected
-    .filter((item) => !submittedIds.has(item.occurrenceId))
+    .filter((item) =>
+      item.policy === "locked"
+      && !submittedIds.has(item.occurrenceId))
     .map((item) => ({
       code: "TERM_USAGE_MISSING" as const,
       occurrenceId: item.occurrenceId,
@@ -295,4 +294,27 @@ export function inferTermUsages(
       targetSurface: surface,
     }];
   });
+}
+
+/**
+ * Preserve every model-submitted receipt, then deterministically fill only
+ * omitted receipts whose allowed target realization is already present in the
+ * translated block.  Invalid, duplicate, or forged submissions are never
+ * replaced, so the strict validator still reports them.
+ */
+export function completeTermUsagesFromTarget(
+  expected: readonly ExpectedTermOccurrence[],
+  submissions: readonly TermUsageSubmission[],
+  targetByBlock: ReadonlyMap<string, string> | Readonly<Record<string, string>>,
+): TermUsageSubmission[] {
+  const submittedIds = new Set(submissions.map((submission) =>
+    submission.occurrenceId));
+  return [
+    ...submissions.map((submission) => ({ ...submission })),
+    ...inferTermUsages(
+      expected.filter((occurrence) =>
+        !submittedIds.has(occurrence.occurrenceId)),
+      targetByBlock,
+    ),
+  ];
 }

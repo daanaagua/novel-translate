@@ -1,4 +1,4 @@
-import { createHash } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 
 import {
   ModelProviderError,
@@ -6,11 +6,20 @@ import {
 } from "../agents/pi-runtime.js";
 import {
   runTranslationBatch,
+  validateTranslationBatchCandidate,
   type TranslationBatchResult,
   type TranslationBatchWindowResult,
+  type TranslationProviderResponseEvidence,
 } from "../agents/translation-batch.js";
-import type { TranslationRequestInput } from "../agents/translation-request.js";
-import { BudgetLedger } from "../kernel/budget.js";
+import {
+  expectedTermOccurrencesForTranslationInput,
+  narrowSelectedKnowledgeToTranslationWireInput,
+  type TranslationRequestInput,
+} from "../agents/translation-request.js";
+import {
+  BudgetLedger,
+  DEFAULT_BUDGET_LIMITS,
+} from "../kernel/budget.js";
 import type { SourceLanguageProfile } from "../language/types.js";
 import type { LosslessBlock } from "../source/types.js";
 import {
@@ -27,6 +36,17 @@ import {
   RequestBudgeter,
   type RequestBudgetAssessment,
 } from "./request-budgeter.js";
+import { coldStartReasoningUpperBound } from "./budget-oracle.js";
+import {
+  assembleParagraphFragmentCandidates,
+  paragraphFragmentExecutionScope,
+  paragraphFragmentFirstRequired,
+  planParagraphFragments,
+  sourceParagraphSpans,
+  type ParagraphFragmentCandidate,
+  type ParagraphFragmentPlan,
+  type ParagraphFragmentUnit,
+} from "./paragraph-fragment.js";
 import type { RuntimeFeatures } from "./runtime-cost-model.js";
 import type { TaskExecutionVariant } from "./rolling-horizon-planner.js";
 import {
@@ -63,6 +83,8 @@ const CONTEXT_FRAGMENT_PROTOCOL_VERSION = "v5-context-fragment-1";
 export const MAX_CONTEXT_SPLIT_DEPTH = 16;
 export const MAX_CONTEXT_SPLIT_ATTEMPTS = 32;
 export const MAX_PROTOCOL_SPLIT_ATTEMPTS = 16;
+export const MAX_PARAGRAPH_REFINEMENTS_PER_PLAN = 1;
+export const MAX_TARGETED_REPAIRS_PER_REQUEST = 3;
 
 export interface AdmittedRequestFragment<TInput> {
   request: PhysicalRequestPlan;
@@ -70,6 +92,10 @@ export interface AdmittedRequestFragment<TInput> {
   assessment: RequestBudgetAssessment;
   /** Every split raises this number, so recovery cannot re-enqueue the same shape forever. */
   depth: number;
+  readonly paragraphPlan?: ParagraphFragmentPlan;
+  readonly paragraphUnit?: ParagraphFragmentUnit;
+  /** One fixed refinement level; children never carry another refinement plan. */
+  readonly paragraphRefinements?: readonly AdmittedRequestFragment<TInput>[];
 }
 
 export interface AdmittedTranslationRequest<TInput> {
@@ -79,6 +105,15 @@ export interface AdmittedTranslationRequest<TInput> {
   readonly fragments: readonly AdmittedRequestFragment<TInput>[];
   /** Largest serial fragment reservation used by the outer schedulers. */
   readonly assessment: RequestBudgetAssessment;
+  /**
+   * Bounded reserve for whole-request degeneration into paragraph vectors and
+   * their one legal scalar-refinement level.
+   */
+  readonly paragraphRecoveryReserveTokens: number;
+  /** Legal-policy baseline reserve for at most one refined unit per paragraph plan. */
+  readonly paragraphRefinementReserveTokens: number;
+  /** Bounded reserve for independent semantic repair scopes in this request. */
+  readonly targetedRepairReserveTokens: number;
 }
 
 export interface PlannedTranslationExecution {
@@ -104,6 +139,8 @@ export interface CompletedTranslationRequest {
   runtime: {
     readonly durationMs: number;
     readonly usage: NormalizedRuntimeUsage;
+    /** Usage charged by the parent attempt; recovery attempts settle separately. */
+    readonly accountingUsage: NormalizedRuntimeUsage;
     readonly observationDurationMs: number;
     readonly observationUsage: NormalizedRuntimeUsage;
     readonly status: RuntimeObservationStatus;
@@ -125,6 +162,14 @@ export interface ScheduledResult<T> {
 
 export interface TranslationExecutionDeps {
   readonly admission: AdmissionController;
+  /**
+   * Allocates a durable request identity that is fresh across process
+   * restarts as well as within the current execution.
+   */
+  readonly nextLedgerAttemptId: (
+    operationId: string,
+    attempt: number,
+  ) => string;
   readonly runtimeSet: TranslationRuntimeSet;
   readonly estimator: Pick<WeightedTokenEstimator, "observeUsage"> & WeightedTokenEstimator;
   readonly languageProfile: SourceLanguageProfile;
@@ -132,6 +177,86 @@ export interface TranslationExecutionDeps {
   readonly signal?: AbortSignal;
   readonly hardDeadlineMs?: number;
   readonly retryRound: number;
+  /** Recomputed immediately before any secondary provider attempt. */
+  readonly conservativeHorizonFloor: () => number;
+  readonly onProviderResponse?: (
+    evidence: TranslationProviderResponseEvidence,
+  ) => void | Promise<void>;
+}
+
+function fragmentTranslationTurnLimit(
+  fragment: Pick<
+    AdmittedRequestFragment<TranslationRequestInput>,
+    "input"
+  >,
+): number {
+  return fragment.input.responseProtocol === "framed_text" ? 1 : 2;
+}
+
+/**
+ * Size the local anti-loop ledger from the already-admitted execution graph.
+ * Token admission remains authoritative; these counters only prevent a legal
+ * paragraph plan from colliding with the older single-request turn defaults.
+ */
+export function executionBudgetLimits(
+  fragments: readonly AdmittedRequestFragment<TranslationRequestInput>[],
+): {
+  readonly modelCalls: number;
+  readonly translationTurns: number;
+  readonly translationToolCalls: number;
+  readonly repairTurns: number;
+} {
+  const directTurns = fragments.reduce(
+    (total, fragment) => total + fragmentTranslationTurnLimit(fragment),
+    0,
+  );
+  const refinementTurnsByPlan = new Map<string, number>();
+  for (const fragment of fragments) {
+    const planId = fragment.paragraphPlan?.planId;
+    if (planId === undefined) continue;
+    const turns = (fragment.paragraphRefinements ?? []).reduce(
+      (total, refinement) =>
+        total + fragmentTranslationTurnLimit(refinement),
+      0,
+    );
+    refinementTurnsByPlan.set(
+      planId,
+      Math.max(refinementTurnsByPlan.get(planId) ?? 0, turns),
+    );
+  }
+  const refinementTurns = [...refinementTurnsByPlan.values()].reduce(
+    (total, turns) => total + turns,
+    0,
+  );
+  const legalTranslationTurns = directTurns + refinementTurns;
+  const potentialRepairScopes = fragments.reduce(
+    (total, fragment) =>
+      total + 1 + (fragment.paragraphRefinements?.length ?? 0),
+    0,
+  );
+  const repairTurns = Math.min(
+    MAX_TARGETED_REPAIRS_PER_REQUEST,
+    potentialRepairScopes,
+  );
+  const translationTurns = Math.max(
+    DEFAULT_BUDGET_LIMITS.translationTurns,
+    legalTranslationTurns,
+  );
+  return {
+    translationTurns,
+    translationToolCalls: Math.max(
+      DEFAULT_BUDGET_LIMITS.translationToolCalls,
+      legalTranslationTurns + repairTurns,
+    ),
+    modelCalls: Math.max(
+      DEFAULT_BUDGET_LIMITS.modelCalls,
+      legalTranslationTurns + repairTurns,
+    ),
+    repairTurns: Math.max(
+      DEFAULT_BUDGET_LIMITS.repairTurns,
+      repairTurns,
+    ),
+  };
 }
 
 interface FragmentTranslationExecution {
@@ -139,37 +264,31 @@ interface FragmentTranslationExecution {
   result: TranslationBatchResult;
 }
 
+const PARAGRAPH_FRAGMENT_ORACLE_CHARACTERS = 1_024;
+const PARAGRAPH_FRAGMENT_ORACLE_PLACEHOLDER =
+  "续".repeat(PARAGRAPH_FRAGMENT_ORACLE_CHARACTERS);
+
 function throwIfAborted(signal: AbortSignal | undefined): void {
   signal?.throwIfAborted();
 }
 
 export function reasoningReserveTokens(runtime: TranslationRuntime): number {
-  switch (runtime.effort ?? runtime.thinkingLevel) {
-    case undefined:
-    case "off":
-      return 0;
-    case "minimal":
-      return 512;
-    case "low":
-      return 1_024;
-    case "medium":
-    case "on":
-      return 2_048;
-    case "high":
-      return 4_096;
-    case "xhigh":
-      return 6_144;
-    case "max":
-      return 8_192;
-  }
+  return coldStartReasoningUpperBound(
+    runtime.model.maxTokens,
+    runtime.effort ?? runtime.thinkingLevel,
+  );
 }
 
 export function outputReserveTokens(
   request: PhysicalRequestPlan,
   runtime: TranslationRuntime,
 ): number {
+  const completionCapacity = Math.max(
+    0,
+    Math.floor(runtime.model.maxTokens) - reasoningReserveTokens(runtime),
+  );
   return Math.min(
-    runtime.model.maxTokens,
+    completionCapacity,
     Math.max(768, Math.ceil(request.sourceTokens * 1.6) + 512),
   );
 }
@@ -189,6 +308,19 @@ function contextFragmentRequestId(
     hash.update("\0");
     hash.update(blockId);
   }
+  return `request-${hash.digest("hex").slice(0, 20)}`;
+}
+
+function paragraphFragmentRequestId(
+  parentRequestId: string,
+  executionUnitId: string,
+): string {
+  const hash = createHash("sha256");
+  hash.update("paragraph-fragment-request-v1");
+  hash.update("\0");
+  hash.update(parentRequestId);
+  hash.update("\0");
+  hash.update(executionUnitId);
   return `request-${hash.digest("hex").slice(0, 20)}`;
 }
 
@@ -284,10 +416,40 @@ export function assessTranslationFragment<TInput extends TranslationRequestInput
   buildInput: (request: PhysicalRequestPlan) => TInput,
   depth = 0,
 ): AdmittedRequestFragment<TInput> {
-  const input = buildInput(request);
+  const built = buildInput(request);
+  const input = (
+    built.responseProtocol === "framed_text"
+    && built.framedNonce === undefined
+  )
+    ? {
+      ...built,
+      framedNonce: randomBytes(16).toString("hex"),
+    } as TInput
+    : built;
+  return assessPreparedTranslationFragment(
+    request,
+    input,
+    runtime,
+    estimator,
+    depth,
+  );
+}
+
+function assessPreparedTranslationFragment<
+  TInput extends TranslationRequestInput,
+>(
+  request: PhysicalRequestPlan,
+  input: TInput,
+  runtime: TranslationRuntime,
+  estimator: WeightedTokenEstimator,
+  depth: number,
+  paragraphPlan?: ParagraphFragmentPlan,
+  paragraphUnit?: ParagraphFragmentUnit,
+): AdmittedRequestFragment<TInput> {
   const assessment = new RequestBudgeter(estimator, {
     modelId: runtime.model.id,
     contextWindowTokens: runtime.model.contextWindow,
+    maxCompletionTokens: runtime.model.maxTokens,
     outputTokens: outputReserveTokens(request, runtime),
     reasoningReserveTokens: Math.min(
       reasoningReserveTokens(runtime),
@@ -295,7 +457,301 @@ export function assessTranslationFragment<TInput extends TranslationRequestInput
     ),
     safetyMarginTokens: Math.max(512, Math.ceil(runtime.model.contextWindow * 0.02)),
   }).assess(input);
-  return { request, input, assessment, depth };
+  return {
+    request,
+    input,
+    assessment,
+    depth,
+    ...(paragraphPlan === undefined ? {} : { paragraphPlan }),
+    ...(paragraphUnit === undefined ? {} : { paragraphUnit }),
+  };
+}
+
+function paragraphFragmentRequest(
+  parentRequest: PhysicalRequestPlan,
+  plan: ParagraphFragmentPlan,
+  unit: ParagraphFragmentUnit,
+  block: LosslessBlock,
+): PhysicalRequestPlan {
+  const parentWindow = parentRequest.windows.find((window) =>
+    window.windowId === plan.windowId);
+  if (parentWindow === undefined) {
+    throw new Error(`paragraph plan references unknown window ${plan.windowId}`);
+  }
+  const fragmentChars = unit.paragraphs.reduce(
+    (total, paragraph) => total + paragraph.sourceText.length,
+    0,
+  );
+  const sourceTokens = Math.max(
+    1,
+    Math.ceil(
+      block.tokenCount
+      * fragmentChars
+      / Math.max(1, block.sourceText.length),
+    ),
+  );
+  return {
+    requestId: paragraphFragmentRequestId(
+      parentRequest.requestId,
+      unit.executionUnitId,
+    ),
+    windows: [{
+      ...parentWindow,
+      blockIds: [plan.blockId],
+      globalIndexes: [block.globalIndex],
+      sourceTokens,
+      sourceChars: fragmentChars,
+      oversized: false,
+    }],
+    sourceTokens,
+  };
+}
+
+function paragraphRefinementUnits(
+  unit: ParagraphFragmentUnit,
+): ParagraphFragmentUnit[] {
+  if (unit.paragraphs.length <= 1) return [];
+  return unit.paragraphs.map((paragraph, index) => {
+    const previous = unit.paragraphs[index - 1];
+    const next = unit.paragraphs[index + 1];
+    const executionUnitId = `paragraph-refinement-${
+      createHash("sha256")
+        .update([
+          unit.executionUnitId,
+          paragraph.paragraphId,
+          String(index),
+        ].join("\0"))
+        .digest("hex")
+        .slice(0, 24)
+    }`;
+    return {
+      executionUnitId,
+      planId: unit.planId,
+      blockId: unit.blockId,
+      paragraphStart: paragraph.ordinal,
+      paragraphEnd: paragraph.ordinal + 1,
+      paragraphs: [paragraph],
+      leftSourceContext: previous === undefined
+        ? unit.leftSourceContext
+        : [previous],
+      rightSourceContext: next === undefined
+        ? unit.rightSourceContext
+        : [next],
+    };
+  });
+}
+
+function paragraphPlanForWindow(
+  request: PhysicalRequestPlan,
+  window: RequestBatchWindow,
+  blockById: ReadonlyMap<string, LosslessBlock>,
+  baseInput: TranslationRequestInput,
+  requireHighRisk: boolean,
+): ParagraphFragmentPlan | undefined {
+  if (window.blockIds.length !== 1) return undefined;
+  const blockId = window.blockIds[0];
+  const block = blockId === undefined ? undefined : blockById.get(blockId);
+  if (block === undefined
+    || sourceParagraphSpans(block).length < 2
+    || (requireHighRisk && !paragraphFragmentFirstRequired(block))) {
+    return undefined;
+  }
+  return planParagraphFragments({
+    windowId: window.windowId,
+    block,
+    snapshotId: baseInput.snapshot.id,
+    protectedSourceRanges: expectedTermOccurrencesForTranslationInput(baseInput)
+      .filter((occurrence) => occurrence.blockId === block.id)
+      .map((occurrence) => ({
+        sourceStart: occurrence.sourceStart,
+        sourceEnd: occurrence.sourceEnd,
+      })),
+  });
+}
+
+function admitParagraphFragmentPlan<
+  TInput extends TranslationRequestInput,
+>(
+  parentRequest: PhysicalRequestPlan,
+  plan: ParagraphFragmentPlan,
+  runtime: TranslationRuntime,
+  estimator: WeightedTokenEstimator,
+  blockById: ReadonlyMap<string, LosslessBlock>,
+  buildInput: (request: PhysicalRequestPlan) => TInput,
+  depth: number,
+): AdmittedRequestFragment<TInput>[] {
+  const block = blockById.get(plan.blockId);
+  if (block === undefined) {
+    throw new Error(`paragraph plan references unknown block ${plan.blockId}`);
+  }
+  return plan.units.map((unit) => {
+    const request = paragraphFragmentRequest(
+      parentRequest,
+      plan,
+      unit,
+      block,
+    );
+    const input = narrowSelectedKnowledgeToTranslationWireInput({
+      ...buildInput(request),
+      responseProtocol: "typed_tool" as const,
+      paragraphFragment: paragraphFragmentExecutionScope(plan, unit),
+      previousActiveTail: PARAGRAPH_FRAGMENT_ORACLE_PLACEHOLDER,
+    } as TInput);
+    const admitted = assessPreparedTranslationFragment(
+      request,
+      input,
+      runtime,
+      estimator,
+      depth,
+      plan,
+      unit,
+    );
+    const paragraphRefinements = paragraphRefinementUnits(unit).map(
+      (refinementUnit) => {
+        const refinementRequest = paragraphFragmentRequest(
+          parentRequest,
+          plan,
+          refinementUnit,
+          block,
+        );
+        const refinementInput =
+          narrowSelectedKnowledgeToTranslationWireInput({
+            ...buildInput(refinementRequest),
+            responseProtocol: "typed_tool" as const,
+            paragraphFragment: paragraphFragmentExecutionScope(
+              plan,
+              refinementUnit,
+            ),
+            previousActiveTail: PARAGRAPH_FRAGMENT_ORACLE_PLACEHOLDER,
+          } as TInput);
+        return assessPreparedTranslationFragment(
+          refinementRequest,
+          refinementInput,
+          runtime,
+          estimator,
+          depth,
+          plan,
+          refinementUnit,
+        );
+      },
+    );
+    return paragraphRefinements.length === 0
+      ? admitted
+      : { ...admitted, paragraphRefinements };
+  });
+}
+
+function admitHighRiskParagraphFragments<
+  TInput extends TranslationRequestInput,
+>(
+  request: PhysicalRequestPlan,
+  runtime: TranslationRuntime,
+  estimator: WeightedTokenEstimator,
+  blockById: ReadonlyMap<string, LosslessBlock>,
+  buildInput: (request: PhysicalRequestPlan) => TInput,
+): AdmittedRequestFragment<TInput>[] | undefined {
+  const fragments: AdmittedRequestFragment<TInput>[] = [];
+  let fragmented = false;
+  for (const window of request.windows) {
+    const highRiskBlockIds = window.blockIds.filter((blockId) => {
+      const block = blockById.get(blockId);
+      if (block === undefined) {
+        throw new Error(`paragraph admission references unknown block ${blockId}`);
+      }
+      return paragraphFragmentFirstRequired(block);
+    });
+    const blockGroups = highRiskBlockIds.length === 0
+      ? [window.blockIds]
+      : window.blockIds.map((blockId) => [blockId]);
+    if (highRiskBlockIds.length > 0) {
+      fragmented = true;
+    }
+    for (const blockIds of blockGroups) {
+      const isolatedWindow = fragmentWindowAtBlocks(
+        window,
+        blockIds,
+        blockById,
+      );
+      const isolatedRequest: PhysicalRequestPlan = {
+        requestId: contextFragmentRequestId(
+          request.requestId,
+          window.windowId,
+          blockIds,
+        ),
+        windows: [isolatedWindow],
+        sourceTokens: isolatedWindow.sourceTokens,
+      };
+      const plan = paragraphPlanForWindow(
+        isolatedRequest,
+        isolatedWindow,
+        blockById,
+        buildInput(isolatedRequest),
+        true,
+      );
+      if (plan === undefined) {
+        fragments.push(...admitTranslationFragments(
+          [isolatedRequest],
+          runtime,
+          estimator,
+          blockById,
+          buildInput,
+        ));
+        continue;
+      }
+      fragments.push(...admitParagraphFragmentPlan(
+        isolatedRequest,
+        plan,
+        runtime,
+        estimator,
+        blockById,
+        buildInput,
+        0,
+      ));
+    }
+  }
+  return fragmented ? fragments : undefined;
+}
+
+function admitParagraphRecoveryFragments<
+  TInput extends TranslationRequestInput,
+>(
+  request: PhysicalRequestPlan,
+  runtime: TranslationRuntime,
+  estimator: WeightedTokenEstimator,
+  blockById: ReadonlyMap<string, LosslessBlock>,
+  buildInput: (request: PhysicalRequestPlan) => TInput,
+  depth: number,
+): AdmittedRequestFragment<TInput>[] | undefined {
+  const fragments: AdmittedRequestFragment<TInput>[] = [];
+  for (const window of request.windows) {
+    const isolatedRequest: PhysicalRequestPlan = {
+      requestId: contextFragmentRequestId(
+        request.requestId,
+        window.windowId,
+        window.blockIds,
+      ),
+      windows: [window],
+      sourceTokens: window.sourceTokens,
+    };
+    const plan = paragraphPlanForWindow(
+      isolatedRequest,
+      window,
+      blockById,
+      buildInput(isolatedRequest),
+      false,
+    );
+    if (plan === undefined) return undefined;
+    fragments.push(...admitParagraphFragmentPlan(
+      isolatedRequest,
+      plan,
+      runtime,
+      estimator,
+      blockById,
+      buildInput,
+      depth,
+    ));
+  }
+  return fragments.length > 0 ? fragments : undefined;
 }
 
 export function capacityAssessmentForProviderContext(
@@ -361,19 +817,87 @@ export function admitTranslationRequests<TInput extends TranslationRequestInput>
   buildInput: (request: PhysicalRequestPlan) => TInput,
 ): AdmittedTranslationRequest<TInput>[] {
   return requests.map((request) => {
-    const fragments = admitTranslationFragments(
-      [request],
+    const fragments = admitHighRiskParagraphFragments(
+      request,
       runtime,
       estimator,
       blockById,
       buildInput,
-    );
+    ) ?? admitTranslationFragments(
+        [request],
+        runtime,
+        estimator,
+        blockById,
+        buildInput,
+      );
     const largest = fragments.reduce((current, fragment) =>
       fragment.assessment.totalReserved > current.assessment.totalReserved
         ? fragment
         : current,
     );
-    return { request, fragments, assessment: largest.assessment };
+    const refinementReserveFor = (
+      candidates: readonly AdmittedRequestFragment<TInput>[],
+    ): number => {
+      const reserveByPlan = new Map<string, number>();
+      for (const fragment of candidates) {
+        const planId = fragment.paragraphPlan?.planId;
+        if (planId === undefined) continue;
+        const reserve = fragment.paragraphRefinements?.reduce(
+          (total, refinement) =>
+            total + refinement.assessment.totalReserved,
+          0,
+        ) ?? 0;
+        reserveByPlan.set(
+          planId,
+          Math.max(reserveByPlan.get(planId) ?? 0, reserve),
+        );
+      }
+      return [...reserveByPlan.values()].reduce(
+        (total, reserve) => total + reserve,
+        0,
+      );
+    };
+    const paragraphRefinementReserveTokens =
+      refinementReserveFor(fragments);
+    const paragraphRecoveryFragments = fragments.some((fragment) =>
+      fragment.paragraphPlan !== undefined)
+      ? []
+      : request.windows.flatMap((window) =>
+          admitParagraphRecoveryFragments(
+            requestWithWindows(request, new Set([window.windowId])),
+            runtime,
+            estimator,
+            blockById,
+            buildInput,
+            1,
+          ) ?? []);
+    const paragraphRecoveryReserveTokens =
+      paragraphRecoveryFragments.reduce(
+        (total, fragment) =>
+          total + fragment.assessment.totalReserved,
+        0,
+      )
+      + refinementReserveFor(paragraphRecoveryFragments);
+    const targetedRepairReserveTokens = [
+      ...fragments,
+      ...paragraphRecoveryFragments,
+    ]
+      .flatMap((fragment) => [
+        fragment.assessment.totalReserved,
+        ...(fragment.paragraphRefinements ?? []).map((refinement) =>
+          refinement.assessment.totalReserved),
+      ])
+      .sort((left, right) => right - left)
+      .slice(0, MAX_TARGETED_REPAIRS_PER_REQUEST)
+      .reduce((total, reserve) => total + reserve, 0);
+    return {
+      request,
+      fragments,
+      assessment: largest.assessment,
+      paragraphRecoveryReserveTokens,
+      paragraphRefinementReserveTokens,
+      targetedRepairReserveTokens,
+    };
   });
 }
 
@@ -399,6 +923,32 @@ export function runtimeUsageForRuns(
   });
 }
 
+function accountingUsageForRuns(
+  runs: readonly PiRunResult[],
+): NormalizedRuntimeUsage {
+  const usage = runtimeUsageForRuns(runs);
+  return runs.length > 0
+    && runs.every((run) =>
+      run.modelCalls === 0 || run.usage.totalTokens > 0)
+    ? usage
+    : { ...usage, complete: false };
+}
+
+function providerErrorRun(error: unknown): PiRunResult | undefined {
+  return error instanceof ModelProviderError ? error.run : undefined;
+}
+
+function providerErrorUsage(error: unknown): NormalizedRuntimeUsage {
+  const run = providerErrorRun(error);
+  if (run === undefined) {
+    return { ...runtimeUsageForRuns([]), complete: false };
+  }
+  const usage = runtimeUsageForRuns([run]);
+  return run.usage.totalTokens > 0
+    ? usage
+    : { ...usage, complete: false };
+}
+
 export function runtimeObservationStatus(
   status: SchedulerObservationStatus,
 ): RuntimeObservationStatus {
@@ -406,7 +956,8 @@ export function runtimeObservationStatus(
 }
 
 const RECOVERABLE_STRUCTURAL_SUBMISSION_ERROR = /^(?:missing window submission|duplicate windowId|unknown blockId|duplicate blockId|empty translation|block set mismatch|missing block translations while merging context fragments|duplicate block translation while merging context fragments)/u;
-const RECOVERABLE_LOCAL_DEGENERATION_ERROR = /^(?:validation|cross-block validation) failed after one targeted repair:[\s\S]*(?:untranslated_latin|paragraph_count_incompatible|paragraph_length_incompatible|abnormal_block_shortening|insufficient_lexical_content|abnormal_shortening|cross_block_translation_overlap)/u;
+const RECOVERABLE_LOCAL_DEGENERATION_ERROR = /^(?:(?:validation|cross-block validation) failed after one targeted repair|shape collapse):[\s\S]*(?:untranslated_latin|paragraph_count_incompatible|paragraph_length_incompatible|abnormal_block_shortening|insufficient_lexical_content|abnormal_shortening|cross_block_translation_overlap)/u;
+const RECOVERABLE_PARAGRAPH_REFINEMENT_ERROR = /^(?:missing window submission|paragraph count mismatch|empty translation|block set mismatch|shape collapse)/u;
 
 function failedWindowIdsMatching(
   result: TranslationBatchResult,
@@ -446,6 +997,7 @@ export function mergeFragmentTranslationResults(
 ): MergedTranslationResult {
   const partsByWindow = new Map<string, TranslationBatchWindowResult[]>();
   for (const execution of executions) {
+    if (execution.fragment.paragraphPlan !== undefined) continue;
     for (const result of execution.result.windows) {
       const parts = partsByWindow.get(result.windowId) ?? [];
       parts.push(result);
@@ -453,7 +1005,118 @@ export function mergeFragmentTranslationResults(
     }
   }
   const windows = request.windows.map((logicalWindow): TranslationBatchWindowResult => {
-    const parts = partsByWindow.get(logicalWindow.windowId) ?? [];
+    const paragraphExecutions = executions.filter((execution) =>
+      execution.fragment.paragraphPlan?.windowId === logicalWindow.windowId);
+    const paragraphExecutionGroups = new Map<
+      string,
+      FragmentTranslationExecution[]
+    >();
+    for (const execution of paragraphExecutions) {
+      const planId = execution.fragment.paragraphPlan?.planId;
+      if (planId === undefined) continue;
+      const group = paragraphExecutionGroups.get(planId) ?? [];
+      group.push(execution);
+      paragraphExecutionGroups.set(planId, group);
+    }
+    const paragraphParts: TranslationBatchWindowResult[] = [];
+    for (const group of paragraphExecutionGroups.values()) {
+      const plan = group[0]?.fragment.paragraphPlan;
+      if (plan === undefined
+        || group.some((execution) =>
+          execution.fragment.paragraphPlan?.planId !== plan.planId
+          || execution.fragment.paragraphPlan?.blockId !== plan.blockId)) {
+        paragraphParts.push({
+          windowId: logicalWindow.windowId,
+          ordinal: logicalWindow.ordinal,
+          status: "failed",
+          translations: [],
+          termUsages: [],
+          notes: [],
+          memoryCandidates: [],
+          error: "mixed paragraph fragment plans while assembling logical block",
+        });
+        continue;
+      }
+      const candidates: ParagraphFragmentCandidate[] = [];
+      let failedPart: TranslationBatchWindowResult | undefined;
+      for (const execution of group) {
+        const unit = execution.fragment.paragraphUnit;
+        const result = execution.result.windows.find((window) =>
+          window.windowId === logicalWindow.windowId);
+        if (unit === undefined || result === undefined
+          || result.status === "failed"
+          || result.paragraphs === undefined) {
+          failedPart = {
+            windowId: logicalWindow.windowId,
+            ordinal: logicalWindow.ordinal,
+            status: "failed",
+            translations: [],
+            termUsages: [],
+            notes: [],
+            memoryCandidates: [],
+            error: result?.error ?? "paragraph fragment translation failed",
+          };
+          break;
+        }
+        candidates.push({
+          planId: plan.planId,
+          executionUnitId: unit.executionUnitId,
+          windowId: plan.windowId,
+          blockId: plan.blockId,
+          sourceHash: plan.sourceHash,
+          snapshotId: plan.snapshotId,
+          paragraphs: result.paragraphs.map((paragraph) => ({ ...paragraph })),
+          termUsages: result.termUsages.map((usage) => ({ ...usage })),
+          notes: [...result.notes],
+          memoryCandidates: [...result.memoryCandidates],
+        });
+      }
+      if (failedPart !== undefined) {
+        paragraphParts.push(failedPart);
+        continue;
+      }
+      try {
+        const assembly = assembleParagraphFragmentCandidates(plan, candidates);
+        let styleObservation: TranslationBatchWindowResult["styleObservation"];
+        for (const execution of group) {
+          const observation = execution.result.windows.find((window) =>
+            window.windowId === logicalWindow.windowId)?.styleObservation;
+          if (observation !== undefined) styleObservation = observation;
+        }
+        paragraphParts.push({
+          windowId: logicalWindow.windowId,
+          ordinal: logicalWindow.ordinal,
+          status: group.some((execution) =>
+            execution.result.windows.some((window) =>
+              window.windowId === logicalWindow.windowId
+              && window.status === "completed_with_warnings"))
+            ? "completed_with_warnings"
+            : "completed",
+          translations: [assembly.translation],
+          termUsages: assembly.termUsages,
+          notes: assembly.notes,
+          memoryCandidates: assembly.memoryCandidates,
+          ...(styleObservation === undefined ? {} : { styleObservation }),
+        });
+      } catch (error) {
+        paragraphParts.push({
+          windowId: logicalWindow.windowId,
+          ordinal: logicalWindow.ordinal,
+          status: "failed",
+          translations: [],
+          termUsages: [],
+          notes: [],
+          memoryCandidates: [],
+          error: error instanceof Error
+            ? error.message
+            : "paragraph fragment assembly failed",
+        });
+      }
+    }
+    const parts = [
+      ...(partsByWindow.get(logicalWindow.windowId) ?? []),
+      ...paragraphParts,
+    ];
     const failedPart = parts.find((part) => part.status === "failed");
     if (failedPart !== undefined) {
       return {
@@ -524,12 +1187,90 @@ export function mergeFragmentTranslationResults(
   };
 }
 
+function mergeParagraphRefinementExecutions(
+  original: AdmittedRequestFragment<TranslationRequestInput>,
+  refinements: readonly FragmentTranslationExecution[],
+): FragmentTranslationExecution {
+  const logicalWindow = original.request.windows[0];
+  const first = refinements[0];
+  const last = refinements.at(-1);
+  if (logicalWindow === undefined || first === undefined || last === undefined) {
+    throw new Error("paragraph refinement requires one window and at least one result");
+  }
+  const parts = refinements.map((execution) =>
+    execution.result.windows.find((window) =>
+      window.windowId === logicalWindow.windowId));
+  const failedIndex = parts.findIndex((part) =>
+    part === undefined
+    || part.status === "failed"
+    || part.paragraphs === undefined);
+  const failed = failedIndex < 0 ? undefined : parts[failedIndex];
+  const aggregateWindow: TranslationBatchWindowResult = failedIndex >= 0
+    ? {
+      windowId: logicalWindow.windowId,
+      ordinal: logicalWindow.ordinal,
+      status: "failed",
+      translations: [],
+      termUsages: [],
+      notes: [],
+      memoryCandidates: [],
+      error: failed?.error ?? "paragraph refinement translation failed",
+    }
+    : (() => {
+      const accepted = parts as Array<
+        TranslationBatchWindowResult & {
+          paragraphs: Array<{ paragraphId: string; text: string }>;
+        }
+      >;
+      const paragraphs = accepted.flatMap((part) =>
+        part.paragraphs.map((paragraph) => ({ ...paragraph })));
+      let styleObservation: TranslationBatchWindowResult["styleObservation"];
+      for (const part of accepted) {
+        if (part.styleObservation !== undefined) {
+          styleObservation = part.styleObservation;
+        }
+      }
+      return {
+        windowId: logicalWindow.windowId,
+        ordinal: logicalWindow.ordinal,
+        status: accepted.some((part) =>
+          part.status === "completed_with_warnings")
+          ? "completed_with_warnings"
+          : "completed",
+        translations: [{
+          blockId: original.input.paragraphFragment?.blockId ?? "",
+          text: paragraphs.map((paragraph) => paragraph.text).join("\n\n"),
+        }],
+        paragraphs,
+        termUsages: accepted.flatMap((part) =>
+          part.termUsages.map((usage) => ({ ...usage }))),
+        notes: accepted.flatMap((part) => [...part.notes]),
+        memoryCandidates: accepted.flatMap((part) => [...part.memoryCandidates]),
+        ...(styleObservation === undefined ? {} : { styleObservation }),
+      };
+    })();
+  return {
+    fragment: original,
+    result: {
+      requestId: original.input.request.requestId,
+      snapshotId: original.input.snapshot.id,
+      windows: [aggregateWindow],
+      responseErrors: refinements.flatMap((execution) =>
+        execution.result.responseErrors),
+      run: last.result.run,
+      repairRuns: refinements.flatMap((execution) =>
+        execution.result.repairRuns),
+    },
+  };
+}
+
 export async function executePlannedTranslationRequest(
   execution: PlannedTranslationExecution,
   deps: TranslationExecutionDeps,
 ): Promise<ScheduledResult<CompletedTranslationRequest>> {
   const {
     admission,
+    nextLedgerAttemptId,
     runtimeSet,
     estimator,
     languageProfile,
@@ -537,6 +1278,8 @@ export async function executePlannedTranslationRequest(
     signal,
     hardDeadlineMs,
     retryRound,
+    conservativeHorizonFloor,
+    onProviderResponse,
   } = deps;
   const {
     admitted: { request, fragments },
@@ -547,6 +1290,7 @@ export async function executePlannedTranslationRequest(
   } = execution;
   const requestStartedAt = performance.now();
   const observedRuns: PiRunResult[] = [];
+  const secondaryRuns = new Set<PiRunResult>();
   const recoveryRuns = new Set<PiRunResult>();
   const recoveries: Array<{
     durationMs: number;
@@ -557,13 +1301,20 @@ export async function executePlannedTranslationRequest(
   // Fragments are one logical provider operation. Reusing the ledger
   // preserves the original hard ceilings instead of multiplying every
   // budget limit by the number of context-recovery fragments.
-  const budget = new BudgetLedger();
+  const budget = new BudgetLedger(executionBudgetLimits(fragments));
   let observedContextOverflow = false;
   let contextSplitAttempts = 0;
   let protocolSplitAttempts = 0;
   let secondaryChargeOrdinal = 0;
+  const targetedRepairScopeKeys = new Set<string>();
+  const refinedParagraphPlanIds = new Set<string>();
+  const acceptedTailByBlockId = new Map<string, string>();
   const chargeSecondaryFragments = async (
-    purpose: "repair" | "protocol_switch" | "context_split",
+    purpose:
+      | "repair"
+      | "protocol_switch"
+      | "context_split"
+      | "paragraph_fragment",
     admitted: readonly AdmittedRequestFragment<TranslationRequestInput>[],
     run: () => Promise<FragmentTranslationExecution[]>,
   ): Promise<FragmentTranslationExecution[]> => {
@@ -574,20 +1325,57 @@ export async function executePlannedTranslationRequest(
         0,
       ),
     );
-    const secondaryId = `${request.requestId}:${purpose}:${secondaryChargeOrdinal}`;
+    const secondaryOperationId = [
+      request.requestId,
+      purpose,
+      secondaryChargeOrdinal,
+    ].join(":");
     secondaryChargeOrdinal += 1;
-    const hold = admission.holdSecondary({
+    const secondaryId = nextLedgerAttemptId(
+      secondaryOperationId,
+      retryRound,
+    );
+    const transaction = admission.begin({
       requestId: secondaryId,
       purpose,
       taskIds: [request.requestId],
       predictedTokens,
       attempt: retryRound,
+      conservativeHorizonFloor: conservativeHorizonFloor(),
     });
+    const firstObservedRun = observedRuns.length;
     try {
-      return await run();
-    } finally {
-      hold.release();
+      transaction.markDispatched();
+    } catch (error) {
+      transaction.releaseUnlaunched("not_launched");
+      throw error;
     }
+    let completed: FragmentTranslationExecution[] | undefined;
+    let failure: unknown;
+    try {
+      completed = await run();
+    } catch (error) {
+      failure = error;
+    }
+    const directlyObservedRuns = observedRuns
+      .slice(firstObservedRun)
+      .filter((observed) => !secondaryRuns.has(observed));
+    directlyObservedRuns.forEach((observed) => secondaryRuns.add(observed));
+    const usage = accountingUsageForRuns(directlyObservedRuns);
+    transaction.settle({
+      actualTokens: usage.totalTokens,
+      usageComplete: usage.complete,
+      outcome: failure === undefined
+        ? "success"
+        : failure instanceof ModelProviderError
+          && failure.kind === "protocol"
+          ? "protocol"
+          : "failed",
+    });
+    if (failure !== undefined) {
+      throw failure;
+    }
+    return completed as FragmentTranslationExecution[];
   };
   const executeFragments = async (
     pendingFragments: readonly AdmittedRequestFragment<TranslationRequestInput>[],
@@ -599,11 +1387,25 @@ export async function executePlannedTranslationRequest(
       const fragmentStartedAt = performance.now();
       try {
         throwIfAborted(signal);
+        const paragraphScope = fragment.input.paragraphFragment;
+        const targetedRepairScopeKey = paragraphScope === undefined
+          ? `fragment:${fragment.request.requestId}`
+          : `paragraph:${paragraphScope.planId}:${paragraphScope.executionUnitId}`;
+        const runtimeInput: TranslationRequestInput = paragraphScope === undefined
+          ? fragment.input
+          : {
+            ...fragment.input,
+            previousActiveTail:
+              acceptedTailByBlockId.get(paragraphScope.blockId) ?? "",
+          };
         const result = await runTranslationBatch({
-          ...fragment.input,
+          ...runtimeInput,
           model: activeRuntime.model,
           streamFn: activeRuntime.streamFn,
           thinkingLevel: activeRuntime.thinkingLevel,
+          repairEnabled:
+            targetedRepairScopeKeys.size < MAX_TARGETED_REPAIRS_PER_REQUEST
+            && !targetedRepairScopeKeys.has(targetedRepairScopeKey),
           repairRuntime: retryingLocally
             ? {
               model: activeRuntime.model,
@@ -618,8 +1420,30 @@ export async function executePlannedTranslationRequest(
           budget,
           signal,
           deadlineMs: hardDeadlineMs,
+          ...(onProviderResponse === undefined
+            ? {}
+            : { onProviderResponse }),
         });
         observedRuns.push(result.run, ...result.repairRuns);
+        if (result.repairRuns.length > 0) {
+          targetedRepairScopeKeys.add(targetedRepairScopeKey);
+        }
+        if (paragraphScope !== undefined) {
+          const accepted = result.windows.find((window) =>
+            window.windowId === fragment.request.windows[0]?.windowId
+            && window.status !== "failed"
+            && window.paragraphs !== undefined);
+          if (accepted?.paragraphs !== undefined) {
+            const tail = accepted.paragraphs.map((paragraph) =>
+              paragraph.text).join("\n\n");
+            acceptedTailByBlockId.set(
+              paragraphScope.blockId,
+              Array.from(tail)
+                .slice(-PARAGRAPH_FRAGMENT_ORACLE_CHARACTERS)
+                .join(""),
+            );
+          }
+        }
         if (result.run.modelCalls === 1
           && fragment.assessment.inputTokens > 0
           && result.run.usage.input > 0) {
@@ -637,7 +1461,89 @@ export async function executePlannedTranslationRequest(
           ...structuralWindowIds,
           ...degenerationWindowIds,
         ]);
+        if (paragraphScope !== undefined
+          && result.windows.some((window) =>
+            window.status === "failed"
+            && RECOVERABLE_PARAGRAPH_REFINEMENT_ERROR.test(
+              window.error ?? "",
+            ))
+          && !refinedParagraphPlanIds.has(paragraphScope.planId)
+          && (fragment.paragraphRefinements?.length ?? 0) > 0) {
+          const failedRuns = [result.run, ...result.repairRuns];
+          failedRuns.forEach((run) => recoveryRuns.add(run));
+          recoveries.push({
+            durationMs: performance.now() - fragmentStartedAt,
+            usage: runtimeUsageForRuns(failedRuns),
+            status: "failed",
+            protocol: "typed_tool",
+          });
+          refinedParagraphPlanIds.add(paragraphScope.planId);
+          const refinementExecutions = await chargeSecondaryFragments(
+            "paragraph_fragment",
+            fragment.paragraphRefinements ?? [],
+            () => executeFragments(
+              fragment.paragraphRefinements ?? [],
+              runtimeSet.escalation,
+              true,
+            ),
+          );
+          completed.push(mergeParagraphRefinementExecutions(
+            fragment,
+            refinementExecutions,
+          ));
+          continue;
+        }
+        if (degenerationWindowIds.size > 0
+          && fragment.paragraphPlan === undefined
+          && fragment.input.responseProtocol === "typed_tool"
+          && protocolSplitAttempts < MAX_PROTOCOL_SPLIT_ATTEMPTS) {
+          const failedRequest = requestWithWindows(
+            fragment.request,
+            degenerationWindowIds,
+          );
+          const admittedRecovery = admitParagraphRecoveryFragments(
+            failedRequest,
+            runtimeSet.escalation,
+            estimator,
+            blockById,
+            selectedBuildInput,
+            fragment.depth + 1,
+          );
+          if (admittedRecovery !== undefined) {
+            const failedRuns = [
+              result.run,
+              ...result.repairRuns,
+            ];
+            failedRuns.forEach((run) => recoveryRuns.add(run));
+            recoveries.push({
+              durationMs: performance.now() - fragmentStartedAt,
+              usage: runtimeUsageForRuns(failedRuns),
+              status: "failed",
+              protocol: "typed_tool",
+            });
+            protocolSplitAttempts += 1;
+            const validWindows = result.windows.filter((window) =>
+              !degenerationWindowIds.has(window.windowId));
+            if (validWindows.length > 0) {
+              completed.push({
+                fragment,
+                result: { ...result, windows: validWindows },
+              });
+            }
+            completed.push(...await chargeSecondaryFragments(
+              "paragraph_fragment",
+              admittedRecovery,
+              () => executeFragments(
+                admittedRecovery,
+                runtimeSet.escalation,
+                true,
+              ),
+            ));
+            continue;
+          }
+        }
         if (recoverableWindowIds.size > 0
+          && fragment.paragraphPlan === undefined
           && fragment.input.responseProtocol === "typed_tool"
           && protocolSplitAttempts < MAX_PROTOCOL_SPLIT_ATTEMPTS) {
           const failedRequest = requestWithWindows(
@@ -753,13 +1659,19 @@ export async function executePlannedTranslationRequest(
         if (error instanceof BookTokenEnvelopeExceededError) {
           throw error;
         }
+        const failedRun = providerErrorRun(error);
+        if (failedRun !== undefined && !observedRuns.includes(failedRun)) {
+          observedRuns.push(failedRun);
+          recoveryRuns.add(failedRun);
+        }
         if (error instanceof ModelProviderError
           && error.kind === "protocol"
+          && fragment.paragraphPlan === undefined
           && fragment.input.responseProtocol === "typed_tool"
           && protocolSplitAttempts < MAX_PROTOCOL_SPLIT_ATTEMPTS) {
           recoveries.push({
             durationMs: performance.now() - fragmentStartedAt,
-            usage: runtimeUsageForRuns([]),
+            usage: providerErrorUsage(error),
             status: "protocol",
             protocol: "typed_tool",
           });
@@ -795,7 +1707,7 @@ export async function executePlannedTranslationRequest(
         observedContextOverflow = true;
         recoveries.push({
           durationMs: performance.now() - fragmentStartedAt,
-          usage: runtimeUsageForRuns([]),
+          usage: providerErrorUsage(error),
           status: "context",
           protocol: fragment.input.responseProtocol ?? "typed_tool",
         });
@@ -852,7 +1764,20 @@ export async function executePlannedTranslationRequest(
   );
   try {
     const executions = await executeFragments(fragments);
-    const result = mergeFragmentTranslationResults(request, executions);
+    let result = mergeFragmentTranslationResults(request, executions);
+    if (executions.some((item) => item.fragment.paragraphPlan !== undefined)) {
+      const checked = await validateTranslationBatchCandidate({
+        ...selectedBuildInput(request),
+        model: selectedRuntime.model,
+        streamFn: selectedRuntime.streamFn,
+        thinkingLevel: selectedRuntime.thinkingLevel,
+        budget,
+      }, result);
+      result = {
+        windows: checked.windows,
+        responseErrors: checked.responseErrors,
+      };
+    }
     const failed = result.windows.some((window) =>
       window.status === "failed");
     const schedulerStatus: SchedulerObservationStatus = failed
@@ -860,6 +1785,9 @@ export async function executePlannedTranslationRequest(
       : observedContextOverflow ? "context" : "success";
     const durationMs = performance.now() - requestStartedAt;
     const observedUsage = runtimeUsageForRuns(observedRuns);
+    const accountingUsage = accountingUsageForRuns(
+      observedRuns.filter((run) => !secondaryRuns.has(run)),
+    );
     const usage = recoveries.some((recovery) =>
       !recovery.usage.complete)
       ? { ...observedUsage, complete: false }
@@ -872,6 +1800,7 @@ export async function executePlannedTranslationRequest(
         runtime: {
           durationMs,
           usage,
+          accountingUsage,
           observationDurationMs:
             successfulObservationDuration(durationMs),
           observationUsage: successfulObservationUsage(),
@@ -891,8 +1820,16 @@ export async function executePlannedTranslationRequest(
         || error.kind === "context")
       ? error.kind
       : "failed";
+    const failedRun = providerErrorRun(error);
+    if (failedRun !== undefined && !observedRuns.includes(failedRun)) {
+      observedRuns.push(failedRun);
+    }
     const observedUsage = runtimeUsageForRuns(observedRuns);
-    const usage = error instanceof ModelProviderError
+    const accountingUsage = accountingUsageForRuns(
+      observedRuns.filter((run) => !secondaryRuns.has(run)),
+    );
+    const providerUsage = providerErrorUsage(error);
+    const usage = (error instanceof ModelProviderError && !providerUsage.complete)
       || recoveries.some((recovery) => !recovery.usage.complete)
       ? { ...observedUsage, complete: false }
       : observedUsage;
@@ -906,9 +1843,11 @@ export async function executePlannedTranslationRequest(
         runtime: {
           durationMs,
           usage,
+          accountingUsage,
           observationDurationMs:
             successfulObservationDuration(durationMs),
           observationUsage: error instanceof ModelProviderError
+            && !providerUsage.complete
             ? { ...observationUsage, complete: false }
             : observationUsage,
           status: runtimeObservationStatus(status),

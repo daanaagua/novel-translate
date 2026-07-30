@@ -118,6 +118,41 @@ test("mandatory evidence and its dependencies enter every feasible profile", () 
   ]);
 });
 
+test("hard entry budgets constrain every profile and mandatory closure", () => {
+  const optional = Array.from(
+    { length: 30 },
+    (_item, index) => bundle(
+      `optional-${String(index).padStart(2, "0")}`,
+      1,
+      index + 1,
+    ),
+  );
+  const profiles = planContextProfiles(planningInput(optional, {
+    budgets: { lean: 100, balanced: 100, rich: 100 },
+    maxEntries: 24,
+  }));
+
+  assert.equal(profiles.lean?.entryCost, 24);
+  assert.equal(profiles.balanced?.entryCost, 24);
+  assert.equal(profiles.rich?.entryCost, 24);
+  assert.deepEqual(
+    profiles.rich?.bundleIds,
+    optional.slice(-24).map((item) => item.bundleId),
+  );
+
+  const mandatory = optional.map((item) => ({
+    ...item,
+    mandatory: true,
+  }));
+  const infeasible = planContextProfiles(planningInput(mandatory, {
+    budgets: { lean: 100, balanced: 100, rich: 100 },
+    maxEntries: 24,
+  }));
+  assert.equal(infeasible.lean, undefined);
+  assert.equal(infeasible.balanced, undefined);
+  assert.equal(infeasible.rich, undefined);
+});
+
 test("a profile is absent when mandatory evidence exceeds its budget", () => {
   const profiles = planContextProfiles(planningInput([
     bundle("mandatory-memory", 240, 5, [], [], {

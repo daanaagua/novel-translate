@@ -39,6 +39,8 @@ export interface AdmissionReserveRequest {
   readonly taskIds: readonly string[];
   readonly predictedTokens: number;
   readonly attempt: number;
+  /** Mandatory work not covered by this or another open reservation. */
+  readonly conservativeHorizonFloor: number;
 }
 
 export interface AdmissionSettleRequest {
@@ -53,6 +55,13 @@ export interface AdmissionBaselineRequest {
   readonly baselineTokens: number;
   readonly source: LedgerBaselineSource;
   readonly reason: string;
+}
+
+export interface AdmissionReservation {
+  readonly requestId: string;
+  markDispatched(): void;
+  settle(request: Omit<AdmissionSettleRequest, "requestId">): void;
+  releaseUnlaunched(reason: LedgerReleaseReason): void;
 }
 
 export interface BaselineProjectionTask {
@@ -170,7 +179,7 @@ export class AdmissionController {
 
   canLaunch(
     predictedTokens: number,
-    conservativeHorizonFloor = 0,
+    conservativeHorizonFloor: number,
   ): boolean {
     if (this.#mode !== "active") return true;
     return this.#ledger.canReserve(predictedTokens, conservativeHorizonFloor);
@@ -195,11 +204,16 @@ export class AdmissionController {
       return;
     }
     const predictedTokens = Math.max(1, request.predictedTokens);
-    if (this.#mode === "active" && !this.#ledger.canReserve(predictedTokens, 0)) {
+    const conservativeHorizonFloor = Math.max(
+      0,
+      request.conservativeHorizonFloor,
+    );
+    if (this.#mode === "active"
+      && !this.#ledger.canReserve(predictedTokens, conservativeHorizonFloor)) {
       throw new BookTokenEnvelopeExceededError(
         this.spentTokens(),
         this.reservedTokens(),
-        predictedTokens,
+        predictedTokens + conservativeHorizonFloor,
         this.allowedTokens(),
       );
     }
@@ -210,6 +224,52 @@ export class AdmissionController {
       taskIds: request.taskIds,
       predictedTokens,
       attempt: request.attempt,
+    });
+  }
+
+  begin(request: AdmissionReserveRequest): AdmissionReservation {
+    this.reserve(request);
+    let terminal = false;
+    return {
+      requestId: request.requestId,
+      markDispatched: () => {
+        if (terminal) {
+          throw new Error(
+            `cannot dispatch terminal reservation: ${request.requestId}`,
+          );
+        }
+        this.markDispatched(request.requestId);
+      },
+      settle: (settlement) => {
+        if (terminal) {
+          throw new Error(
+            `cannot settle terminal reservation: ${request.requestId}`,
+          );
+        }
+        this.settle({
+          requestId: request.requestId,
+          ...settlement,
+        });
+        terminal = true;
+      },
+      releaseUnlaunched: (reason) => {
+        if (terminal) return;
+        this.release(request.requestId, reason);
+        terminal = true;
+      },
+    };
+  }
+
+  markDispatched(requestId: string): void {
+    if (this.#ledger.state().dispatchedRequestIds.has(requestId)) {
+      return;
+    }
+    if (!this.#ledger.state().openReservations.has(requestId)) {
+      throw new Error(`cannot dispatch request without reservation: ${requestId}`);
+    }
+    this.#apply({
+      type: "dispatched",
+      requestId,
     });
   }
 
@@ -246,22 +306,6 @@ export class AdmissionController {
       requestId,
       reason,
     });
-  }
-
-  /**
-   * Temporary secondary headroom (protocol/split). Caller must release;
-   * actual usage settles on the parent request.
-   */
-  holdSecondary(request: AdmissionReserveRequest): { release(): void } {
-    this.reserve(request);
-    let released = false;
-    return {
-      release: () => {
-        if (released) return;
-        released = true;
-        this.release(request.requestId, "superseded");
-      },
-    };
   }
 
   #apply(event: LedgerEvent): void {

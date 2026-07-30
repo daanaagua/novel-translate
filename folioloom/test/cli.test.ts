@@ -7,8 +7,10 @@ import { dirname, join, resolve } from "node:path";
 import test from "node:test";
 import { DatabaseSync } from "node:sqlite";
 
+import { ModelProviderError } from "../src/agents/pi-runtime.js";
 import {
   buildTranslationRuntimeSet,
+  cliErrorPayload,
   main,
   parseArgs,
   resolveRunSelection,
@@ -24,6 +26,22 @@ import {
 } from "../src/recovery/recovery-engine.js";
 import { auditLosslessBookStore, bookArtifactFileNames } from "../src/report.js";
 import { LosslessBookStore } from "../src/storage/lossless-book-store.js";
+
+test("CLI exposes a stable provider failure code without request content", () => {
+  assert.deepEqual(
+    cliErrorPayload(new ModelProviderError(
+      "model provider error: Connection error.",
+      "busy",
+      true,
+    )),
+    {
+      schema: "v5-book-cli-error-1",
+      code: "PROVIDER_BUSY",
+      message: "model provider error: Connection error.",
+      retryable: true,
+    },
+  );
+});
 
 function sourceManifest(source: string): string {
   const directory = mkdtempSync(join(tmpdir(), "v5-cli-doctor-"));

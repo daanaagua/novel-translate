@@ -108,6 +108,23 @@ test("property: block ids do not depend on structure titles", () => {
   );
 });
 
+test("one logical block never asks the model to preserve more than thirty-two paragraphs", () => {
+  const source = Array.from(
+    { length: 80 },
+    (_unused, index) => `Frontmatter entry ${index + 1}.`,
+  ).join("\n\n");
+  const blocks = buildLosslessBlocks(source, [], {
+    maxSourceTokens: 10_000,
+    sourceVersion: "many-paragraphs",
+  });
+
+  assert.equal(blocks.map((block) => block.sourceText).join(""), source);
+  assert.ok(blocks.length >= 2);
+  assert.ok(blocks.every((block) =>
+    block.sourceText.split(/\r?\n[ \t]*\r?\n/u)
+      .filter((paragraph) => paragraph.trim().length > 0).length <= 32));
+});
+
 test("Japanese blocks prefer a full stop without following whitespace", () => {
   const japanese = getSourceLanguageProfile("ja");
   const estimator = new WeightedTokenEstimator();

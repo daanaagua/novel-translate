@@ -40,7 +40,7 @@ function formEntries(
   const conceptsByForm = new Map<string, Set<string>>();
   for (const concept of concepts) {
     for (const raw of concept.sourceForms) {
-      const form = profile.normalizeSourceForm(raw);
+      const form = profile.normalizeSourceLiteral(raw.trim());
       if (Array.from(form).length < 2) continue;
       const ids = conceptsByForm.get(form) ?? new Set<string>();
       ids.add(concept.conceptId);
@@ -90,45 +90,50 @@ function buildMatcher(entries: readonly FormEntry[]): MatcherNode[] {
   return nodes;
 }
 
+interface OriginalScalarSpan {
+  readonly start: number;
+  readonly end: number;
+}
+
 function normalizedToOriginalScalarMap(
   sourceText: string,
   normalizedSource: string,
-  locale: string,
-): number[] {
+  profile: SourceLanguageProfile,
+): OriginalScalarSpan[] {
   const original = Array.from(sourceText);
   const baseline: string[] = [];
-  const originalIndex: number[] = [];
+  const originalSpans: OriginalScalarSpan[] = [];
   for (let index = 0; index < original.length; index += 1) {
-    const normalized = original[index]!
-      .normalize("NFKC")
-      .replace(/[’‘`]/gu, "'")
-      .toLocaleLowerCase(locale);
+    const normalized = profile.normalizeSourceLiteral(original[index]!);
     for (const scalar of normalized) {
       baseline.push(scalar);
-      originalIndex.push(index);
+      originalSpans.push({ start: index, end: index + 1 });
     }
   }
   const normalized = Array.from(normalizedSource);
   if (normalized.length === 0) return [];
-  let baselineStart = -1;
-  outer: for (let start = 0; start <= baseline.length - normalized.length; start += 1) {
-    for (let offset = 0; offset < normalized.length; offset += 1) {
-      if (baseline[start + offset] !== normalized[offset]) continue outer;
+  if (baseline.length === normalized.length
+    && baseline.every((scalar, index) => scalar === normalized[index])) {
+    return originalSpans;
+  }
+  const graphemeNormalized: string[] = [];
+  const graphemeSpans: OriginalScalarSpan[] = [];
+  let scalarOffset = 0;
+  const segmenter = new Intl.Segmenter(profile.locale, { granularity: "grapheme" });
+  for (const part of segmenter.segment(sourceText)) {
+    const start = scalarOffset;
+    const end = start + Array.from(part.segment).length;
+    scalarOffset = end;
+    for (const scalar of profile.normalizeSourceLiteral(part.segment)) {
+      graphemeNormalized.push(scalar);
+      graphemeSpans.push({ start, end });
     }
-    baselineStart = start;
-    break;
   }
-  if (baselineStart >= 0) {
-    return originalIndex.slice(baselineStart, baselineStart + normalized.length);
+  if (graphemeNormalized.length === normalized.length
+    && graphemeNormalized.every((scalar, index) => scalar === normalized[index])) {
+    return graphemeSpans;
   }
-  // Unusual locale-specific contraction normalization can make exact alignment
-  // impossible. Preserve monotonic, bounded coordinates instead of rescanning
-  // once per concept.
-  return normalized.map((_, index) =>
-    Math.min(
-      original.length - 1,
-      Math.floor(index * original.length / normalized.length),
-    ));
+  throw new Error("source literal normalization cannot preserve scalar coordinates");
 }
 
 /**
@@ -151,17 +156,26 @@ export function buildConceptOccurrenceIndex(
     spans: Map<string, ConceptOccurrenceSpan>;
   }>();
   for (const block of blocks) {
-    const normalizedSource = profile.normalizeSourceForm(block.sourceText);
+    const normalizedSource = profile.normalizeSourceLiteral(block.sourceText);
     const normalizedScalars = Array.from(normalizedSource);
     const originalScalars = Array.from(block.sourceText);
     const normalizedToOriginal = normalizedToOriginalScalarMap(
       block.sourceText,
       normalizedSource,
-      profile.locale,
+      profile,
     );
-    const sourceTokens = new Set(profile.segment(block.sourceText)
+    const sourceWordSpans = new Set(profile.segment(block.sourceText)
       .filter((token) => token.isWordLike)
-      .map((token) => token.normalized));
+      .map((token) => `${token.start}\0${token.end}`));
+    const originalUtf16Spans: OriginalScalarSpan[] = [];
+    let utf16Offset = 0;
+    for (const scalar of originalScalars) {
+      originalUtf16Spans.push({
+        start: utf16Offset,
+        end: utf16Offset + scalar.length,
+      });
+      utf16Offset += scalar.length;
+    }
     let state = 0;
     for (let offset = 0; offset < normalizedScalars.length; offset += 1) {
       const character = normalizedScalars[offset]!;
@@ -173,16 +187,21 @@ export function buildConceptOccurrenceIndex(
       for (const output of nodes[state]!.outputs) {
         const entry = entries[output]!;
         const start = end - entry.normalizedScalars.length;
-        const normalizedForm = entry.normalizedScalars.join("");
+        const originalFirst = normalizedToOriginal[start];
+        const originalLast = normalizedToOriginal[end - 1];
+        if (originalFirst === undefined || originalLast === undefined) continue;
+        const originalStart = originalFirst.start;
+        const originalEnd = originalLast.end;
+        const utf16First = originalUtf16Spans[originalStart];
+        const utf16Last = originalUtf16Spans[originalEnd - 1];
+        const isExactWordToken = utf16First !== undefined
+          && utf16Last !== undefined
+          && sourceWordSpans.has(`${utf16First.start}\0${utf16Last.end}`);
         const hasBoundary = cjk
-          || sourceTokens.has(normalizedForm)
+          || isExactWordToken
           || (!identifierCharacter(normalizedScalars[start - 1])
             && !identifierCharacter(normalizedScalars[end]));
         if (!hasBoundary) continue;
-        const originalStart = normalizedToOriginal[start];
-        const originalLast = normalizedToOriginal[end - 1];
-        if (originalStart === undefined || originalLast === undefined) continue;
-        const originalEnd = originalLast + 1;
         const sourceForm = originalScalars.slice(originalStart, originalEnd).join("");
         for (const conceptId of entry.conceptIds) {
           const key = `${conceptId}\0${block.blockId}`;

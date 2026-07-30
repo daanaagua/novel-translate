@@ -15,12 +15,18 @@ import {
   conceptFromAnchor,
   type LexicalSemanticClass,
 } from "../knowledge/lexical-concept.js";
+import { canonicalJson } from "../knowledge/knowledge-store.js";
 import { getSourceLanguageProfile } from "../language/profiles.js";
 import type { SourceLanguageProfile } from "../language/types.js";
 import { sourceTextForTranslation } from "../source/layout-separators.js";
 import { simplifyChineseTranslation } from "../style/chinese-script-normalization.js";
 import { assertNotAborted, Type, type TypedToolSpec } from "../tools/tool-spec.js";
-import { ModelProviderError, PiRuntime, type PiRunResult } from "./pi-runtime.js";
+import {
+  ModelProviderError,
+  PiRuntime,
+  type PiAssistantResponseObservation,
+  type PiRunResult,
+} from "./pi-runtime.js";
 
 export interface AnchorCandidate {
   sourceForm: string;
@@ -51,7 +57,7 @@ export interface LexicalAnchor {
   confidence: number;
 }
 
-interface LexicalAnchorInput {
+export interface LexicalAnchorInput {
   candidates: readonly AnchorCandidate[];
   stableTerms: readonly StableTerm[];
   model: Model<any>;
@@ -61,6 +67,9 @@ interface LexicalAnchorInput {
   thinkingLevel?: ThinkingLevel;
   signal?: AbortSignal;
   deadlineMs?: number;
+  onAssistantResponse?: (
+    observation: PiAssistantResponseObservation,
+  ) => void | Promise<void>;
 }
 
 export interface LexicalAnchorOutcome {
@@ -74,6 +83,16 @@ export interface LexicalPreferredFallbackProtocol {
   nonce: string;
   beginLine: string;
   endLine: string;
+}
+
+export type LexicalAnchorResponseProtocol = "typed_tool" | "framed_text";
+
+export interface PreparedLexicalAnchorRequest {
+  readonly systemPrompt: string;
+  readonly prompt: string;
+  readonly serializedToolSchemas: string;
+  readonly toolSchemaPayload: readonly Record<string, unknown>[];
+  readonly fallbackProtocol?: LexicalPreferredFallbackProtocol;
 }
 
 type LexicalPreferredFallbackResult = Pick<
@@ -94,6 +113,119 @@ const CONCEPT_ELIGIBLE_CLASSES = new Set<LexicalAnchorSemanticClass>([
   "technical_term",
   "role",
 ]);
+
+function lexicalAnchorParameters() {
+  return Type.Object({
+    anchors: Type.Array(Type.Object({
+      sourceForm: Type.String(),
+      target: Type.String(),
+      mode: Type.Union([Type.Literal("stable"), Type.Literal("contextual")]),
+      semanticClass: Type.Union([
+        Type.Literal("proper_name"),
+        Type.Literal("unique_title"),
+        Type.Literal("technical_term"),
+        Type.Literal("role"),
+        Type.Literal("form_of_address"),
+        Type.Literal("ordinary_word"),
+        Type.Literal("unclassified"),
+      ]),
+      confidence: Type.Number({ minimum: 0, maximum: 1 }),
+    }), { maxItems: 24 }),
+    entityLinks: Type.Optional(Type.Array(Type.Object({
+      sourceForms: Type.Array(Type.String(), { minItems: 2, maxItems: 4 }),
+      proposedTarget: Type.String(),
+      evidenceKind: Type.Union([
+        Type.Literal("explicit_naming"),
+        Type.Literal("apposition"),
+        Type.Literal("contextual_compatibility"),
+        Type.Literal("distributional_compatibility"),
+      ]),
+      evidenceQuote: Type.String(),
+      confidence: Type.Number({ minimum: 0, maximum: 1 }),
+    }, { additionalProperties: false }), { maxItems: 6 })),
+  });
+}
+
+function serializableLexicalAnchorToolSchema(): Record<string, unknown> {
+  return JSON.parse(JSON.stringify({
+    name: "submit_lexical_anchors",
+    label: "Submit lexical anchors",
+    description:
+      "Classify every supplied source-language form and bind only context-invariant forms to one Chinese target.",
+    phase: "translation",
+    parameters: lexicalAnchorParameters(),
+  })) as Record<string, unknown>;
+}
+
+export function prepareLexicalAnchorRequest(
+  input: Pick<
+    LexicalAnchorInput,
+    "candidates" | "stableTerms" | "sourceLanguageProfile"
+  >,
+  responseProtocol: LexicalAnchorResponseProtocol,
+): PreparedLexicalAnchorRequest {
+  const profile = input.sourceLanguageProfile ?? getSourceLanguageProfile("en");
+  if (responseProtocol === "framed_text") {
+    const protocol = createLexicalPreferredFallbackProtocol(
+      input.candidates,
+      profile,
+    );
+    return {
+      systemPrompt: [
+        "You recover a small set of safe run-local lexical preferences when structured tool calls are unavailable.",
+        `The source language is ${profile.displayName} (${profile.id}).`,
+        "Return only proper names, unique titles, and invariant technical terms that can safely keep one concise Simplified-Chinese rendering across the supplied contexts.",
+        "Omit ordinary words, forms of address, relationship labels, ambiguous forms, and anything below 0.8 confidence. Omission means undecided and is safer than guessing.",
+        "Every proper-name or unique-title target must be a usable Chinese rendering containing Chinese characters. When no Hanja/Chinese spelling is printed, choose one conservative Chinese transliteration; never copy Hangul, hiragana, or katakana into target.",
+        "For sourceAuthoredTarget, copy that printed Hanja/Chinese target exactly; the harness will normalize its Chinese script.",
+        "Do not infer aliases or entity identity in this compatibility path. Every returned binding is only a preferred rendering, never a hard constraint.",
+        "Inside the exact response frame, emit one JSON array and nothing else. Each item must contain exactly sourceForm, target, semanticClass, and confidence.",
+        "semanticClass must be proper_name, unique_title, technical_term, or role. Use role for a profession, office, or institutional function whose Chinese wording may vary by sentence. confidence must be from 0.8 through 1.",
+      ].join("\n"),
+      prompt: [
+        "CANDIDATES AND COMPACT CONCORDANCE",
+        JSON.stringify(input.candidates),
+        "ESTABLISHED TERMS (do not duplicate or contradict)",
+        input.stableTerms.map((term) =>
+          `${term.sourceForm} => ${term.target}`).join("\n") || "(none)",
+        "EXACT RESPONSE FRAME",
+        protocol.beginLine,
+        "[{\"sourceForm\":\"...\",\"target\":\"...\",\"semanticClass\":\"proper_name\",\"confidence\":0.9}]",
+        protocol.endLine,
+      ].join("\n\n"),
+      serializedToolSchemas: "[]",
+      toolSchemaPayload: [],
+      fallbackProtocol: protocol,
+    };
+  }
+  const toolSchemaPayload = [serializableLexicalAnchorToolSchema()];
+  return {
+    systemPrompt: [
+      "You establish run-local lexical anchors before parallel literary translation.",
+      `The source language is ${profile.displayName} (${profile.id}).`,
+      "Mark proper names, unique titles, and invariant technical terms as stable and choose one concise Chinese target. Classify professions, offices, and institutional functions as role; give their concise default Chinese rendering and normally mark them contextual.",
+      "For every anchor, classify semanticClass. Use proper_name only for a concrete named entity; common nouns, pronouns, verbs, and forms of address must use their corresponding non-name class.",
+      "A sourceAuthoredTarget is an explicit Hanja/Chinese gloss printed immediately after that source form. For a stable proper name, unique title, or technical term, use that target exactly; the harness treats this source-authored evidence as authoritative.",
+      "Every single-pass lexical classification remains a preference; only independently confirmed entity links or user-supplied glossary policy may become exact constraints.",
+      "Write every Chinese target in Simplified Chinese (zh-Hans); the harness will normalize model-created targets before persistence.",
+      "Mark ordinary words and forms of address as contextual. A role may also be contextual while remaining translator-visible semantic knowledge.",
+      "Do not force surface consistency where Chinese grammar or relationship context requires variation.",
+      "When compact evidence explicitly links two supplied forms to one entity, submit an entityLinks item and quote the exact supplied context. Leave uncertain relationships unconfirmed.",
+      "Quote the smallest source span containing every linked form and any overt naming cue. Links from this single pass remain provisional until independent evidence accumulates; never treat one model judgment as an exact constraint.",
+      "For entityLinks, proposedTarget must be the concise canonical Chinese name alone. Do not include aliases, titles, parenthetical explanations, or relation glosses; surrounding descriptors remain contextual translation. The harness will conservatively project only the leading canonical name if you append an explanation.",
+      "Call submit_lexical_anchors exactly once and classify every supplied form.",
+    ].join("\n"),
+    prompt: [
+      "SOURCE-LANGUAGE FORMS AND COMPACT CONCORDANCE",
+      JSON.stringify(input.candidates),
+      "ESTABLISHED TERMS",
+      input.stableTerms.map((term) =>
+        `${term.sourceForm} => ${term.target}`).join("\n") || "(none)",
+    ].join("\n\n"),
+    serializedToolSchemas: canonicalJson(toolSchemaPayload),
+    toolSchemaPayload,
+  };
+}
 
 function lexicalProtocolError(message: string): ModelProviderError {
   return new ModelProviderError(
@@ -362,30 +494,14 @@ export class LexicalAnchorer {
 
   async runPreferredTextFallback(input: LexicalAnchorInput): Promise<LexicalAnchorOutcome> {
     const profile = input.sourceLanguageProfile ?? getSourceLanguageProfile("en");
-    const protocol = createLexicalPreferredFallbackProtocol(input.candidates, profile);
+    const prepared = prepareLexicalAnchorRequest(input, "framed_text");
+    const protocol = prepared.fallbackProtocol;
+    if (protocol === undefined) {
+      throw new Error("framed lexical request is missing its protocol");
+    }
     const run = await this.runtime.run({
-      systemPrompt: [
-        "You recover a small set of safe run-local lexical preferences when structured tool calls are unavailable.",
-        `The source language is ${profile.displayName} (${profile.id}).`,
-        "Return only proper names, unique titles, and invariant technical terms that can safely keep one concise Simplified-Chinese rendering across the supplied contexts.",
-        "Omit ordinary words, forms of address, relationship labels, ambiguous forms, and anything below 0.8 confidence. Omission means undecided and is safer than guessing.",
-        "Every proper-name or unique-title target must be a usable Chinese rendering containing Chinese characters. When no Hanja/Chinese spelling is printed, choose one conservative Chinese transliteration; never copy Hangul, hiragana, or katakana into target.",
-        "For sourceAuthoredTarget, copy that printed Hanja/Chinese target exactly; the harness will normalize its Chinese script.",
-        "Do not infer aliases or entity identity in this compatibility path. Every returned binding is only a preferred rendering, never a hard constraint.",
-        "Inside the exact response frame, emit one JSON array and nothing else. Each item must contain exactly sourceForm, target, semanticClass, and confidence.",
-        "semanticClass must be proper_name, unique_title, technical_term, or role. Use role for a profession, office, or institutional function whose Chinese wording may vary by sentence. confidence must be from 0.8 through 1.",
-      ].join("\n"),
-      prompt: [
-        "CANDIDATES AND COMPACT CONCORDANCE",
-        JSON.stringify(input.candidates),
-        "ESTABLISHED TERMS (do not duplicate or contradict)",
-        input.stableTerms.map((term) =>
-          `${term.sourceForm} => ${term.target}`).join("\n") || "(none)",
-        "EXACT RESPONSE FRAME",
-        protocol.beginLine,
-        "[{\"sourceForm\":\"...\",\"target\":\"...\",\"semanticClass\":\"proper_name\",\"confidence\":0.9}]",
-        protocol.endLine,
-      ].join("\n\n"),
+      systemPrompt: prepared.systemPrompt,
+      prompt: prepared.prompt,
       phase: "translation",
       model: input.model,
       tools: [],
@@ -395,16 +511,24 @@ export class LexicalAnchorer {
       signal: input.signal,
       deadlineMs: input.deadlineMs,
       thinkingLevel: input.thinkingLevel,
+      onAssistantResponse: input.onAssistantResponse,
     }, input.streamFn);
-    return {
-      ...parseLexicalPreferredFallbackResponse(
-        lastAssistantText(run),
-        protocol,
-        input.candidates,
-        profile,
-      ),
-      run,
-    };
+    try {
+      return {
+        ...parseLexicalPreferredFallbackResponse(
+          lastAssistantText(run),
+          protocol,
+          input.candidates,
+          profile,
+        ),
+        run,
+      };
+    } catch (error) {
+      if (error instanceof ModelProviderError) {
+        throw error.withRun(run);
+      }
+      throw error;
+    }
   }
 
   async run(input: LexicalAnchorInput): Promise<LexicalAnchorOutcome> {
@@ -425,35 +549,7 @@ export class LexicalAnchorer {
       label: "Submit lexical anchors",
       description: "Classify every supplied source-language form and bind only context-invariant forms to one Chinese target.",
       phase: "translation",
-      parameters: Type.Object({
-        anchors: Type.Array(Type.Object({
-          sourceForm: Type.String(),
-          target: Type.String(),
-          mode: Type.Union([Type.Literal("stable"), Type.Literal("contextual")]),
-          semanticClass: Type.Union([
-            Type.Literal("proper_name"),
-            Type.Literal("unique_title"),
-            Type.Literal("technical_term"),
-            Type.Literal("role"),
-            Type.Literal("form_of_address"),
-            Type.Literal("ordinary_word"),
-            Type.Literal("unclassified"),
-          ]),
-          confidence: Type.Number({ minimum: 0, maximum: 1 }),
-        }), { maxItems: 24 }),
-        entityLinks: Type.Optional(Type.Array(Type.Object({
-          sourceForms: Type.Array(Type.String(), { minItems: 2, maxItems: 4 }),
-          proposedTarget: Type.String(),
-          evidenceKind: Type.Union([
-            Type.Literal("explicit_naming"),
-            Type.Literal("apposition"),
-            Type.Literal("contextual_compatibility"),
-            Type.Literal("distributional_compatibility"),
-          ]),
-          evidenceQuote: Type.String(),
-          confidence: Type.Number({ minimum: 0, maximum: 1 }),
-        }, { additionalProperties: false }), { maxItems: 6 })),
-      }),
+      parameters: lexicalAnchorParameters(),
       execute: async (rawArgs, signal) => {
         assertNotAborted(signal);
         const args = rawArgs as {
@@ -573,29 +669,10 @@ export class LexicalAnchorer {
         };
       },
     };
+    const prepared = prepareLexicalAnchorRequest(input, "typed_tool");
     const run = await this.runtime.run({
-      systemPrompt: [
-        "You establish run-local lexical anchors before parallel literary translation.",
-        `The source language is ${profile.displayName} (${profile.id}).`,
-        "Mark proper names, unique titles, and invariant technical terms as stable and choose one concise Chinese target. Classify professions, offices, and institutional functions as role; give their concise default Chinese rendering and normally mark them contextual.",
-        "For every anchor, classify semanticClass. Use proper_name only for a concrete named entity; common nouns, pronouns, verbs, and forms of address must use their corresponding non-name class.",
-        "A sourceAuthoredTarget is an explicit Hanja/Chinese gloss printed immediately after that source form. For a stable proper name, unique title, or technical term, use that target exactly; the harness treats this source-authored evidence as authoritative.",
-        "Every single-pass lexical classification remains a preference; only independently confirmed entity links or user-supplied glossary policy may become exact constraints.",
-        "Write every Chinese target in Simplified Chinese (zh-Hans); the harness will normalize model-created targets before persistence.",
-        "Mark ordinary words and forms of address as contextual. A role may also be contextual while remaining translator-visible semantic knowledge.",
-        "Do not force surface consistency where Chinese grammar or relationship context requires variation.",
-        "When compact evidence explicitly links two supplied forms to one entity, submit an entityLinks item and quote the exact supplied context. Leave uncertain relationships unconfirmed.",
-        "Quote the smallest source span containing every linked form and any overt naming cue. Links from this single pass remain provisional until independent evidence accumulates; never treat one model judgment as an exact constraint.",
-        "For entityLinks, proposedTarget must be the concise canonical Chinese name alone. Do not include aliases, titles, parenthetical explanations, or relation glosses; surrounding descriptors remain contextual translation. The harness will conservatively project only the leading canonical name if you append an explanation.",
-        "Call submit_lexical_anchors exactly once and classify every supplied form.",
-      ].join("\n"),
-      prompt: [
-        "SOURCE-LANGUAGE FORMS AND COMPACT CONCORDANCE",
-        JSON.stringify(input.candidates),
-        "ESTABLISHED TERMS",
-        input.stableTerms.map((term) =>
-          `${term.sourceForm} => ${term.target}`).join("\n") || "(none)",
-      ].join("\n\n"),
+      systemPrompt: prepared.systemPrompt,
+      prompt: prepared.prompt,
       phase: "translation",
       model: input.model,
       tools: [tool],
@@ -605,13 +682,14 @@ export class LexicalAnchorer {
       signal: input.signal,
       deadlineMs: input.deadlineMs,
       thinkingLevel: input.thinkingLevel,
+      onAssistantResponse: input.onAssistantResponse,
     }, input.streamFn);
     if (!submitted) {
       throw new ModelProviderError(
         "lexical anchor protocol error: submit_lexical_anchors was not called",
         "protocol",
         true,
-      );
+      ).withRun(run);
     }
     const confirmedForms = new Set(entityLinks
       .filter((link) => link.status === "confirmed")

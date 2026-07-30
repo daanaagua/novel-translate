@@ -260,6 +260,72 @@ test("partial scheduler report contains only aggregate execution metrics", () =>
   }
 });
 
+test("strict export fails closed when durable provider usage is incomplete", () => {
+  const item = fixture();
+  try {
+    addRun(item.store, item.context, "run-a", item.context.losslessBlocks.length);
+    item.store.appendTokenLedgerEvent("run-a", {
+      type: "baseline_added",
+      taskIds: ["translate-window:one"],
+      baselineTokens: 1_000,
+      source: "translate_horizon",
+      reason: "fixture",
+    });
+    item.store.appendTokenLedgerEvent("run-a", {
+      type: "reserved",
+      requestId: "attempt-one",
+      purpose: "translate",
+      taskIds: ["translate-window:one"],
+      predictedTokens: 300,
+      attempt: 0,
+    });
+    item.store.appendTokenLedgerEvent("run-a", {
+      type: "dispatched",
+      requestId: "attempt-one",
+    });
+    item.store.appendTokenLedgerEvent("run-a", {
+      type: "settled",
+      requestId: "attempt-one",
+      actualTokens: 120,
+      usageComplete: false,
+      outcome: "failed",
+    });
+    const ledger = item.store.loadTokenLedger("run-a", {
+      mode: "active",
+      profile: "balanced",
+      tokenIncreaseCap: 0.1,
+      enforceDispatchLifecycle: true,
+    });
+    item.store.saveSchedulerRunProjection(
+      "run-a",
+      ledger.toSchedulerRunReport(),
+    );
+
+    assert.throws(
+      () => writeLosslessBookArtifacts(item.store, "run-a", item.output),
+      /TOKEN_USAGE_INCOMPLETE/u,
+    );
+    const paths = writeLosslessBookArtifacts(
+      item.store,
+      "run-a",
+      item.output,
+      { allowIncomplete: true },
+    );
+    const audit = JSON.parse(readFileSync(paths.audit, "utf8")) as {
+      complete: boolean;
+      strictExportable: boolean;
+      incidentCodes: string[];
+    };
+    assert.equal(audit.complete, false);
+    assert.equal(audit.strictExportable, false);
+    assert.ok(audit.incidentCodes.includes("TOKEN_USAGE_INCOMPLETE"));
+    assert.equal(verifyExport(paths, item.store, "run-a").ok, true);
+  } finally {
+    item.store.close();
+    item.context.close();
+  }
+});
+
 test("verifier rejects lineage from a different run", () => {
   const item = fixture();
   try {

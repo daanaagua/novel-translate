@@ -9,6 +9,7 @@ export type LedgerPurpose =
   | "repair"
   | "protocol_switch"
   | "context_split"
+  | "paragraph_fragment"
   | "anchor"
   | "revalidate";
 
@@ -50,6 +51,26 @@ export interface SchedulerCountersPatch {
   >>>;
 }
 
+export function schedulerCountersPatch(
+  report: SchedulerRunReport,
+): SchedulerCountersPatch {
+  return {
+    decisions: report.decisions,
+    fallbacks: report.fallbacks,
+    recoveries: report.recoveries,
+    plannerDeadlines: report.plannerDeadlines,
+    throttles: report.throttles,
+    planningStatus: report.planningStatus,
+    predictedTokens: report.predictedTokens,
+    predictedWallTimeMs: Math.floor(report.predictedWallTimeMs),
+    actualWallTimeMs: Math.floor(report.actualWallTimeMs),
+    baselineWallTimeMs: Math.floor(report.baselineWallTimeMs),
+    contextProfiles: report.contextProfiles,
+    effortCounts: report.effortCounts,
+    protocolCounts: report.protocolCounts,
+  };
+}
+
 export type LedgerEvent =
   | {
       readonly type: "baseline_added";
@@ -65,6 +86,10 @@ export type LedgerEvent =
       readonly taskIds: readonly string[];
       readonly predictedTokens: number;
       readonly attempt: number;
+    }
+  | {
+      readonly type: "dispatched";
+      readonly requestId: string;
     }
   | {
       readonly type: "settled";
@@ -87,6 +112,12 @@ export interface TokenLedgerInit {
   readonly mode: SchedulerMode;
   readonly profile: OptimizationProfile;
   readonly tokenIncreaseCap: number;
+  /**
+   * New writers require an explicit dispatched event before settlement.
+   * Historical event streams are replayed permissively, then enforcement is
+   * enabled for every event appended after recovery.
+   */
+  readonly enforceDispatchLifecycle?: boolean;
 }
 
 export interface OpenReservation {
@@ -105,6 +136,8 @@ export interface LedgerState {
   readonly tokenUsageComplete: boolean;
   readonly baselinedTaskIds: ReadonlySet<string>;
   readonly openReservations: ReadonlyMap<string, OpenReservation>;
+  readonly dispatchedRequestIds: ReadonlySet<string>;
+  readonly terminalRequestIds: ReadonlySet<string>;
   readonly decisions: number;
   readonly fallbacks: number;
   readonly recoveries: number;
@@ -121,6 +154,26 @@ export interface LedgerState {
     "typed_tool" | "framed_text" | "local",
     number
   >>;
+}
+
+export interface TokenLedgerReconciliation {
+  readonly consistent: boolean;
+  readonly openRequestIds: readonly string[];
+  readonly dispatchedOpenRequestIds: readonly string[];
+  readonly orphanDispatchedRequestIds: readonly string[];
+}
+
+export class TokenLedgerReconciliationError extends Error {
+  readonly code = "TOKEN_LEDGER_RECONCILIATION_FAILED" as const;
+
+  constructor(readonly reconciliation: TokenLedgerReconciliation) {
+    super(
+      "TOKEN_LEDGER_RECONCILIATION_FAILED: "
+      + `${reconciliation.openRequestIds.length} open attempts, `
+      + `${reconciliation.orphanDispatchedRequestIds.length} orphan dispatches`,
+    );
+    this.name = "TokenLedgerReconciliationError";
+  }
 }
 
 function nonnegativeInteger(value: number, label: string): number {
@@ -150,6 +203,9 @@ export class TokenLedger {
   #tokenUsageComplete = true;
   readonly #baselinedTaskIds = new Set<string>();
   readonly #openReservations = new Map<string, OpenReservation>();
+  readonly #dispatchedRequestIds = new Set<string>();
+  readonly #terminalRequestIds = new Set<string>();
+  #enforceDispatchLifecycle: boolean;
   #decisions = 0;
   #fallbacks = 0;
   #recoveries = 0;
@@ -168,13 +224,17 @@ export class TokenLedger {
     local: 0,
   };
 
-  private constructor(init: TokenLedgerInit) {
+  private constructor(
+    init: TokenLedgerInit,
+    enforceDispatchLifecycle = init.enforceDispatchLifecycle ?? false,
+  ) {
     this.#mode = init.mode;
     this.#profile = init.profile;
     if (!(init.tokenIncreaseCap >= 0) || !Number.isFinite(init.tokenIncreaseCap)) {
       throw new TypeError("tokenIncreaseCap must be a finite non-negative number");
     }
     this.#tokenIncreaseCap = init.tokenIncreaseCap;
+    this.#enforceDispatchLifecycle = enforceDispatchLifecycle;
     this.#planningStatus = init.mode === "off"
       ? "disabled"
       : init.mode === "shadow"
@@ -190,10 +250,11 @@ export class TokenLedger {
     init: TokenLedgerInit,
     events: readonly LedgerEvent[],
   ): TokenLedger {
-    const ledger = new TokenLedger(init);
+    const ledger = new TokenLedger(init, false);
     for (const event of events) {
       ledger.apply(event);
     }
+    ledger.#enforceDispatchLifecycle = init.enforceDispatchLifecycle ?? false;
     return ledger;
   }
 
@@ -204,6 +265,9 @@ export class TokenLedger {
         return;
       case "reserved":
         this.#applyReserved(event);
+        return;
+      case "dispatched":
+        this.#applyDispatched(event);
         return;
       case "settled":
         this.#applySettled(event);
@@ -230,6 +294,8 @@ export class TokenLedger {
       tokenUsageComplete: this.#tokenUsageComplete,
       baselinedTaskIds: new Set(this.#baselinedTaskIds),
       openReservations: new Map(this.#openReservations),
+      dispatchedRequestIds: new Set(this.#dispatchedRequestIds),
+      terminalRequestIds: new Set(this.#terminalRequestIds),
       decisions: this.#decisions,
       fallbacks: this.#fallbacks,
       recoveries: this.#recoveries,
@@ -244,6 +310,30 @@ export class TokenLedger {
       effortCounts: { ...this.#effortCounts },
       protocolCounts: { ...this.#protocolCounts },
     };
+  }
+
+  reconcile(): TokenLedgerReconciliation {
+    const openRequestIds = [...this.#openReservations.keys()].sort();
+    const dispatchedOpenRequestIds = [...this.#dispatchedRequestIds]
+      .filter((requestId) => this.#openReservations.has(requestId))
+      .sort();
+    const orphanDispatchedRequestIds = [...this.#dispatchedRequestIds]
+      .filter((requestId) => !this.#openReservations.has(requestId))
+      .sort();
+    return {
+      consistent: openRequestIds.length === 0
+        && orphanDispatchedRequestIds.length === 0,
+      openRequestIds,
+      dispatchedOpenRequestIds,
+      orphanDispatchedRequestIds,
+    };
+  }
+
+  assertReconciled(): void {
+    const reconciliation = this.reconcile();
+    if (!reconciliation.consistent) {
+      throw new TokenLedgerReconciliationError(reconciliation);
+    }
   }
 
   canReserve(
@@ -311,8 +401,9 @@ export class TokenLedger {
 
   #applyReserved(event: Extract<LedgerEvent, { type: "reserved" }>): void {
     const requestId = nonemptyId(event.requestId, "requestId");
-    if (this.#openReservations.has(requestId)) {
-      throw new Error(`request already reserved: ${requestId}`);
+    if (this.#openReservations.has(requestId)
+      || this.#terminalRequestIds.has(requestId)) {
+      throw new Error(`request already reserved or terminal: ${requestId}`);
     }
     const predictedTokens = nonnegativeInteger(
       event.predictedTokens,
@@ -328,18 +419,35 @@ export class TokenLedger {
     });
   }
 
+  #applyDispatched(event: Extract<LedgerEvent, { type: "dispatched" }>): void {
+    const requestId = nonemptyId(event.requestId, "requestId");
+    if (!this.#openReservations.has(requestId)) {
+      throw new Error(`dispatch for unknown request (not open): ${requestId}`);
+    }
+    if (this.#dispatchedRequestIds.has(requestId)) {
+      throw new Error(`request already dispatched: ${requestId}`);
+    }
+    this.#dispatchedRequestIds.add(requestId);
+  }
+
   #applySettled(event: Extract<LedgerEvent, { type: "settled" }>): void {
     const requestId = nonemptyId(event.requestId, "requestId");
     const open = this.#openReservations.get(requestId);
     if (open === undefined) {
       throw new Error(`settle for unknown request (not open): ${requestId}`);
     }
+    if (this.#enforceDispatchLifecycle
+      && !this.#dispatchedRequestIds.has(requestId)) {
+      throw new Error(`settle requires dispatched request: ${requestId}`);
+    }
     const actualTokens = nonnegativeInteger(event.actualTokens, "actualTokens");
     this.#openReservations.delete(requestId);
+    this.#dispatchedRequestIds.delete(requestId);
+    this.#terminalRequestIds.add(requestId);
     if (event.usageComplete) {
       this.#spentTokens += actualTokens;
     } else {
-      this.#spentTokens += open.predictedTokens;
+      this.#spentTokens += Math.max(actualTokens, open.predictedTokens);
       this.#tokenUsageComplete = false;
     }
   }
@@ -349,7 +457,12 @@ export class TokenLedger {
     if (!this.#openReservations.has(requestId)) {
       throw new Error(`release for unknown request (not open): ${requestId}`);
     }
+    if (this.#enforceDispatchLifecycle
+      && this.#dispatchedRequestIds.has(requestId)) {
+      throw new Error(`cannot release dispatched request as unlaunched: ${requestId}`);
+    }
     this.#openReservations.delete(requestId);
+    this.#terminalRequestIds.add(requestId);
   }
 
   #applyCounters(patch: SchedulerCountersPatch): void {

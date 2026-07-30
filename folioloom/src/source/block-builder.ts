@@ -41,6 +41,7 @@ interface SemanticScalarIndex {
 }
 
 const DEFAULT_MAX_SOURCE_TOKENS = 1_500;
+const MAX_PARAGRAPHS_PER_BLOCK = 32;
 const DEFAULT_TOKEN_ESTIMATOR = new WeightedTokenEstimator();
 const GENERIC_ESTIMATOR_PROBE_SCALARS = 256;
 const GENERIC_ESTIMATOR_MIN_HORIZON_SCALARS = 1_024;
@@ -434,6 +435,10 @@ export function buildLosslessBlocks(
     cuts.filter((candidate) => candidate.kind === "layout")
       .map((candidate) => candidate.scalarOffset),
   )].filter((end) => end > 0);
+  const paragraphEnds = [...new Set(
+    cuts.filter((candidate) => candidate.kind === "paragraph")
+      .map((candidate) => candidate.scalarOffset),
+  )].filter((end) => end > 0);
   const sortedAnnotations = [...annotations].sort((left, right) => (
     left.start - right.start || left.end - right.end || left.id.localeCompare(right.id)
   ));
@@ -447,6 +452,7 @@ export function buildLosslessBlocks(
   let cursor = 0;
   let structureIndex = 0;
   let layoutIndex = 0;
+  let paragraphIndex = 0;
   let candidateIndex = 0;
   let annotationIndex = 0;
   let activeStructure: StructureAnnotation | undefined;
@@ -475,9 +481,19 @@ export function buildLosslessBlocks(
         ))) {
       layoutIndex += 1;
     }
+    while ((paragraphEnds[paragraphIndex] ?? Number.POSITIVE_INFINITY) <= cursor) {
+      paragraphIndex += 1;
+    }
     const nextStructureStart = structureStarts[structureIndex];
     const nextLayoutEnd = layoutEnds[layoutIndex];
-    const nextHardBoundary = [nextStructureStart, nextLayoutEnd]
+    const paragraphCapEnd = paragraphEnds[
+      paragraphIndex + MAX_PARAGRAPHS_PER_BLOCK - 1
+    ];
+    const nextHardBoundary = [
+      nextStructureStart,
+      nextLayoutEnd,
+      paragraphCapEnd,
+    ]
       .filter((value): value is number => value !== undefined && value <= maximumEnd)
       .sort((left, right) => left - right)[0];
     let end = nextHardBoundary

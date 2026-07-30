@@ -29,6 +29,7 @@ import type {
   TranslationRuntimeSet,
 } from "./fullbook/types.js";
 import {
+  optimizationPolicy,
   profileFromLegacyRunMode,
   validateRuntimeVariants,
   type OptimizationProfile,
@@ -1120,6 +1121,28 @@ export async function main(
       });
     } finally {
       runtimeProfileStore.close();
+    }
+    if (result.scheduler !== undefined) {
+      const schedulerStore = new LosslessBookStore(
+        requireOption(options, "store"),
+      );
+      try {
+        const durableScheduler = schedulerStore.loadSchedulerMetrics(runId, {
+          mode: schedulerMode,
+          profile: optimizationProfile,
+          tokenIncreaseCap:
+            optimizationPolicy(optimizationProfile).tokenIncreaseCap,
+          enforceDispatchLifecycle: true,
+        });
+        if (durableScheduler !== undefined) {
+          result = {
+            ...result,
+            scheduler: durableScheduler,
+          };
+        }
+      } finally {
+        schedulerStore.close();
+      }
     }
     let artifacts: BookArtifactPaths | null = result.artifacts;
     if (options.output !== undefined) {

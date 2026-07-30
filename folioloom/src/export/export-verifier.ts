@@ -5,7 +5,7 @@ import { XMLParser, XMLValidator } from "fast-xml-parser";
 
 import { readStoredZipEntries, type StoredZipEntry } from "./stored-zip.js";
 import {
-  auditLosslessBookStore,
+  auditLosslessBookExport,
   losslessBookLineage,
   losslessBookTranslations,
   renderBilingual,
@@ -292,7 +292,11 @@ export function verifyExport(
   runId: string,
 ): ExportVerificationResult {
   const incidents = new Set<ExportVerificationIncidentCode>();
-  const expected = losslessBookLineage(store, runId);
+  const exportAudit = auditLosslessBookExport(store, runId);
+  const expected = {
+    ...losslessBookLineage(store, runId),
+    complete: exportAudit.audit.complete,
+  };
   const expectedJson = canonical(expected);
   const translations = losslessBookTranslations(store, runId);
   if (!readMatches(paths.translation, renderTranslation(translations, {
@@ -305,7 +309,7 @@ export function verifyExport(
   }
   try {
     const actualAudit = JSON.parse(readFileSync(paths.audit, "utf8")) as unknown;
-    if (canonical(actualAudit) !== canonical(auditLosslessBookStore(store, runId))) {
+    if (canonical(actualAudit) !== canonical(exportAudit.audit)) {
       incidents.add("AUDIT_CONTENT_MISMATCH");
     }
   } catch {

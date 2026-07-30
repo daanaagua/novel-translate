@@ -35,11 +35,84 @@ export interface BlockTranslation {
   text: string;
 }
 
+export const TRANSLATION_MEMORY_KINDS = [
+  "entity_identity",
+  "entity_relation",
+  "term_sense",
+  "coreference",
+  "local_continuity",
+] as const;
+
+export type TranslationMemoryKind = typeof TRANSLATION_MEMORY_KINDS[number];
+
+export function isTranslationMemoryKind(
+  value: unknown,
+): value is TranslationMemoryKind {
+  return typeof value === "string"
+    && (TRANSLATION_MEMORY_KINDS as readonly string[]).includes(value);
+}
+
 export interface TranslationMemoryCandidate {
-  kind: string;
+  kind: TranslationMemoryKind;
   subjectForms: string[];
   fact: string;
   confidence: number;
+}
+
+export interface SanitizedTranslationMemoryCandidates {
+  candidates: TranslationMemoryCandidate[];
+  warnings: string[];
+}
+
+export function sanitizeTranslationMemoryCandidates(
+  values: readonly unknown[] | undefined,
+): SanitizedTranslationMemoryCandidates {
+  const candidates: TranslationMemoryCandidate[] = [];
+  const warnings: string[] = [];
+  const reject = (index: number, reason: string, value?: unknown): void => {
+    warnings.push([
+      "INVALID_TRANSLATION_MEMORY_CANDIDATE_IGNORED:",
+      `index=${index};`,
+      `reason=${reason}${value === undefined ? "" : `; value=${String(value)}`}`,
+    ].join(" "));
+  };
+  for (const [index, value] of (values ?? []).entries()) {
+    if (value === null || typeof value !== "object" || Array.isArray(value)) {
+      reject(index, "shape");
+      continue;
+    }
+    const candidate = value as Partial<TranslationMemoryCandidate>;
+    if (!isTranslationMemoryKind(candidate.kind)) {
+      reject(index, "kind", candidate.kind);
+      continue;
+    }
+    if (!Array.isArray(candidate.subjectForms)
+      || candidate.subjectForms.length < 1
+      || candidate.subjectForms.length > 3
+      || candidate.subjectForms.some((form: unknown) =>
+        typeof form !== "string" || form.trim().length === 0)) {
+      reject(index, "subject_forms");
+      continue;
+    }
+    if (typeof candidate.fact !== "string" || candidate.fact.trim().length === 0) {
+      reject(index, "fact");
+      continue;
+    }
+    if (typeof candidate.confidence !== "number"
+      || !Number.isFinite(candidate.confidence)
+      || candidate.confidence < 0
+      || candidate.confidence > 1) {
+      reject(index, "confidence", candidate.confidence);
+      continue;
+    }
+    candidates.push({
+      kind: candidate.kind,
+      subjectForms: [...candidate.subjectForms],
+      fact: candidate.fact,
+      confidence: candidate.confidence,
+    });
+  }
+  return { candidates, warnings };
 }
 
 export interface TranslationCandidate {

@@ -14,6 +14,7 @@ import { scalarLength } from "./source/types.js";
 import type { BookStore } from "./storage/book-store.js";
 import type { LosslessBookStore } from "./storage/lossless-book-store.js";
 import type { SchedulerRunReport } from "./fullbook/dynamic-scheduler.js";
+import { optimizationPolicy } from "./fullbook/optimization-policy.js";
 
 export interface PilotTranslation {
   blockId: string;
@@ -744,19 +745,119 @@ function schedulerMetricsProjection(
   return schedulerMetrics(scheduler);
 }
 
+const TOKEN_LEDGER_EXPORT_INCIDENTS = new Set([
+  "TOKEN_LEDGER_PROJECTION_MISSING",
+  "TOKEN_LEDGER_PROJECTION_MISMATCH",
+  "TOKEN_LEDGER_OPEN_ATTEMPT",
+  "TOKEN_USAGE_INCOMPLETE",
+]);
+
+function sameLedgerProjection(
+  left: SchedulerRunReport,
+  right: SchedulerRunReport,
+): boolean {
+  return left.baselineTokens === right.baselineTokens
+    && left.allowedTokens === right.allowedTokens
+    && left.actualTokens === right.actualTokens
+    && left.tokenUsageComplete === right.tokenUsageComplete;
+}
+
+export function auditLosslessBookExport(
+  store: LosslessBookStore,
+  runId: string,
+  schedulerOverride?: SchedulerRunReport,
+): {
+  readonly audit: LosslessBookAuditReport;
+  readonly scheduler: SchedulerRunReport | undefined;
+} {
+  const baseAudit = auditLosslessBookStore(store, runId);
+  const ledgerEvents = store.loadTokenLedgerEvents(runId);
+  let storedProjection: SchedulerRunReport | undefined;
+  try {
+    storedProjection = store.loadSchedulerMetrics(runId);
+  } catch (error) {
+    if (!(error instanceof TypeError)
+      || !/requires TokenLedgerInit/u.test(error.message)) {
+      throw error;
+    }
+  }
+  const projection = schedulerOverride ?? storedProjection;
+  let scheduler = projection;
+  const ledgerIncidents: string[] = [];
+  if (ledgerEvents.length > 0) {
+    if (projection === undefined) {
+      ledgerIncidents.push("TOKEN_LEDGER_PROJECTION_MISSING");
+    } else {
+      const init = {
+        mode: projection.mode,
+        profile: projection.profile,
+        tokenIncreaseCap:
+          optimizationPolicy(projection.profile).tokenIncreaseCap,
+        enforceDispatchLifecycle: true,
+      };
+      const ledger = store.loadTokenLedger(runId, init);
+      const durableScheduler = store.loadSchedulerMetrics(runId, init);
+      if (durableScheduler === undefined) {
+        ledgerIncidents.push("TOKEN_LEDGER_PROJECTION_MISSING");
+      } else {
+        scheduler = durableScheduler;
+        if (!sameLedgerProjection(projection, durableScheduler)
+          || (storedProjection !== undefined
+            && !sameLedgerProjection(storedProjection, durableScheduler))) {
+          ledgerIncidents.push("TOKEN_LEDGER_PROJECTION_MISMATCH");
+        }
+        if (!durableScheduler.tokenUsageComplete) {
+          ledgerIncidents.push("TOKEN_USAGE_INCOMPLETE");
+        }
+      }
+      if (!ledger.reconcile().consistent) {
+        ledgerIncidents.push("TOKEN_LEDGER_OPEN_ATTEMPT");
+      }
+    }
+  }
+  const incidentCodes = [...new Set([
+    ...baseAudit.incidentCodes,
+    ...ledgerIncidents,
+  ])].sort();
+  const strictExportable = baseAudit.strictExportable
+    && ledgerIncidents.length === 0;
+  return {
+    audit: {
+      ...baseAudit,
+      complete: strictExportable,
+      strictExportable,
+      incidentCodes,
+    },
+    scheduler,
+  };
+}
+
 export function writeLosslessBookArtifacts(
   store: LosslessBookStore,
   runId: string,
   outputDirectory: string,
   options: WriteLosslessBookArtifactsOptions = {},
 ): LosslessBookArtifactPaths {
-  const audit = auditLosslessBookStore(store, runId);
+  const projection = auditLosslessBookExport(
+    store,
+    runId,
+    options.scheduler,
+  );
+  const audit = projection.audit;
   const integrityIncidents = audit.incidentCodes.filter((code) =>
-    code !== "STALE_KNOWLEDGE_BINDING");
+    code !== "STALE_KNOWLEDGE_BINDING"
+    && !TOKEN_LEDGER_EXPORT_INCIDENTS.has(code));
   if (integrityIncidents.length > 0) {
     throw new Error(`lossless export audit failed: ${integrityIncidents.join(",")}`);
   }
   if (!options.allowIncomplete && !audit.strictExportable) {
+    const ledgerIncidents = audit.incidentCodes.filter((code) =>
+      TOKEN_LEDGER_EXPORT_INCIDENTS.has(code));
+    if (ledgerIncidents.length > 0) {
+      throw new Error(
+        `strict book export requires reconciled token usage: ${ledgerIncidents.join(",")}`,
+      );
+    }
     if (!audit.knowledgeConverged) {
       throw new Error(
         "strict book export requires knowledge convergence: STALE_KNOWLEDGE_BINDING",
@@ -774,8 +875,7 @@ export function writeLosslessBookArtifacts(
   }), "utf8");
   writeFileSync(paths.bilingual, renderBilingual(translations), "utf8");
   writeFileSync(paths.audit, `${JSON.stringify(audit, null, 2)}\n`, "utf8");
-  const schedulerReport = options.scheduler
-    ?? store.loadSchedulerMetrics(runId);
+  const schedulerReport = projection.scheduler;
   writeFileSync(paths.metrics, `${JSON.stringify({
     schema: "v5-book-metrics-1",
     runId: audit.runId,
@@ -793,7 +893,10 @@ export function writeLosslessBookArtifacts(
     status: store.statusSummary(runId),
     scheduler: schedulerMetricsProjection(schedulerReport),
   }, null, 2)}\n`, "utf8");
-  const lineageJson = `${JSON.stringify(losslessBookLineage(store, runId), null, 2)}\n`;
+  const lineageJson = `${JSON.stringify({
+    ...losslessBookLineage(store, runId),
+    complete: audit.complete,
+  }, null, 2)}\n`;
   writeFileSync(paths.translationLineage, lineageJson, "utf8");
   writeFileSync(paths.bilingualLineage, lineageJson, "utf8");
   writeFileSync(paths.auditLineage, lineageJson, "utf8");

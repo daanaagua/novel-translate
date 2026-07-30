@@ -4,6 +4,7 @@ import { join } from "node:path";
 import { performance } from "node:perf_hooks";
 import test from "node:test";
 
+import { ModelProviderError } from "../src/agents/pi-runtime.js";
 import { BudgetExceeded } from "../src/kernel/budget.js";
 import {
   conceptFromAnchor,
@@ -37,7 +38,9 @@ function fixtureStore(
   definitions: readonly FixtureTask[],
 ): {
   readonly store: RevalidationExecutionStore;
+  readonly deferred: string[];
   readonly replacements: string[];
+  readonly task: (taskId: string) => KnowledgeRevalidationTask;
   readonly warnings: string[];
 } {
   const conceptsByTaskId = new Map(definitions.map((definition) => {
@@ -74,6 +77,7 @@ function fixtureStore(
     }]),
   );
   const replacements: string[] = [];
+  const deferredTasks: string[] = [];
   const warnings: string[] = [];
 
   function workItem(task: KnowledgeRevalidationTask): RevalidationWorkItem {
@@ -174,13 +178,28 @@ function fixtureStore(
       });
       return task.translationId + 100;
     },
+    deferRevalidationTask(_runId, taskId) {
+      deferredTasks.push(taskId);
+      const task = tasks.get(taskId)!;
+      tasks.set(taskId, {
+        ...task,
+        status: "pending",
+        attempts: task.attempts - 1,
+      });
+    },
     completeRevalidationWithWarning(_runId, taskId) {
       warnings.push(taskId);
       const task = tasks.get(taskId)!;
       tasks.set(taskId, { ...task, status: "completed_with_warning" });
     },
   };
-  return { store, replacements, warnings };
+  return {
+    store,
+    deferred: deferredTasks,
+    replacements,
+    task: (taskId: string) => ({ ...tasks.get(taskId)! }),
+    warnings,
+  };
 }
 
 function replacement(work: RevalidationWorkItem) {
@@ -276,6 +295,40 @@ test("one warning does not roll back an unrelated successful replacement", async
   assert.equal(report.warning, 1);
   assert.deepEqual(fixture.replacements, ["task-a"]);
   assert.deepEqual(fixture.warnings, ["task-b"]);
+});
+
+test("retryable provider failure defers the task and aborts the revalidation wave", async () => {
+  const fixture = fixtureStore([
+    { taskId: "task-a", conceptId: "concept-a", translationId: 1 },
+    { taskId: "task-b", conceptId: "concept-b", translationId: 2 },
+  ]);
+  let calls = 0;
+
+  await assert.rejects(executeRevalidationTasks({
+    store: fixture.store,
+    runId: "run-0",
+    maxAttempts: 2,
+    maxConcurrency: 1,
+    maxInFlightTokens: 100,
+    translate: async () => {
+      calls += 1;
+      throw new ModelProviderError(
+        "model provider error: Connection error.",
+        "busy",
+        true,
+      );
+    },
+    isExpectedFailure: (error) => error instanceof ModelProviderError,
+    isRunBlockingFailure: (error) =>
+      error instanceof ModelProviderError && error.retryable,
+  }), /Connection error/u);
+
+  assert.equal(calls, 1);
+  assert.deepEqual(fixture.deferred, ["task-a"]);
+  assert.deepEqual(fixture.warnings, []);
+  assert.equal(fixture.task("task-a").status, "pending");
+  assert.equal(fixture.task("task-a").attempts, 0);
+  assert.equal(fixture.task("task-b").status, "pending");
 });
 
 test("revalidation planner failure falls back to validated serial execution", async () => {

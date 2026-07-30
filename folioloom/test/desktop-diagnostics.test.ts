@@ -66,7 +66,7 @@ test("diagnostic report redacts secrets, private paths and nested error causes",
   const tempRoot = join(root, "temp");
   const logger = new DesktopDiagnosticLogger({
     directory: join(userData, "diagnostics"),
-    appVersion: "1.4.0",
+    appVersion: "1.5.0",
     pathAliases: { userData, app: appRoot, temp: tempRoot },
     environment: {
       platform: "win32",
@@ -110,7 +110,7 @@ test("diagnostic logger rotates bounded JSONL files and caps individual events",
   const directory = temporaryDirectory("diagnostics-rotation");
   const logger = new DesktopDiagnosticLogger({
     directory,
-    appVersion: "1.4.0",
+    appVersion: "1.5.0",
     maximumFileBytes: 600,
     maximumFiles: 4,
     maximumEventBytes: 320,
@@ -144,7 +144,7 @@ test("diagnostic logger failures never alter application control flow", () => {
   writeFileSync(notDirectory, "file", "utf8");
   const logger = new DesktopDiagnosticLogger({
     directory: notDirectory,
-    appVersion: "1.4.0",
+    appVersion: "1.5.0",
   });
 
   assert.doesNotThrow(() => logger.record({
@@ -161,7 +161,7 @@ test("final sensitive scanner refuses unsafe objects before a report is written"
     manifest: {
       schema: "folioloom-diagnostics-1",
       generatedAt: "2026-07-26T12:00:00.000Z",
-      appVersion: "1.4.0",
+      appVersion: "1.5.0",
     },
     environment: { platform: "win32", release: "fixture", arch: "x64" },
     events: [],
@@ -188,7 +188,7 @@ test("exported diagnostics are valid UTF-8 JSON and contain no manuscript payloa
   const directory = temporaryDirectory("diagnostics-export");
   const logger = new DesktopDiagnosticLogger({
     directory: join(directory, "events"),
-    appVersion: "1.4.0",
+    appVersion: "1.5.0",
     now: () => "2026-07-26T12:00:00.000Z",
   });
   logger.record({
@@ -213,7 +213,7 @@ test("diagnostic summary stays short, useful, and privacy-safe", () => {
   const root = temporaryDirectory("diagnostic-summary");
   const logger = new DesktopDiagnosticLogger({
     directory: root,
-    appVersion: "1.4.0",
+    appVersion: "1.5.0",
     now: () => "2026-07-26T08:00:00.000Z",
   });
   logger.record({

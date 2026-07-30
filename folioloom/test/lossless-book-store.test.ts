@@ -1,10 +1,16 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { existsSync, mkdtempSync, rmSync } from "node:fs";
+import {
+  existsSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import test from "node:test";
+import { gunzipSync } from "node:zlib";
 
 import type { BookWindowPlan } from "../src/fullbook/types.js";
 import { CommitCoordinator } from "../src/fullbook/commit-coordinator.js";
@@ -184,6 +190,88 @@ function initialize(
   store.initializeWindowPlan(runId, windows);
   return runId;
 }
+
+test("provider response evidence is durable, compressed, and raw-body deduplicated", () => {
+  const path = fixturePath();
+  const store = new LosslessBookStore(path);
+  try {
+    const runId = initialize(store);
+    const assistantMessage = {
+      role: "assistant",
+      provider: "fixture",
+      model: "fixture-model",
+      api: "fixture-api",
+      stopReason: "toolUse",
+      usage: {
+        input: 10,
+        output: 5,
+        cacheRead: 0,
+        cacheWrite: 0,
+        reasoning: 0,
+        totalTokens: 15,
+      },
+      content: [{
+        type: "toolCall",
+        name: "finalize_translation_batch",
+        arguments: { windows: [{ windowId: "window-0" }] },
+      }],
+    };
+    const input = {
+      runId,
+      requestId: "request-0",
+      snapshotId: "snapshot-a",
+      phase: "translation" as const,
+      modelCallOrdinal: 1,
+      requestHash: "a".repeat(64),
+      responseProtocol: "typed_tool" as const,
+      executionUnitId: "paragraph-unit-0",
+      assistantMessage,
+    };
+    store.appendProviderResponseEvidence(input);
+    store.appendProviderResponseEvidence({
+      ...input,
+      requestId: "request-replay",
+    });
+
+    const database = new DatabaseSync(path);
+    const rows = database.prepare(`
+      SELECT payload_json FROM events
+      WHERE run_id=? AND kind='provider_response_evidence'
+      ORDER BY sequence
+    `).all(runId) as unknown as Array<{ payload_json: string }>;
+    database.close();
+    assert.equal(rows.length, 2);
+    const metadata = rows.map((row) =>
+      JSON.parse(row.payload_json) as {
+        locator: string;
+        responseHash: string;
+        requestId: string;
+      });
+    assert.equal(metadata[0]?.locator, metadata[1]?.locator);
+    assert.equal(metadata[0]?.responseHash, metadata[1]?.responseHash);
+    assert.notEqual(metadata[0]?.requestId, metadata[1]?.requestId);
+
+    const locator = metadata[0]?.locator;
+    assert.ok(locator);
+    const evidencePath = join(dirname(path), ...locator.split("/"));
+    assert.equal(existsSync(evidencePath), true);
+    const envelope = JSON.parse(
+      gunzipSync(readFileSync(evidencePath)).toString("utf8"),
+    ) as {
+      schema: string;
+      responseHash: string;
+      assistantMessage: typeof assistantMessage;
+    };
+    assert.equal(
+      envelope.schema,
+      "folioloom-provider-response-evidence-1",
+    );
+    assert.equal(envelope.responseHash, metadata[0]?.responseHash);
+    assert.deepEqual(envelope.assistantMessage, assistantMessage);
+  } finally {
+    store.close();
+  }
+});
 
 function validStage(
   runId = "run-a",
@@ -756,6 +844,44 @@ test("translation concept bindings follow the staged translation version", () =>
   store.close();
 });
 
+test("contextual occurrences keep clean coverage when the receipt is omitted", () => {
+  const store = new LosslessBookStore(fixturePath());
+  const runId = initialize(store);
+  const concept = alphaConcept();
+  const [first, second] = blocks();
+  store.upsertLexicalConcepts(runId, [concept]);
+  store.claimWindow(runId, "window-0");
+  store.stageWindow({
+    ...validStage(),
+    translations: [
+      {
+        blockId: first!.id,
+        sourceHash: first!.sourceHash,
+        text: "A contextually valid rendering.",
+      },
+      {
+        blockId: second!.id,
+        sourceHash: second!.sourceHash,
+        text: "Beta.",
+      },
+    ],
+    knowledgeCandidates: [],
+    conceptBindings: {
+      usages: [],
+      concepts: [concept],
+    },
+  });
+  store.promoteStagedWindow(runId, "window-0");
+
+  const [binding] = store.activeTranslationBindings(runId, first!.id);
+  assert.equal(binding?.conceptId, concept.conceptId);
+  assert.equal(binding?.appliedRevisionId, concept.revisionId);
+  assert.equal(binding?.validationStatus, "clean");
+  assert.deepEqual(binding?.termUsages, []);
+  assert.deepEqual(store.auditState(runId).missingConceptBindings, []);
+  store.close();
+});
+
 test("promotion retries a staged translation whose term surface became obsolete", () => {
   const store = new LosslessBookStore(fixturePath());
   const runId = initialize(store);
@@ -1023,6 +1149,57 @@ test("concept promotion backfills one sparse task for an earlier unbound occurre
   store.close();
 });
 
+test("coverage reconciliation retires legacy tasks whose exact source occurrence vanished", () => {
+  const path = fixturePath();
+  const store = new LosslessBookStore(path);
+  const current = reviseConcept(alphaConcept(), {
+    sourceForms: ["Alpha's"],
+    canonicalTarget: "阿尔法的",
+    allowedRealizations: ["阿尔法的"],
+  });
+  const fixture = createStaleConceptTask(store, current);
+  const [binding] = store.activeTranslationBindings(fixture.runId, fixture.first.id);
+  assert.ok(binding);
+  assert.equal(store.revalidationTasks(fixture.runId).length, 0);
+
+  const legacyTaskId = "revalidation-legacy-possessive-projection";
+  const database = new DatabaseSync(path);
+  database.prepare(`
+    INSERT INTO knowledge_revalidation_tasks(
+      task_id, run_id, translation_id, block_id, change_set_hash,
+      from_snapshot_id, to_snapshot_id, concept_ids_json, status
+    ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, 'pending')
+  `).run(
+    legacyTaskId,
+    fixture.runId,
+    binding.translationId,
+    fixture.first.id,
+    sha256("legacy-possessive-projection"),
+    fixture.nextSnapshot.parentSnapshotId,
+    fixture.nextSnapshot.id,
+    JSON.stringify([current.conceptId]),
+  );
+  database.close();
+
+  store.ensureConceptCoverageRevalidationTasks(
+    fixture.runId,
+    fixture.nextSnapshot.id,
+  );
+
+  assert.deepEqual(store.conceptOccurrences(fixture.runId, current.conceptId), []);
+  assert.deepEqual(
+    store.activeTranslationBindings(fixture.runId, fixture.first.id),
+    [],
+  );
+  const legacyTask = store.revalidationTasks(fixture.runId)
+    .find((task) => task.taskId === legacyTaskId);
+  assert.equal(legacyTask?.status, "resolved_noop");
+  assert.deepEqual(legacyTask?.result, {
+    reason: "source_occurrence_obsolete",
+  });
+  store.close();
+});
+
 test("revalidation noop advances the binding without creating a translation version", () => {
   const store = new LosslessBookStore(fixturePath());
   const fixture = createStaleConceptTask(store, reviseConcept(alphaConcept(), {
@@ -1087,6 +1264,37 @@ test("revalidation claims an exact planned task with compare-and-swap attempts",
     ),
     undefined,
   );
+  store.close();
+});
+
+test("external provider failure defers revalidation without consuming a quality attempt", () => {
+  const store = new LosslessBookStore(fixturePath());
+  const fixture = createStaleConceptTask(store);
+  const pending = store.revalidationTasks(fixture.runId)[0];
+  assert.ok(pending);
+  const claimed = store.claimRevalidationTask(
+    fixture.runId,
+    pending.taskId,
+    2,
+    pending.attempts,
+  );
+  assert.equal(claimed?.status, "validating");
+  assert.equal(claimed?.attempts, 1);
+
+  store.deferRevalidationTask(fixture.runId, pending.taskId, {
+    code: "PROVIDER_BUSY",
+  });
+
+  const deferred = store.revalidationTasks(fixture.runId)[0];
+  assert.equal(deferred?.status, "pending");
+  assert.equal(deferred?.attempts, 0);
+  const reclaimed = store.claimRevalidationTask(
+    fixture.runId,
+    pending.taskId,
+    2,
+    0,
+  );
+  assert.equal(reclaimed?.attempts, 1);
   store.close();
 });
 
@@ -1155,6 +1363,37 @@ test("revalidation replacement preserves history and activates version two", () 
     { version: 2, active: 1 },
   ]);
   database.close();
+});
+
+test("revalidation replacement preserves coverage when a contextual receipt is omitted", () => {
+  const store = new LosslessBookStore(fixturePath());
+  const fixture = createStaleConceptTask(store);
+  const task = store.claimNextRevalidationTask(fixture.runId, 2);
+  assert.ok(task);
+
+  store.replaceTranslationForRevalidation({
+    runId: fixture.runId,
+    taskId: task.taskId,
+    snapshotId: fixture.nextSnapshot.id,
+    action: "repair",
+    text: "另一种可接受的上下文译法。",
+    resultStatus: "completed",
+    termUsages: [],
+    concepts: [fixture.current],
+    result: { reason: "contextual_realization_without_receipt" },
+  });
+
+  const [binding] = store.activeTranslationBindings(
+    fixture.runId,
+    fixture.first.id,
+  );
+  assert.equal(binding?.conceptId, fixture.current.conceptId);
+  assert.equal(binding?.appliedRevisionId, fixture.current.revisionId);
+  assert.equal(binding?.appliedRenderFingerprint, fixture.current.renderFingerprint);
+  assert.deepEqual(binding?.termUsages, []);
+  assert.equal(binding?.validationStatus, "clean");
+  assert.equal(binding?.validatedRevisionId, fixture.current.revisionId);
+  store.close();
 });
 
 test("revalidation replacement promotes warning status across its whole window", () => {

@@ -12,6 +12,15 @@ const input = {
   blockIds: ["block-0", "block-1"],
 };
 
+test("framed attempts use independent 128-bit random nonces", () => {
+  const first = createFramedTranslationProtocol(input);
+  const second = createFramedTranslationProtocol(input);
+
+  assert.match(first.nonce, /^[0-9a-f]{32}$/u);
+  assert.match(second.nonce, /^[0-9a-f]{32}$/u);
+  assert.notEqual(first.nonce, second.nonce);
+});
+
 test("framed translation protocol round-trips raw Chinese quotes and newlines", () => {
   const protocol = createFramedTranslationProtocol(input);
   const [first, second] = protocol.frames;
