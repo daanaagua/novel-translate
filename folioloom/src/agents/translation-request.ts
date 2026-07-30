@@ -88,7 +88,27 @@ function canonicalizeFinalizerEnvelope(
   rawArgs: FinalizeTranslationBatchWireArgs,
   paragraphFragment?: ParagraphFragmentExecutionScope,
 ): FinalizeTranslationBatchArgs {
-  const envelopeKeys = FINALIZER_METADATA_KEYS.filter(
+  const allowedEnvelopeKeys = paragraphFragment === undefined
+    ? FINALIZER_METADATA_KEYS
+    : (["termUsages"] as const);
+  if (paragraphFragment !== undefined) {
+    const disallowedFragmentMetadata = [
+      "notes",
+      "memoryCandidates",
+      "styleObservation",
+    ] as const;
+    for (const key of disallowedFragmentMetadata) {
+      if (
+        rawArgs[key] !== undefined
+        || rawArgs.windows.some((window) => window[key] !== undefined)
+      ) {
+        throw new Error(
+          `paragraph fragment finalization does not accept ${key}`,
+        );
+      }
+    }
+  }
+  const envelopeKeys = allowedEnvelopeKeys.filter(
     (key) => rawArgs[key] !== undefined,
   );
   if (envelopeKeys.length > 0 && rawArgs.windows.length !== 1) {
@@ -354,7 +374,7 @@ function finalizerTool(
       },
     };
   }
-  const windowProperties = {
+  const wholeWindowProperties = {
     windowId: paragraphFragment === undefined
       ? Type.String()
       : Type.Literal(expectedWindowId!),
@@ -372,6 +392,14 @@ function finalizerTool(
     memoryCandidates: Type.Optional(memoryCandidatesSchema),
     styleObservation: Type.Optional(styleObservationSchema),
   };
+  const fragmentWindowProperties = {
+    windowId: Type.Literal(expectedWindowId!),
+    translations: Type.Array(translationSchema, {
+      minItems: 1,
+      maxItems: 1,
+    }),
+    termUsages: Type.Optional(termUsagesSchema),
+  };
   return {
     name: "finalize_translation_batch",
     label: "Finalize translation batch",
@@ -382,7 +410,7 @@ function finalizerTool(
     parameters: paragraphFragment === undefined
       ? Type.Object({
         windows: Type.Array(Type.Object(
-          windowProperties,
+          wholeWindowProperties,
           { additionalProperties: false },
         )),
         // Some OpenAI-compatible providers occasionally lift fields from the
@@ -395,19 +423,15 @@ function finalizerTool(
       }, { additionalProperties: false })
       : Type.Object({
         windows: Type.Array(Type.Object(
-          windowProperties,
+          fragmentWindowProperties,
           { additionalProperties: false },
         ), {
           minItems: 1,
           maxItems: 1,
         }),
-        // Fragment arrays and identities remain exact. Metadata lifting is a
-        // separate, deterministic compatibility seam because ownership is
-        // unambiguous for the sole admitted window.
+        // Term receipts are the only fragment-owned metadata. Discovery
+        // notes, memory, and style are consolidated outside recovery calls.
         termUsages: Type.Optional(termUsagesSchema),
-        notes: Type.Optional(notesSchema),
-        memoryCandidates: Type.Optional(memoryCandidatesSchema),
-        styleObservation: Type.Optional(styleObservationSchema),
       }, { additionalProperties: false }),
     execute: async (rawArgs: FinalizeTranslationBatchWireArgs, signal) => {
       assertNotAborted(signal);
@@ -753,7 +777,7 @@ export function prepareTranslationRequest(
           ? "Translate every source block. Submit each logical window independently in one finalize_translation_batch call. For every listed TERM OCCURRENCE, include one exact termUsages receipt in its owning window; omit termUsages only when that window has no listed occurrence. Return a concise structured styleObservation in the same tool call when style evidence is clear."
           : input.paragraphFragment.paragraphs.length === 1
             ? "Translate only the one TARGET SOURCE FRAGMENT paragraph. Call finalize_paragraph_fragment with only its complete Chinese text. The host owns the window, block, paragraph identity, and metadata. CONTEXT-ONLY PARAGRAPHS provide continuity and must not appear in the output."
-            : "Translate only TARGET SOURCE FRAGMENT. Return the original canonical blockId and encode each target paragraph as one separate translations[].paragraphs[] {text} item, in exact source order. Never join multiple source paragraphs inside one item. CONTEXT-ONLY PARAGRAPHS provide continuity and must not appear in the output. Include exact TERM OCCURRENCES for this execution unit. Place notes, termUsages, memoryCandidates, and styleObservation inside the sole windows item, never at the tool-call top level."
+            : "Translate only TARGET SOURCE FRAGMENT. Return the original canonical blockId and encode each target paragraph as one separate translations[].paragraphs[] {text} item, in exact source order. Never join multiple source paragraphs inside one item. CONTEXT-ONLY PARAGRAPHS provide continuity and must not appear in the output. Include exact termUsages receipts for listed TERM OCCURRENCES. Do not emit notes, memoryCandidates, styleObservation, or other discovery metadata; the host consolidates those outside fragment recovery."
         : framedTranslationInstructions(framedProtocol),
     },
   ];

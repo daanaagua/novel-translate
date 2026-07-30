@@ -62,7 +62,7 @@ const plan = planParagraphFragments({
   snapshotId: "snapshot-1",
   maxTargetParagraphs: 2,
 });
-const unit = plan.units[0]!;
+const unit = plan.units.at(-1)!;
 const executionScope = {
   planId: plan.planId,
   executionUnitId: unit.executionUnitId,
@@ -93,6 +93,10 @@ test("fragment typed prompt distinguishes target paragraphs from context-only so
   assert.doesNotMatch(prepared.serializedToolSchemas, /executionUnitId/u);
   assert.doesNotMatch(prepared.serializedToolSchemas, /paragraphId/u);
   assert.match(prepared.serializedToolSchemas, /"paragraphs"/u);
+  assert.match(prepared.serializedToolSchemas, /"termUsages"/u);
+  assert.doesNotMatch(prepared.serializedToolSchemas, /"notes"/u);
+  assert.doesNotMatch(prepared.serializedToolSchemas, /"memoryCandidates"/u);
+  assert.doesNotMatch(prepared.serializedToolSchemas, /"styleObservation"/u);
 
   const [toolSchema] = JSON.parse(prepared.serializedToolSchemas) as Array<{
     parameters: {
@@ -287,7 +291,6 @@ test("fragment typed submission requires exact paragraph identity and joins loca
             { text: "第二段完整译文继续场景并保持清晰连贯。" },
           ],
         }],
-        notes: [],
       }],
     },
   ), { stopReason: "toolUse" })]);
@@ -319,12 +322,10 @@ test("fragment typed submission requires exact paragraph identity and joins loca
   );
 });
 
-test("fragment keeps exact arrays while normalizing unambiguous envelope metadata", async () => {
+test("fragment rejects discovery metadata and accepts a minimal correction", async () => {
   const faux = fauxProvider();
-  faux.setResponses([fauxAssistantMessage(fauxToolCall(
-    "finalize_translation_batch",
-    {
-      windows: [{
+  const fragmentSubmission = {
+    windows: [{
         windowId: request.windows[0]?.windowId,
         translations: [{
           blockId: sourceBlock.id,
@@ -340,9 +341,20 @@ test("fragment keeps exact arrays while normalizing unambiguous envelope metadat
           ],
         }],
       }],
-      notes: ["metadata was emitted at the sole-window envelope"],
-    },
-  ), { stopReason: "toolUse" })]);
+  };
+  faux.setResponses([
+    fauxAssistantMessage(fauxToolCall(
+      "finalize_translation_batch",
+      {
+        ...fragmentSubmission,
+        notes: ["disallowed fragment discovery metadata"],
+      },
+    ), { stopReason: "toolUse" }),
+    fauxAssistantMessage(fauxToolCall(
+      "finalize_translation_batch",
+      fragmentSubmission,
+    ), { stopReason: "toolUse" }),
+  ]);
 
   const result = await runTranslationBatch({
     request,
@@ -356,16 +368,13 @@ test("fragment keeps exact arrays while normalizing unambiguous envelope metadat
     budget: new BudgetLedger(),
   });
 
-  assert.equal(faux.state.callCount, 1);
+  assert.equal(faux.state.callCount, 2);
   assert.equal(
     result.windows[0]?.status,
-    "completed_with_warnings",
+    "completed",
     result.windows[0]?.error,
   );
-  assert.deepEqual(
-    result.windows[0]?.notes,
-    ["metadata was emitted at the sole-window envelope"],
-  );
+  assert.deepEqual(result.windows[0]?.notes, []);
 });
 
 test("fragment exact schema rejects sibling spill and accepts one correction", async () => {
@@ -381,7 +390,6 @@ test("fragment exact schema rejects sibling spill and accepts one correction", a
             paragraphs?: Array<{ text: string }>;
             text?: string;
           }>;
-          notes: string[];
         }>;
       };
     const malformedWindow = malformedArgs.windows[0]!;
@@ -398,7 +406,6 @@ test("fragment exact schema rejects sibling spill and accepts one correction", a
               { text: spilled!.text! },
             ],
           }],
-          notes: malformedWindow.notes,
         }],
       }), { stopReason: "toolUse" }),
     ]);
@@ -416,7 +423,6 @@ test("fragment exact schema rejects sibling spill and accepts one correction", a
         }, {
           text: "第二段完整译文继续场景并保持清晰连贯。",
         }],
-        notes: [],
       }],
     },
   ), { stopReason: "toolUse" })]);
@@ -573,7 +579,6 @@ test("fragment typed submission rejects paragraph-count drift without repair", a
           blockId: sourceBlock.id,
           paragraphs: [{ text: "只有一段，缺少第二段。" }],
         }],
-        notes: [],
       }],
     },
   ), { stopReason: "toolUse" })]);

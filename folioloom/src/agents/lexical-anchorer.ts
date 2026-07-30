@@ -114,6 +114,24 @@ const CONCEPT_ELIGIBLE_CLASSES = new Set<LexicalAnchorSemanticClass>([
   "role",
 ]);
 
+function hasIndependentConceptEvidence(
+  anchor: LexicalAnchor,
+  candidate: AnchorCandidate | undefined,
+): boolean {
+  if (candidate?.sourceAuthoredTarget !== undefined) return true;
+  if (anchor.confidence < 0.9 || candidate === undefined) return false;
+  const semanticClass = anchor.semanticClass ?? "unclassified";
+  if (semanticClass === "proper_name" || semanticClass === "unique_title") {
+    return candidate.likelyProperName === true;
+  }
+  if (semanticClass === "technical_term" || semanticClass === "role") {
+    return (candidate.corpusFrequency ?? 0) >= 3
+      && (candidate.currentWaveOccurrences ?? 0) >= 2
+      && (candidate.documentFrequency ?? 0) >= 1;
+  }
+  return false;
+}
+
 function lexicalAnchorParameters() {
   return Type.Object({
     anchors: Type.Array(Type.Object({
@@ -543,6 +561,7 @@ export class LexicalAnchorer {
     ]));
     let anchors: LexicalAnchor[] = [];
     let entityLinks: EntityLink[] = [];
+    const uncorroboratedConceptForms = new Set<string>();
     let submitted = false;
     const tool: TypedToolSpec = {
       name: "submit_lexical_anchors",
@@ -648,7 +667,14 @@ export class LexicalAnchorer {
         anchors = args.anchors.map((anchor) => {
           const normalizedSource = profile.normalizeSourceForm(anchor.sourceForm);
           const candidate = candidateByForm.get(normalizedSource);
-          const semanticClass = anchor.semanticClass ?? "unclassified";
+          let semanticClass = anchor.semanticClass ?? "unclassified";
+          if (CONCEPT_ELIGIBLE_CLASSES.has(semanticClass)
+            && !hasIndependentConceptEvidence(anchor, candidate)) {
+            semanticClass = "unclassified";
+            if (anchor.confidence >= 0.9) {
+              uncorroboratedConceptForms.add(normalizedSource);
+            }
+          }
           const sourceAuthoredTarget = candidate?.sourceAuthoredTarget;
           const sourceAuthoredBinding = anchor.mode === "stable"
             && anchor.confidence >= 0.75
@@ -701,9 +727,19 @@ export class LexicalAnchorer {
         && anchor.target.trim().length > 0
         && !confirmedForms.has(profile.normalizeSourceForm(anchor.sourceForm)))
       .map(anchorAsTerm);
+    const softAnchorTerms = anchors
+      .filter((anchor) =>
+        uncorroboratedConceptForms.has(
+          profile.normalizeSourceForm(anchor.sourceForm),
+        )
+        && anchor.target.trim().length > 0
+        && !confirmedForms.has(profile.normalizeSourceForm(anchor.sourceForm)))
+      .map(anchorAsTerm);
     const projectedForms = new Set([
       ...confirmedForms,
       ...anchorTerms.map((term) => profile.normalizeSourceForm(term.sourceForm)),
+      ...softAnchorTerms.map((term) =>
+        profile.normalizeSourceForm(term.sourceForm)),
     ]);
     const sourceAuthoredPreferences = input.candidates.flatMap((candidate): StableTerm[] => {
       const normalized = profile.normalizeSourceForm(candidate.sourceForm);
@@ -725,6 +761,7 @@ export class LexicalAnchorer {
       entityLinks: entityLinks.map((link) => structuredClone(link)),
       terms: [
         ...anchorTerms,
+        ...softAnchorTerms,
         ...sourceAuthoredPreferences,
         ...entityLinks.flatMap(entityLinkAsTerms),
       ],

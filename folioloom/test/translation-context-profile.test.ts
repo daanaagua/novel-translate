@@ -358,6 +358,6 @@ test("paragraph execution narrows planned knowledge to the exact wire fragment",
   assert.deepEqual(
     admitted.fragments.map((fragment) =>
       fragment.input.selectedKnowledgeRevisionIds),
-    [[], [], ["revision-brin"]],
+    [[], ["revision-brin"]],
   );
 });

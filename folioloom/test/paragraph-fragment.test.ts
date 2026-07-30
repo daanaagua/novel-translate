@@ -67,14 +67,14 @@ test("paragraph planner creates deterministic exact-cover units for tx8-shaped b
   assert.equal(first.planId, second.planId);
   assert.deepEqual(
     first.units.map((unit) => unit.paragraphs.length),
-    [6, 6, 6, 5],
+    [8, 8, 7],
   );
   assert.deepEqual(
     first.units.flatMap((unit) => unit.paragraphs.map((paragraph) =>
       paragraph.paragraphId)),
     first.paragraphs.map((paragraph) => paragraph.paragraphId),
   );
-  assert.equal(new Set(first.units.map((unit) => unit.executionUnitId)).size, 4);
+  assert.equal(new Set(first.units.map((unit) => unit.executionUnitId)).size, 3);
 });
 
 test("paragraph planner treats certified scene separators as paragraph boundaries", () => {
@@ -170,7 +170,7 @@ test("paragraph planner never splits a protected canonical source occurrence", (
 
   assert.deepEqual(
     protectedPlan.units.map((unit) => unit.paragraphs.length),
-    [7, 5],
+    [5, 7],
   );
   assert.notEqual(protectedPlan.planId, unprotected.planId);
 });
@@ -247,7 +247,7 @@ test("assembler rejects missing, duplicate, reordered, or foreign paragraph iden
   );
 
   const reordered = structuredClone(candidates);
-  reordered[0]?.paragraphs.reverse();
+  reordered.at(-1)?.paragraphs.reverse();
   assert.throws(
     () => assembleParagraphFragmentCandidates(plan, reordered),
     /paragraph order/u,

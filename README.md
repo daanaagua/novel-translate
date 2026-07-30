@@ -4,9 +4,9 @@
 
 FolioLoom 是一个面向长篇小说的开源 AI 翻译引擎。它把原文完整性、叙事记忆、实体别名、术语连续性、局部风格和失败恢复作为同一条可审计流水线处理，目标是让复杂小说在分块、并行和长时间运行后仍保持可追溯的一致性。
 
-当前版本为 **FolioLoom v1.4.0**。正式内核位于 [`folioloom/`](folioloom/)，以 TypeScript 编写；仓库根目录的 Python 代码主要承担 TXT、Markdown、DOCX、EPUB 输入适配，并保留 V1–V4 的研究历史。
+当前版本为 **FolioLoom v1.5.1**。正式内核位于 [`folioloom/`](folioloom/)，以 TypeScript 编写；仓库根目录的 Python 代码主要承担 TXT、Markdown、DOCX、EPUB 输入适配，并保留 V1–V4 的研究历史。
 
-## V1.4 能做什么
+## V1.5.1 能做什么
 
 - 为原始文本建立带哈希和位置映射的无损账本；
 - 按逻辑窗口串行或有限并行翻译，并在中断后恢复；
@@ -21,10 +21,19 @@ FolioLoom 是一个面向长篇小说的开源 AI 翻译引擎。它把原文完
 - 一键导出不含密钥、书稿、译文和完整私人路径的诊断 JSON，便于定位导入、连接、试译、校验或提交阶段的失败；
 - DeepSeek 固定提供 `deepseek-v4-flash` 和 `deepseek-v4-pro`，旧模型名会被明确拒绝而不会进入翻译。
 
+## V4 Flash 100K 实测
+
+FolioLoom v1.5.1 使用当前 `deepseek-v4-flash` 模型、Active/Balanced 调度和 3 路并发，在全新项目数据库上的前 100K 字符实测如下：
+
+- 德语《变形记》：**10 分 55 秒**；
+- 英语《时间之子》第一部：**18 分 56 秒**。
+
+两次运行均完成严格导出与审计，且没有 human-required 或 failed 窗口。实际耗时仍会受模型服务负载、网络状况、段落结构和知识重验证次数影响；上述数字是本次发布验收样本，不是固定速度承诺。详细口径与结果见[双语 100K 验收报告](docs/superpowers/reports/2026-07-30-translation-throughput-and-revalidation-live-validation.md)。
+
 ## 当前限制
 
 - 当前发布 Windows x64 单文件便携版和目录便携 ZIP，尚未提供代码签名；
-- V4 的本地裁决页和旧 Streamlit 页面仍保留，但不是 V1.4 主入口；
+- V4 的本地裁决页和旧 Streamlit 页面仍保留，但不是当前版本主入口；
 - 已完成离线回归和真实模型的一窗口、三窗口门禁，尚未发布最新版架构的全书质量基准；
 - 桌面端已接通书稿导入、模型兼容性检查、单片段试译、整本开始、暂停、恢复和严格导出；批量审阅队列仍是后续工作；
 - 桌面端内置 DeepSeek、Kimi、阿里云百炼、火山方舟、OpenAI、硅基流动及自定义 OpenAI-compatible 接口入口；DeepSeek 只接受 V4 Flash/Pro，各模型仍须通过真实兼容性检查。
@@ -45,7 +54,7 @@ npm.cmd ci
 Set-Location ..
 ```
 
-复制示例配置。V1.4 可以把真实 API Key 写入不会被 Git 跟踪的 `config/config.yaml`，也可以在运行命令中使用 `--opencode-auth` 从本机 OpenCode 的认证文件读取：
+复制示例配置。V1.5.1 可以把真实 API Key 写入不会被 Git 跟踪的 `config/config.yaml`，也可以在运行命令中使用 `--opencode-auth` 从本机 OpenCode 的认证文件读取：
 
 ```powershell
 Copy-Item config\config.example.yaml config\config.yaml
