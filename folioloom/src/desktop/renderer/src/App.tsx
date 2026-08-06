@@ -644,11 +644,13 @@ export function App({ api }: AppProps): JSX.Element {
             busy={busyAction === "load-fullbook"
               || busyAction === "start-fullbook"
               || busyAction === "pause-fullbook"
-              || busyAction === "resume-fullbook"}
+              || busyAction === "resume-fullbook"
+              || busyAction === "export-diagnostics"}
             error={fullBookError}
             onStart={(profile) => { void startFullBook(profile); }}
             onPause={() => { void pauseFullBook(); }}
             onResume={(runId) => { void resumeFullBook(runId); }}
+            onExportDiagnostics={() => { void exportDiagnostics(); }}
           />
         ) : activeWorkspace === "memory" && knowledgeAvailable ? (
           <KnowledgeWorkbench

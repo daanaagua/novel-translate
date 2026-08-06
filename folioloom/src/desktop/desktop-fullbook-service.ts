@@ -9,6 +9,12 @@ import {
   type LosslessBookRunResult,
 } from "../fullbook/book-runner.js";
 import { profileFromLegacyRunMode } from "../fullbook/optimization-policy.js";
+import {
+  createStoreRecoveryIncident,
+  loadAttemptedRecoveryStrategies,
+  RecoveryEngine,
+  StoreRecoveryKernel,
+} from "../recovery/recovery-engine.js";
 import { SourceLedger } from "../source/source-ledger.js";
 import {
   LosslessBookStore,
@@ -18,6 +24,7 @@ import {
 import type { RuntimeProfileStore } from "../storage/runtime-profile-store.js";
 import type {
   DesktopError,
+  DesktopAttentionSummary,
   DesktopFullBookPhase,
   DesktopFullBookProgress,
   DesktopFullBookRunSnapshot,
@@ -28,6 +35,7 @@ import type {
   DesktopStartFullBookRequest,
   DesktopTrialMode,
 } from "./contracts.js";
+import { projectAttentionItems } from "./desktop-attention.js";
 import { toDesktopError } from "./desktop-errors.js";
 import {
   buildDesktopRuntimePlan,
@@ -44,6 +52,7 @@ const DEFAULT_POLL_INTERVAL_MS = 750;
 
 export type DesktopFullBookErrorCode =
   | "DESKTOP_FULLBOOK_ALREADY_RUNNING"
+  | "DESKTOP_FULLBOOK_ATTENTION_RECOVERY_UNAVAILABLE"
   | "DESKTOP_FULLBOOK_INPUT_INVALID"
   | "DESKTOP_FULLBOOK_MODEL_NOT_READY"
   | "DESKTOP_FULLBOOK_PAUSED"
@@ -325,6 +334,7 @@ function persistedPhase(
 function capabilities(
   phase: DesktopFullBookPhase,
   progress: DesktopFullBookRunSnapshot["progress"],
+  attentionRetryAvailable = false,
 ): Pick<DesktopFullBookRunSnapshot, "canPause" | "canResume" | "canExport"> {
   const complete = progress.totalWindows > 0
     && progress.completedWindows === progress.totalWindows
@@ -335,7 +345,9 @@ function capabilities(
     && progress.failedWindows === 0;
   return {
     canPause: phase === "preparing" || phase === "running",
-    canResume: phase === "paused" || phase === "failed",
+    canResume: phase === "paused"
+      || phase === "failed"
+      || (phase === "needs_attention" && attentionRetryAvailable),
     canExport: phase === "completed" && complete,
   };
 }
@@ -344,6 +356,7 @@ function publicRun(
   run: StoredTranslationRun,
   metadata: FullBookMetadata,
   progress: DesktopFullBookRunSnapshot["progress"],
+  attention: DesktopAttentionSummary | undefined,
   overlay?: RunOverlay,
 ): DesktopFullBookRunSnapshot {
   const phase = overlay?.phase ?? persistedPhase(progress);
@@ -358,7 +371,8 @@ function publicRun(
     ...(overlay?.scheduler === undefined
       ? {}
       : { scheduler: overlay.scheduler }),
-    ...capabilities(phase, overlay?.progress ?? progress),
+    ...capabilities(phase, overlay?.progress ?? progress, attention?.retryAvailable),
+    ...(attention === undefined ? {} : { attention }),
     ...(overlay?.error === undefined ? {} : { error: overlay.error }),
   };
 }
@@ -448,8 +462,26 @@ export class DesktopFullBookService {
           const metadata = fullBookMetadata(run.metadata);
           if (metadata === undefined) continue;
           const progress = publicProgress(store.statusSummary(run.runId));
+          const allAttentionItems = projectAttentionItems(store.allWindows(run.runId));
+          const retryAttempted = allAttentionItems.length > 0
+            && loadAttemptedRecoveryStrategies(
+              project.storePath,
+              run.runId,
+              "EXPORT_INCOMPLETE",
+            ).length > 0;
+          const attention: DesktopAttentionSummary | undefined = allAttentionItems.length === 0
+            ? undefined
+            : {
+                items: allAttentionItems.slice(0, 100),
+                totalItems: allAttentionItems.length,
+                truncated: allAttentionItems.length > 100,
+                retryAvailable: !retryAttempted
+                  && progress.failedWindows === 0
+                  && allAttentionItems.some((item) => item.retryable),
+                retryAttempted,
+              };
           const overlay = this.#overlays.get(run.runId);
-          persisted.push(publicRun(run, metadata, progress, overlay));
+          persisted.push(publicRun(run, metadata, progress, attention, overlay));
           seen.add(run.runId);
         }
       } finally {
@@ -542,11 +574,22 @@ export class DesktopFullBookService {
     const store = LosslessBookStore.openReadOnly(project.storePath);
     let storedRun: StoredTranslationRun | undefined;
     let metadata: FullBookMetadata | undefined;
+    let requiresAttentionRecovery = false;
     try {
       storedRun = store.listTranslationRuns().find((candidate) =>
         candidate.runId === request.runId
         && candidate.sourceVersion === project.sourceVersion);
       metadata = fullBookMetadata(storedRun?.metadata);
+      if (storedRun !== undefined && metadata !== undefined) {
+        const status = store.statusSummary(storedRun.runId);
+        if (status.failedWindows > 0) {
+          throw new DesktopFullBookError(
+            "DESKTOP_FULLBOOK_ATTENTION_RECOVERY_UNAVAILABLE",
+            "failed windows require diagnostics before the run can resume",
+          );
+        }
+        requiresAttentionRecovery = status.humanRequiredWindows > 0;
+      }
     } finally {
       store.close();
     }
@@ -581,6 +624,9 @@ export class DesktopFullBookService {
           "the manuscript changed while the translation runtime was being prepared",
         );
       }
+      if (requiresAttentionRecovery) {
+        await this.#recoverAttentionWindows(project, storedRun.runId);
+      }
       return this.#launch(task, plan, {
         runId: storedRun.runId,
         protocolVersion: storedRun.protocolVersion,
@@ -590,6 +636,43 @@ export class DesktopFullBookService {
     } catch (error) {
       this.#releasePreparation(task);
       throw error;
+    }
+  }
+
+  async #recoverAttentionWindows(
+    project: NormalizedProject,
+    runId: string,
+  ): Promise<void> {
+    const attempted = loadAttemptedRecoveryStrategies(
+      project.storePath,
+      runId,
+      "EXPORT_INCOMPLETE",
+    );
+    if (attempted.length > 0) {
+      throw new DesktopFullBookError(
+        "DESKTOP_FULLBOOK_ATTENTION_RECOVERY_UNAVAILABLE",
+        "the audited automatic retry for these windows has already been used",
+      );
+    }
+    const store = new LosslessBookStore(project.storePath);
+    try {
+      const incident = createStoreRecoveryIncident(
+        store,
+        runId,
+        "EXPORT_INCOMPLETE",
+      );
+      const engine = new RecoveryEngine({
+        kernel: new StoreRecoveryKernel(store, project.storePath),
+      });
+      const result = await engine.recover(incident);
+      if (result.status !== "resumed" || result.strategy !== "reset_missing_windows") {
+        throw new DesktopFullBookError(
+          "DESKTOP_FULLBOOK_ATTENTION_RECOVERY_UNAVAILABLE",
+          result.reason ?? "the audited automatic retry was not accepted",
+        );
+      }
+    } finally {
+      store.close();
     }
   }
 

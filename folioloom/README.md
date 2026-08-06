@@ -15,7 +15,7 @@ npm.cmd install
 
 ## 本地桌面工作台
 
-桌面端已经随 FolioLoom v1.5.1 提供 Windows x64 便携包。普通用户不需要理解内部清单或数据库，按以下步骤操作即可：
+桌面端已经随 FolioLoom v1.5.3 提供 Windows x64 便携包。普通用户不需要理解内部清单或数据库，按以下步骤操作即可：
 
 1. 选择 TXT、EPUB、DOCX 或 Markdown 书稿；
 2. 选择 DeepSeek、Kimi、阿里云百炼、火山方舟、OpenAI、硅基流动或自定义兼容服务，填写 API Key、模型与 provider 原始 effort 值；DeepSeek 只提供当前的 `deepseek-v4-flash` 和 `deepseek-v4-pro`；
@@ -47,7 +47,8 @@ npm.cmd run desktop:dev
 - 导出只开放完整且审计通过的运行；中文 TXT、双语 TXT 和 EPUB 会先写入临时目录并严格校验，通过后再原子发布到用户选择的目录。
 - “术语与记忆”已经支持分页浏览、筛选、详情、证据、关系、历史、影响诊断、人工修改、恢复旧版本、全局术语附加与多格式导入。
 - 左侧“导出诊断”及错误面板中的诊断按钮会生成严格隐私模式 JSON；其中不含 API Key、原文、译文、提示词、模型原始响应或完整私人路径，可直接用于反馈试译失败。
-- 批量审阅队列尚未接入桌面入口，继续作为后续功能；命令行工作流保持兼容。
+- “需要处理”会列出文本块位置、失败类别、公开错误码和建议动作；安全重试只对 `human_required` 开放一次，并复用既有影子恢复、完整审计和原子晋升协议。
+- 逐段人工改译与批量审阅尚未接入桌面入口，继续作为后续功能；命令行工作流保持兼容。
 - `desktop:dist` 会同时生成 Windows x64 单文件便携版
   `release/FolioLoom-portable-win-x64.exe` 和目录便携版
   `release/FolioLoom-portable-win-x64.zip`。普通用户建议下载 ZIP，完整解压后直接双击根目录的

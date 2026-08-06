@@ -204,6 +204,7 @@ function storedFullBookRun(options: {
   optimizationProfile?: "economy" | "balanced" | "speed";
   completedWindows?: number;
   humanRequired?: boolean;
+  failureError?: string;
   runtime?: DesktopRuntimeResolver;
 }): unknown {
   const runtime = options.runtime ?? runtimeResolver();
@@ -277,10 +278,10 @@ function storedFullBookRun(options: {
         assert.ok(window);
         store.claimWindow(options.runId, window.windowId);
         store.failWindow(options.runId, window.windowId, {
-          error: "fixture needs attention",
+          error: options.failureError ?? "fixture needs attention",
           retry: false,
           budget: {},
-          warnings: ["fixture needs attention"],
+          warnings: [options.failureError ?? "fixture needs attention"],
         });
       }
       return metadata;
@@ -601,11 +602,111 @@ test("desktop full-book reconstructs paused, completed, and attention states fro
     const attention = service.snapshot({ manifestPath: attentionProject.manifestPath });
     assert.equal(attention.runs[0]?.phase, "needs_attention");
     assert.equal(attention.runs[0]?.progress.humanRequiredWindows, 1);
+    assert.equal(attention.runs[0]?.canResume, true);
     assert.equal(attention.runs[0]?.canExport, false);
+    assert.equal(attention.runs[0]?.attention?.items.length, 1);
+    assert.equal(attention.runs[0]?.attention?.items[0]?.code, "ATTENTION_UNCLASSIFIED");
+    assert.equal(attention.runs[0]?.attention?.retryAvailable, true);
+    assert.equal(attention.runs[0]?.attention?.retryAttempted, false);
   } finally {
     rmSync(pausedProject.directory, { recursive: true, force: true });
     rmSync(completedProject.directory, { recursive: true, force: true });
     rmSync(attentionProject.directory, { recursive: true, force: true });
+  }
+});
+
+test("desktop full-book safely requeues human-required windows before resuming", async () => {
+  const project = fixture();
+  const seen: LosslessBookRunOptions[] = [];
+  try {
+    await storedFullBookRun({
+      project,
+      runId: "run-attention-retry",
+      completedWindows: 1,
+      humanRequired: true,
+      failureError: "framed response protocol rejected the final submission",
+    });
+    const service = new DesktopFullBookService({
+      runtime: runtimeResolver(),
+      runBook: async (options) => {
+        seen.push(options);
+        return runResult("run-attention-retry", {
+          outcome: "partial",
+          processedWindows: 0,
+        });
+      },
+      pollIntervalMs: 5,
+    });
+
+    const before = service.snapshot({ manifestPath: project.manifestPath });
+    assert.equal(before.runs[0]?.attention?.items[0]?.category, "protocol");
+
+    await service.resume(
+      { manifestPath: project.manifestPath },
+      { runId: "run-attention-retry" },
+    );
+    await flushBackground();
+    assert.equal(seen.length, 1);
+
+    const store = LosslessBookStore.openReadOnly(project.storePath);
+    try {
+      const windows = store.allWindows("run-attention-retry");
+      assert.equal(windows.filter((window) => window.status === "human_required").length, 0);
+      assert.equal(windows.filter((window) => window.status === "pending").length, 1);
+    } finally {
+      store.close();
+    }
+  } finally {
+    rmSync(project.directory, { recursive: true, force: true });
+  }
+});
+
+test("desktop full-book exposes an exhausted attention retry without offering a second mutation", async () => {
+  const project = fixture();
+  try {
+    await storedFullBookRun({
+      project,
+      runId: "run-attention-once",
+      completedWindows: 1,
+      humanRequired: true,
+      failureError: "external model provider timeout",
+    });
+    const service = new DesktopFullBookService({
+      runtime: runtimeResolver(),
+      runBook: async () => runResult("run-attention-once", {
+        outcome: "partial",
+        processedWindows: 0,
+      }),
+      pollIntervalMs: 5,
+    });
+    await service.resume(
+      { manifestPath: project.manifestPath },
+      { runId: "run-attention-once" },
+    );
+    await flushBackground();
+
+    const store = new LosslessBookStore(project.storePath);
+    try {
+      const pending = store.pendingWindows("run-attention-once")[0];
+      assert.ok(pending);
+      store.claimWindow("run-attention-once", pending.windowId);
+      store.failWindow("run-attention-once", pending.windowId, {
+        error: "external model provider timeout after audited retry",
+        retry: false,
+        budget: {},
+        warnings: [],
+      });
+    } finally {
+      store.close();
+    }
+
+    const restarted = new DesktopFullBookService({ runtime: runtimeResolver() });
+    const after = restarted.snapshot({ manifestPath: project.manifestPath });
+    assert.equal(after.runs[0]?.attention?.retryAttempted, true);
+    assert.equal(after.runs[0]?.attention?.retryAvailable, false);
+    assert.equal(after.runs[0]?.canResume, false);
+  } finally {
+    rmSync(project.directory, { recursive: true, force: true });
   }
 });
 
