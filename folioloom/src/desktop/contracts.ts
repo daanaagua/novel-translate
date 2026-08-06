@@ -236,6 +236,38 @@ export type DesktopFullBookWindowProgress = DesktopRunSummary["progress"] & {
   stagedWindows: number;
 };
 
+export type DesktopAttentionCategory =
+  | "provider"
+  | "protocol"
+  | "validation"
+  | "budget"
+  | "source"
+  | "storage"
+  | "unknown";
+
+export interface DesktopAttentionItem {
+  windowId: string;
+  ordinal: number;
+  location: string;
+  sourceChars: number;
+  attemptCount: number;
+  status: "human_required" | "failed";
+  category: DesktopAttentionCategory;
+  code: string;
+  title: string;
+  explanation: string;
+  nextAction: string;
+  retryable: boolean;
+}
+
+export interface DesktopAttentionSummary {
+  items: readonly DesktopAttentionItem[];
+  totalItems: number;
+  truncated: boolean;
+  retryAvailable: boolean;
+  retryAttempted: boolean;
+}
+
 export interface DesktopFullBookRunSnapshot {
   runId: string;
   sourceVersion: string;
@@ -257,6 +289,7 @@ export interface DesktopFullBookRunSnapshot {
   canPause: boolean;
   canResume: boolean;
   canExport: boolean;
+  attention?: DesktopAttentionSummary;
   error?: DesktopError;
 }
 

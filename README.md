@@ -4,9 +4,9 @@
 
 FolioLoom 是一个面向长篇小说的开源 AI 翻译引擎。它把原文完整性、叙事记忆、实体别名、术语连续性、局部风格和失败恢复作为同一条可审计流水线处理，目标是让复杂小说在分块、并行和长时间运行后仍保持可追溯的一致性。
 
-当前版本为 **FolioLoom v1.5.2**。正式内核位于 [`folioloom/`](folioloom/)，以 TypeScript 编写；仓库根目录的 Python 代码主要承担 TXT、Markdown、DOCX、EPUB 输入适配，并保留 V1–V4 的研究历史。
+当前版本为 **FolioLoom v1.5.3**。正式内核位于 [`folioloom/`](folioloom/)，以 TypeScript 编写；仓库根目录的 Python 代码主要承担 TXT、Markdown、DOCX、EPUB 输入适配，并保留 V1–V4 的研究历史。
 
-## V1.5.2 能做什么
+## V1.5.3 能做什么
 
 - 为原始文本建立带哈希和位置映射的无损账本；
 - 按逻辑窗口串行或有限并行翻译，并在中断后恢复；
@@ -20,11 +20,12 @@ FolioLoom 是一个面向长篇小说的开源 AI 翻译引擎。它把原文完
 - 导入 JSON、YAML、CSV 或 XLSX 术语数据，并在写入前处理字段映射和冲突；
 - 针对英语、德语、法语、西班牙语、俄语、日语和韩语提供语言画像，并支持常见 Unicode、Windows-1252 及日韩传统编码；
 - 一键导出不含密钥、书稿、译文和完整私人路径的诊断 JSON，便于定位导入、连接、试译、校验或提交阶段的失败；
+- 在桌面端列出需要处理的文本块、失败类别、公开错误码和下一步；可恢复项只允许一次经过影子审计与原子晋升的安全重试；
 - DeepSeek 固定提供 `deepseek-v4-flash` 和 `deepseek-v4-pro`，旧模型名会被明确拒绝而不会进入翻译。
 
 ## V4 Flash 100K 实测
 
-FolioLoom v1.5.1 使用当前 `deepseek-v4-flash` 模型、Active/Balanced 调度和 3 路并发，在全新项目数据库上的前 100K 字符实测如下；v1.5.2 只增加 EPUB 结构保真，不改变该翻译调度内核：
+FolioLoom v1.5.1 使用当前 `deepseek-v4-flash` 模型、Active/Balanced 调度和 3 路并发，在全新项目数据库上的前 100K 字符实测如下；v1.5.2 增加 EPUB 结构保真，v1.5.3 增加桌面端处理与恢复工作流，均不改变该翻译调度内核：
 
 - 德语《变形记》：**10 分 55 秒**；
 - 英语《时间之子》第一部：**18 分 56 秒**。
@@ -36,7 +37,7 @@ FolioLoom v1.5.1 使用当前 `deepseek-v4-flash` 模型、Active/Balanced 调�
 - 当前发布 Windows x64 单文件便携版和目录便携 ZIP，尚未提供代码签名；
 - V4 的本地裁决页和旧 Streamlit 页面仍保留，但不是当前版本主入口；
 - 已完成离线回归和真实模型的一窗口、三窗口门禁，尚未发布最新版架构的全书质量基准；
-- 桌面端已接通书稿导入、模型兼容性检查、单片段试译、整本开始、暂停、恢复和严格导出；批量审阅队列仍是后续工作；
+- 桌面端已接通书稿导入、模型兼容性检查、单片段试译、整本开始、暂停、恢复、需要处理中心和严格导出；逐段人工改译与批量审阅仍是后续工作；
 - 桌面端内置 DeepSeek、Kimi、阿里云百炼、火山方舟、OpenAI、硅基流动及自定义 OpenAI-compatible 接口入口；DeepSeek 只接受 V4 Flash/Pro，各模型仍须通过真实兼容性检查。
 - EPUB 原模板保真只适用于由 v1.5.2 重新导入的项目；旧项目不会用模糊对齐猜测链接位置，需重新导入原 EPUB 后再翻译。
 
@@ -56,7 +57,7 @@ npm.cmd ci
 Set-Location ..
 ```
 
-复制示例配置。V1.5.2 可以把真实 API Key 写入不会被 Git 跟踪的 `config/config.yaml`，也可以在运行命令中使用 `--opencode-auth` 从本机 OpenCode 的认证文件读取：
+复制示例配置。V1.5.3 可以把真实 API Key 写入不会被 Git 跟踪的 `config/config.yaml`，也可以在运行命令中使用 `--opencode-auth` 从本机 OpenCode 的认证文件读取：
 
 ```powershell
 Copy-Item config\config.example.yaml config\config.yaml

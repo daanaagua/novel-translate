@@ -103,6 +103,11 @@ const PUBLIC_ERRORS: Readonly<Record<string, PublicErrorDefinition>> = Object.fr
     message: "试译已取消",
     retryable: true,
   },
+  DESKTOP_FULLBOOK_ATTENTION_RECOVERY_UNAVAILABLE: {
+    message: "这些文本块不能再次自动重试",
+    nextAction: "请导出隐私诊断文件；现有翻译进度仍保存在本地。",
+    retryable: false,
+  },
   KNOWLEDGE_IMPORT_ALREADY_COMMITTED: {
     message: "这份知识已经导入",
     nextAction: "如需再次导入，请先撤销上一次导入，或修改文件内容。",

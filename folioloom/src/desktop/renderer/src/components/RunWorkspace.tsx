@@ -17,6 +17,7 @@ interface RunWorkspaceProps {
   onStart(profile: DesktopOptimizationProfile): void;
   onPause(): void;
   onResume(runId: string): void;
+  onExportDiagnostics(): void;
 }
 
 const phaseCopy: Readonly<Record<DesktopFullBookRunSnapshot["phase"], string>> = {
@@ -107,6 +108,7 @@ export function RunWorkspace({
   onStart,
   onPause,
   onResume,
+  onExportDiagnostics,
 }: RunWorkspaceProps): JSX.Element {
   const [selectedProfile, setSelectedProfile] =
     useState<DesktopOptimizationProfile>("balanced");
@@ -225,6 +227,59 @@ export function RunWorkspace({
               </div>
             ) : null}
 
+            {run.attention === undefined ? null : (
+              <section className="attention-center" aria-labelledby="attention-center-title">
+                <header>
+                  <div>
+                    <p className="eyebrow">安全恢复</p>
+                    <h3 id="attention-center-title">需要处理的文本块</h3>
+                  </div>
+                  <span>{run.attention.totalItems} 项</span>
+                </header>
+                <p className="attention-intro">
+                  已完成进度仍保存在本地。这里不显示正文片段、译文、私人路径或模型原始响应。
+                </p>
+                {run.attention.truncated ? (
+                  <p className="attention-intro">当前只显示前 100 项；诊断文件包含完整聚合计数。</p>
+                ) : null}
+                <div className="attention-list">
+                  {run.attention.items.map((item) => (
+                    <article key={item.windowId}>
+                      <div className="attention-item-heading">
+                        <div>
+                          <strong>{item.location}</strong>
+                          <small>{item.sourceChars.toLocaleString("zh-CN")} 字符 · 已尝试 {item.attemptCount} 次</small>
+                        </div>
+                        <code>{item.code}</code>
+                      </div>
+                      <h4>{item.title}</h4>
+                      <p>{item.explanation}</p>
+                      <p className="attention-next-action">下一步：{item.nextAction}</p>
+                    </article>
+                  ))}
+                </div>
+                {run.progress.failedWindows > 0 ? (
+                  <p className="attention-blocker">
+                    存在运行失败的文本块，自动重试不可用；请先导出诊断文件。
+                  </p>
+                ) : run.attention.retryAttempted ? (
+                  <p className="attention-blocker">
+                    本次受审计的自动重试已经使用；再次失败需要诊断具体原因。
+                  </p>
+                ) : null}
+                <div className="attention-actions">
+                  <button
+                    className="secondary-button"
+                    type="button"
+                    disabled={busy}
+                    onClick={onExportDiagnostics}
+                  >
+                    导出诊断文件
+                  </button>
+                </div>
+              </section>
+            )}
+
             <div className="workspace-actions">
               {run.canPause ? (
                 <button
@@ -243,7 +298,11 @@ export function RunWorkspace({
                   disabled={busy || !modelReady}
                   onClick={() => onResume(run.runId)}
                 >
-                  {busy ? "正在继续" : "继续翻译"}
+                  {busy
+                    ? run.phase === "needs_attention" ? "正在安全恢复" : "正在继续"
+                    : run.phase === "needs_attention"
+                      ? `安全重试 ${run.attention?.totalItems ?? 0} 个文本块`
+                      : "继续翻译"}
                 </button>
               ) : null}
             </div>
